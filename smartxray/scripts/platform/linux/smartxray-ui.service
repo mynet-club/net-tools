@@ -1,0 +1,16 @@
+[Unit]
+Description=SmartXray Web UI
+After=network.target smartxray.service
+Wants=smartxray.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/local/lib/smartxray
+ExecStart=/usr/bin/node /usr/local/lib/smartxray/index.js ui
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
