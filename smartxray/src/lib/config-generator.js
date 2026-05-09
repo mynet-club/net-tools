@@ -154,7 +154,8 @@ function buildConfig() {
     // 仅当现有配置有实质内容时才做 merge（空 inbounds 不算）
     const hasRealContent = existing.outbounds?.length > 2 ||
                            existing.routing?.rules?.length > 1 ||
-                           existing.balancers?.length > 0;
+                           existing.balancers?.length > 0 ||
+                           existing.routing?.balancers?.length > 0;
     if (hasRealContent) {
       const preservedRules = [];
       const catchAllRules  = [];
@@ -183,9 +184,11 @@ function buildConfig() {
           ? existing.outbounds
           : config.outbounds,
       };
-      if (existing.balancers?.length)    merged.balancers       = existing.balancers;
-      if (existing.observatory)          merged.observatory     = existing.observatory;
-      if (existing.burstObservatory)     merged.burstObservatory = existing.burstObservatory;
+      if (existing.balancers?.length)             merged.balancers              = existing.balancers;
+      if (existing.routing?.balancers?.length)    merged.routing.balancers      = existing.routing.balancers;
+      if (existing.observatory)                   merged.observatory            = existing.observatory;
+      if (existing.burstObservatory)              merged.burstObservatory       = existing.burstObservatory;
+      if (existing.api)                           merged.api                    = existing.api;
 
       fs.mkdirSync(path.dirname(XRAY_CONF), { recursive: true });
       fs.writeFileSync(XRAY_CONF, JSON.stringify(merged, null, 2));
