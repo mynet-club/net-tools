@@ -50,7 +50,7 @@ const LOG_FILE    = path.join(LOGS_DIR, 'xray.log');
 
 // ==================== 版本和仓库 ====================
 
-const VERSION = '3.0.2';
+const VERSION = '3.0.3';
 const GITHUB_REPO = 'luoyueliang/smartxray';
 const API_PORT = 2088;
 

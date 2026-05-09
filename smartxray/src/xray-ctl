@@ -70,6 +70,14 @@ async function cmdStart() {
     return;
   }
 
+  // 启动前清理任何遗留 xray 进程（PID 文件未跟踪的孤儿）
+  const strayPids = run('pgrep -x xray').split('\n').filter(Boolean).map(Number).filter(Boolean);
+  if (strayPids.length > 0) {
+    for (const p of strayPids) { try { process.kill(p, 'SIGTERM'); } catch {} }
+    console.log(c.yellow(`  已清理 ${strayPids.length} 个遗留 xray 进程`));
+    await new Promise(r => setTimeout(r, 500));
+  }
+
   // 生成完整配置（从数据库构建 inbounds）
   console.log(c.dim('  正在生成 Xray 配置...'));
   const builtCfg = buildConfig();
@@ -96,22 +104,37 @@ async function cmdStart() {
 
 function cmdStop() {
   const pid = readPid();
-  if (!pid) {
-    console.log(c.yellow('  Xray 未运行'));
-    return;
+  let stopped = false;
+
+  // 停止 PID 文件跟踪的进程
+  if (pid) {
+    try {
+      process.kill(pid, 'SIGTERM');
+      stopped = true;
+    } catch (e) {
+      if (e.code !== 'ESRCH') {
+        console.log(c.red(`  ✗ 停止失败: ${e.message}`));
+      }
+    }
+    removePid();
   }
 
-  try {
-    process.kill(pid, 'SIGTERM');
-    removePid();
+  // 清理所有未被 PID 文件跟踪的孤儿 xray 进程（包括 systemd 管理的）
+  const orphanPids = run('pgrep -x xray').split('\n').filter(Boolean).map(Number).filter(p => p && p !== pid);
+  let orphanCount = 0;
+  for (const p of orphanPids) {
+    try {
+      process.kill(p, 'SIGTERM');
+      orphanCount++;
+      stopped = true;
+    } catch {}
+  }
+  if (orphanCount > 0) console.log(c.yellow(`  已清理 ${orphanCount} 个孤儿 xray 进程`));
+
+  if (stopped) {
     console.log(c.green('  ✓ Xray 已停止'));
-  } catch (e) {
-    if (e.code === 'ESRCH') {
-      removePid();
-      console.log(c.yellow('  Xray 进程不存在，已清理 PID 文件'));
-    } else {
-      console.log(c.red(`  ✗ 停止失败: ${e.message}`));
-    }
+  } else {
+    console.log(c.yellow('  Xray 未运行'));
   }
 }
 
