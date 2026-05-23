@@ -4,7 +4,7 @@
  */
 
 const path = require('path');
-const fs   = require('fs');
+const fs = require('fs');
 
 // 检测是否在 bundle 模式下运行
 function getBaseDir() {
@@ -18,7 +18,7 @@ function getBaseDir() {
 
 // 数据库路径
 const DATA_DIR = path.join(getBaseDir(), 'data');
-const DB_FILE  = path.join(DATA_DIR, 'smartxray.db');
+const DB_FILE = path.join(DATA_DIR, 'smartxray.db');
 
 // 兼容旧版：数据库曾直接放在 BASE_DIR 而非 data/ 子目录
 // 若新路径无数据库但旧路径有，则自动迁移
@@ -38,11 +38,11 @@ if (!fs.existsSync(DB_FILE) && fs.existsSync(LEGACY_DB)) {
 
 // 清理上次崩溃可能残留的 SQLite 锁目录
 const LOCK_DIR = `${DB_FILE}.lock`;
-try { if (fs.statSync(LOCK_DIR).isDirectory()) fs.rmdirSync(LOCK_DIR); } catch {}
+try { if (fs.statSync(LOCK_DIR).isDirectory()) fs.rmdirSync(LOCK_DIR); } catch { }
 
 // 加载 node-sqlite3-wasm
 let Database;
-try { 
+try {
   const sqlite3 = require('node-sqlite3-wasm');
   Database = sqlite3.Database;
 } catch {
@@ -72,7 +72,7 @@ function db() {
  */
 function initTables() {
   const database = _db;
-  
+
   // 用户表
   database.exec(`
     CREATE TABLE IF NOT EXISTS users (
@@ -120,7 +120,7 @@ function initTables() {
  * @returns {string} 配置值
  */
 function getSetting(key, defaultValue = '') {
-  const row = db().prepare('SELECT value FROM settings WHERE key=?').get(key);
+  const row = db().prepare('SELECT value FROM settings WHERE key=?').get([key]);
   return row ? row.value : defaultValue;
 }
 
@@ -130,7 +130,7 @@ function getSetting(key, defaultValue = '') {
  * @param {string} value - 配置值
  */
 function setSetting(key, value) {
-  db().prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run(key, value);
+  db().prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run([key, value]);
 }
 
 /**
@@ -154,7 +154,7 @@ function setSettings(settings) {
   const stmt = db().prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)');
   const transaction = db().transaction((items) => {
     for (const [key, value] of Object.entries(items)) {
-      stmt.run(key, value);
+      stmt.run([key, value]);
     }
   });
   transaction(settings);
@@ -165,7 +165,7 @@ function setSettings(settings) {
  * @param {string} key - 配置键名
  */
 function deleteSetting(key) {
-  db().prepare('DELETE FROM settings WHERE key=?').run(key);
+  db().prepare('DELETE FROM settings WHERE key=?').run([key]);
 }
 
 /**
@@ -189,7 +189,7 @@ function getAllSettings() {
  * @returns {Object|null} 用户对象
  */
 function getUserById(id) {
-  return db().prepare('SELECT * FROM users WHERE id=?').get(id) || null;
+  return db().prepare('SELECT * FROM users WHERE id=?').get([id]) || null;
 }
 
 /**
@@ -198,7 +198,7 @@ function getUserById(id) {
  * @returns {Object|null} 用户对象
  */
 function getUserByName(name) {
-  return db().prepare('SELECT * FROM users WHERE name=?').get(name) || null;
+  return db().prepare('SELECT * FROM users WHERE name=?').get([name]) || null;
 }
 
 /**
@@ -208,7 +208,7 @@ function getUserByName(name) {
  * @returns {Object|null} 用户对象
  */
 function getUserByCredentials(username, password) {
-  return db().prepare('SELECT * FROM users WHERE username=? AND password=? AND enabled=1').get(username, password) || null;
+  return db().prepare('SELECT * FROM users WHERE username=? AND password=? AND enabled=1').get([username, password]) || null;
 }
 
 /**
@@ -240,7 +240,7 @@ function createUser(userData) {
   const result = db().prepare(`
     INSERT INTO users (name, port, http_port, uuid, protocol, username, password, tag, expires_at, note)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(name, port, http_port, uuid, protocol, username, password, tag, expires_at, note);
+  `).run([name, port, http_port, uuid, protocol, username, password, tag, expires_at, note]);
 
   return getUserById(result.lastInsertRowid);
 }
@@ -265,7 +265,7 @@ function updateUser(id, data) {
   if (fields.length === 0) return getUserById(id);
 
   values.push(id);
-  db().prepare(`UPDATE users SET ${fields.join(',')} WHERE id=?`).run(...values);
+  db().prepare(`UPDATE users SET ${fields.join(',')} WHERE id=?`).run(values);
   return getUserById(id);
 }
 
@@ -275,7 +275,7 @@ function updateUser(id, data) {
  * @returns {boolean} 是否删除成功
  */
 function deleteUser(id) {
-  const result = db().prepare('DELETE FROM users WHERE id=?').run(id);
+  const result = db().prepare('DELETE FROM users WHERE id=?').run([id]);
   return result.changes > 0;
 }
 
@@ -285,7 +285,7 @@ function deleteUser(id) {
  */
 function getExpiredUsers() {
   const now = new Date().toISOString();
-  return db().prepare('SELECT * FROM users WHERE expires_at IS NOT NULL AND expires_at < ?').all(now);
+  return db().prepare('SELECT * FROM users WHERE expires_at IS NOT NULL AND expires_at < ?').all([now]);
 }
 
 /**
@@ -302,7 +302,7 @@ function getUsersWithoutUuid() {
  * @param {string} uuid - UUID 值
  */
 function assignUserUuid(id, uuid) {
-  db().prepare('UPDATE users SET uuid=? WHERE id=?').run(uuid, id);
+  db().prepare('UPDATE users SET uuid=? WHERE id=?').run([uuid, id]);
 }
 
 // ==================== 验证码相关操作 ====================
@@ -315,8 +315,8 @@ function assignUserUuid(id, uuid) {
  */
 function createVerification(email, code, expiresAt) {
   // 清理同邮箱旧验证码
-  db().prepare('DELETE FROM verifications WHERE email=? AND used=0').run(email);
-  db().prepare('INSERT INTO verifications(email,code,expires_at) VALUES(?,?,?)').run(email, code, expiresAt);
+  db().prepare('DELETE FROM verifications WHERE email=? AND used=0').run([email]);
+  db().prepare('INSERT INTO verifications(email,code,expires_at) VALUES(?,?,?)').run([email, code, expiresAt]);
 }
 
 /**
@@ -329,10 +329,10 @@ function verifyCode(email, code) {
   const now = new Date().toISOString();
   const rec = db().prepare(
     'SELECT * FROM verifications WHERE email=? AND code=? AND used=0 AND expires_at>?'
-  ).get(email, code, now);
-  
+  ).get([email, code, now]);
+
   if (rec) {
-    db().prepare('UPDATE verifications SET used=1 WHERE id=?').run(rec.id);
+    db().prepare('UPDATE verifications SET used=1 WHERE id=?').run([rec.id]);
   }
   return rec || null;
 }
@@ -342,7 +342,7 @@ function verifyCode(email, code) {
  */
 function cleanupExpiredVerifications() {
   const now = new Date().toISOString();
-  db().prepare('DELETE FROM verifications WHERE expires_at < ?').run(now);
+  db().prepare('DELETE FROM verifications WHERE expires_at < ?').run([now]);
 }
 
 // ==================== 数据库维护 ====================

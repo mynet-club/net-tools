@@ -1,0 +1,62 @@
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+dns:
+  enable: true
+  nameserver:
+    - 8.8.8.8
+    - 1.1.1.1
+
+proxies:
+  - name: "home-vless-reality"
+    type: vless
+    server: home.luoyueliang.com
+    port: 8443
+    uuid: a3271d95-1d9d-491f-8144-01f5dc376c83
+    flow: xtls-rprx-vision
+    tls: true
+    network: tcp
+    reality-opts:
+      public-key: q0ZYkygr0dOOzsu3v8yN8kYJ4sOYpuYOZuJlxX9UnDs
+      short-id: 04b002e0
+    servername: www.microsoft.com
+    client-fingerprint: chrome
+    udp: true
+
+proxy-groups:
+  - name: "PROXY"
+    type: select
+    proxies:
+      - AUTO
+      - home-vless-reality
+
+  - name: "AUTO"
+    type: url-test
+    proxies:
+      - home-vless-reality
+    url: "http://www.gstatic.com/generate_204"
+    interval: 300
+    tolerance: 50
+    lazy: true
+
+rules:
+  # ── GitHub / Copilot / VS Code → 走 Clash 代理，确保 Copilot 可用 ──
+  - DOMAIN-SUFFIX,github.com,PROXY
+  - DOMAIN-SUFFIX,githubusercontent.com,PROXY
+  - DOMAIN-SUFFIX,githubcopilot.com,PROXY
+  - DOMAIN-SUFFIX,githubassets.com,PROXY
+  - DOMAIN-SUFFIX,github.io,PROXY
+  - DOMAIN-SUFFIX,npmjs.com,PROXY
+  - DOMAIN-SUFFIX,npmjs.org,PROXY
+  # VS Code Marketplace / extension CDN
+  - DOMAIN-SUFFIX,visualstudio.com,PROXY
+  - DOMAIN-SUFFIX,vscode-cdn.net,PROXY
+  - DOMAIN-SUFFIX,vsassets.io,PROXY
+  # Copilot 遥测 / A/B
+  - DOMAIN-SUFFIX,exp-tas.com,PROXY
+  - DOMAIN-SUFFIX,microsoft.com,PROXY
+  # ── 中国大陆 IP 直连 ──
+  - GEOIP,CN,DIRECT
+  # ── 其余全部走代理 ──
+  - MATCH,PROXY
