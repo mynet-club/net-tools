@@ -263,7 +263,7 @@ mihomo-ctl tray install       安装菜单栏插件；未装时自动用 Homebre
 ```
 
 > `tray install` 插件脚本由 mihomo-ctl 内联生成，无需仓库源文件（安装后也能用）。
-> 若未安装 xbar / SwiftBar，会自动 `brew install --cask swiftbar` 并完成插件配置、启动 SwiftBar。
+> 若未安装 xbar / SwiftBar，会直接从 GitHub 下载 SwiftBar.dmg 安装（仅靠 curl + hdiutil，无 Homebrew 依赖）并完成插件配置、启动 SwiftBar。
 > 菜单栏显示运行状态与当前节点，下拉菜单可一键 启动/停止/重启/切换系统代理或 TUN/打开面板。
 > 全部逻辑在 `mihomo-ctl tray` 中，插件脚本仅做转发，零原生编译、零 npm 依赖。
 

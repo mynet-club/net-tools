@@ -11,7 +11,7 @@ const fs   = require('fs');
 const IS_WIN = process.platform === 'win32';
 
 // ─── 路径常量（跨平台）────────────────────────────────────────
-const VERSION     = '1.5.7';
+const VERSION     = '1.5.8';
 const GITHUB_REPO = 'luoyueliang/net-tools';
 const API         = 'http://127.0.0.1:9090';
 
@@ -2626,7 +2626,7 @@ ${c.cyan('Web UI（可切换面板）')}
 
 ${c.cyan('菜单栏图标（macOS）')}
   mihomo-ctl tray            输出菜单栏插件内容（供 xbar/SwiftBar 调用）
-  mihomo-ctl tray install    安装菜单栏插件；未装 SwiftBar 时自动用 brew 安装
+  mihomo-ctl tray install    安装菜单栏插件；未装 SwiftBar 时从 GitHub 自动下载安装
 
 ${c.cyan('配置备份 & 恢复')}
   mihomo-ctl backup           备份当前 config.yaml（带时间戳）
@@ -2686,7 +2686,7 @@ ${c.cyan('配置文件')}
 // 插件脚本只需 exec 本命令；首行为菜单栏标题，--- 之后为下拉菜单。
 // 菜单项用 xbar/SwiftBar 通用语法：text | bash=<self> param1=<cmd> terminal=false refresh=true
 async function cmdTray(sub) {
-  if (sub === 'install') { cmdTrayInstall(); return; }
+  if (sub === 'install') { await cmdTrayInstall(); return; }
 
   let SELF;
   try { SELF = fs.realpathSync(process.argv[1]); } catch { SELF = process.argv[1]; }
@@ -2766,8 +2766,8 @@ function trayPluginScript(selfPath) {
 }
 
 // 安装菜单栏插件（仅 macOS）：内联生成插件 → 写入 xbar/SwiftBar 插件目录；
-// 若两者都没装，则自动通过 Homebrew 安装 SwiftBar 并完成配置。
-function cmdTrayInstall() {
+// 若两者都没装，则直接从 GitHub 下载 SwiftBar（zip/dmg）安装（仅 curl，无 brew 依赖）。
+async function cmdTrayInstall() {
   if (P.name !== 'macos') {
     console.log(c.yellow('  菜单栏插件仅支持 macOS（依赖 xbar / SwiftBar）'));
     return;
@@ -2816,24 +2816,12 @@ function cmdTrayInstall() {
     return;
   }
 
-  // 未检测到任何宿主 App —— 自动安装 SwiftBar
-  console.log(c.yellow('  未检测到 xbar / SwiftBar'));
-  const hasBrew = !!run('command -v brew 2>/dev/null');
-  if (!hasBrew) {
-    console.log(c.dim('  未检测到 Homebrew，无法自动安装。二选一：'));
-    console.log(c.dim('    1) 安装 Homebrew 后重试: mihomo-ctl tray install'));
-    console.log(c.dim('    2) 手动安装 SwiftBar(https://swiftbar.app) 或 xbar(https://xbarapp.com)'));
+  // 未检测到任何宿主 App —— 直接从 GitHub 下载安装 SwiftBar（仅用 curl，无 brew 依赖）
+  console.log(c.yellow('  未检测到 xbar / SwiftBar，开始从 GitHub 安装 SwiftBar...'));
+  const ok = await downloadInstallSwiftBar();
+  if (!ok) {
     console.log(c.dim(`\n  插件脚本已就绪: ${canonical}`));
-    console.log(c.dim('  手动复制到对应 App 的插件目录即可'));
-    return;
-  }
-
-  console.log(c.dim('  正在通过 Homebrew 安装 SwiftBar...\n'));
-  try {
-    execSync('brew install --cask swiftbar', { stdio: 'inherit' });
-  } catch {
-    console.log(c.red('\n  ✗ SwiftBar 安装失败，请手动执行: brew install --cask swiftbar'));
-    console.log(c.dim(`  插件已就绪: ${canonical}`));
+    console.log(c.dim('  也可手动安装 SwiftBar(https://swiftbar.app) 或 xbar(https://xbarapp.com) 后重试'));
     return;
   }
   const dst = writePlugin(swiftPlugins);
@@ -2843,6 +2831,110 @@ function cmdTrayInstall() {
   run('open -a SwiftBar 2>/dev/null');
   console.log(c.dim('  SwiftBar 已启动。若弹窗要求选择插件目录，请选择：'));
   console.log(c.dim(`    ${swiftPlugins}`));
+}
+
+// 直接从 GitHub Releases 下载 SwiftBar 并安装到 /Applications（仅依赖 curl + unzip/hdiutil）
+async function downloadInstallSwiftBar() {
+  // 1) 查询最新 release，优先 .zip（官方现在用 zip 分发），其次 .dmg
+  const apiUrl = 'https://api.github.com/repos/swiftbar/SwiftBar/releases/latest';
+  const meta = run(`curl -fsSL -4 --max-time 30 ${resolveProxyArg()} -H "Accept: application/vnd.github+json" "${apiUrl}" 2>/dev/null`);
+  let asset = null;
+  try {
+    const json = JSON.parse(meta);
+    const assets = json.assets || [];
+    asset = assets.find(a => /\.zip$/i.test(a.name)) || assets.find(a => /\.dmg$/i.test(a.name));
+  } catch {}
+  if (!asset || !asset.browser_download_url) {
+    console.log(c.red('  ✗ 无法获取 SwiftBar 下载地址（GitHub API 失败）'));
+    return false;
+  }
+  const isZip = /\.zip$/i.test(asset.name);
+  const dlUrl = asset.browser_download_url;
+
+  // 2) 下载
+  const file = path.join(TMP, `${path.basename(asset.name)}`);
+  process.stdout.write(`  下载 ${asset.name}... `);
+  run(`curl -fsSL -4 -L --max-time 180 ${resolveProxyArg()} -o "${file}" "${dlUrl}" 2>/dev/null`);
+  if (!fs.existsSync(file) || fs.statSync(file).size < 500000) {
+    console.log(c.red('✗ 下载失败或文件过小'));
+    try { fs.unlinkSync(file); } catch {}
+    return false;
+  }
+  console.log(c.green(`✓ ${(fs.statSync(file).size / 1024 / 1024).toFixed(1)} MB`));
+
+  // 3) 解出 SwiftBar.app 并拷贝到 /Applications（失败回退 ~/Applications）
+  const targets = ['/Applications', path.join(process.env.HOME || '', 'Applications')];
+  const installApp = (srcApp) => {
+    const appName = path.basename(srcApp);
+    for (const tdir of targets) {
+      try {
+        fs.mkdirSync(tdir, { recursive: true });
+        const dstApp = path.join(tdir, appName);
+        fs.rmSync(dstApp, { recursive: true, force: true });
+        run(`cp -R "${srcApp}" "${dstApp}"`);
+        if (fs.existsSync(dstApp)) return tdir;
+      } catch {}
+    }
+    return '';
+  };
+
+  let appliedDir = '';
+  if (isZip) {
+    const tmpDir = path.join(TMP, `swiftbar-zip-${Date.now()}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+    try {
+      process.stdout.write('  解压并安装... ');
+      run(`unzip -oq "${file}" -d "${tmpDir}"`);
+      const appName = walkFindApp(tmpDir);
+      if (!appName) throw new Error('zip 内未找到 .app');
+      appliedDir = installApp(appName);
+    } catch (e) {
+      console.log(c.red(`✗ ${e.message}`));
+    } finally {
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+      try { fs.unlinkSync(file); } catch {}
+    }
+  } else {
+    const mnt = path.join(TMP, `swiftbar-mnt-${Date.now()}`);
+    fs.mkdirSync(mnt, { recursive: true });
+    try {
+      process.stdout.write('  挂载并安装... ');
+      run(`hdiutil attach "${file}" -nobrowse -quiet -mountpoint "${mnt}"`);
+      const appName = fs.readdirSync(mnt).find(n => /\.app$/i.test(n));
+      if (!appName) throw new Error('dmg 内未找到 .app');
+      appliedDir = installApp(path.join(mnt, appName));
+    } catch (e) {
+      console.log(c.red(`✗ ${e.message}`));
+    } finally {
+      run(`hdiutil detach "${mnt}" -quiet 2>/dev/null`);
+      try { fs.rmSync(mnt, { recursive: true, force: true }); } catch {}
+      try { fs.unlinkSync(file); } catch {}
+    }
+  }
+
+  if (!appliedDir) {
+    console.log(c.red('✗ 安装失败（无法写入 /Applications）'));
+    return false;
+  }
+  // 移除下载隔离属性，避免首次打开被 Gatekeeper 拦截
+  run(`xattr -dr com.apple.quarantine "${path.join(appliedDir, 'SwiftBar.app')}" 2>/dev/null`);
+  console.log(c.green(`✓ 已安装到 ${appliedDir}/SwiftBar.app`));
+  return true;
+}
+
+// 在目录树中查找第一个 .app（zip 解压后 SwiftBar.app 可能不在顶层）
+function walkFindApp(dir) {
+  for (const ent of fs.readdirSync(dir)) {
+    const full = path.join(dir, ent);
+    if (/\.app$/i.test(ent)) return full;
+    try {
+      if (fs.statSync(full).isDirectory()) {
+        const found = walkFindApp(full);
+        if (found) return found;
+      }
+    } catch {}
+  }
+  return '';
 }
 
 // ─── 入口 ──────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 {
   "name": "mihomo-ctl",
-  "version": "1.5.7",
+  "version": "1.5.8",
   "description": "Mihomo (Clash.Meta) server management tool",
   "scripts": {
     "pack": "node scripts/release.js",
