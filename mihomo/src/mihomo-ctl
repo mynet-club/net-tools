@@ -11,7 +11,7 @@ const fs   = require('fs');
 const IS_WIN = process.platform === 'win32';
 
 // ─── 路径常量（跨平台）────────────────────────────────────────
-const VERSION     = '1.5.8';
+const VERSION     = '1.5.9';
 const GITHUB_REPO = 'luoyueliang/net-tools';
 const API         = 'http://127.0.0.1:9090';
 
@@ -2683,19 +2683,22 @@ ${c.cyan('配置文件')}
 }
 
 // ─── 命令：tray（xbar / SwiftBar 菜单栏插件输出）─────────────────
-// 插件脚本只需 exec 本命令；首行为菜单栏标题，--- 之后为下拉菜单。
-// 菜单项用 xbar/SwiftBar 通用语法：text | bash=<self> param1=<cmd> terminal=false refresh=true
 async function cmdTray(sub) {
   if (sub === 'install') { await cmdTrayInstall(); return; }
 
   let SELF;
   try { SELF = fs.realpathSync(process.argv[1]); } catch { SELF = process.argv[1]; }
-  // 通过 /bin/bash -c 包一层并显式补 PATH：macOS 菜单栏 App（xbar/SwiftBar）
-  // 拿到的 PATH 很精简，直接 exec node 脚本会因为找不到 node 而失败。
-  const act = (label, ...params) => {
-    const cmd = `export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; ${SELF} ${params.join(' ')}`;
-    return `${label} | bash=/bin/bash param1=-c param2="${cmd}" terminal=false refresh=true`;
+
+  // squote: 将参数用单引号包裹（处理空格/emoji），嵌入 bash -c 字符串安全
+  const squote = s => `'${String(s).replace(/'/g, "'\\''")}'`;
+  // bashAct: 返回 xbar/SwiftBar 动作属性字符串（不含标签）
+  const bashAct = (...params) => {
+    const cmd = `export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; ${squote(SELF)} ${params.map(squote).join(' ')}`;
+    return `bash=/bin/bash param1=-c param2="${cmd}" terminal=false refresh=true`;
   };
+  // act: 顶级菜单项；sub_act: 子菜单项（-- 前缀）
+  const act     = (label, ...params) => `${label} | ${bashAct(...params)}`;
+  const sub_act = (label, ...params) => `-- ${label} | ${bashAct(...params)}`;
   const sep = '---';
 
   const running = await isRunning();
@@ -2709,34 +2712,104 @@ async function cmdTray(sub) {
     return;
   }
 
-  const [ver, cfg, groups] = await Promise.all([
+  const [ver, cfg, proxiesData] = await Promise.all([
     apiGet('/version').catch(() => ({})),
     apiGet('/configs').catch(() => ({})),
     apiGet('/proxies').catch(() => ({})),
   ]);
-  const node = groups?.proxies?.['\u{1F30D} 默认出口']?.now
-            || groups?.proxies?.['\u{1F680} 自动选择']?.now || '?';
+  const proxies = proxiesData?.proxies || {};
+
+  // 递归解析代理组 now，最多 4 层（URLTest/Fallback 继续向下）
+  const resolveNow = (name, depth = 0) => {
+    if (depth > 4 || !name) return name || '?';
+    const g = proxies[name];
+    if (g && g.now && g.now !== name && (g.type === 'URLTest' || g.type === 'Fallback' || g.type === 'LoadBalance'))
+      return resolveNow(g.now, depth + 1);
+    return name;
+  };
+
   const proxyOn = P.isSystemProxyActive();
   const tunOn   = cfg.tun?.enable === true;
+  const mode    = cfg.mode || 'rule';
 
-  // 菜单栏标题：绿点 + 当前节点（截断）
-  const shortNode = node.length > 16 ? node.slice(0, 15) + '…' : node;
+  // DNS 接管检测（macOS，读取 networksetup 与 DNS_BACKUP_FILE）
+  let dnsOn = false;
+  if (P.name === 'macos') {
+    let dnsIface = P.getActiveInterface() || 'Wi-Fi';
+    try {
+      const bak = JSON.parse(fs.readFileSync(DNS_BACKUP_FILE, 'utf8'));
+      dnsIface = bak.iface || bak.primaryIface || dnsIface;
+    } catch {}
+    try { dnsOn = P.isDnsActive(dnsIface); } catch {}
+  }
+
+  // 找出主要出口的有效节点用于菜单栏标题
+  const mainGroupName = ['\u{1F30D} 默认出口', '\u26A1 手动选择', '\u{1F680} 自动选择']
+    .find(n => proxies[n]);
+  const displayNode = mainGroupName ? resolveNow(proxies[mainGroupName]?.now) : '?';
+  const shortNode = displayNode.length > 16 ? displayNode.slice(0, 15) + '…' : displayNode;
+
+  // ── 菜单栏标题 ──
   console.log(`🟢 ${shortNode}`);
   console.log(sep);
+
+  // ── 状态概览（可读 info 行）──
   console.log(`Mihomo ${ver.version || ''} 运行中 | color=green`);
-  console.log(`节点: ${node}`);
-  console.log(`模式: ${cfg.mode || '?'}   系统代理: ${proxyOn ? '已接管' : '关闭'}   TUN: ${tunOn ? '开启' : '关闭'}`);
+  const dnsTag = P.name === 'macos' ? `   DNS: ${dnsOn ? '接管' : '关闭'}` : '';
+  console.log(`模式: ${mode}   系统代理: ${proxyOn ? '已接管' : '关闭'}   TUN: ${tunOn ? '开启' : '关闭'}${dnsTag} | color=gray`);
   console.log(sep);
+
+  // ── 进程控制 ──
   console.log(act('⏹ 停止', 'stop'));
   console.log(act('🔁 重启', 'restart'));
   console.log(act('♻︎ 重载配置', 'reload'));
   console.log(sep);
+
+  // ── 代理 / TUN / DNS 开关 ──
   if (proxyOn) console.log(act('🚫 关闭系统代理', 'proxy-off'));
   else         console.log(act('✅ 接管系统代理', 'proxy-on'));
   if (tunOn)   console.log(act('🚫 关闭 TUN', 'tun-off'));
   else         console.log(act('🌐 开启 TUN', 'tun-on'));
+  if (P.name === 'macos') {
+    if (dnsOn) console.log(act('🔴 关闭 DNS 接管', 'dns-off'));
+    else       console.log(act('🟢 开启 DNS 接管', 'dns-on'));
+  }
   console.log(sep);
+
+  // ── 模式切换（带子菜单）──
+  const modeIcons = { rule: '📋', global: '🌍', direct: '➡️' };
+  console.log(`${modeIcons[mode] || '📋'} 模式: ${mode}`);
+  for (const m of ['rule', 'global', 'direct']) {
+    const mark = m === mode ? '● ' : '  ';
+    const color = m === mode ? ' color=green' : '';
+    console.log(`-- ${mark}${m} | ${bashAct('mode', m)}${color}`);
+  }
+
+  // ── Selector 代理组节点切换（带子菜单）──
+  const selectorGroups = Object.entries(proxies)
+    .filter(([n, v]) => v.type === 'Selector' && n !== 'GLOBAL')
+    .sort(([a], [b]) => a.localeCompare(b, 'zh'));
+  if (selectorGroups.length > 0) {
+    for (const [gname, gval] of selectorGroups) {
+      const nowNode = gval.now || '';
+      const effectiveNode = resolveNow(nowNode);
+      const label = effectiveNode !== nowNode
+        ? `${gname}: ${nowNode} (→${effectiveNode})`
+        : `${gname}: ${nowNode}`;
+      console.log(`${label}`);
+      for (const member of (gval.all || [])) {
+        const isCur = member === nowNode;
+        const mark = isCur ? '● ' : '  ';
+        const color = isCur ? ' color=green' : '';
+        console.log(`-- ${mark}${member} | ${bashAct('select', gname, member)}${color}`);
+      }
+    }
+  }
+  console.log(sep);
+
+  // ── 工具 ──
   console.log(act('🖥 打开面板', 'ui', 'open'));
+  console.log(act('🌍 更新 Geo 数据', 'geo', 'update'));
   console.log(act('🔄 刷新', 'tray'));
 }
 
