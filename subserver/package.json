@@ -1,0 +1,28 @@
+{
+  "name": "subserver",
+  "version": "1.5.0",
+  "description": "订阅分发服务 — 集中管理节点信息，动态生成 mihomo 订阅配置",
+  "main": "src/server.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-org/net-tools.git",
+    "directory": "subserver"
+  },
+  "license": "MIT",
+  "scripts": {
+    "start": "node src/server.js",
+    "seed": "node scripts/seed.js",
+    "pack": "node scripts/release.js",
+    "release": "node scripts/release.js --publish"
+  },
+  "dependencies": {
+    "node-sqlite3-wasm": "^0.8.11"
+  },
+  "devDependencies": {
+    "@vercel/ncc": "^0.38.3",
+    "javascript-obfuscator": "^4.1.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
