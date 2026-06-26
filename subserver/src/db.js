@@ -37,7 +37,7 @@ try {
 const DEFAULT_TEMPLATE_CONTENT = `mixed-port: 7890
 allow-lan: false
 mode: rule
-log-level: silent
+log-level: info
 ipv6: false
 external-controller: 127.0.0.1:9090
 
@@ -46,14 +46,10 @@ dns:
   ipv6: false
   listen: 127.0.0.1:1053
   enhanced-mode: redir-host
-  respect-rules: true
   default-nameserver:
     - 223.5.5.5
     - 119.29.29.29
   nameserver:
-    - https://dns.alidns.com/dns-query
-    - https://doh.pub/dns-query
-  proxy-server-nameserver:
     - https://dns.alidns.com/dns-query
     - https://doh.pub/dns-query
   fallback:
