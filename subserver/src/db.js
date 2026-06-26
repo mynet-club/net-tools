@@ -45,30 +45,15 @@ dns:
   enable: true
   ipv6: false
   listen: 127.0.0.1:1053
-  enhanced-mode: fake-ip
-  fake-ip-range: 198.18.0.1/16
-  fake-ip-filter:
-    - '*.lan'
-    - '*.local'
-    - localhost.ptlogin2.qq.com
-    - '+.msftconnecttest.com'
-    - '+.msftncsi.com'
-    - 'dns.msftncsi.com'
-    - '*.msftncsi.com'
-    - '*.msftconnecttest.com'
-    - 'time.*.com'
-    - 'time.*.gov'
-    - '.ntp.org.cn'
-    - '+.pool.ntp.org'
-    - 'localhost'
-    - 'localhost.*'
-    - '*.mcdn.bcebos.com'
-    - 'stun.*.*'
-    - 'stun.*.*.*'
+  enhanced-mode: redir-host
+  respect-rules: true
   default-nameserver:
     - 223.5.5.5
     - 119.29.29.29
   nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  proxy-server-nameserver:
     - https://dns.alidns.com/dns-query
     - https://doh.pub/dns-query
   fallback:
@@ -118,6 +103,10 @@ rules:
   - IP-CIDR,10.0.0.0/8,DIRECT
   - IP-CIDR,172.16.0.0/12,DIRECT
   - IP-CIDR,127.0.0.0/8,DIRECT
+  - DOMAIN-SUFFIX,luoyueliang.com,DIRECT
+  - DOMAIN-SUFFIX,asuscomm.com,DIRECT
+  - DOMAIN-SUFFIX,icdn.plus,DIRECT
+  - DOMAIN-SUFFIX,19800820.com,DIRECT
   - GEOSITE,telegram,默认出口
   - IP-CIDR,91.108.4.0/22,默认出口
   - IP-CIDR,91.108.56.0/22,默认出口
