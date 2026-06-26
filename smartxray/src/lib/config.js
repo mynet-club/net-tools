@@ -10,34 +10,83 @@ const { execSync } = require('child_process');
 
 // ==================== 路径常量 ====================
 
-// 检测是否在 bundle 模式下运行（ncc 打包后 __dirname 会指向 bundle 目录）
-function getBaseDir() {
-  // 如果 __dirname 包含 /usr/local/lib/smartxray 或类似系统路径，说明是 bundle 模式
-  // 此时使用 HOME 目录下的 .config/smartxray 作为基础目录
-  const dir = __dirname;
-  if (dir.includes('/usr/local/lib/') || dir.includes('\\AppData\\')) {
-    const os = require('os');
-    return path.join(os.homedir(), '.config', 'smartxray');
+// 检测运行模式并返回 FHS 标准路径
+function getPaths() {
+  const isLinux   = process.platform === 'linux';
+  const isBundle  = __dirname.includes('/usr/local/lib/') || __dirname.includes('\\AppData\\');
+
+  if (isLinux && isBundle) {
+    // 生产环境 (Linux): FHS 标准路径
+    return {
+      CONFIG_DIR: '/etc/smartxray',
+      DATA_DIR:   '/var/lib/smartxray',
+      LOGS_DIR:   '/var/log/smartxray',
+      PID_FILE:   '/run/smartxray/xray.pid',
+      UI_DIR:     path.join(__dirname, 'ui'),  // UI 随 bundle
+    };
   }
-  // 开发模式：向上两级到项目根目录
-  return path.join(dir, '..', '..');
+  // 开发模式 / macOS: 保持 ~/.config/smartxray/
+  const os  = require('os');
+  const base = path.join(os.homedir(), '.config', 'smartxray');
+  return {
+    CONFIG_DIR: path.join(base, 'config'),
+    DATA_DIR:   path.join(base, 'data'),
+    LOGS_DIR:   path.join(base, 'logs'),
+    PID_FILE:   path.join(base, 'data', 'xray.pid'),
+    UI_DIR:     path.join(base, 'ui'),
+  };
 }
 
-const BASE_DIR   = getBaseDir();
-const DATA_DIR   = path.join(BASE_DIR, 'data');
-const LOGS_DIR   = path.join(BASE_DIR, 'logs');
-const UI_DIR     = path.join(BASE_DIR, 'ui');
-const CONFIG_DIR = path.join(BASE_DIR, 'config');
+const paths = getPaths();
+const BASE_DIR   = paths.DATA_DIR;        // 向后兼容（部分旧代码可能引用）
+const DATA_DIR   = paths.DATA_DIR;
+const LOGS_DIR   = paths.LOGS_DIR;
+const UI_DIR     = paths.UI_DIR;
+const CONFIG_DIR = paths.CONFIG_DIR;
 
 const XRAY_CONF   = path.join(DATA_DIR, 'config.json');
 const MIHOMO_OUT  = path.join(DATA_DIR, 'mihomo-proxies.yaml');
-const PID_FILE    = path.join(DATA_DIR, 'xray.pid');
+const PID_FILE    = paths.PID_FILE;
 const LOG_FILE    = path.join(LOGS_DIR, 'xray.log');
 
-// 确保目录存在
-[DATA_DIR, LOGS_DIR].forEach(dir => {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+// 确保目录存在（生产环境需 root 权限，安装时已创建）
+[DATA_DIR, LOGS_DIR, path.dirname(PID_FILE)].forEach(dir => {
+  try { if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); } catch {}
 });
+
+// 迁移旧路径数据（~/.config/smartxray/ → FHS 路径）
+function migrateOldPaths() {
+  const os = require('os');
+  const oldBase = path.join(os.homedir(), '.config', 'smartxray');
+  const oldData = path.join(oldBase, 'data');
+  const oldLogs = path.join(oldBase, 'logs');
+
+  // 仅在 Linux bundle 模式下迁移
+  if (process.platform !== 'linux' || !__dirname.includes('/usr/local/lib/')) return;
+
+  // 迁移数据库
+  const oldDb = path.join(oldData, 'smartxray.db');
+  const newDb = path.join(DATA_DIR, 'smartxray.db');
+  if (!fs.existsSync(newDb) && fs.existsSync(oldDb)) {
+    try { fs.copyFileSync(oldDb, newDb); console.log(`[migrate] 数据库迁移: ${oldDb} → ${newDb}`); } catch {}
+  }
+
+  // 迁移 xray 配置
+  const oldConf = path.join(oldData, 'config.json');
+  const newConf = XRAY_CONF;
+  if (!fs.existsSync(newConf) && fs.existsSync(oldConf)) {
+    try { fs.copyFileSync(oldConf, newConf); console.log(`[migrate] xray配置迁移: ${oldConf} → ${newConf}`); } catch {}
+  }
+
+  // 迁移日志
+  const oldLog = path.join(oldLogs, 'xray.log');
+  const newLog = LOG_FILE;
+  if (!fs.existsSync(newLog) && fs.existsSync(oldLog)) {
+    try { fs.copyFileSync(oldLog, newLog); console.log(`[migrate] 日志迁移: ${oldLog} → ${newLog}`); } catch {}
+  }
+}
+
+migrateOldPaths();
 
 // 兼容旧版：config.json / xray.pid 曾直接放在 BASE_DIR
 ['config.json', 'xray.pid'].forEach(name => {
@@ -50,7 +99,7 @@ const LOG_FILE    = path.join(LOGS_DIR, 'xray.log');
 
 // ==================== 版本和仓库 ====================
 
-const VERSION = '3.0.3';
+const VERSION = '3.0.7';
 const GITHUB_REPO = 'luoyueliang/smartxray';
 const API_PORT = 2088;
 

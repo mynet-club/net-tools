@@ -256,6 +256,22 @@ function initSchema() {
     'CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email IS NOT NULL AND email != \'\''
   );
 
+  // ── 迁移：为 nodes 表新增上游 API 字段 ──
+  const nodeCols = _db.prepare('PRAGMA table_info(nodes)').all();
+  const nodeColNames = nodeCols.map(c => c.name);
+  if (!nodeColNames.includes('api_host')) {
+    _db.exec('ALTER TABLE nodes ADD COLUMN api_host TEXT');
+  }
+  if (!nodeColNames.includes('api_port')) {
+    _db.exec('ALTER TABLE nodes ADD COLUMN api_port INTEGER DEFAULT 2088');
+  }
+  if (!nodeColNames.includes('api_token')) {
+    _db.exec('ALTER TABLE nodes ADD COLUMN api_token TEXT');
+  }
+  if (!nodeColNames.includes('has_upstream_api')) {
+    _db.exec('ALTER TABLE nodes ADD COLUMN has_upstream_api INTEGER DEFAULT 0');
+  }
+
   // 自动插入默认模板
   const existing = _db.prepare('SELECT id FROM templates WHERE name = ?').get('default');
   if (!existing) {
@@ -478,7 +494,8 @@ function createNode(data) {
     'pubkey', 'shortid', 'sni', 'flow', 'fingerprint',
     'alter_id', 'cipher', 'network', 'ws_path', 'ws_host',
     'tls', 'tls_sni', 'skip_cert',
-    'enabled', 'sort_order'
+    'enabled', 'sort_order',
+    'api_host', 'api_port', 'api_token', 'has_upstream_api',
   ];
   const cols = allCols.filter(c => data[c] !== undefined);
   const vals = cols.map(c => data[c]);
@@ -495,7 +512,8 @@ function updateNode(id, fields) {
     'pubkey', 'shortid', 'sni', 'flow', 'fingerprint',
     'alter_id', 'cipher', 'network', 'ws_path', 'ws_host',
     'tls', 'tls_sni', 'skip_cert',
-    'enabled', 'sort_order'
+    'enabled', 'sort_order',
+    'api_host', 'api_port', 'api_token', 'has_upstream_api',
   ];
   const sets = [];
   const vals = [];

@@ -30,6 +30,7 @@ const nodes     = require('./routes/nodes');
 const mappings  = require('./routes/mappings');
 const templates = require('./routes/templates');
 const register  = require('./routes/register');
+const { getUserTraffic, syncAll } = require('./upstream-sync');
 
 // 初始化数据库（确保 schema 就绪）
 require('./db').db();
@@ -244,6 +245,22 @@ async function handleRequest(req, res) {
     // POST /api/invite-codes
     if (method === 'POST' && pathname === '/api/invite-codes') {
       return register.handleCreateCodes(req, res, json);
+    }
+
+    // ── 流量查询 ──────────────────────────────────────────────
+    // GET /api/traffic/:userId — 单个用户在所有上游节点的流量
+    const trafficMatch = pathname.match(/^\/api\/traffic\/(\d+)$/);
+    if (method === 'GET' && trafficMatch) {
+      const userId = parseInt(trafficMatch[1]);
+      const result = await getUserTraffic(userId);
+      return apiResponse(res, 200, result);
+    }
+
+    // ── 上游同步管理 ──────────────────────────────────────────
+    // POST /api/upstream/sync — 手动触发全量重新同步
+    if (method === 'POST' && pathname === '/api/upstream/sync') {
+      const result = await syncAll();
+      return apiResponse(res, 200, result);
     }
 
     // 404

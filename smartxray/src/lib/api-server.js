@@ -32,8 +32,13 @@ const {
 const { getRealityConfig } = require('./reality');
 
 const {
-  cleanupExpiredUsers
+  cleanupExpiredUsers,
+  addUpstreamUser,
+  removeUpstreamUser,
+  setUserEnabledByUuid,
 } = require('./user-manager');
+
+const { getUserTraffic, getAllTraffic } = require('./traffic-stats');
 
 // 导入路由模块
 const routes = require('./routes');
@@ -379,6 +384,7 @@ function startApiServer() {
             public_host:        getSetting('public_host', ''),
             log_level:          getSetting('log_level', 'warning'),
             upstream_outbounds: getSetting('upstream_outbounds', ''),
+            upstream_endpoints: getSetting('upstream_endpoints', '[]'),
             use_upstream:       getSetting('use_upstream', '0') === '1',
           });
         }
@@ -395,6 +401,13 @@ function startApiServer() {
               catch (e) { return apiResponse(res, 400, { error: 'upstream_outbounds JSON 格式错误: ' + e.message }); }
             }
             setSetting('upstream_outbounds', json.upstream_outbounds);
+          }
+          if (json.upstream_endpoints !== undefined) {
+            if (json.upstream_endpoints) {
+              try { JSON.parse(json.upstream_endpoints); }
+              catch (e) { return apiResponse(res, 400, { error: 'upstream_endpoints JSON 格式错误: ' + e.message }); }
+            }
+            setSetting('upstream_endpoints', json.upstream_endpoints);
           }
           if (_commands.cmdReload) _commands.cmdReload();
           return apiResponse(res, 200, { ok: true });
@@ -590,6 +603,107 @@ function startApiServer() {
           return apiResponse(res, 200, { ok: true });
         }
 
+        // ── 上游同步（中继侧）— 必须在 :username 路由之前 ────
+        // POST /api/upstream/sync — 手动触发上游同步
+        if (method === 'POST' && pathname === '/api/upstream/sync') {
+          const { syncUpstreams } = require('./upstream-sync');
+          try {
+            const result = await syncUpstreams();
+            if (_commands.cmdReload) _commands.cmdReload();
+            return apiResponse(res, 200, result);
+          } catch (e) {
+            return apiResponse(res, 500, { error: e.message });
+          }
+        }
+
+        // GET /api/upstream/status — 查看上游同步状态
+        if (method === 'GET' && pathname === '/api/upstream/status') {
+          let endpoints = [];
+          let outbounds = [];
+          try { endpoints = JSON.parse(getSetting('upstream_endpoints', '[]')); } catch {}
+          try { outbounds = JSON.parse(getSetting('upstream_outbounds', '[]')); } catch {}
+          return apiResponse(res, 200, {
+            endpoints_count: endpoints.length,
+            endpoints: endpoints.map(e => ({ name: e.name, host: e.host, port: e.port, username: e.username })),
+            outbounds_count: outbounds.length,
+            outbounds: outbounds.map(o => ({ tag: o.tag })),
+            use_upstream: getSetting('use_upstream', '0') === '1',
+          });
+        }
+
+        // ── 上游用户管理（供 subserver 同步调用）──────────────
+        // POST /api/upstream/user — 用指定 UUID 创建/更新用户
+        if (method === 'POST' && pathname === '/api/upstream/user') {
+          const { uuid, name } = json;
+          if (!uuid || !name) return apiResponse(res, 400, { error: 'uuid 和 name 必填' });
+          try {
+            const user = addUpstreamUser({ uuid, name });
+            return apiResponse(res, 200, { ok: true, user: { id: user.id, name: user.name, uuid: user.uuid, enabled: !!user.enabled } });
+          } catch (e) {
+            return apiResponse(res, 500, { error: e.message });
+          }
+        }
+
+        // DELETE /api/upstream/user/:uuid — 删除上游用户
+        const upstreamUserDelMatch = pathname.match(/^\/api\/upstream\/user\/([^\/]+)$/);
+        if (method === 'DELETE' && upstreamUserDelMatch) {
+          const uuid = decodeURIComponent(upstreamUserDelMatch[1]);
+          const ok = removeUpstreamUser(uuid);
+          return apiResponse(res, ok ? 200 : 404, ok ? { ok: true } : { error: '用户不存在' });
+        }
+
+        // PATCH /api/upstream/user/:uuid — 启用/停用上游用户
+        const upstreamUserPatchMatch = pathname.match(/^\/api\/upstream\/user\/([^\/]+)$/);
+        if (method === 'PATCH' && upstreamUserPatchMatch) {
+          const uuid = decodeURIComponent(upstreamUserPatchMatch[1]);
+          const { enabled } = json;
+          if (typeof enabled === 'undefined') return apiResponse(res, 400, { error: '缺少 enabled 字段' });
+          const user = setUserEnabledByUuid(uuid, !!enabled);
+          if (!user) return apiResponse(res, 404, { error: '用户不存在' });
+          return apiResponse(res, 200, { ok: true, user: { id: user.id, name: user.name, uuid: user.uuid, enabled: !!user.enabled } });
+        }
+
+        // ── 流量查询 ─────────────────────────────────────────
+        // GET /api/traffic — 所有用户流量列表
+        if (method === 'GET' && pathname === '/api/traffic') {
+          const traffic = getAllTraffic();
+          return apiResponse(res, 200, { traffic });
+        }
+
+        // GET /api/traffic/:uuid — 单个用户流量
+        const trafficMatch = pathname.match(/^\/api\/traffic\/([^\/]+)$/);
+        if (method === 'GET' && trafficMatch) {
+          const uuid = decodeURIComponent(trafficMatch[1]);
+          const traffic = getUserTraffic(uuid);
+          return apiResponse(res, 200, traffic);
+        }
+
+        // ── 上游连接详情（供中继节点拉取）────────────────────
+        // GET /api/upstream/:username — 返回该用户的上游 VLESS+Reality 连接详情
+        const upstreamMatch = pathname.match(/^\/api\/upstream\/(?!sync$|status$|user$)([^\/]+)$/);
+        if (method === 'GET' && upstreamMatch) {
+          const username = decodeURIComponent(upstreamMatch[1]);
+          const user = db().prepare('SELECT * FROM users WHERE name = ? AND enabled = 1').get(username);
+          if (!user) {
+            return apiResponse(res, 404, { error: '用户不存在或已禁用' });
+          }
+          const reality = getRealityConfig();
+          if (!reality.enabled || !user.uuid) {
+            return apiResponse(res, 404, { error: '该用户无上游映射' });
+          }
+          return apiResponse(res, 200, {
+            server:   getServerHost(getSetting),
+            port:     reality.port,
+            uuid:     user.uuid,
+            sni:      reality.serverNames[0] || '',
+            pubkey:   reality.publicKey || '',
+            shortid:  reality.shortIds[0] || '',
+            flow:     'xtls-rprx-vision',
+            network:  'tcp',
+            security: 'reality',
+          });
+        }
+
         // ── 原始配置 ────────────────────────────────────────
         // GET /api/config/raw
         if (method === 'GET' && pathname === '/api/config/raw') {
@@ -739,5 +853,6 @@ module.exports = {
   startApiServer,
   stopApiServer,
   registerCommands,
-  apiResponse
+  apiResponse,
+  isRunning: () => _apiServerRunning
 };

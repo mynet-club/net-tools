@@ -19,6 +19,8 @@ const {
   bulkSetMappings,
 } = require('../db');
 
+const { syncUserCreate, syncMappingCreate, syncMappingDelete } = require('../upstream-sync');
+
 /**
  * GET /api/mappings/:userId
  */
@@ -48,6 +50,8 @@ async function handleCreate(req, res, userId, json) {
     return apiResponse(res, 404, { error: '节点不存在' });
   }
   const mapping = upsertMapping(userId, json.node_id, json.uuid);
+  // 异步同步到上游节点
+  syncMappingCreate(userId, json.node_id).catch(e => console.error('[upstream-sync] mappingCreate:', e.message));
   return apiResponse(res, 201, mapping);
 }
 
@@ -61,13 +65,15 @@ function handleBulk(req, res, userId) {
     return apiResponse(res, 404, { error: '用户不存在' });
   }
   const results = bulkSetMappings(userId);
+  // 异步同步到上游节点
+  syncUserCreate(userId).catch(e => console.error('[upstream-sync] mappingBulk:', e.message));
   return apiResponse(res, 200, { total: results.length, mappings: results });
 }
 
 /**
  * DELETE /api/mappings/:userId/:nodeId
  */
-function handleDelete(req, res, userId, nodeId) {
+async function handleDelete(req, res, userId, nodeId) {
   const user = getUserById(userId);
   if (!user) {
     return apiResponse(res, 404, { error: '用户不存在' });
@@ -76,7 +82,9 @@ function handleDelete(req, res, userId, nodeId) {
   if (!mapping) {
     return apiResponse(res, 404, { error: '映射不存在' });
   }
-  deleteMapping(userId, nodeId);
+  // 先同步删除上游节点用户（需要 mapping 仍存在）
+  try { await syncMappingDelete(userId, parseInt(nodeId)); } catch (e) { console.error('[upstream-sync] mappingDelete:', e.message); }
+  deleteMapping(userId, parseInt(nodeId));
   return apiResponse(res, 200, { ok: true });
 }
 

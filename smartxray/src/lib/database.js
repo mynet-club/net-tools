@@ -4,35 +4,40 @@
  */
 
 const path = require('path');
-const fs = require('fs');
+const fs   = require('fs');
 
-// 检测是否在 bundle 模式下运行
-function getBaseDir() {
-  const dir = __dirname;
-  if (dir.includes('/usr/local/lib/') || dir.includes('\\AppData\\')) {
-    const os = require('os');
-    return path.join(os.homedir(), '.config', 'smartxray');
-  }
-  return path.join(dir, '..', '..');
-}
+// 从 config.js 获取数据目录（FHS 路径或开发模式路径）
+const { DATA_DIR } = require('./config');
 
 // 数据库路径
-const DATA_DIR = path.join(getBaseDir(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'smartxray.db');
 
-// 兼容旧版：数据库曾直接放在 BASE_DIR 而非 data/ 子目录
-// 若新路径无数据库但旧路径有，则自动迁移
-const LEGACY_DB = path.join(getBaseDir(), 'smartxray.db');
+// 兼容旧版：数据库曾直接放在旧 BASE_DIR 而非 data/ 子目录
+// 如果新路径无数据库但旧路径有，自动迁移
+function findLegacyDb() {
+  const os = require('os');
+  const candidates = [
+    path.join(os.homedir(), '.config', 'smartxray', 'smartxray.db'),        // 旧根路径
+    path.join(os.homedir(), '.config', 'smartxray', 'data', 'smartxray.db'),  // 旧 data 子目录
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p) && p !== DB_FILE) return p;
+  }
+  return null;
+}
 
 // 确保数据目录存在
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-if (!fs.existsSync(DB_FILE) && fs.existsSync(LEGACY_DB)) {
-  try {
-    fs.copyFileSync(LEGACY_DB, DB_FILE);
-    console.log(`[database] 已从旧路径迁移数据库: ${LEGACY_DB} → ${DB_FILE}`);
-  } catch (e) {
-    console.error(`[database] 迁移旧数据库失败: ${e.message}`);
+if (!fs.existsSync(DB_FILE)) {
+  const legacyDb = findLegacyDb();
+  if (legacyDb) {
+    try {
+      fs.copyFileSync(legacyDb, DB_FILE);
+      console.log(`[database] 已从旧路径迁移数据库: ${legacyDb} → ${DB_FILE}`);
+    } catch (e) {
+      console.error(`[database] 迁移旧数据库失败: ${e.message}`);
+    }
   }
 }
 
@@ -199,6 +204,40 @@ function getUserById(id) {
  */
 function getUserByName(name) {
   return db().prepare('SELECT * FROM users WHERE name=?').get([name]) || null;
+}
+
+/**
+ * 根据 UUID 获取用户
+ */
+function getUserByUuid(uuid) {
+  return db().prepare('SELECT * FROM users WHERE uuid=?').get([uuid]) || null;
+}
+
+/**
+ * 根据 UUID 删除用户
+ */
+function deleteUserByUuid(uuid) {
+  const result = db().prepare('DELETE FROM users WHERE uuid=?').run([uuid]);
+  return result.changes > 0;
+}
+
+/**
+ * 按 UUID 创建或更新用户（用于上游同步）
+ * 如果 UUID 已存在则更新 name/enabled，不存在则创建
+ */
+function upsertUserByUuid(uuid, name, tag, port, httpPort) {
+  const existing = getUserByUuid(uuid);
+  if (existing) {
+    // 更新 name 和启用状态
+    db().prepare('UPDATE users SET name=?, enabled=1 WHERE uuid=?').run([name, uuid]);
+    return getUserById(existing.id);
+  }
+  // 新建
+  const result = db().prepare(`
+    INSERT INTO users (name, port, http_port, uuid, protocol, username, password, tag, note)
+    VALUES (?, ?, ?, ?, 'socks', ?, ?, ?, '上游同步')
+  `).run([name, port, httpPort, uuid, name, name, tag]);
+  return getUserById(result.lastInsertRowid);
 }
 
 /**
@@ -408,6 +447,9 @@ module.exports = {
   // 用户操作
   getUserById,
   getUserByName,
+  getUserByUuid,
+  deleteUserByUuid,
+  upsertUserByUuid,
   getUserByCredentials,
   getAllUsers,
   createUser,

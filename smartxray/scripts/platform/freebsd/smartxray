@@ -9,6 +9,31 @@
 name="smartxray"
 rcvar="smartxray_enable"
 command="/usr/local/bin/xray"
+command_args="run -c /var/db/smartxray/config.json"
+command_interpreter=""
+smartxray_enable="${smartxray_enable-NO}"
+pidfile="/var/run/smartxray.pid"
+
+start_precmd="smartxray_prestart"
+
+smartxray_prestart()
+{
+  mkdir -p /var/db/smartxray /var/log/smartxray
+}
+
+load_rc_config $name
+run_rc_command "$1"
+#!/bin/sh
+# SmartXray FreeBSD rc.d script
+# PROVIDE: smartxray
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="smartxray"
+rcvar="smartxray_enable"
+command="/usr/local/bin/xray"
 command_args="run -c /home/__USER__/.config/smartxray/config.json"
 command_interpreter=""
 smartxray_user="__USER__"

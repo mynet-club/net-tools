@@ -6,6 +6,29 @@ name="smartxray"
 description="SmartXray - Xray Server Manager"
 command="/usr/local/bin/xray-ctl"
 command_args="ui"
+command_background=true
+pidfile="/run/smartxray-node.pid"
+output_log="/var/log/smartxray/smartxray.log"
+error_log="/var/log/smartxray/smartxray.log"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    mkdir -p /var/lib/smartxray /var/log/smartxray
+    # 先启动 Xray 二进制（start 命令会立即返回）
+    /usr/local/bin/xray-ctl start 2>&1 | tail -1
+}
+#!/sbin/openrc-run
+# SmartXray OpenRC init script (Alpine Linux)
+# 由 Node.js 进程统一管理 Xray 二进制和 Web UI API Server
+
+name="smartxray"
+description="SmartXray - Xray Server Manager"
+command="/usr/local/bin/xray-ctl"
+command_args="ui"
 command_user="__USER__"
 command_background=true
 pidfile="/run/smartxray-node.pid"

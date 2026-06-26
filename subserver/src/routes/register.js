@@ -29,6 +29,8 @@ const {
   getBaseUrl,
 } = require('../mailer');
 
+const { syncUserCreate } = require('../upstream-sync');
+
 // 邮箱格式校验
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -124,6 +126,8 @@ async function handleRegister(req, res, json) {
   } else {
     // SMTP 未配置，自动激活
     verifyUserEmail(user.id);
+    // 自动激活后同步到上游节点
+    syncUserCreate(user.id).catch(e => console.error('[upstream-sync] register auto-verify:', e.message));
   }
 
   const { password_hash, ...safeUser } = user;
@@ -156,6 +160,9 @@ function handleVerify(req, res, url) {
 
   // 激活用户邮箱
   verifyUserEmail(tokenRow.user_id);
+
+  // 邮箱验证后同步到上游节点
+  syncUserCreate(tokenRow.user_id).catch(e => console.error('[upstream-sync] verify:', e.message));
 
   return apiResponse(res, 200, {
     ok: true,

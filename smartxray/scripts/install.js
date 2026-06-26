@@ -95,8 +95,11 @@ const REPO_ROOT  = path.join(__dirname, '..');
 const SCRIPT_DIR = __dirname;
 const user       = run('whoami');
 
-const configDir  = `${HOME}/.config/smartxray`;
-const logsDir    = path.join(configDir, 'logs');
+// Linux 生产环境使用 FHS 路径，其他平台保持 ~/.config/smartxray/
+const isLinuxProd = PLATFORM === 'linux' || PLATFORM === 'alpine';
+const configDir  = isLinuxProd ? '/etc/smartxray'    : `${HOME}/.config/smartxray`;
+const dataDir    = isLinuxProd ? '/var/lib/smartxray' : path.join(HOME, '.config/smartxray', 'data');
+const logsDir    = isLinuxProd ? '/var/log/smartxray' : path.join(HOME, '.config/smartxray', 'logs');
 const binDir     = '/usr/local/bin';
 const LIB_DIR    = '/usr/local/lib/smartxray';  // bundle 安装目录
 const XRAY_BIN   = path.join(binDir, 'xray');
@@ -164,12 +167,23 @@ async function installXray() {
 
 // ── Step 4: Create config directories ────────────────────────────
 function createDirs() {
-  for (const dir of [configDir, logsDir]) {
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+  if (isLinuxProd) {
+    // FHS 标准路径
+    const dirs = [configDir, dataDir, logsDir];
+    for (const dir of dirs) {
+      run(`${sudoPrefix()}mkdir -p ${dir}`);
+      run(`${sudoPrefix()}chmod 755 ${dir}`);
       success(`Created ${dir}`);
-    } else {
-      info(`Directory exists: ${dir}`);
+    }
+  } else {
+    // macOS / 开发模式
+    for (const dir of [configDir, logsDir, dataDir]) {
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+        success(`Created ${dir}`);
+      } else {
+        info(`Directory exists: ${dir}`);
+      }
     }
   }
 }
@@ -191,10 +205,8 @@ function installStartup() {
   } else if (PLATFORM === 'linux') {
     const src = path.join(SCRIPT_DIR, 'platform/linux/smartxray.service');
     const dst = '/etc/systemd/system/smartxray.service';
-    // /home/__USER__ must be replaced BEFORE __USER__ to handle root (HOME=/root)
-    const content = fs.readFileSync(src, 'utf8')
-      .replace(/\/home\/__USER__/g, HOME)
-      .replace(/__USER__/g, user);
+    // 服务文件已使用 FHS 硬编码路径，无需替换
+    const content = fs.readFileSync(src, 'utf8');
     run(`${sudoPrefix()}tee "${dst}" > /dev/null`, { input: content, stdio: ['pipe', 'inherit', 'inherit'] });
     run(`${sudoPrefix()}systemctl daemon-reload`);
     success(`systemd service installed: ${dst}`);
@@ -204,10 +216,8 @@ function installStartup() {
   } else if (PLATFORM === 'alpine') {
     const src = path.join(SCRIPT_DIR, 'platform/alpine/smartxray.openrc');
     const dst = '/etc/init.d/smartxray';
-    // /home/__USER__ must be replaced BEFORE __USER__ to handle root (HOME=/root)
-    const content = fs.readFileSync(src, 'utf8')
-      .replace(/\/home\/__USER__/g, HOME)
-      .replace(/__USER__/g, user);
+    // OpenRC 脚本已使用 FHS 路径，无需替换
+    const content = fs.readFileSync(src, 'utf8');
     run(`${sudoPrefix()}tee "${dst}" > /dev/null`, { input: content, stdio: ['pipe', 'inherit', 'inherit'] });
     run(`${sudoPrefix()}chmod +x "${dst}"`);
     success(`OpenRC init script installed: ${dst}`);
@@ -322,13 +332,14 @@ async function installCtl() {
 function installUi() {
   const srcDir = path.join(REPO_ROOT, 'ui');
   if (!fs.existsSync(srcDir)) { warn('ui/ not found, skipping Web UI install'); return; }
-  const uiDst = path.join(configDir, 'ui');
-  fs.mkdirSync(uiDst, { recursive: true });
+  // UI 随 bundle 一起安装在 /usr/local/lib/smartxray/ui/
+  const uiDst = path.join(LIB_DIR, 'ui');
+  run(`${sudoPrefix()}mkdir -p "${uiDst}"`);
   for (const f of fs.readdirSync(srcDir)) {
-    fs.copyFileSync(path.join(srcDir, f), path.join(uiDst, f));
+    run(`${sudoPrefix()}cp -r "${path.join(srcDir, f)}" "${uiDst}/"`);
   }
   success(`Web UI installed to ${uiDst}`);
-  info(`Access: http://127.0.0.1:9091/  (after xray-ctl start)`);
+  info(`Access: http://127.0.0.1:2088/  (after xray-ctl start)`);
 }
 
 // ── Main ──────────────────────────────────────────────────────────

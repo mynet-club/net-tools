@@ -6,6 +6,9 @@
 const {
   getUserById,
   getUserByName,
+  getUserByUuid,
+  deleteUserByUuid,
+  upsertUserByUuid,
   getAllUsers,
   createUser,
   updateUser,
@@ -273,6 +276,70 @@ function getUserStats() {
   };
 }
 
+// ==================== 上游同步用户管理 ====================
+
+/**
+ * 添加上游同步用户（用指定 UUID 创建）
+ * @param {Object} options - { uuid, name }
+ * @returns {Object} 创建/更新的用户
+ */
+function addUpstreamUser({ uuid, name }) {
+  if (!uuid || !name) throw new Error('uuid 和 name 必填');
+
+  // 分配端口（上游用户使用 30000+ 区间，不实际使用）
+  const portRange = getFixedPortRange(getSetting);
+  const socksPort = allocPort(portRange.socksMin, portRange.socksMax, db);
+  const httpPort = allocPort(portRange.httpMin, portRange.httpMax, db);
+  const tag = `upstream-${name}`;
+
+  // 按 UUID 创建或更新
+  const user = upsertUserByUuid(uuid, name, tag, socksPort, httpPort);
+
+  // 不开防火墙（VLESS-Reality 共享端口）
+  // 重新生成 xray 配置
+  const { buildConfig } = require('./config-generator');
+  buildConfig();
+
+  return user;
+}
+
+/**
+ * 删除上游同步用户（按 UUID）
+ * @param {string} uuid
+ * @returns {boolean}
+ */
+function removeUpstreamUser(uuid) {
+  const user = getUserByUuid(uuid);
+  if (!user) return false;
+
+  // 不关防火墙（上游用户无独立端口需关闭）
+  const ok = deleteUserByUuid(uuid);
+
+  if (ok) {
+    const { buildConfig } = require('./config-generator');
+    buildConfig();
+  }
+  return ok;
+}
+
+/**
+ * 启用/停用上游同步用户（按 UUID）
+ * @param {string} uuid
+ * @param {boolean} enabled
+ * @returns {Object|null}
+ */
+function setUserEnabledByUuid(uuid, enabled) {
+  const user = getUserByUuid(uuid);
+  if (!user) return null;
+
+  updateUser(user.id, { enabled: enabled ? 1 : 0 });
+
+  const { buildConfig } = require('./config-generator');
+  buildConfig();
+
+  return getUserById(user.id);
+}
+
 module.exports = {
   addUser,
   removeUser,
@@ -283,5 +350,9 @@ module.exports = {
   listUsers,
   cleanupExpiredUsers,
   assignMissingUuids,
-  getUserStats
+  getUserStats,
+  // 上游同步
+  addUpstreamUser,
+  removeUpstreamUser,
+  setUserEnabledByUuid,
 };

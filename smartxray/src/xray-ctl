@@ -100,6 +100,11 @@ async function cmdStart() {
   } catch (e) {
     console.log(c.red(`  ✗ 启动失败: ${e.message}`));
   }
+
+  // 启动 API 服务器（保持进程运行，systemd 服务模式）
+  apiServer.registerCommands({ cmdStart, cmdStop, cmdReload });
+  apiServer.startApiServer();
+  console.log(c.green(`  ✓ API server 已启动 → http://127.0.0.1:${API_PORT}/`));
 }
 
 function cmdStop() {
@@ -350,7 +355,7 @@ function cmdReality(args) {
       try {
         const result = reality.initReality(
           rest[0] ? parseInt(rest[0]) : 443,
-          rest[1] || 'www.microsoft.com:443'
+          rest[1] || 'www.cloudflare.com:443'
         );
         console.log(c.green('  ✓ Reality 已初始化'));
         console.log(`    端口: ${result.port}`);
@@ -541,7 +546,9 @@ const [,, cmd, ...args] = process.argv;
     console.error(c.red(`错误: ${e.message}`));
     process.exit(1);
   } finally {
-    // 关闭数据库连接
-    database.closeDb();
+    // 仅在非服务模式下关闭数据库（API server 运行时保持连接）
+    if (!apiServer.isRunning?.() && cmd !== 'start' && cmd !== 'ui') {
+      database.closeDb();
+    }
   }
 })();

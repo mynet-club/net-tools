@@ -20,7 +20,10 @@ const {
   updateUserRole,
   deleteUser,
   batchCreateUsers,
+  bulkSetMappings,
 } = require('../db');
+
+const { syncUserCreate, syncUserDelete, syncUserEnabled } = require('../upstream-sync');
 
 /**
  * GET /api/users
@@ -58,6 +61,10 @@ async function handleCreate(req, res, json) {
       note: json.note || '',
       role: json.role || 'user',
     });
+    // 自动为所有节点生成 UUID 映射
+    try { bulkSetMappings(user.id); } catch (e) { console.error('自动映射失败:', e.message); }
+    // 异步同步到上游节点
+    syncUserCreate(user.id).catch(e => console.error('[upstream-sync] userCreate:', e.message));
     // 不返回 password_hash
     const { password_hash, ...safeUser } = user;
     return apiResponse(res, 201, safeUser);
@@ -132,6 +139,10 @@ async function handleUpdate(req, res, id, json) {
       fields.username = cleanUsername;
     }
     const updated = updateUser(id, fields);
+    // 如果启停状态有变化，同步到上游节点
+    if (json.enabled !== undefined) {
+      syncUserEnabled(id, !!json.enabled).catch(e => console.error('[upstream-sync] userUpdate:', e.message));
+    }
     const { password_hash, ...safeUser } = updated;
     return apiResponse(res, 200, safeUser);
   } catch (e) {
@@ -145,11 +156,13 @@ async function handleUpdate(req, res, id, json) {
 /**
  * DELETE /api/users/:id
  */
-function handleDelete(req, res, id) {
+async function handleDelete(req, res, id) {
   const user = getUserById(id);
   if (!user) {
     return apiResponse(res, 404, { error: '用户不存在' });
   }
+  // 先同步删除上游节点用户（需要 mappings 仍存在）
+  try { await syncUserDelete(id); } catch (e) { console.error('[upstream-sync] userDelete:', e.message); }
   deleteUser(id);
   return apiResponse(res, 200, { ok: true });
 }

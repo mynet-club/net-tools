@@ -1,5 +1,21 @@
 [Unit]
 Description=SmartXray - Xray Server Manager
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xray run -c /var/lib/smartxray/config.json
+StandardOutput=append:/var/log/smartxray/xray.log
+StandardError=append:/var/log/smartxray/xray.log
+RuntimeDirectory=smartxray
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+[Unit]
+Description=SmartXray - Xray Server Manager
 After=network.target NetworkManager.service systemd-networkd.service
 
 [Service]

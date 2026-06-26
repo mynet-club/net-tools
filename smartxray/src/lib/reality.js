@@ -20,9 +20,9 @@ function getRealityConfig() {
   const port = parseInt(getSetting('reality_port', '443')) || 443;
   const privateKey = getSetting('reality_private_key', '');
   const publicKey = getSetting('reality_public_key', '');
-  const serverNames = getSetting('reality_server_names', 'www.microsoft.com,cloudflare.com').split(',');
+  const serverNames = getSetting('reality_server_names', 'www.cloudflare.com,www.apple.com').split(',');
   const shortIds = getSetting('reality_short_ids', randHex(8)).split(',');
-  const dest = getSetting('reality_dest', 'www.microsoft.com:443');
+  const dest = getSetting('reality_dest', 'www.cloudflare.com:443');
 
   return {
     enabled,
@@ -72,10 +72,10 @@ function generateRealityKeys() {
 /**
  * 初始化 Reality 配置
  * @param {number} [port=443] - Reality 端口
- * @param {string} [dest='www.microsoft.com:443'] - 目标地址
+ * @param {string} [dest='www.cloudflare.com:443'] - 目标地址
  * @returns {Object} 配置结果
  */
-function initReality(port = 443, dest = 'www.microsoft.com:443') {
+function initReality(port = 443, dest = 'www.cloudflare.com:443') {
   const keys = generateRealityKeys();
   const shortId = randHex(8);
 
@@ -83,7 +83,7 @@ function initReality(port = 443, dest = 'www.microsoft.com:443') {
   setSetting('reality_port', String(port));
   setSetting('reality_private_key', keys.privateKey);
   setSetting('reality_public_key', keys.publicKey);
-  setSetting('reality_server_names', 'www.microsoft.com,cloudflare.com');
+  setSetting('reality_server_names', 'www.cloudflare.com,www.apple.com');
   setSetting('reality_short_ids', shortId);
   setSetting('reality_dest', dest);
 
@@ -112,7 +112,7 @@ function importReality(privateKey, publicKey, port = 443, shortId = null, dest =
   }
 
   const finalShortId = shortId || randHex(8);
-  const finalDest = dest || 'www.microsoft.com:443';
+  const finalDest = dest || 'www.cloudflare.com:443';
 
   setSetting('reality_enabled', '1');
   setSetting('reality_port', String(port));
@@ -170,7 +170,7 @@ function generateRealityLink(user, uuid = null) {
   const port = config.port;
   const publicKey = config.publicKey;
   const shortId = config.shortIds[0] || '';
-  const sni = config.serverNames[0] || 'www.microsoft.com';
+  const sni = config.serverNames[0] || 'www.cloudflare.com';
 
   // 构建 VLESS Reality 链接
   const params = new URLSearchParams({

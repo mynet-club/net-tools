@@ -661,6 +661,20 @@ brew update && brew upgrade</code></pre>
         </div>
       </div>
 
+      <div style="margin-top:12px;border-top:1px solid #2d3748;padding-top:12px">
+        <div class="form-group"><label>上游同步（SmartXray API）</label></div>
+        <div class="form-row">
+          <div class="form-group"><label>API 地址</label><input id="nodeApiHost" placeholder="留空则同服务器地址"></div>
+          <div class="form-group"><label>API 端口</label><input type="number" id="nodeApiPort" placeholder="2088"></div>
+        </div>
+        <div class="form-row">
+          <div class="form-group"><label>API Token</label><input id="nodeApiToken" placeholder="SmartXray 管理密码"></div>
+          <div class="form-group"><label>启用上游同步</label>
+            <select id="nodeHasUpstreamApi"><option value="0">否</option><option value="1">是</option></select>
+          </div>
+        </div>
+      </div>
+
       <div class="form-group"><label>启用</label>
         <select id="nodeEnabled"><option value="1">是</option><option value="0">否</option></select>
       </div>
@@ -1030,6 +1044,10 @@ function openNodeModal(id) {
     document.getElementById('nodeTlsSni').value = n.tls_sni || '';
     document.getElementById('nodeSkipCert').value = String(n.skip_cert);
     document.getElementById('nodeEnabled').value = String(n.enabled);
+    document.getElementById('nodeApiHost').value = n.api_host || '';
+    document.getElementById('nodeApiPort').value = n.api_port || 2088;
+    document.getElementById('nodeApiToken').value = n.api_token || '';
+    document.getElementById('nodeHasUpstreamApi').value = String(n.has_upstream_api || 0);
   } else {
     document.getElementById('nodeModalTitle').textContent = '新增节点';
     ['nodeName','nodeDisplayName','nodeServer','nodePort','nodePubkey','nodeShortid','nodeSni','nodeWsPath','nodeWsHost','nodeTlsSni'].forEach(f => document.getElementById(f).value = '');
@@ -1044,6 +1062,10 @@ function openNodeModal(id) {
     document.getElementById('nodeTls').value = '0';
     document.getElementById('nodeSkipCert').value = '0';
     document.getElementById('nodeEnabled').value = '1';
+    document.getElementById('nodeApiHost').value = '';
+    document.getElementById('nodeApiPort').value = '2088';
+    document.getElementById('nodeApiToken').value = '';
+    document.getElementById('nodeHasUpstreamApi').value = '0';
   }
   toggleNodeFields();
   modal.classList.add('show');
@@ -1088,6 +1110,11 @@ async function saveNode() {
     data.tls_sni = document.getElementById('nodeTlsSni').value.trim();
     data.skip_cert = parseInt(document.getElementById('nodeSkipCert').value);
   }
+  // 上游同步字段
+  data.api_host = document.getElementById('nodeApiHost').value.trim();
+  data.api_port = parseInt(document.getElementById('nodeApiPort').value) || 2088;
+  data.api_token = document.getElementById('nodeApiToken').value.trim();
+  data.has_upstream_api = parseInt(document.getElementById('nodeHasUpstreamApi').value);
   if (!data.name || !data.display_name || !data.server || !data.port) { toast('请填写必填字段', 'error'); return; }
   const r = await api(id ? 'PUT' : 'POST', id ? '/api/nodes/' + id : '/api/nodes', data);
   if (r.ok) {

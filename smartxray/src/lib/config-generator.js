@@ -27,6 +27,7 @@ function buildConfig() {
     const vlessClients = users.filter(u => u.uuid).map(u => ({
       id:   u.uuid,
       flow: 'xtls-rprx-vision',
+      level: 0,  // 启用 per-user stats
     }));
     if (vlessClients.length) {
       inbounds.push({
@@ -110,14 +111,32 @@ function buildConfig() {
   })();
   for (const b of lanEntries) inbounds.push(b);
 
+  // ── xray API 入站（dokodemo-door，用于查询流量统计）──
+  const apiPort = parseInt(getSetting('xray_api_port', '10085'));
+  inbounds.push({
+    tag: 'api',
+    listen: '127.0.0.1',
+    port: apiPort,
+    protocol: 'dokodemo-door',
+    settings: { address: '127.0.0.1' },
+  });
+
   // ── 基础配置 ──
   const config = {
     log:    { loglevel: getSetting('log_level', 'warning'), access: LOG_FILE, error: LOG_FILE },
     stats:  {},
-    policy: { system: { statsInboundUplink: true, statsInboundDownlink: true } },
+    api: {
+      tag: 'api',
+      services: ['StatsService'],
+    },
+    policy: {
+      system: { statsInboundUplink: true, statsInboundDownlink: true },
+      levels: { '0': { statsUserUplink: true, statsUserDownlink: true } },
+    },
     routing: {
       domainStrategy: 'IPIfNonMatch',
       rules: [
+        { type: 'field', inboundTag: ['api'], outboundTag: 'api' },
         { type: 'field', ip: ['geoip:private'], outboundTag: 'direct' },
       ],
     },
@@ -129,6 +148,8 @@ function buildConfig() {
   };
 
   // ── 上游出站注入 ──
+  // upstream_outbounds 由 POST /api/upstream/sync 异步拉取后写入设置
+  // buildConfig 同步读取已同步的 upstream_outbounds 设置并注入
   const upstreamJson = getSetting('upstream_outbounds', '');
   if (upstreamJson) {
     try {
@@ -168,21 +189,34 @@ function buildConfig() {
         }
       }
 
+      // merge 模式下：保留旧的 non-upstream outbounds，但用新的 upstream outbounds 替换旧的
+      const existingNonUpstream = (existing.outbounds || []).filter(
+        o => !o.tag?.startsWith('upstream-')
+      );
+      const newUpstream = config.outbounds.filter(
+        o => o.tag?.startsWith('upstream-')
+      );
+      const mergedOutbounds = existingNonUpstream.length
+        ? [...existingNonUpstream, ...newUpstream]
+        : config.outbounds;
+
       const merged = {
         log:    { loglevel: getSetting('log_level', 'warning'), access: LOG_FILE, error: LOG_FILE },
         stats:  {},
-        policy: { system: { statsInboundUplink: true, statsInboundDownlink: true } },
+        policy: {
+          system: { statsInboundUplink: true, statsInboundDownlink: true },
+          levels: { '0': { statsUserUplink: true, statsUserDownlink: true } },
+        },
         routing: {
           domainStrategy: existing.routing?.domainStrategy || 'IPIfNonMatch',
           rules: [
+            { type: 'field', inboundTag: ['api'], outboundTag: 'api' },
             ...preservedRules,
             ...catchAllRules,
           ],
         },
         inbounds,
-        outbounds: existing.outbounds?.length
-          ? existing.outbounds
-          : config.outbounds,
+        outbounds: mergedOutbounds,
       };
       if (existing.balancers?.length)             merged.balancers              = existing.balancers;
       if (existing.routing?.balancers?.length)    merged.routing.balancers      = existing.routing.balancers;
