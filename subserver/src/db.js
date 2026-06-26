@@ -45,10 +45,29 @@ dns:
   enable: true
   ipv6: false
   listen: 127.0.0.1:1053
-  enhanced-mode: redir-host
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - '*.lan'
+    - '*.local'
+    - localhost.ptlogin2.qq.com
+    - '+.msftconnecttest.com'
+    - '+.msftncsi.com'
+    - 'dns.msftncsi.com'
+    - '*.msftncsi.com'
+    - '*.msftconnecttest.com'
+    - 'time.*.com'
+    - 'time.*.gov'
+    - '.ntp.org.cn'
+    - '+.pool.ntp.org'
+    - 'localhost'
+    - 'localhost.*'
+    - '*.mcdn.bcebos.com'
+    - 'stun.*.*'
+    - 'stun.*.*.*'
   default-nameserver:
     - 223.5.5.5
-    - 114.114.114.114
+    - 119.29.29.29
   nameserver:
     - https://dns.alidns.com/dns-query
     - https://doh.pub/dns-query
@@ -73,25 +92,25 @@ tun:
 {{PROXIES}}
 
 proxy-groups:
-  - name: "\u81ea\u52a8\u9009\u62e9"
+  - name: "自动选择"
     type: url-test
     proxies: [{{PROXY_NAMES}}]
     url: "https://www.gstatic.com/generate_204"
     interval: 120
     tolerance: 50
 
-  - name: "\u624b\u52a8\u9009\u62e9"
+  - name: "手动选择"
     type: select
     proxies:
-      - "\u81ea\u52a8\u9009\u62e9"
+      - "自动选择"
 {{PROXY_NAMES_INLINE}}
       - DIRECT
 
-  - name: "\u9ed8\u8ba4\u51fa\u53e3"
+  - name: "默认出口"
     type: select
     proxies:
-      - "\u81ea\u52a8\u9009\u62e9"
-      - "\u624b\u52a8\u9009\u62e9"
+      - "自动选择"
+      - "手动选择"
       - DIRECT
 
 rules:
@@ -99,30 +118,22 @@ rules:
   - IP-CIDR,10.0.0.0/8,DIRECT
   - IP-CIDR,172.16.0.0/12,DIRECT
   - IP-CIDR,127.0.0.0/8,DIRECT
-  - DOMAIN-SUFFIX,baidu.com,DIRECT
-  - DOMAIN-SUFFIX,bilibili.com,DIRECT
-  - DOMAIN-SUFFIX,iqiyi.com,DIRECT
-  - DOMAIN-SUFFIX,163.com,DIRECT
-  - DOMAIN-SUFFIX,qq.com,DIRECT
-  - DOMAIN-SUFFIX,wechat.com,DIRECT
-  - DOMAIN-SUFFIX,weixin.qq.com,DIRECT
-  - DOMAIN-SUFFIX,taobao.com,DIRECT
-  - DOMAIN-SUFFIX,tmall.com,DIRECT
-  - DOMAIN-SUFFIX,jd.com,DIRECT
-  - DOMAIN-SUFFIX,weibo.com,DIRECT
-  - DOMAIN-SUFFIX,zhihu.com,DIRECT
-  - DOMAIN-SUFFIX,alipay.com,DIRECT
-  - DOMAIN-SUFFIX,aliyun.com,DIRECT
-  - DOMAIN-SUFFIX,tencent.com,DIRECT
-  - DOMAIN-SUFFIX,bytedance.com,DIRECT
-  - DOMAIN-SUFFIX,douyin.com,DIRECT
-  - GEOSITE,telegram,\u9ed8\u8ba4\u51fa\u53e3
-  - IP-CIDR,91.108.4.0/22,\u9ed8\u8ba4\u51fa\u53e3
-  - IP-CIDR,91.108.56.0/22,\u9ed8\u8ba4\u51fa\u53e3
-  - IP-CIDR,149.154.160.0/20,\u9ed8\u8ba4\u51fa\u53e3
-  - IP-CIDR,149.154.164.0/22,\u9ed8\u8ba4\u51fa\u53e3
+  - GEOSITE,telegram,默认出口
+  - IP-CIDR,91.108.4.0/22,默认出口
+  - IP-CIDR,91.108.56.0/22,默认出口
+  - IP-CIDR,149.154.160.0/20,默认出口
+  - IP-CIDR,149.154.164.0/22,默认出口
+  - GEOSITE,youtube,默认出口
+  - GEOSITE,google,默认出口
+  - DOMAIN-SUFFIX,googlevideo.com,默认出口
+  - DOMAIN-SUFFIX,ytimg.com,默认出口
+  - DOMAIN-SUFFIX,ggpht.com,默认出口
+  - DOMAIN-SUFFIX,gstatic.com,默认出口
+  - DOMAIN-SUFFIX,googleapis.com,默认出口
+  - GEOSITE,cn,DIRECT
+  - GEOSITE,geolocation-!cn,默认出口
   - GEOIP,CN,DIRECT
-  - MATCH,\u9ed8\u8ba4\u51fa\u53e3
+  - MATCH,默认出口
 `;
 
 // ── 初始化数据库 ────────────────────────────────────────────────
