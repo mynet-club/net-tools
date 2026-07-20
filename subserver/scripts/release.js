@@ -10,15 +10,14 @@
 // 依赖: @vercel/ncc, javascript-obfuscator（npm install 自动安装）
 // 步骤:
 //   1. ncc bundle → dist/bundle/
-//   2. 手动复制 .wasm 文件
-//   3. javascript-obfuscator 混淆
-//   4. 打包为发行包
+//   2. javascript-obfuscator 混淆
+//   3. 打包为发行包
 
 'use strict';
 
 const JavaScriptObfuscator = require('javascript-obfuscator');
 const { execSync } = require('child_process');
-const fs   = require('fs');
+const fs = require('fs');
 const path = require('path');
 
 // ── 颜色 ─────────────────────────────────────────────────────────
@@ -28,18 +27,18 @@ const c = {
   b: s => `\x1b[34m${s}\x1b[0m`,
   r: s => `\x1b[31m${s}\x1b[0m`,
 };
-const ok  = s => console.log(c.g('✓ ') + s);
+const ok = s => console.log(c.g('✓ ') + s);
 const log = s => console.log(c.b('» ') + s);
 const die = s => { console.error(c.r('✗ ') + s); process.exit(1); };
 
 // ── 路径 ─────────────────────────────────────────────────────────
-const rootDir   = path.join(__dirname, '..');
-const srcFile   = path.join(rootDir, 'src', 'server.js');
-const distDir   = path.join(rootDir, 'dist');
+const rootDir = path.join(__dirname, '..');
+const srcFile = path.join(rootDir, 'src', 'server.js');
+const distDir = path.join(rootDir, 'dist');
 const bundleDir = path.join(distDir, 'bundle');
 
 // GitHub 仓库（发布 Release 用，按需修改）
-const REPO = 'your-org/net-tools';
+const REPO = 'luoyueliang/net-tools';
 
 // ── CLI 参数 ─────────────────────────────────────────────────────
 const PUBLISH = process.argv.includes('--publish');
@@ -85,18 +84,6 @@ for (const f of fs.readdirSync(bundleDir)) {
   const s = fs.statSync(path.join(bundleDir, f)).size;
   totalKB += s / 1024;
   ok(`  bundle/${f}  (${(s / 1024).toFixed(0)} KB)`);
-}
-
-// ncc 不会自动复制 .wasm 文件，需手动补齐
-const wasmSrc = path.join(rootDir, 'node_modules', 'node-sqlite3-wasm', 'dist', 'node-sqlite3-wasm.wasm');
-if (fs.existsSync(wasmSrc)) {
-  const wasmDst = path.join(bundleDir, 'node-sqlite3-wasm.wasm');
-  fs.copyFileSync(wasmSrc, wasmDst);
-  const wasmKB = fs.statSync(wasmDst).size / 1024;
-  totalKB += wasmKB;
-  ok(`  bundle/node-sqlite3-wasm.wasm  (${wasmKB.toFixed(0)} KB)  [copied]`);
-} else {
-  console.error('⚠ node-sqlite3-wasm.wasm not found — SQLite will fail at runtime!');
 }
 
 // 复制 UI 文件到 bundle 目录（bundle 模式下从 __dirname/ui 加载）
@@ -166,8 +153,8 @@ ok(`${path.basename(BUNDLE_TAR)}  (${(fs.statSync(BUNDLE_TAR).size / 1024).toFix
 
 // ── Step 5: installer tar.gz（含 bundle/ + scripts/ + config/）──
 const installerName = `subserver-installer-${VERSION}`;
-const installerTar  = path.join(distDir, `${installerName}.tar.gz`);
-const pkgDir        = path.join(distDir, '_pkg', installerName);
+const installerTar = path.join(distDir, `${installerName}.tar.gz`);
+const pkgDir = path.join(distDir, '_pkg', installerName);
 
 log(`构建 installer: ${path.basename(installerTar)}`);
 
@@ -187,7 +174,7 @@ function copyDir(src, dst, exclude = []) {
 }
 
 copyDir(path.join(rootDir, 'scripts'), path.join(pkgDir, 'scripts'), ['release.js']);
-copyDir(path.join(rootDir, 'config'),  path.join(pkgDir, 'config'));
+copyDir(path.join(rootDir, 'config'), path.join(pkgDir, 'config'));
 copyDir(bundleDir, path.join(pkgDir, 'bundle'));
 
 if (fs.existsSync(installerTar)) fs.rmSync(installerTar, { force: true });
@@ -202,10 +189,10 @@ ok(`${path.basename(installerTar)}  (${tarKB} KB)  ← 安装用`);
 
 // ── Step 6: manifest ─────────────────────────────────────────────
 const manifest = {
-  version:    VERSION,
-  built_at:   new Date().toISOString(),
+  version: VERSION,
+  built_at: new Date().toISOString(),
   bundle_tar: path.basename(BUNDLE_TAR),
-  installer:  path.basename(installerTar),
+  installer: path.basename(installerTar),
 };
 fs.writeFileSync(path.join(distDir, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
 

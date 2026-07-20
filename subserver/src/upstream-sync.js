@@ -12,7 +12,7 @@
 'use strict';
 
 const http = require('http');
-const { db, getUserById, getMappings, getMapping } = require('./db');
+const { getUserById, getMapping, getUpstreamMappings, getUpstreamNode, getUpstreamNodes, getEnabledUserIds } = require('./db');
 
 // ==================== HTTP 请求封装 ====================
 
@@ -67,39 +67,6 @@ function apiCall(host, port, method, path, token, body) {
 
 // ==================== 查询辅助 ====================
 
-/**
- * 获取所有启用上游同步的节点
- */
-function getUpstreamNodes() {
-  return db().prepare(`
-    SELECT * FROM nodes WHERE has_upstream_api = 1 AND enabled = 1
-    ORDER BY sort_order, id
-  `).all();
-}
-
-/**
- * 获取用户在上游节点上的映射（UUID + 节点 API 信息）
- */
-function getUpstreamMappings(userId) {
-  return db().prepare(`
-    SELECT m.uuid, m.node_id,
-           n.name as node_name, n.server, n.api_host, n.api_port, n.api_token
-    FROM user_node_uuids m
-    JOIN nodes n ON m.node_id = n.id
-    WHERE m.user_id = ? AND n.has_upstream_api = 1 AND n.enabled = 1
-    ORDER BY n.sort_order, n.id
-  `).all(userId);
-}
-
-/**
- * 获取单个节点信息（含 API 字段）
- */
-function getUpstreamNode(nodeId) {
-  return db().prepare(`
-    SELECT * FROM nodes WHERE id = ? AND has_upstream_api = 1 AND enabled = 1
-  `).get(nodeId);
-}
-
 // ==================== 同步函数 ====================
 
 /**
@@ -109,10 +76,10 @@ function getUpstreamNode(nodeId) {
  * @returns {Promise<{synced: number, failed: number, errors: string[]}>}
  */
 async function syncUserCreate(userId) {
-  const user = getUserById(userId);
+  const user = await getUserById(userId);
   if (!user) return { synced: 0, failed: 0, errors: ['用户不存在'] };
 
-  const mappings = getUpstreamMappings(userId);
+  const mappings = await getUpstreamMappings(userId);
   if (!mappings.length) return { synced: 0, failed: 0, errors: [] };
 
   const results = await Promise.allSettled(
@@ -161,10 +128,10 @@ async function syncUserCreate(userId) {
  * @returns {Promise<{synced: number, failed: number, errors: string[]}>}
  */
 async function syncUserDelete(userId) {
-  const user = getUserById(userId);
+  const user = await getUserById(userId);
   if (!user) return { synced: 0, failed: 0, errors: ['用户不存在'] };
 
-  const mappings = getUpstreamMappings(userId);
+  const mappings = await getUpstreamMappings(userId);
   if (!mappings.length) return { synced: 0, failed: 0, errors: [] };
 
   const results = await Promise.allSettled(
@@ -211,10 +178,10 @@ async function syncUserDelete(userId) {
  * @returns {Promise<{synced: number, failed: number, errors: string[]}>}
  */
 async function syncUserEnabled(userId, enabled) {
-  const user = getUserById(userId);
+  const user = await getUserById(userId);
   if (!user) return { synced: 0, failed: 0, errors: ['用户不存在'] };
 
-  const mappings = getUpstreamMappings(userId);
+  const mappings = await getUpstreamMappings(userId);
   if (!mappings.length) return { synced: 0, failed: 0, errors: [] };
 
   const results = await Promise.allSettled(
@@ -259,22 +226,22 @@ async function syncUserEnabled(userId, enabled) {
  * 同步单条映射创建
  * @param {number} userId - subserver 用户 ID
  * @param {number} nodeId - 节点 ID
- * @returns {Promise<{ok: boolean, error?: string}>}
+ * @returns {Promise<{synced: number, failed: number, errors: string[]}>}
  */
 async function syncMappingCreate(userId, nodeId) {
-  const user = getUserById(userId);
-  if (!user) return { ok: false, error: '用户不存在' };
+  const user = await getUserById(userId);
+  if (!user) return { synced: 0, failed: 1, errors: ['用户不存在'] };
 
-  const mapping = getMapping(userId, nodeId);
-  if (!mapping) return { ok: false, error: '映射不存在' };
+  const mapping = await getMapping(userId, nodeId);
+  if (!mapping) return { synced: 0, failed: 1, errors: ['映射不存在'] };
 
-  const node = getUpstreamNode(nodeId);
-  if (!node) return { ok: true, skipped: true }; // 非上游节点，跳过
+  const node = await getUpstreamNode(nodeId);
+  if (!node) return { synced: 0, failed: 0, errors: [] }; // 非上游节点，跳过
 
   const host = node.api_host || node.server;
   const port = node.api_port || 2088;
   const token = node.api_token || '';
-  if (!token) return { ok: false, error: '未配置 api_token' };
+  if (!token) return { synced: 0, failed: 1, errors: ['未配置 api_token'] };
 
   try {
     const res = await apiCall(host, port, 'POST', '/api/upstream/user', token, {
@@ -282,13 +249,15 @@ async function syncMappingCreate(userId, nodeId) {
       name: user.name,
     });
     if (res.status !== 200) {
-      return { ok: false, error: res.data.error || `HTTP ${res.status}` };
+      const err = res.data.error || `HTTP ${res.status}`;
+      console.error(`[upstream-sync] syncMappingCreate(${user.name} → ${node.name}): ${err}`);
+      return { synced: 0, failed: 1, errors: [err] };
     }
     console.log(`[upstream-sync] syncMappingCreate(${user.name} → ${node.name}): OK`);
-    return { ok: true };
+    return { synced: 1, failed: 0, errors: [] };
   } catch (e) {
     console.error(`[upstream-sync] syncMappingCreate(${user.name} → ${node.name}): ${e.message}`);
-    return { ok: false, error: e.message };
+    return { synced: 0, failed: 1, errors: [e.message] };
   }
 }
 
@@ -296,31 +265,69 @@ async function syncMappingCreate(userId, nodeId) {
  * 同步单条映射删除
  * @param {number} userId - subserver 用户 ID
  * @param {number} nodeId - 节点 ID
- * @returns {Promise<{ok: boolean, error?: string}>}
+ * @returns {Promise<{synced: number, failed: number, errors: string[]}>}
  */
 async function syncMappingDelete(userId, nodeId) {
-  const mapping = getMapping(userId, nodeId);
-  if (!mapping) return { ok: true, skipped: true }; // 映射已不存在
+  const mapping = await getMapping(userId, nodeId);
+  if (!mapping) return { synced: 0, failed: 0, errors: [] }; // 映射已不存在
 
-  const node = getUpstreamNode(nodeId);
-  if (!node) return { ok: true, skipped: true }; // 非上游节点
+  const node = await getUpstreamNode(nodeId);
+  if (!node) return { synced: 0, failed: 0, errors: [] }; // 非上游节点
 
   const host = node.api_host || node.server;
   const port = node.api_port || 2088;
   const token = node.api_token || '';
-  if (!token) return { ok: false, error: '未配置 api_token' };
+  if (!token) return { synced: 0, failed: 1, errors: ['未配置 api_token'] };
 
   try {
     const res = await apiCall(host, port, 'DELETE', `/api/upstream/user/${encodeURIComponent(mapping.uuid)}`, token);
     // 404 也算成功
     if (res.status !== 200 && res.status !== 404) {
-      return { ok: false, error: res.data.error || `HTTP ${res.status}` };
+      const err = res.data.error || `HTTP ${res.status}`;
+      console.error(`[upstream-sync] syncMappingDelete(${node.name}): ${err}`);
+      return { synced: 0, failed: 1, errors: [err] };
     }
     console.log(`[upstream-sync] syncMappingDelete(${node.name}): OK`);
-    return { ok: true };
+    return { synced: 1, failed: 0, errors: [] };
   } catch (e) {
     console.error(`[upstream-sync] syncMappingDelete(${node.name}): ${e.message}`);
-    return { ok: false, error: e.message };
+    return { synced: 0, failed: 1, errors: [e.message] };
+  }
+}
+
+/**
+ * 同步单条映射启用/禁用状态到上游节点
+ * @param {number} userId - subserver 用户 ID
+ * @param {number} nodeId - 节点 ID
+ * @param {boolean} enabled - 是否启用
+ * @returns {Promise<{synced: number, failed: number, errors: string[]}>}
+ */
+async function syncMappingEnabled(userId, nodeId, enabled) {
+  const mapping = await getMapping(userId, nodeId);
+  if (!mapping) return { synced: 0, failed: 0, errors: [] };
+
+  const node = await getUpstreamNode(nodeId);
+  if (!node) return { synced: 0, failed: 0, errors: [] }; // 非上游节点
+
+  const host = node.api_host || node.server;
+  const port = node.api_port || 2088;
+  const token = node.api_token || '';
+  if (!token) return { synced: 0, failed: 1, errors: ['未配置 api_token'] };
+
+  try {
+    const res = await apiCall(host, port, 'PATCH', `/api/upstream/user/${encodeURIComponent(mapping.uuid)}`, token, {
+      enabled: !!enabled,
+    });
+    if (res.status !== 200) {
+      const err = res.data.error || `HTTP ${res.status}`;
+      console.error(`[upstream-sync] syncMappingEnabled(${node.name}, ${enabled}): ${err}`);
+      return { synced: 0, failed: 1, errors: [err] };
+    }
+    console.log(`[upstream-sync] syncMappingEnabled(${node.name}, ${enabled}): OK`);
+    return { synced: 1, failed: 0, errors: [] };
+  } catch (e) {
+    console.error(`[upstream-sync] syncMappingEnabled(${node.name}, ${enabled}): ${e.message}`);
+    return { synced: 0, failed: 1, errors: [e.message] };
   }
 }
 
@@ -330,7 +337,7 @@ async function syncMappingDelete(userId, nodeId) {
  * @returns {Promise<{users: number, synced: number, failed: number, errors: string[]}>}
  */
 async function syncAll() {
-  const users = db().prepare('SELECT id FROM users WHERE enabled = 1 ORDER BY id').all();
+  const users = await getEnabledUserIds();
   let totalSynced = 0, totalFailed = 0;
   const allErrors = [];
 
@@ -353,10 +360,10 @@ async function syncAll() {
  * @returns {Promise<{userId: number, nodes: Array}>}
  */
 async function getUserTraffic(userId) {
-  const user = getUserById(userId);
+  const user = await getUserById(userId);
   if (!user) return { userId, nodes: [] };
 
-  const mappings = getUpstreamMappings(userId);
+  const mappings = await getUpstreamMappings(userId);
   if (!mappings.length) return { userId, nodes: [] };
 
   const results = await Promise.allSettled(
@@ -408,6 +415,7 @@ module.exports = {
   syncUserEnabled,
   syncMappingCreate,
   syncMappingDelete,
+  syncMappingEnabled,
   syncAll,
   getUserTraffic,
 };

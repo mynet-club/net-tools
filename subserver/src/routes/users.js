@@ -28,8 +28,8 @@ const { syncUserCreate, syncUserDelete, syncUserEnabled } = require('../upstream
 /**
  * GET /api/users
  */
-function handleList(req, res) {
-  const users = getUsers();
+async function handleList(req, res) {
+  const users = await getUsers();
   // 过滤掉 password_hash
   const safeUsers = users.map(({ password_hash, ...u }) => u);
   return apiResponse(res, 200, safeUsers);
@@ -54,7 +54,7 @@ async function handleCreate(req, res, json) {
     return apiResponse(res, 400, { error: 'role 只能为 admin 或 user' });
   }
   try {
-    const user = createUser({
+    const user = await createUser({
       name: json.name,
       username,
       password: json.password,
@@ -62,7 +62,7 @@ async function handleCreate(req, res, json) {
       role: json.role || 'user',
     });
     // 自动为所有节点生成 UUID 映射
-    try { bulkSetMappings(user.id); } catch (e) { console.error('自动映射失败:', e.message); }
+    try { await bulkSetMappings(user.id); } catch (e) { console.error('自动映射失败:', e.message); }
     // 异步同步到上游节点
     syncUserCreate(user.id).catch(e => console.error('[upstream-sync] userCreate:', e.message));
     // 不返回 password_hash
@@ -84,7 +84,14 @@ async function handleBatchCreate(req, res, json) {
   if (!Array.isArray(json.users) || json.users.length === 0) {
     return apiResponse(res, 400, { error: '缺少 users 数组' });
   }
-  const results = batchCreateUsers(json.users);
+  const results = await batchCreateUsers(json.users);
+  // 对每个创建成功的用户生成 UUID 映射并同步上游
+  for (const r of results) {
+    if (r.ok && r.user) {
+      try { await bulkSetMappings(r.user.id); } catch (e) { console.error('批量自动映射失败:', e.message); }
+      syncUserCreate(r.user.id).catch(e => console.error('[upstream-sync] batchCreate:', e.message));
+    }
+  }
   const ok = results.filter(r => r.ok).length;
   const fail = results.filter(r => !r.ok).length;
   return apiResponse(res, 201, { created: ok, failed: fail, results });
@@ -93,8 +100,8 @@ async function handleBatchCreate(req, res, json) {
 /**
  * GET /api/users/:id
  */
-function handleGet(req, res, id) {
-  const user = getUserById(id);
+async function handleGet(req, res, id) {
+  const user = await getUserById(id);
   if (!user) {
     return apiResponse(res, 404, { error: '用户不存在' });
   }
@@ -107,7 +114,7 @@ function handleGet(req, res, id) {
  * body: { name, note, enabled, username, role, password }
  */
 async function handleUpdate(req, res, id, json) {
-  const user = getUserById(id);
+  const user = await getUserById(id);
   if (!user) {
     return apiResponse(res, 404, { error: '用户不存在' });
   }
@@ -117,14 +124,14 @@ async function handleUpdate(req, res, id, json) {
       if (typeof json.password !== 'string' || json.password.length < 6 || json.password.length > 200) {
         return apiResponse(res, 400, { error: '密码长度需在 6-200 之间' });
       }
-      updateUserPassword(id, json.password);
+      await updateUserPassword(id, json.password);
     }
     // 如果提供了 role，单独处理角色更新
     if (json.role) {
       if (!['admin', 'user'].includes(json.role)) {
         return apiResponse(res, 400, { error: 'role 只能为 admin 或 user' });
       }
-      updateUserRole(id, json.role);
+      await updateUserRole(id, json.role);
     }
     // 更新其他字段
     const fields = {};
@@ -138,8 +145,13 @@ async function handleUpdate(req, res, id, json) {
       }
       fields.username = cleanUsername;
     }
-    const updated = updateUser(id, fields);
-    // 如果启停状态有变化，同步到上游节点
+    const updated = await updateUser(id, fields);
+    // 如果用户名变化，先同步名称（upsert 会重置 enabled=1），再同步启停状态（覆盖正确的 enabled 值）
+    // 顺序很重要：syncUserCreate 必须先完成，否则它会把 enabled 重置为 1
+    if (json.name !== undefined && json.name !== user.name) {
+      try { await syncUserCreate(id); } catch (e) { console.error('[upstream-sync] userNameUpdate:', e.message); }
+    }
+    // 如果启停状态有变化，同步到上游节点（在 name sync 之后执行，确保 enabled 值正确）
     if (json.enabled !== undefined) {
       syncUserEnabled(id, !!json.enabled).catch(e => console.error('[upstream-sync] userUpdate:', e.message));
     }
@@ -157,13 +169,13 @@ async function handleUpdate(req, res, id, json) {
  * DELETE /api/users/:id
  */
 async function handleDelete(req, res, id) {
-  const user = getUserById(id);
+  const user = await getUserById(id);
   if (!user) {
     return apiResponse(res, 404, { error: '用户不存在' });
   }
   // 先同步删除上游节点用户（需要 mappings 仍存在）
   try { await syncUserDelete(id); } catch (e) { console.error('[upstream-sync] userDelete:', e.message); }
-  deleteUser(id);
+  await deleteUser(id);
   return apiResponse(res, 200, { ok: true });
 }
 

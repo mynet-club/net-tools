@@ -8,35 +8,35 @@
 'use strict';
 
 const { execSync } = require('child_process');
-const fs   = require('fs');
+const fs = require('fs');
 const path = require('path');
 
 // ==================== 颜色输出 ====================
 const c = {
-  red:    s => `\x1b[31m${s}\x1b[0m`,
-  green:  s => `\x1b[32m${s}\x1b[0m`,
+  red: s => `\x1b[31m${s}\x1b[0m`,
+  green: s => `\x1b[32m${s}\x1b[0m`,
   yellow: s => `\x1b[33m${s}\x1b[0m`,
-  blue:   s => `\x1b[34m${s}\x1b[0m`,
-  dim:    s => `\x1b[2m${s}\x1b[0m`,
-  bold:   s => `\x1b[1m${s}\x1b[0m`,
+  blue: s => `\x1b[34m${s}\x1b[0m`,
+  dim: s => `\x1b[2m${s}\x1b[0m`,
+  bold: s => `\x1b[1m${s}\x1b[0m`,
 };
 
 // ==================== 导入模块 ====================
 const database = require('./lib/database');
-const config   = require('./lib/config');
+const config = require('./lib/config');
 const firewall = require('./lib/firewall');
-const reality  = require('./lib/reality');
+const reality = require('./lib/reality');
 const userManager = require('./lib/user-manager');
-const apiServer   = require('./lib/api-server');
+const apiServer = require('./lib/api-server');
 const { buildConfig } = require('./lib/config-generator');
 
 // ==================== 常量 ====================
-const VERSION     = config.VERSION;
-const XRAY_CONF   = config.XRAY_CONF;
-const PID_FILE    = config.PID_FILE;
-const LOG_FILE    = config.LOG_FILE;
-const MIHOMO_OUT  = config.MIHOMO_OUT;
-const API_PORT    = config.API_PORT;
+const VERSION = config.VERSION;
+const XRAY_CONF = config.XRAY_CONF;
+const PID_FILE = config.PID_FILE;
+const LOG_FILE = config.LOG_FILE;
+const MIHOMO_OUT = config.MIHOMO_OUT;
+const API_PORT = config.API_PORT;
 
 // ==================== 工具函数 ====================
 function run(cmd) {
@@ -73,7 +73,7 @@ async function cmdStart() {
   // 启动前清理任何遗留 xray 进程（PID 文件未跟踪的孤儿）
   const strayPids = run('pgrep -x xray').split('\n').filter(Boolean).map(Number).filter(Boolean);
   if (strayPids.length > 0) {
-    for (const p of strayPids) { try { process.kill(p, 'SIGTERM'); } catch {} }
+    for (const p of strayPids) { try { process.kill(p, 'SIGTERM'); } catch { } }
     console.log(c.yellow(`  已清理 ${strayPids.length} 个遗留 xray 进程`));
     await new Promise(r => setTimeout(r, 500));
   }
@@ -132,7 +132,7 @@ function cmdStop() {
       process.kill(p, 'SIGTERM');
       orphanCount++;
       stopped = true;
-    } catch {}
+    } catch { }
   }
   if (orphanCount > 0) console.log(c.yellow(`  已清理 ${orphanCount} 个孤儿 xray 进程`));
 
@@ -193,28 +193,45 @@ function cmdReload() {
     return;
   }
 
-  // 先重新生成配置再发信号
+  // 重新生成配置
   const builtCfg = buildConfig();
   console.log(c.dim(`  已更新配置 (${builtCfg.inbounds.length} 个入站)`));
 
+  // 完全重启 xray 进程（SIGUSR1 不会重载路由表/outbounds 变更）
   const pid = readPid();
   try {
-    process.kill(pid, 'SIGUSR1');
-    console.log(c.green('  ✓ 配置已重载'));
+    process.kill(pid, 'SIGTERM');
   } catch (e) {
-    console.log(c.red(`  ✗ 重载失败: ${e.message}`));
+    if (e.code !== 'ESRCH') {
+      console.log(c.red(`  ✗ 停止旧进程失败: ${e.message}`));
+      return;
+    }
+  }
+
+  // 等待进程退出后启动新进程
+  try {
+    execSync('sleep 1', { stdio: 'pipe' });
+    const xrayBin = findXrayBinary();
+    if (!xrayBin) {
+      console.log(c.red('  ✗ 未找到 xray 可执行文件'));
+      return;
+    }
+    const newPid = execSync(`nohup ${xrayBin} run -c ${XRAY_CONF} > ${LOG_FILE} 2>&1 & echo $!`, {
+      encoding: 'utf8'
+    }).trim();
+    writePid(parseInt(newPid));
+    console.log(c.green(`  ✓ 配置已重载 (PID: ${newPid})`));
+  } catch (e) {
+    console.log(c.red(`  ✗ 重启失败: ${e.message}`));
   }
 }
 
 /**
- * 重新生成配置并热重载 Xray（用户操作后调用）
+ * 重新生成配置并重启 Xray（用户操作后调用）
  */
 function regenAndReload() {
   if (!isRunning()) return;
-  const builtCfg = buildConfig();
-  console.log(c.dim(`  已更新配置 (${builtCfg.inbounds.length} 个入站)`));
-  const pid = readPid();
-  try { process.kill(pid, 'SIGUSR1'); } catch {}
+  cmdReload();
 }
 
 function findXrayBinary() {
@@ -228,7 +245,7 @@ function findXrayBinary() {
     try {
       execSync(`which ${p}`, { stdio: 'pipe' });
       return p;
-    } catch {}
+    } catch { }
   }
 
   return null;
@@ -492,7 +509,7 @@ ${c.bold('Web UI')}
 }
 
 // ==================== 主入口 ====================
-const [,, cmd, ...args] = process.argv;
+const [, , cmd, ...args] = process.argv;
 
 (async () => {
   try {

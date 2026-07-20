@@ -45,7 +45,7 @@ async function handleLogin(req, res, json) {
     return apiResponse(res, 400, { error: '用户名或密码过长' });
   }
 
-  const user = getUserByName(username);
+  const user = await getUserByName(username);
   if (!user || !user.password_hash) {
     return apiResponse(res, 401, { error: '用户名或密码错误' });
   }
@@ -113,10 +113,10 @@ async function handleForgotPassword(req, res, json) {
     return apiResponse(res, 503, { error: '邮件服务未配置，请联系管理员' });
   }
 
-  const user = getUserByEmail(email.toLowerCase().trim());
+  const user = await getUserByEmail(email.toLowerCase().trim());
   if (user && user.enabled && user.username) {
     try {
-      const tokenRow = createEmailToken(user.id, 'reset', 1); // 1 小时有效
+      const tokenRow = await createEmailToken(user.id, 'reset', 1); // 1 小时有效
       const resetUrl = `${getBaseUrl()}/reset-password?token=${tokenRow.token}`;
       await sendResetEmail(user.email, resetUrl, user.username);
     } catch (e) {
@@ -135,7 +135,7 @@ async function handleForgotPassword(req, res, json) {
  * POST /api/auth/reset-password
  * body: { token, password }
  */
-function handleResetPassword(req, res, json) {
+async function handleResetPassword(req, res, json) {
   const { token, password } = json;
   if (!token || typeof token !== 'string') {
     return apiResponse(res, 400, { error: '缺少重置令牌' });
@@ -144,16 +144,16 @@ function handleResetPassword(req, res, json) {
     return apiResponse(res, 400, { error: '密码长度需在 6-200 之间' });
   }
 
-  const tokenRow = getEmailToken(token);
+  const tokenRow = await getEmailToken(token);
   if (!tokenRow || tokenRow.type !== 'reset') {
     return apiResponse(res, 400, { error: '重置链接无效或已过期' });
   }
 
   // 使用令牌
-  useEmailToken(token);
+  await useEmailToken(token);
 
   // 更新密码
-  updateUserPassword(tokenRow.user_id, password);
+  await updateUserPassword(tokenRow.user_id, password);
 
   return apiResponse(res, 200, {
     ok: true,

@@ -29,9 +29,10 @@ const c = {
   b: s => `\x1b[34m${s}\x1b[0m`,
   r: s => `\x1b[31m${s}\x1b[0m`,
 };
-const ok  = s => console.log(c.g('✓ ') + s);
-const log = s => console.log(c.b('» ') + s);
-const die = s => { console.error(c.r('✗ ') + s); process.exit(1); };
+const ok   = s => console.log(c.g('✓ ') + s);
+const log  = s => console.log(c.b('» ') + s);
+const warn = s => console.log(c.y('⚠ ') + s);
+const die  = s => { console.error(c.r('✗ ') + s); process.exit(1); };
 
 // ── 路径 ─────────────────────────────────────────────────────────────────────
 const rootDir   = path.join(__dirname, '..');

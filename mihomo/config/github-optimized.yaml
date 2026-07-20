@@ -1,0 +1,194 @@
+# Clash Meta (Mihomo) - GitHub 推送优化配置
+# 针对 git push 间歇性失败问题的专项优化
+# 适用场景：sub.mynet.club 订阅 + 52.221.22.241 (SG) + 47.236.76.195 (SG)
+
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: warning
+ipv6: false
+external-controller: 127.0.0.1:9090
+
+# DNS 配置 - 优化 GitHub 解析
+dns:
+  enable: true
+  ipv6: false
+  listen: 127.0.0.1:1053
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - '*.lan'
+    - '*.local'
+    - localhost.ptlogin2.qq.com
+  default-nameserver:
+    - 223.5.5.5
+    - 114.114.114.114
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  fallback:
+    - https://dns.google/dns-query
+    - tls://8.8.8.8:853
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+  # GitHub 域名强制使用国际 DNS
+  nameserver-policy:
+    'github.com':
+      - https://dns.google/dns-query
+      - tls://1.1.1.1:853
+    'githubusercontent.com':
+      - https://dns.google/dns-query
+    'githubassets.com':
+      - https://dns.google/dns-query
+
+# TUN 模式（可选，接管所有流量）
+tun:
+  enable: false
+  stack: system
+  auto-route: true
+  auto-detect-interface: true
+  dns-hijack:
+    - any:53
+
+proxies:
+  # 节点 1: AWS 新加坡 (52.221.22.241) - 主节点
+  - name: "🇸🇬 AWS-SG-主"
+    type: vless
+    server: 52.221.22.241
+    port: 8443
+    uuid: __YOUR_UUID__
+    network: tcp
+    tls: true
+    flow: xtls-rprx-vision
+    reality-opts:
+      public-key: __REALITY_PUBLIC_KEY__
+      short-id: __REALITY_SHORT_ID__
+    servername: www.microsoft.com
+    client-fingerprint: chrome
+    udp: true
+    # 优化：禁用 UDP 分片，减少 git push 时的丢包
+    smux:
+      enabled: false
+
+  # 节点 2: 阿里云新加坡 (47.236.76.195) - 备用
+  - name: "🇸🇬 Ali-SG-备"
+    type: vless
+    server: 47.236.76.195
+    port: 8443
+    uuid: __YOUR_UUID__
+    network: tcp
+    tls: true
+    flow: xtls-rprx-vision
+    reality-opts:
+      public-key: __REALITY_PUBLIC_KEY__
+      short-id: __REALITY_SHORT_ID__
+    servername: www.microsoft.com
+    client-fingerprint: chrome
+    udp: true
+    smux:
+      enabled: false
+
+proxy-groups:
+  # GitHub 专用策略组 - 使用 fallback 而非 url-test
+  - name: "🔑 GitHub 出口"
+    type: fallback
+    proxies:
+      - 🇸🇬 AWS-SG-主
+      - 🇸🇬 Ali-SG-备
+    url: "https://github.com"
+    interval: 60
+    timeout: 5000
+    lazy: true
+    # fallback 特性：主节点可用时永不切换，避免 git push 中途断连
+
+  # 通用代理策略组
+  - name: "🚀 自动选择"
+    type: url-test
+    proxies:
+      - 🇸🇬 AWS-SG-主
+      - 🇸🇬 Ali-SG-备
+    url: "https://www.gstatic.com/generate_204"
+    interval: 120
+    tolerance: 50
+
+  # 手动选择
+  - name: "⚡ 手动选择"
+    type: select
+    proxies:
+      - 🔑 GitHub 出口
+      - 🚀 自动选择
+      - 🇸🇬 AWS-SG-主
+      - 🇸🇬 Ali-SG-备
+      - DIRECT
+
+  # 默认出口
+  - name: "🌐 默认出口"
+    type: select
+    proxies:
+      - ⚡ 手动选择
+      - 🚀 自动选择
+      - DIRECT
+
+rules:
+  # ── GitHub 全家桶 - 专用出口（最关键）──
+  - DOMAIN-SUFFIX,github.com,🔑 GitHub 出口
+  - DOMAIN-SUFFIX,githubusercontent.com,🔑 GitHub 出口
+  - DOMAIN-SUFFIX,githubcopilot.com,🔑 GitHub 出口
+  - DOMAIN-SUFFIX,githubassets.com,🔑 GitHub 出口
+  - DOMAIN-SUFFIX,github.io,🔑 GitHub 出口
+  - DOMAIN-SUFFIX,npmjs.com,🔑 GitHub 出口
+  - DOMAIN-SUFFIX,npmjs.org,🔑 GitHub 出口
+  # VS Code / Copilot
+  - DOMAIN-SUFFIX,visualstudio.com,🔑 GitHub 出口
+  - DOMAIN-SUFFIX,vscode-cdn.net,🔑 GitHub 出口
+  - DOMAIN-SUFFIX,vsassets.io,🔑 GitHub 出口
+  - DOMAIN-SUFFIX,exp-tas.com,🔑 GitHub 出口
+  # GitHub API IP 段
+  - IP-CIDR,140.82.112.0/20,🔑 GitHub 出口,no-resolve
+  - IP-CIDR,140.82.113.0/24,🔑 GitHub 出口,no-resolve
+  - IP-CIDR,140.82.114.0/24,🔑 GitHub 出口,no-resolve
+  - IP-CIDR,185.199.108.0/22,🔑 GitHub 出口,no-resolve
+
+  # ── 局域网直连 ──
+  - IP-CIDR,192.168.0.0/16,DIRECT
+  - IP-CIDR,10.0.0.0/8,DIRECT
+  - IP-CIDR,172.16.0.0/12,DIRECT
+  - IP-CIDR,127.0.0.0/8,DIRECT
+
+  # ── 中国大陆域名直连 ──
+  - DOMAIN-SUFFIX,baidu.com,DIRECT
+  - DOMAIN-SUFFIX,bilibili.com,DIRECT
+  - DOMAIN-SUFFIX,iqiyi.com,DIRECT
+  - DOMAIN-SUFFIX,163.com,DIRECT
+  - DOMAIN-SUFFIX,qq.com,DIRECT
+  - DOMAIN-SUFFIX,wechat.com,DIRECT
+  - DOMAIN-SUFFIX,weixin.qq.com,DIRECT
+  - DOMAIN-SUFFIX,taobao.com,DIRECT
+  - DOMAIN-SUFFIX,tmall.com,DIRECT
+  - DOMAIN-SUFFIX,jd.com,DIRECT
+  - DOMAIN-SUFFIX,weibo.com,DIRECT
+  - DOMAIN-SUFFIX,zhihu.com,DIRECT
+  - DOMAIN-SUFFIX,alipay.com,DIRECT
+  - DOMAIN-SUFFIX,aliyun.com,DIRECT
+  - DOMAIN-SUFFIX,tencent.com,DIRECT
+  - DOMAIN-SUFFIX,bytedance.com,DIRECT
+  - DOMAIN-SUFFIX,douyin.com,DIRECT
+
+  # ── Telegram ──
+  - GEOSITE,telegram,🌐 默认出口
+  - IP-CIDR,91.108.4.0/22,🌐 默认出口,no-resolve
+  - IP-CIDR,91.108.56.0/22,🌐 默认出口,no-resolve
+  - IP-CIDR,149.154.160.0/20,🌐 默认出口,no-resolve
+
+  # ── Google/YouTube ──
+  - DOMAIN-SUFFIX,google.com,🌐 默认出口
+  - DOMAIN-SUFFIX,youtube.com,🌐 默认出口
+  - DOMAIN-SUFFIX,ytimg.com,🌐 默认出口
+  - DOMAIN-SUFFIX,gstatic.com,🌐 默认出口
+
+  # ── 中国大陆 IP 直连 ──
+  - GEOIP,CN,DIRECT
+
+  # ── 兜底 ──
+  - MATCH,🌐 默认出口

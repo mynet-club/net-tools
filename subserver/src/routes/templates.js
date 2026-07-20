@@ -22,27 +22,27 @@ const {
 /**
  * GET /api/templates — 列出所有模板（不含 content）
  */
-function handleList(req, res) {
-  const list = getTemplates();
+async function handleList(req, res) {
+  const list = await getTemplates();
   return apiResponse(res, 200, list);
 }
 
 /**
  * POST /api/templates — 创建模板
  */
-function handleCreate(req, res, json) {
+async function handleCreate(req, res, json) {
   if (!json.name || !json.content) {
     return apiResponse(res, 400, { error: '缺少 name 或 content 字段' });
   }
   try {
-    const tpl = createTemplate({
+    const tpl = await createTemplate({
       name: json.name,
       description: json.description || '',
       content: json.content,
     });
     return apiResponse(res, 201, tpl);
   } catch (e) {
-    if (e.message.includes('UNIQUE')) {
+    if (e.message.includes('Duplicate') || e.message.includes('UNIQUE')) {
       return apiResponse(res, 409, { error: '模板名已存在' });
     }
     return apiResponse(res, 400, { error: e.message });
@@ -52,8 +52,8 @@ function handleCreate(req, res, json) {
 /**
  * GET /api/templates/:id — 获取模板（含 content）
  */
-function handleGet(req, res, id) {
-  const tpl = getTemplateById(id);
+async function handleGet(req, res, id) {
+  const tpl = await getTemplateById(id);
   if (!tpl) {
     return apiResponse(res, 404, { error: '模板不存在' });
   }
@@ -63,8 +63,8 @@ function handleGet(req, res, id) {
 /**
  * GET /api/templates/:id/content — 返回模板 YAML 原文
  */
-function handleContent(req, res, id) {
-  const tpl = getTemplateById(id);
+async function handleContent(req, res, id) {
+  const tpl = await getTemplateById(id);
   if (!tpl) {
     return apiResponse(res, 404, { error: '模板不存在' });
   }
@@ -79,13 +79,13 @@ function handleContent(req, res, id) {
 /**
  * PUT /api/templates/:id — 更新模板
  */
-function handleUpdate(req, res, id, json) {
-  const tpl = getTemplateById(id);
+async function handleUpdate(req, res, id, json) {
+  const tpl = await getTemplateById(id);
   if (!tpl) {
     return apiResponse(res, 404, { error: '模板不存在' });
   }
   try {
-    const updated = updateTemplate(id, {
+    const updated = await updateTemplate(id, {
       name: json.name,
       description: json.description,
       content: json.content,
@@ -93,7 +93,7 @@ function handleUpdate(req, res, id, json) {
     });
     return apiResponse(res, 200, updated);
   } catch (e) {
-    if (e.message.includes('UNIQUE')) {
+    if (e.message.includes('Duplicate') || e.message.includes('UNIQUE')) {
       return apiResponse(res, 409, { error: '模板名已存在' });
     }
     return apiResponse(res, 400, { error: e.message });
@@ -103,12 +103,12 @@ function handleUpdate(req, res, id, json) {
 /**
  * DELETE /api/templates/:id — 删除模板
  */
-function handleDelete(req, res, id) {
-  const tpl = getTemplateById(id);
+async function handleDelete(req, res, id) {
+  const tpl = await getTemplateById(id);
   if (!tpl) {
     return apiResponse(res, 404, { error: '模板不存在' });
   }
-  deleteTemplate(id);
+  await deleteTemplate(id);
   return apiResponse(res, 200, { ok: true });
 }
 

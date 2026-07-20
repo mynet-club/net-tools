@@ -14,7 +14,7 @@ const { generateProxiesYaml, generateFullConfigYaml } = require('../yaml-gen');
 /**
  * GET /sub/:token 或 /sub/:token/:template/full
  */
-function handleSub(req, res, pathname) {
+async function handleSub(req, res, pathname) {
   // 解析路径段: /sub/:token 或 /sub/:token/:template/full
   const parts = pathname.replace(/^\/sub\//, '').split('/');
   const token = parts[0];
@@ -24,16 +24,20 @@ function handleSub(req, res, pathname) {
   }
 
   // 验证用户
-  const user = getUserByToken(token);
+  const user = await getUserByToken(token);
   if (!user) {
     return apiResponse(res, 404, { error: 'token 无效' });
   }
   if (!user.enabled) {
     return apiResponse(res, 403, { error: '用户已禁用' });
   }
+  // 邮箱未验证则拒绝订阅（UUID 尚未同步到上游节点，订阅配置不可用）
+  if (user.email && !user.email_verified) {
+    return apiResponse(res, 403, { error: '邮箱未验证，请先完成邮箱激活' });
+  }
 
   // 获取订阅数据（仅返回用户已建立 UUID 映射的节点）
-  const nodes = getSubscriptionData(token);
+  const nodes = await getSubscriptionData(token);
 
   // 判断模式：订阅模式 vs 导出模式
   const isExportMode = parts.length === 3 && parts[2] === 'full';
@@ -43,7 +47,7 @@ function handleSub(req, res, pathname) {
     if (isExportMode) {
       // 导出模式: /sub/:token/:template/full
       const templateName = parts[1];
-      const template = getTemplateByName(templateName);
+      const template = await getTemplateByName(templateName);
       if (!template) {
         return apiResponse(res, 404, { error: `模板 "${templateName}" 不存在` });
       }

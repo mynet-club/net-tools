@@ -1,497 +1,1280 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
+
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SubServer Dashboard</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
-a{color:#63b3ed}
-::-webkit-scrollbar{width:6px;height:6px}
-::-webkit-scrollbar-track{background:#1a1d27}
-::-webkit-scrollbar-thumb{background:#2d3748;border-radius:3px}
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>SubServer Dashboard</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0
+    }
 
-.sidebar{position:fixed;top:0;left:0;width:200px;height:100vh;background:#1a1d27;border-right:1px solid #2d3748;display:flex;flex-direction:column}
-.logo{padding:20px 16px 16px;font-size:18px;font-weight:700;color:#63b3ed;border-bottom:1px solid #2d3748}
-.logo span{font-size:11px;font-weight:400;color:#718096;display:block;margin-top:2px}
-nav{flex:1;padding:8px 0;overflow-y:auto}
-nav a{display:flex;align-items:center;gap:8px;padding:10px 16px;color:#a0aec0;text-decoration:none;font-size:14px;cursor:pointer;transition:all .15s}
-nav a:hover,nav a.active{background:#2d3748;color:#fff}
-nav a .ico{width:18px;text-align:center}
-.main{margin-left:200px;padding:24px}
-.page{display:none}.page.active{display:block}
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0f1117;
+      color: #e2e8f0;
+      min-height: 100vh
+    }
 
-.stat-card{background:#1a1d27;border:1px solid #2d3748;border-radius:10px;padding:16px 20px;flex:1;min-width:150px}
-.stat-card .label{font-size:12px;color:#718096;margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px}
-.stat-card .value{font-size:22px;font-weight:700}
-.stat-card .value.green{color:#68d391}
-.stat-card .value.blue{color:#63b3ed}
-.status-bar{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:24px}
+    a {
+      color: #63b3ed
+    }
 
-.card{background:#1a1d27;border:1px solid #2d3748;border-radius:10px;overflow:hidden;margin-bottom:20px}
-.card-header{padding:14px 20px;border-bottom:1px solid #2d3748;display:flex;align-items:center;justify-content:space-between;font-weight:600}
-.card-header .actions{display:flex;gap:8px}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th{padding:10px 16px;text-align:left;color:#718096;font-weight:500;border-bottom:1px solid #2d3748;background:#171923}
-td{padding:10px 16px;border-bottom:1px solid #1e2433}
-tr:last-child td{border-bottom:none}
-tr:hover td{background:#1e2433}
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px
+    }
 
-.badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600}
-.badge.green{background:#1a3a2a;color:#68d391}
-.badge.red{background:#3a1a1a;color:#fc8181}
-.badge.gray{background:#2d3748;color:#a0aec0}
-.badge.blue{background:#1a2a3a;color:#63b3ed}
-.badge.purple{background:#2a1a3a;color:#b794f4}
+    ::-webkit-scrollbar-track {
+      background: #1a1d27
+    }
 
-.btn{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:6px;font-size:13px;font-weight:500;border:none;cursor:pointer;transition:all .15s}
-.btn-primary{background:#3182ce;color:#fff}.btn-primary:hover{background:#2b6cb0}
-.btn-green{background:#276749;color:#fff}.btn-green:hover{background:#2f855a}
-.btn-red{background:#822727;color:#fff}.btn-red:hover{background:#9b2c2c}
-.btn-gray{background:#2d3748;color:#e2e8f0}.btn-gray:hover{background:#4a5568}
-.btn-sm{padding:4px 10px;font-size:12px}
+    ::-webkit-scrollbar-thumb {
+      background: #2d3748;
+      border-radius: 3px
+    }
 
-.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:100}
-.modal-overlay.show{display:flex}
-.modal{background:#1a1d27;border:1px solid #2d3748;border-radius:12px;width:520px;max-height:90vh;overflow-y:auto}
-.modal-header{padding:16px 20px;border-bottom:1px solid #2d3748;font-weight:600;font-size:16px;display:flex;justify-content:space-between;align-items:center}
-.modal-body{padding:20px}
-.modal-footer{padding:12px 20px;border-top:1px solid #2d3748;display:flex;justify-content:flex-end;gap:8px}
+    .sidebar {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 200px;
+      height: 100vh;
+      background: #1a1d27;
+      border-right: 1px solid #2d3748;
+      display: flex;
+      flex-direction: column
+    }
 
-.form-group{margin-bottom:14px}
-.form-group label{display:block;font-size:12px;color:#a0aec0;margin-bottom:4px}
-.form-group input,.form-group select,.form-group textarea{width:100%;padding:8px 12px;background:#131720;border:1px solid #2d3748;border-radius:6px;color:#e2e8f0;font-size:13px;outline:none}
-.form-group input:focus,.form-group select:focus,.form-group textarea:focus{border-color:#3182ce}
-.form-group textarea{font-family:'SF Mono',Consolas,monospace;min-height:300px;resize:vertical}
-.form-row{display:flex;gap:12px}
-.form-row .form-group{flex:1}
-.form-hint{font-size:11px;color:#718096;margin-top:3px}
+    .logo {
+      padding: 20px 16px 16px;
+      font-size: 18px;
+      font-weight: 700;
+      color: #63b3ed;
+      border-bottom: 1px solid #2d3748
+    }
 
-.toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:8px;font-size:14px;z-index:200;animation:slideIn .2s}
-.toast.success{background:#1a3a2a;color:#68d391;border:1px solid #2f855a}
-.toast.error{background:#3a1a1a;color:#fc8181;border:1px solid #9b2c2c}
-@keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
+    .logo span {
+      font-size: 11px;
+      font-weight: 400;
+      color: #718096;
+      display: block;
+      margin-top: 2px
+    }
 
-.code{background:#131720;border:1px solid #2d3748;border-radius:6px;padding:8px 12px;font-family:'SF Mono',Consolas,monospace;font-size:12px;word-break:break-all;cursor:pointer}
-.code:hover{border-color:#3182ce}
-.empty{text-align:center;padding:40px;color:#718096}
-.mono{font-family:'SF Mono',Consolas,monospace;font-size:12px}
-.sub-box{background:#1a1d27;border:1px solid #2d3748;border-radius:10px;padding:20px;margin-bottom:20px}
-.sub-box .sub-label{font-size:12px;color:#718096;margin-bottom:8px;text-transform:uppercase;letter-spacing:.5px}
-.sub-box .sub-url{font-family:'SF Mono',Consolas,monospace;font-size:13px;color:#63b3ed;word-break:break-all}
-.sub-actions{display:flex;gap:8px;align-items:center}
-.sub-actions .code{flex:1}
+    nav {
+      flex: 1;
+      padding: 8px 0;
+      overflow-y: auto
+    }
 
-/* Help page */
-.help-section{margin-bottom:28px}
-.help-section h3{font-size:1.05rem;color:#63b3ed;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid #2d3748}
-.help-section h4{font-size:.9rem;color:#e2e8f0;margin:14px 0 8px}
-.help-section p{font-size:.83rem;color:#a0aec0;line-height:1.7;margin-bottom:8px}
-.help-section ul,.help-section ol{font-size:.83rem;color:#a0aec0;line-height:1.8;margin:6px 0 10px 20px}
-.help-section li{margin-bottom:3px}
-.help-section code{background:#131720;border:1px solid #2d3748;border-radius:4px;padding:2px 6px;font-family:'SF Mono',Consolas,monospace;font-size:12px;color:#63b3ed}
-.help-section pre{background:#131720;border:1px solid #2d3748;border-radius:6px;padding:12px 16px;overflow-x:auto;font-size:12px;line-height:1.6;color:#e2e8f0;margin:8px 0}
-.help-section pre code{background:none;border:none;padding:0;color:inherit}
-.help-section .tip{background:#1a2a3a;border-left:3px solid #3182ce;border-radius:0 6px 6px 0;padding:8px 14px;margin:10px 0;font-size:.8rem;color:#a0aec0}
-.help-section .warn{background:#3a2a1a;border-left:3px solid #d69e2e;border-radius:0 6px 6px 0;padding:8px 14px;margin:10px 0;font-size:.8rem;color:#a0aec0}
-.help-section table{font-size:.8rem}
-.help-section th{color:#63b3ed}
-.help-tabs{display:flex;gap:4px;margin-bottom:16px;border-bottom:1px solid #2d3748;padding-bottom:0}
-.help-tab{padding:8px 16px;font-size:.83rem;color:#a0aec0;cursor:pointer;border-bottom:2px solid transparent;transition:all .15s}
-.help-tab:hover{color:#e2e8f0}
-.help-tab.active{color:#63b3ed;border-bottom-color:#63b3ed}
-.help-pane{display:none}.help-pane.active{display:block}
+    nav a {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 16px;
+      color: #a0aec0;
+      text-decoration: none;
+      font-size: 14px;
+      cursor: pointer;
+      transition: all .15s
+    }
 
-/* Node detail popover */
-.popover-overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;z-index:90}
-.popover-overlay.show{display:block}
-.popover{position:fixed;background:#1a1d27;border:1px solid #3182ce;border-radius:10px;box-shadow:0 8px 32px rgba(0,0,0,.5);z-index:100;max-width:420px;min-width:320px;display:none}
-.popover.show{display:block}
-.popover-header{padding:10px 16px;border-bottom:1px solid #2d3748;font-weight:600;font-size:14px;color:#63b3ed;display:flex;justify-content:space-between;align-items:center}
-.popover-body{padding:14px 16px}
-.popover-body .detail-row{display:flex;justify-content:space-between;padding:4px 0;font-size:.8rem;border-bottom:1px solid #1e2433}
-.popover-body .detail-row:last-child{border-bottom:none}
-.popover-body .detail-row .dk{color:#718096;min-width:100px}
-.popover-body .detail-row .dv{color:#e2e8f0;text-align:right;word-break:break-all}
-.popover-body .detail-row .dv.mono{font-family:'SF Mono',Consolas,monospace;font-size:11px}
-</style>
+    nav a:hover,
+    nav a.active {
+      background: #2d3748;
+      color: #fff
+    }
+
+    nav a .ico {
+      width: 18px;
+      text-align: center
+    }
+
+    .main {
+      margin-left: 200px;
+      padding: 24px
+    }
+
+    .page {
+      display: none
+    }
+
+    .page.active {
+      display: block
+    }
+
+    .stat-card {
+      background: #1a1d27;
+      border: 1px solid #2d3748;
+      border-radius: 10px;
+      padding: 16px 20px;
+      flex: 1;
+      min-width: 150px
+    }
+
+    .stat-card .label {
+      font-size: 12px;
+      color: #718096;
+      margin-bottom: 6px;
+      text-transform: uppercase;
+      letter-spacing: .5px
+    }
+
+    .stat-card .value {
+      font-size: 22px;
+      font-weight: 700
+    }
+
+    .stat-card .value.green {
+      color: #68d391
+    }
+
+    .stat-card .value.blue {
+      color: #63b3ed
+    }
+
+    .status-bar {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 24px
+    }
+
+    .card {
+      background: #1a1d27;
+      border: 1px solid #2d3748;
+      border-radius: 10px;
+      overflow: hidden;
+      margin-bottom: 20px
+    }
+
+    .card-header {
+      padding: 14px 20px;
+      border-bottom: 1px solid #2d3748;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-weight: 600
+    }
+
+    .card-header .actions {
+      display: flex;
+      gap: 8px
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px
+    }
+
+    th {
+      padding: 10px 16px;
+      text-align: left;
+      color: #718096;
+      font-weight: 500;
+      border-bottom: 1px solid #2d3748;
+      background: #171923
+    }
+
+    td {
+      padding: 10px 16px;
+      border-bottom: 1px solid #1e2433
+    }
+
+    tr:last-child td {
+      border-bottom: none
+    }
+
+    tr:hover td {
+      background: #1e2433
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600
+    }
+
+    .badge.green {
+      background: #1a3a2a;
+      color: #68d391
+    }
+
+    .badge.red {
+      background: #3a1a1a;
+      color: #fc8181
+    }
+
+    .badge.gray {
+      background: #2d3748;
+      color: #a0aec0
+    }
+
+    .badge.blue {
+      background: #1a2a3a;
+      color: #63b3ed
+    }
+
+    .badge.purple {
+      background: #2a1a3a;
+      color: #b794f4
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 14px;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 500;
+      border: none;
+      cursor: pointer;
+      transition: all .15s
+    }
+
+    .btn-primary {
+      background: #3182ce;
+      color: #fff
+    }
+
+    .btn-primary:hover {
+      background: #2b6cb0
+    }
+
+    .btn-green {
+      background: #276749;
+      color: #fff
+    }
+
+    .btn-green:hover {
+      background: #2f855a
+    }
+
+    .btn-red {
+      background: #822727;
+      color: #fff
+    }
+
+    .btn-red:hover {
+      background: #9b2c2c
+    }
+
+    .btn-gray {
+      background: #2d3748;
+      color: #e2e8f0
+    }
+
+    .btn-gray:hover {
+      background: #4a5568
+    }
+
+    .btn-sm {
+      padding: 4px 10px;
+      font-size: 12px
+    }
+
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 38px;
+      height: 20px;
+      cursor: pointer;
+      vertical-align: middle
+    }
+
+    .switch input {
+      opacity: 0;
+      width: 0;
+      height: 0
+    }
+
+    .switch .slider {
+      position: absolute;
+      inset: 0;
+      background: #2d3748;
+      border-radius: 20px;
+      transition: all .25s;
+      box-shadow: inset 0 1px 3px rgba(0, 0, 0, .4)
+    }
+
+    .switch .slider:before {
+      content: '';
+      position: absolute;
+      width: 14px;
+      height: 14px;
+      left: 3px;
+      top: 3px;
+      background: #718096;
+      border-radius: 50%;
+      transition: all .25s
+    }
+
+    .switch input:checked+.slider {
+      background: #2f855a;
+      box-shadow: 0 0 8px rgba(104, 211, 145, .45)
+    }
+
+    .switch input:checked+.slider:before {
+      transform: translateX(18px);
+      background: #fff
+    }
+
+    .switch:hover .slider {
+      filter: brightness(1.15)
+    }
+
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, .6);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 100
+    }
+
+    .modal-overlay.show {
+      display: flex
+    }
+
+    .modal {
+      background: #1a1d27;
+      border: 1px solid #2d3748;
+      border-radius: 12px;
+      width: 520px;
+      max-height: 90vh;
+      overflow-y: auto
+    }
+
+    .modal-header {
+      padding: 16px 20px;
+      border-bottom: 1px solid #2d3748;
+      font-weight: 600;
+      font-size: 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center
+    }
+
+    .modal-body {
+      padding: 20px
+    }
+
+    .modal-footer {
+      padding: 12px 20px;
+      border-top: 1px solid #2d3748;
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px
+    }
+
+    .form-group {
+      margin-bottom: 14px
+    }
+
+    .form-group label {
+      display: block;
+      font-size: 12px;
+      color: #a0aec0;
+      margin-bottom: 4px
+    }
+
+    .form-group input,
+    .form-group select,
+    .form-group textarea {
+      width: 100%;
+      padding: 8px 12px;
+      background: #131720;
+      border: 1px solid #2d3748;
+      border-radius: 6px;
+      color: #e2e8f0;
+      font-size: 13px;
+      outline: none
+    }
+
+    .form-group input:focus,
+    .form-group select:focus,
+    .form-group textarea:focus {
+      border-color: #3182ce
+    }
+
+    .form-group textarea {
+      font-family: 'SF Mono', Consolas, monospace;
+      min-height: 300px;
+      resize: vertical
+    }
+
+    .form-row {
+      display: flex;
+      gap: 12px
+    }
+
+    .form-row .form-group {
+      flex: 1
+    }
+
+    .form-hint {
+      font-size: 11px;
+      color: #718096;
+      margin-top: 3px
+    }
+
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      padding: 12px 20px;
+      border-radius: 8px;
+      font-size: 14px;
+      z-index: 200;
+      animation: slideIn .2s
+    }
+
+    .toast.success {
+      background: #1a3a2a;
+      color: #68d391;
+      border: 1px solid #2f855a
+    }
+
+    .toast.error {
+      background: #3a1a1a;
+      color: #fc8181;
+      border: 1px solid #9b2c2c
+    }
+
+    @keyframes slideIn {
+      from {
+        transform: translateX(100%);
+        opacity: 0
+      }
+
+      to {
+        transform: translateX(0);
+        opacity: 1
+      }
+    }
+
+    .code {
+      background: #131720;
+      border: 1px solid #2d3748;
+      border-radius: 6px;
+      padding: 8px 12px;
+      font-family: 'SF Mono', Consolas, monospace;
+      font-size: 12px;
+      word-break: break-all;
+      cursor: pointer
+    }
+
+    .code:hover {
+      border-color: #3182ce
+    }
+
+    .empty {
+      text-align: center;
+      padding: 40px;
+      color: #718096
+    }
+
+    .mono {
+      font-family: 'SF Mono', Consolas, monospace;
+      font-size: 12px
+    }
+
+    .sub-box {
+      background: #1a1d27;
+      border: 1px solid #2d3748;
+      border-radius: 10px;
+      padding: 20px;
+      margin-bottom: 20px
+    }
+
+    .sub-box .sub-label {
+      font-size: 12px;
+      color: #718096;
+      margin-bottom: 8px;
+      text-transform: uppercase;
+      letter-spacing: .5px
+    }
+
+    .sub-box .sub-url {
+      font-family: 'SF Mono', Consolas, monospace;
+      font-size: 13px;
+      color: #63b3ed;
+      word-break: break-all
+    }
+
+    .sub-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center
+    }
+
+    .sub-actions .code {
+      flex: 1
+    }
+
+    /* Help page */
+    .help-section {
+      margin-bottom: 28px
+    }
+
+    .help-section h3 {
+      font-size: 1.05rem;
+      color: #63b3ed;
+      margin-bottom: 10px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid #2d3748
+    }
+
+    .help-section h4 {
+      font-size: .9rem;
+      color: #e2e8f0;
+      margin: 14px 0 8px
+    }
+
+    .help-section p {
+      font-size: .83rem;
+      color: #a0aec0;
+      line-height: 1.7;
+      margin-bottom: 8px
+    }
+
+    .help-section ul,
+    .help-section ol {
+      font-size: .83rem;
+      color: #a0aec0;
+      line-height: 1.8;
+      margin: 6px 0 10px 20px
+    }
+
+    .help-section li {
+      margin-bottom: 3px
+    }
+
+    .help-section code {
+      background: #131720;
+      border: 1px solid #2d3748;
+      border-radius: 4px;
+      padding: 2px 6px;
+      font-family: 'SF Mono', Consolas, monospace;
+      font-size: 12px;
+      color: #63b3ed
+    }
+
+    .help-section pre {
+      background: #131720;
+      border: 1px solid #2d3748;
+      border-radius: 6px;
+      padding: 12px 16px;
+      overflow-x: auto;
+      font-size: 12px;
+      line-height: 1.6;
+      color: #e2e8f0;
+      margin: 8px 0
+    }
+
+    .help-section pre code {
+      background: none;
+      border: none;
+      padding: 0;
+      color: inherit
+    }
+
+    .help-section .tip {
+      background: #1a2a3a;
+      border-left: 3px solid #3182ce;
+      border-radius: 0 6px 6px 0;
+      padding: 8px 14px;
+      margin: 10px 0;
+      font-size: .8rem;
+      color: #a0aec0
+    }
+
+    .help-section .warn {
+      background: #3a2a1a;
+      border-left: 3px solid #d69e2e;
+      border-radius: 0 6px 6px 0;
+      padding: 8px 14px;
+      margin: 10px 0;
+      font-size: .8rem;
+      color: #a0aec0
+    }
+
+    .help-section table {
+      font-size: .8rem
+    }
+
+    .help-section th {
+      color: #63b3ed
+    }
+
+    .help-tabs {
+      display: flex;
+      gap: 4px;
+      margin-bottom: 16px;
+      border-bottom: 1px solid #2d3748;
+      padding-bottom: 0
+    }
+
+    .help-tab {
+      padding: 8px 16px;
+      font-size: .83rem;
+      color: #a0aec0;
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      transition: all .15s
+    }
+
+    .help-tab:hover {
+      color: #e2e8f0
+    }
+
+    .help-tab.active {
+      color: #63b3ed;
+      border-bottom-color: #63b3ed
+    }
+
+    .help-pane {
+      display: none
+    }
+
+    .help-pane.active {
+      display: block
+    }
+
+    /* Node detail popover */
+    .popover-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, .45);
+      display: none;
+      z-index: 90
+    }
+
+    .popover-overlay.show {
+      display: block
+    }
+
+    .popover {
+      position: fixed;
+      background: #1a1d27;
+      border: 1px solid #3182ce;
+      border-radius: 10px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, .5);
+      z-index: 100;
+      max-width: 420px;
+      min-width: 320px;
+      display: none
+    }
+
+    .popover.show {
+      display: block
+    }
+
+    .popover-header {
+      padding: 10px 16px;
+      border-bottom: 1px solid #2d3748;
+      font-weight: 600;
+      font-size: 14px;
+      color: #63b3ed;
+      display: flex;
+      justify-content: space-between;
+      align-items: center
+    }
+
+    .popover-body {
+      padding: 14px 16px
+    }
+
+    .popover-body .detail-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 4px 0;
+      font-size: .8rem;
+      border-bottom: 1px solid #1e2433
+    }
+
+    .popover-body .detail-row:last-child {
+      border-bottom: none
+    }
+
+    .popover-body .detail-row .dk {
+      color: #718096;
+      min-width: 100px
+    }
+
+    .popover-body .detail-row .dv {
+      color: #e2e8f0;
+      text-align: right;
+      word-break: break-all
+    }
+
+    .popover-body .detail-row .dv.mono {
+      font-family: 'SF Mono', Consolas, monospace;
+      font-size: 11px
+    }
+  </style>
 </head>
+
 <body>
 
-<!-- Login / Register -->
-<div id="loginPage" style="display:flex;align-items:center;justify-content:center;min-height:100vh">
-  <div style="background:#1a1d27;border:1px solid #2d3748;border-radius:12px;padding:36px;width:100%;max-width:380px;box-shadow:0 8px 32px rgba(0,0,0,.4)">
-    <!-- Login Form -->
-    <div id="loginForm">
-      <h1 style="font-size:1.3rem;color:#63b3ed;margin-bottom:6px">SubServer</h1>
-      <p style="font-size:.82rem;color:#718096;margin-bottom:24px">输入用户名和密码登录</p>
-      <div class="form-group">
-        <label>用户名</label>
-        <input type="text" id="loginUser" placeholder="username" autofocus oninput="this.value=this.value.replace(/\s+/g,'')" onkeydown="if(event.key==='Enter')document.getElementById('loginPass').focus()">
+  <!-- Login / Register -->
+  <div id="loginPage" style="display:flex;align-items:center;justify-content:center;min-height:100vh">
+    <div
+      style="background:#1a1d27;border:1px solid #2d3748;border-radius:12px;padding:36px;width:100%;max-width:380px;box-shadow:0 8px 32px rgba(0,0,0,.4)">
+      <!-- Login Form -->
+      <div id="loginForm">
+        <h1 style="font-size:1.3rem;color:#63b3ed;margin-bottom:6px">SubServer</h1>
+        <p style="font-size:.82rem;color:#718096;margin-bottom:24px">输入用户名和密码登录</p>
+        <div class="form-group">
+          <label>用户名</label>
+          <input type="text" id="loginUser" placeholder="username" autofocus
+            oninput="this.value=this.value.replace(/\s+/g,'')"
+            onkeydown="if(event.key==='Enter')document.getElementById('loginPass').focus()">
+        </div>
+        <div class="form-group">
+          <label>密码</label>
+          <input type="password" id="loginPass" placeholder="password" onkeydown="if(event.key==='Enter')doLogin()">
+        </div>
+        <button class="btn btn-primary" style="width:100%;justify-content:center" onclick="doLogin()">登录</button>
+        <p id="loginErr" style="color:#fc8181;font-size:.82rem;margin-top:10px;display:none"></p>
+        <p style="text-align:center;margin-top:16px;font-size:.82rem;color:#718096">没有账号？<a href="#"
+            onclick="showRegister();return false" style="color:#63b3ed;text-decoration:none">邀请码注册</a></p>
+        <p style="text-align:center;margin-top:8px;font-size:.82rem;color:#718096"><a href="#"
+            onclick="showForgot();return false" style="color:#63b3ed;text-decoration:none">忘记密码</a></p>
       </div>
-      <div class="form-group">
-        <label>密码</label>
-        <input type="password" id="loginPass" placeholder="password" onkeydown="if(event.key==='Enter')doLogin()">
+      <!-- Register Form -->
+      <div id="registerForm" style="display:none">
+        <h1 style="font-size:1.3rem;color:#63b3ed;margin-bottom:6px">注册新账号</h1>
+        <p style="font-size:.82rem;color:#718096;margin-bottom:24px">需要邀请码才能注册</p>
+        <div class="form-group">
+          <label>邀请码</label>
+          <input type="text" id="regInviteCode" placeholder="ABCD1234"
+            style="text-transform:uppercase;letter-spacing:.1em"
+            onkeydown="if(event.key==='Enter')document.getElementById('regUsername').focus()">
+        </div>
+        <div class="form-group">
+          <label>用户名</label>
+          <input type="text" id="regUsername" placeholder="3-50个字符" oninput="this.value=this.value.replace(/\s+/g,'')"
+            onkeydown="if(event.key==='Enter')document.getElementById('regEmail').focus()">
+        </div>
+        <div class="form-group">
+          <label>邮箱</label>
+          <input type="email" id="regEmail" placeholder="用于验证和找回密码"
+            onkeydown="if(event.key==='Enter')document.getElementById('regPassword').focus()">
+        </div>
+        <div class="form-group">
+          <label>密码</label>
+          <input type="password" id="regPassword" placeholder="至少6个字符"
+            onkeydown="if(event.key==='Enter')document.getElementById('regPassword2').focus()">
+        </div>
+        <div class="form-group">
+          <label>确认密码</label>
+          <input type="password" id="regPassword2" placeholder="再次输入密码" onkeydown="if(event.key==='Enter')doRegister()">
+        </div>
+        <button class="btn btn-primary" style="width:100%;justify-content:center" onclick="doRegister()">注册</button>
+        <p id="regErr" style="color:#fc8181;font-size:.82rem;margin-top:10px;display:none"></p>
+        <p id="regOk" style="color:#68d391;font-size:.82rem;margin-top:10px;display:none"></p>
+        <p style="text-align:center;margin-top:16px;font-size:.82rem;color:#718096">已有账号？<a href="#"
+            onclick="showLogin();return false" style="color:#63b3ed;text-decoration:none">返回登录</a></p>
       </div>
-      <button class="btn btn-primary" style="width:100%;justify-content:center" onclick="doLogin()">登录</button>
-      <p id="loginErr" style="color:#fc8181;font-size:.82rem;margin-top:10px;display:none"></p>
-      <p style="text-align:center;margin-top:16px;font-size:.82rem;color:#718096">没有账号？<a href="#" onclick="showRegister();return false" style="color:#63b3ed;text-decoration:none">邀请码注册</a></p>
-      <p style="text-align:center;margin-top:8px;font-size:.82rem;color:#718096"><a href="#" onclick="showForgot();return false" style="color:#63b3ed;text-decoration:none">忘记密码</a></p>
-    </div>
-    <!-- Register Form -->
-    <div id="registerForm" style="display:none">
-      <h1 style="font-size:1.3rem;color:#63b3ed;margin-bottom:6px">注册新账号</h1>
-      <p style="font-size:.82rem;color:#718096;margin-bottom:24px">需要邀请码才能注册</p>
-      <div class="form-group">
-        <label>邀请码</label>
-        <input type="text" id="regInviteCode" placeholder="ABCD1234" style="text-transform:uppercase;letter-spacing:.1em" onkeydown="if(event.key==='Enter')document.getElementById('regUsername').focus()">
+      <!-- Forgot Password Form -->
+      <div id="forgotForm" style="display:none">
+        <h1 style="font-size:1.3rem;color:#63b3ed;margin-bottom:6px">找回密码</h1>
+        <p style="font-size:.82rem;color:#718096;margin-bottom:24px">输入注册邮箱，我们将发送密码重置链接</p>
+        <div class="form-group">
+          <label>邮箱</label>
+          <input type="email" id="forgotEmail" placeholder="email@example.com"
+            onkeydown="if(event.key==='Enter')doForgotPassword()">
+        </div>
+        <button class="btn btn-primary" style="width:100%;justify-content:center"
+          onclick="doForgotPassword()">发送重置邮件</button>
+        <p id="forgotMsg" style="font-size:.82rem;margin-top:10px;display:none"></p>
+        <p style="text-align:center;margin-top:16px;font-size:.82rem;color:#718096"><a href="#"
+            onclick="showLogin();return false" style="color:#63b3ed;text-decoration:none">返回登录</a></p>
       </div>
-      <div class="form-group">
-        <label>用户名</label>
-        <input type="text" id="regUsername" placeholder="3-50个字符" oninput="this.value=this.value.replace(/\s+/g,'')" onkeydown="if(event.key==='Enter')document.getElementById('regEmail').focus()">
+      <!-- Reset Password Form -->
+      <div id="resetForm" style="display:none">
+        <h1 style="font-size:1.3rem;color:#63b3ed;margin-bottom:6px">重置密码</h1>
+        <p style="font-size:.82rem;color:#718096;margin-bottom:24px">请输入新密码</p>
+        <input type="hidden" id="resetToken">
+        <div class="form-group">
+          <label>新密码</label>
+          <input type="password" id="resetPass" placeholder="至少6个字符"
+            onkeydown="if(event.key==='Enter')document.getElementById('resetPass2').focus()">
+        </div>
+        <div class="form-group">
+          <label>确认密码</label>
+          <input type="password" id="resetPass2" placeholder="再次输入密码"
+            onkeydown="if(event.key==='Enter')doResetPassword()">
+        </div>
+        <button class="btn btn-primary" style="width:100%;justify-content:center"
+          onclick="doResetPassword()">重置密码</button>
+        <p id="resetMsg" style="font-size:.82rem;margin-top:10px;display:none"></p>
       </div>
-      <div class="form-group">
-        <label>邮箱</label>
-        <input type="email" id="regEmail" placeholder="用于验证和找回密码" onkeydown="if(event.key==='Enter')document.getElementById('regPassword').focus()">
-      </div>
-      <div class="form-group">
-        <label>密码</label>
-        <input type="password" id="regPassword" placeholder="至少6个字符" onkeydown="if(event.key==='Enter')document.getElementById('regPassword2').focus()">
-      </div>
-      <div class="form-group">
-        <label>确认密码</label>
-        <input type="password" id="regPassword2" placeholder="再次输入密码" onkeydown="if(event.key==='Enter')doRegister()">
-      </div>
-      <button class="btn btn-primary" style="width:100%;justify-content:center" onclick="doRegister()">注册</button>
-      <p id="regErr" style="color:#fc8181;font-size:.82rem;margin-top:10px;display:none"></p>
-      <p id="regOk" style="color:#68d391;font-size:.82rem;margin-top:10px;display:none"></p>
-      <p style="text-align:center;margin-top:16px;font-size:.82rem;color:#718096">已有账号？<a href="#" onclick="showLogin();return false" style="color:#63b3ed;text-decoration:none">返回登录</a></p>
-    </div>
-    <!-- Forgot Password Form -->
-    <div id="forgotForm" style="display:none">
-      <h1 style="font-size:1.3rem;color:#63b3ed;margin-bottom:6px">找回密码</h1>
-      <p style="font-size:.82rem;color:#718096;margin-bottom:24px">输入注册邮箱，我们将发送密码重置链接</p>
-      <div class="form-group">
-        <label>邮箱</label>
-        <input type="email" id="forgotEmail" placeholder="email@example.com" onkeydown="if(event.key==='Enter')doForgotPassword()">
-      </div>
-      <button class="btn btn-primary" style="width:100%;justify-content:center" onclick="doForgotPassword()">发送重置邮件</button>
-      <p id="forgotMsg" style="font-size:.82rem;margin-top:10px;display:none"></p>
-      <p style="text-align:center;margin-top:16px;font-size:.82rem;color:#718096"><a href="#" onclick="showLogin();return false" style="color:#63b3ed;text-decoration:none">返回登录</a></p>
-    </div>
-    <!-- Reset Password Form -->
-    <div id="resetForm" style="display:none">
-      <h1 style="font-size:1.3rem;color:#63b3ed;margin-bottom:6px">重置密码</h1>
-      <p style="font-size:.82rem;color:#718096;margin-bottom:24px">请输入新密码</p>
-      <input type="hidden" id="resetToken">
-      <div class="form-group">
-        <label>新密码</label>
-        <input type="password" id="resetPass" placeholder="至少6个字符" onkeydown="if(event.key==='Enter')document.getElementById('resetPass2').focus()">
-      </div>
-      <div class="form-group">
-        <label>确认密码</label>
-        <input type="password" id="resetPass2" placeholder="再次输入密码" onkeydown="if(event.key==='Enter')doResetPassword()">
-      </div>
-      <button class="btn btn-primary" style="width:100%;justify-content:center" onclick="doResetPassword()">重置密码</button>
-      <p id="resetMsg" style="font-size:.82rem;margin-top:10px;display:none"></p>
-    </div>
-    <!-- Verify Result -->
-    <div id="verifyResult" style="display:none;text-align:center">
-      <h1 style="font-size:1.3rem;color:#63b3ed;margin-bottom:6px">邮箱验证</h1>
-      <p id="verifyMsg" style="font-size:.9rem;margin:20px 0"></p>
-      <button class="btn btn-primary" style="justify-content:center" onclick="showLogin();return false">前往登录</button>
-    </div>
-  </div>
-</div>
-
-<!-- Dashboard -->
-<div id="dash" style="display:none">
-<aside class="sidebar">
-  <div class="logo">SubServer<span id="userBadge">订阅分发管理</span></div>
-  <nav id="navMenu"></nav>
-  <div style="padding:12px 16px;border-top:1px solid #2d3748">
-    <button class="btn btn-gray btn-sm" style="width:100%;justify-content:center" onclick="logout()">退出</button>
-  </div>
-</aside>
-
-<div class="main">
-
-<!-- Admin: Nodes Page -->
-<div id="page-nodes" class="page">
-  <h2 style="margin-bottom:20px;font-size:1.4rem">节点管理</h2>
-  <div class="status-bar">
-    <div class="stat-card"><div class="label">总节点</div><div class="value blue" id="statNodesTotal">0</div></div>
-    <div class="stat-card"><div class="label">启用</div><div class="value green" id="statNodesEnabled">0</div></div>
-    <div class="stat-card"><div class="label">VLESS-Reality</div><div class="value" id="statNodesVless">0</div></div>
-    <div class="stat-card"><div class="label">VMess</div><div class="value" id="statNodesVmess">0</div></div>
-  </div>
-  <div class="card">
-    <div class="card-header">节点列表
-      <div class="actions"><button class="btn btn-primary btn-sm" onclick="openNodeModal()">+ 新增节点</button></div>
-    </div>
-    <table>
-      <thead><tr><th>名称</th><th>显示名</th><th>类型</th><th>服务器</th><th>端口</th><th>状态</th><th>排序</th><th>操作</th></tr></thead>
-      <tbody id="nodesTbody"></tbody>
-    </table>
-  </div>
-</div>
-
-<!-- Admin: Users Page -->
-<div id="page-users" class="page">
-  <h2 style="margin-bottom:20px;font-size:1.4rem">用户管理</h2>
-  <div class="status-bar">
-    <div class="stat-card"><div class="label">总用户</div><div class="value blue" id="statUsersTotal">0</div></div>
-    <div class="stat-card"><div class="label">启用</div><div class="value green" id="statUsersEnabled">0</div></div>
-    <div class="stat-card"><div class="label">管理员</div><div class="value" id="statUsersAdmin">0</div></div>
-  </div>
-  <div class="card">
-    <div class="card-header">用户列表
-      <div class="actions"><button class="btn btn-primary btn-sm" onclick="openUserModal()">+ 新增用户</button></div>
-    </div>
-    <table>
-      <thead><tr><th>ID</th><th>名称</th><th>用户名</th><th>角色</th><th>Token</th><th>订阅链接</th><th>状态</th><th>操作</th></tr></thead>
-      <tbody id="usersTbody"></tbody>
-    </table>
-  </div>
-</div>
-
-<!-- Admin: Mappings Page -->
-<div id="page-mappings" class="page">
-  <h2 style="margin-bottom:20px;font-size:1.4rem">UUID 映射</h2>
-  <div class="card">
-    <div class="card-header">选择用户查看映射
-      <div class="actions">
-        <select id="mapUserSelect" onchange="loadMappings()" style="background:#131720;border:1px solid #2d3748;border-radius:6px;color:#e2e8f0;padding:6px 10px;font-size:13px"></select>
-        <button class="btn btn-green btn-sm" onclick="bulkMap()">批量分配</button>
+      <!-- Verify Result -->
+      <div id="verifyResult" style="display:none;text-align:center">
+        <h1 style="font-size:1.3rem;color:#63b3ed;margin-bottom:6px">邮箱验证</h1>
+        <p id="verifyMsg" style="font-size:.9rem;margin:20px 0"></p>
+        <button class="btn btn-primary" style="justify-content:center" onclick="showLogin();return false">前往登录</button>
       </div>
     </div>
-    <table>
-      <thead><tr><th>节点名称</th><th>显示名</th><th>类型</th><th>UUID</th><th>节点状态</th><th>操作</th></tr></thead>
-      <tbody id="mappingsTbody"></tbody>
-    </table>
   </div>
-</div>
 
-<!-- Admin: Templates Page -->
-<div id="page-templates" class="page">
-  <h2 style="margin-bottom:20px;font-size:1.4rem">模板管理</h2>
-  <div class="card">
-    <div class="card-header">配置模板列表
-      <div class="actions"><button class="btn btn-primary btn-sm" onclick="openTplModal()">+ 新增模板</button></div>
-    </div>
-    <table>
-      <thead><tr><th>ID</th><th>名称</th><th>描述</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead>
-      <tbody id="tplTbody"></tbody>
-    </table>
-  </div>
-</div>
-
-<!-- Admin: Invite Codes Page -->
-<div id="page-invites" class="page">
-  <h2 style="margin-bottom:20px;font-size:1.4rem">邀请码管理</h2>
-  <div class="status-bar">
-    <div class="stat-card"><div class="label">总数</div><div class="value blue" id="statCodesTotal">0</div></div>
-    <div class="stat-card"><div class="label">已用</div><div class="value" id="statCodesUsed">0</div></div>
-    <div class="stat-card"><div class="label">可用</div><div class="value green" id="statCodesAvail">0</div></div>
-  </div>
-  <div class="card">
-    <div class="card-header">邀请码列表
-      <div class="actions">
-        <input type="number" id="genCount" value="10" min="1" max="500" style="width:60px;background:#131720;border:1px solid #2d3748;border-radius:6px;color:#e2e8f0;padding:5px 8px;font-size:13px">
-        <button class="btn btn-primary btn-sm" onclick="genCodes()">+ 生成</button>
-        <button class="btn btn-gray btn-sm" onclick="copyAllCodes()">复制全部</button>
+  <!-- Dashboard -->
+  <div id="dash" style="display:none">
+    <aside class="sidebar">
+      <div class="logo">SubServer<span id="userBadge">订阅分发管理</span></div>
+      <nav id="navMenu"></nav>
+      <div style="padding:12px 16px;border-top:1px solid #2d3748">
+        <button class="btn btn-gray btn-sm" style="width:100%;justify-content:center" onclick="logout()">退出</button>
       </div>
-    </div>
-    <table>
-      <thead><tr><th>ID</th><th>邀请码</th><th>状态</th><th>使用者</th><th>使用时间</th><th>创建时间</th></tr></thead>
-      <tbody id="codesTbody"></tbody>
-    </table>
-  </div>
-</div>
+    </aside>
 
-<!-- User: My Subscription Page -->
-<div id="page-mysub" class="page">
-  <h2 style="margin-bottom:20px;font-size:1.4rem">我的订阅</h2>
+    <div class="main">
 
-  <div class="sub-box">
-    <div class="sub-label">选择配置模板</div>
-    <select id="myTplSelect" onchange="onTemplateChange()" style="background:#131720;border:1px solid #2d3748;border-radius:6px;color:#e2e8f0;padding:8px 12px;font-size:13px;width:100%"></select>
-    <div id="myTplDesc" class="form-hint" style="margin-top:6px"></div>
-  </div>
+      <!-- Admin: Nodes Page -->
+      <div id="page-nodes" class="page">
+        <h2 style="margin-bottom:20px;font-size:1.4rem">节点管理</h2>
+        <div class="status-bar">
+          <div class="stat-card">
+            <div class="label">总节点</div>
+            <div class="value blue" id="statNodesTotal">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">启用</div>
+            <div class="value green" id="statNodesEnabled">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">VLESS-Reality</div>
+            <div class="value" id="statNodesVless">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">VMess</div>
+            <div class="value" id="statNodesVmess">0</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header">节点列表
+            <div class="actions"><button class="btn btn-primary btn-sm" onclick="openNodeModal()">+ 新增节点</button></div>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>显示名</th>
+                <th>类型</th>
+                <th>服务器</th>
+                <th>端口</th>
+                <th>状态</th>
+                <th>排序</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="nodesTbody"></tbody>
+          </table>
+        </div>
+      </div>
 
-  <div class="sub-box">
-    <div class="sub-label">基础订阅地址（仅 Proxies YAML，可直接导入客户端）</div>
-    <div class="sub-actions">
-      <div class="code" id="mySubUrl" onclick="copyText(this.textContent)" title="点击复制" style="flex:1"></div>
-      <button class="btn btn-gray btn-sm" onclick="downloadYaml('sub')" title="下载 YAML 文件">下载</button>
-    </div>
-  </div>
+      <!-- Admin: Users Page -->
+      <div id="page-users" class="page">
+        <h2 style="margin-bottom:20px;font-size:1.4rem">用户管理</h2>
+        <div class="status-bar">
+          <div class="stat-card">
+            <div class="label">总用户</div>
+            <div class="value blue" id="statUsersTotal">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">启用</div>
+            <div class="value green" id="statUsersEnabled">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">管理员</div>
+            <div class="value" id="statUsersAdmin">0</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header">用户列表
+            <div class="actions"><button class="btn btn-primary btn-sm" onclick="openUserModal()">+ 新增用户</button></div>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>名称</th>
+                <th>用户名</th>
+                <th>角色</th>
+                <th>Token</th>
+                <th>订阅链接</th>
+                <th>状态</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="usersTbody"></tbody>
+          </table>
+        </div>
+      </div>
 
-  <div class="sub-box">
-    <div class="sub-label">完整配置导出（Clash.Meta 完整配置 — 模板: <span id="myTplName" style="color:#63b3ed">-</span>）</div>
-    <div class="sub-actions">
-      <div class="code" id="myExportUrl" onclick="copyText(this.textContent)" title="点击复制" style="flex:1"></div>
-      <button class="btn btn-gray btn-sm" onclick="downloadYaml('full')" title="下载 YAML 文件">下载</button>
-      <button class="btn btn-primary btn-sm" onclick="previewYaml()" title="预览生成的 YAML">预览</button>
-    </div>
-  </div>
+      <!-- Admin: Mappings Page -->
+      <div id="page-mappings" class="page">
+        <h2 style="margin-bottom:20px;font-size:1.4rem">UUID 映射</h2>
+        <div class="card">
+          <div class="card-header">选择用户查看映射
+            <div class="actions">
+              <select id="mapUserSelect" onchange="loadMappings()"
+                style="background:#131720;border:1px solid #2d3748;border-radius:6px;color:#e2e8f0;padding:6px 10px;font-size:13px"></select>
+              <button class="btn btn-green btn-sm" onclick="bulkMap()">批量分配</button>
+            </div>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>节点名称</th>
+                <th>显示名</th>
+                <th>类型</th>
+                <th>UUID</th>
+                <th>节点状态</th>
+                <th>映射开关</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="mappingsTbody"></tbody>
+          </table>
+        </div>
+      </div>
 
-  <div class="card">
-    <div class="card-header">已分配节点</div>
-    <table>
-      <thead><tr><th>节点名称</th><th>显示名</th><th>类型</th><th>服务器</th><th>端口</th></tr></thead>
-      <tbody id="myNodesTbody"></tbody>
-    </table>
-  </div>
-</div>
+      <!-- Admin: Templates Page -->
+      <div id="page-templates" class="page">
+        <h2 style="margin-bottom:20px;font-size:1.4rem">模板管理</h2>
+        <div class="card">
+          <div class="card-header">配置模板列表
+            <div class="actions"><button class="btn btn-primary btn-sm" onclick="openTplModal()">+ 新增模板</button></div>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>名称</th>
+                <th>描述</th>
+                <th>状态</th>
+                <th>更新时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="tplTbody"></tbody>
+          </table>
+        </div>
+      </div>
 
-<!-- Help Page -->
-<div id="page-help" class="page">
-  <h2 style="margin-bottom:20px;font-size:1.4rem">使用帮助</h2>
-  <div class="help-tabs">
-    <div class="help-tab active" onclick="showHelpTab('clients',this)">客户端下载</div>
-    <div class="help-tab" onclick="showHelpTab('platform',this)">平台设置</div>
-    <div class="help-tab" onclick="showHelpTab('cli',this)">命令行工具</div>
-    <div class="help-tab" onclick="showHelpTab('faq',this)">常见问题</div>
-  </div>
+      <!-- Admin: Invite Codes Page -->
+      <div id="page-invites" class="page">
+        <h2 style="margin-bottom:20px;font-size:1.4rem">邀请码管理</h2>
+        <div class="status-bar">
+          <div class="stat-card">
+            <div class="label">总数</div>
+            <div class="value blue" id="statCodesTotal">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">已用</div>
+            <div class="value" id="statCodesUsed">0</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">可用</div>
+            <div class="value green" id="statCodesAvail">0</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header">邀请码列表
+            <div class="actions">
+              <input type="number" id="genCount" value="10" min="1" max="500"
+                style="width:60px;background:#131720;border:1px solid #2d3748;border-radius:6px;color:#e2e8f0;padding:5px 8px;font-size:13px">
+              <button class="btn btn-primary btn-sm" onclick="genCodes()">+ 生成</button>
+              <button class="btn btn-gray btn-sm" onclick="copyAllCodes()">复制全部</button>
+            </div>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>邀请码</th>
+                <th>状态</th>
+                <th>使用者</th>
+                <th>使用时间</th>
+                <th>创建时间</th>
+              </tr>
+            </thead>
+            <tbody id="codesTbody"></tbody>
+          </table>
+        </div>
+      </div>
 
-  <!-- Tab: Client Downloads -->
-  <div class="help-pane active" id="help-clients">
-    <div class="help-section">
-      <h3>客户端下载</h3>
-      <p>SubServer 提供 Clash.Meta / mihomo 格式的订阅配置。请根据您的平台选择合适的客户端：</p>
-      <table>
-        <thead><tr><th>平台</th><th>客户端</th><th>下载地址</th><th>说明</th></tr></thead>
-        <tbody>
-          <tr><td>Windows</td><td>Clash Verge Rev</td><td><a href="https://github.com/clash-verge-rev/clash-verge-rev/releases" target="_blank">GitHub Releases</a></td><td>推荐，支持 mihomo 内核</td></tr>
-          <tr><td>Windows</td><td>v2rayN</td><td><a href="https://github.com/2dust/v2rayN/releases" target="_blank">GitHub Releases</a></td><td>支持 VLESS/VMess/Reality</td></tr>
-          <tr><td>macOS</td><td>Clash Verge Rev</td><td><a href="https://github.com/clash-verge-rev/clash-verge-rev/releases" target="_blank">GitHub Releases</a></td><td>推荐，跨平台</td></tr>
-          <tr><td>macOS</td><td>ClashX Meta</td><td><a href="https://github.com/MetaCubeX/ClashX.Meta/releases" target="_blank">GitHub Releases</a></td><td>原生 macOS 客户端</td></tr>
-          <tr><td>Linux</td><td>Clash Verge Rev</td><td><a href="https://github.com/clash-verge-rev/clash-verge-rev/releases" target="_blank">GitHub Releases</a></td><td>推荐，GUI 客户端</td></tr>
-          <tr><td>Linux</td><td>mihomo (CLI)</td><td><a href="https://github.com/MetaCubeX/mihomo/releases" target="_blank">GitHub Releases</a></td><td>命令行，需手动配置</td></tr>
-          <tr><td>iOS</td><td>Shadowrocket</td><td>App Store 搜索</td><td>付费，支持订阅导入</td></tr>
-          <tr><td>iOS</td><td>Stash</td><td>App Store 搜索</td><td>付费，Clash 兼容</td></tr>
-          <tr><td>Android</td><td>Clash Meta for Android</td><td><a href="https://github.com/MetaCubeX/ClashMetaForAndroid/releases" target="_blank">GitHub Releases</a></td><td>推荐，免费</td></tr>
-          <tr><td>Android</td><td>NekoBox</td><td><a href="https://github.com/MatsuriDay/NekoBoxForAndroid/releases" target="_blank">GitHub Releases</a></td><td>支持 VLESS/Reality</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <div class="help-section">
-      <h3>导入订阅</h3>
-      <ol>
-        <li>在「我的订阅」页面复制<strong>基础订阅地址</strong>或<strong>完整配置导出</strong>URL</li>
-        <li>打开客户端，找到「订阅」或「Profiles」设置</li>
-        <li>粘贴订阅 URL，点击「更新」或「Import」</li>
-        <li>选择导入的配置作为活动配置</li>
-        <li>选择节点并连接</li>
-      </ol>
-      <div class="tip">基础订阅地址仅包含节点列表（Proxies YAML），需配合模板使用。完整配置导出可直接导入 Clash.Meta 客户端使用。</div>
-    </div>
-  </div>
+      <!-- User: My Subscription Page -->
+      <div id="page-mysub" class="page">
+        <h2 style="margin-bottom:20px;font-size:1.4rem">我的订阅</h2>
 
-  <!-- Tab: Platform Setup -->
-  <div class="help-pane" id="help-platform">
-    <div class="help-section">
-      <h3>Windows</h3>
-      <h4>系统全局代理（HTTP）</h4>
-      <ol>
-        <li>打开 <strong>设置</strong> → <strong>网络和 Internet</strong> → <strong>代理</strong></li>
-        <li>在「手动设置代理」中<strong>开启</strong></li>
-        <li><strong>地址</strong>填入 <code>127.0.0.1</code>，<strong>端口</strong>填入客户端混合端口（通常 7890）</li>
-        <li>点击保存</li>
-      </ol>
-      <div class="warn">Windows 系统代理仅支持 HTTP，不支持 SOCKS5 认证。建议使用浏览器插件或客户端内置的 TUN 模式。</div>
-      <h4>浏览器代理（SwitchyOmega）</h4>
-      <ol>
-        <li>安装 <a href="https://chrome.google.com/webstore/detail/proxy-switchyomega/padekgcemlokbadohgkifijomclgjgif" target="_blank">Proxy SwitchyOmega</a> 扩展</li>
-        <li>新建情景模式，选择代理服务器</li>
-        <li>协议选 <strong>SOCKS5</strong> 或 <strong>HTTP</strong>，地址 <code>127.0.0.1</code>，端口填客户端端口</li>
-        <li>点击「应用选项」</li>
-      </ol>
-      <h4>命令行</h4>
-      <pre><code># PowerShell — 设置 HTTP 代理（当前会话）
+        <div class="sub-box">
+          <div class="sub-label">选择配置模板</div>
+          <select id="myTplSelect" onchange="onTemplateChange()"
+            style="background:#131720;border:1px solid #2d3748;border-radius:6px;color:#e2e8f0;padding:8px 12px;font-size:13px;width:100%"></select>
+          <div id="myTplDesc" class="form-hint" style="margin-top:6px"></div>
+        </div>
+
+        <div class="sub-box">
+          <div class="sub-label">基础订阅地址（仅 Proxies YAML，可直接导入客户端）</div>
+          <div class="sub-actions">
+            <div class="code" id="mySubUrl" onclick="copyText(this.textContent)" title="点击复制" style="flex:1"></div>
+            <button class="btn btn-gray btn-sm" onclick="downloadYaml('sub')" title="下载 YAML 文件">下载</button>
+          </div>
+        </div>
+
+        <div class="sub-box">
+          <div class="sub-label">完整配置导出（Clash.Meta 完整配置 — 模板: <span id="myTplName" style="color:#63b3ed">-</span>）</div>
+          <div class="sub-actions">
+            <div class="code" id="myExportUrl" onclick="copyText(this.textContent)" title="点击复制" style="flex:1"></div>
+            <button class="btn btn-gray btn-sm" onclick="downloadYaml('full')" title="下载 YAML 文件">下载</button>
+            <button class="btn btn-primary btn-sm" onclick="previewYaml()" title="预览生成的 YAML">预览</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">已分配节点</div>
+          <table>
+            <thead>
+              <tr>
+                <th>节点名称</th>
+                <th>显示名</th>
+                <th>类型</th>
+                <th>服务器</th>
+                <th>端口</th>
+              </tr>
+            </thead>
+            <tbody id="myNodesTbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Help Page -->
+      <div id="page-help" class="page">
+        <h2 style="margin-bottom:20px;font-size:1.4rem">使用帮助</h2>
+        <div class="help-tabs">
+          <div class="help-tab active" onclick="showHelpTab('clients',this)">客户端下载</div>
+          <div class="help-tab" onclick="showHelpTab('platform',this)">平台设置</div>
+          <div class="help-tab" onclick="showHelpTab('cli',this)">命令行工具</div>
+          <div class="help-tab" onclick="showHelpTab('faq',this)">常见问题</div>
+        </div>
+
+        <!-- Tab: Client Downloads -->
+        <div class="help-pane active" id="help-clients">
+          <div class="help-section">
+            <h3>客户端下载</h3>
+            <p>SubServer 提供 Clash.Meta / mihomo 格式的订阅配置。请根据您的平台选择合适的客户端：</p>
+            <table>
+              <thead>
+                <tr>
+                  <th>平台</th>
+                  <th>客户端</th>
+                  <th>下载地址</th>
+                  <th>说明</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Windows</td>
+                  <td>Clash Verge Rev</td>
+                  <td><a href="https://github.com/clash-verge-rev/clash-verge-rev/releases" target="_blank">GitHub
+                      Releases</a></td>
+                  <td>推荐，支持 mihomo 内核</td>
+                </tr>
+                <tr>
+                  <td>Windows</td>
+                  <td>v2rayN</td>
+                  <td><a href="https://github.com/2dust/v2rayN/releases" target="_blank">GitHub Releases</a></td>
+                  <td>支持 VLESS/VMess/Reality</td>
+                </tr>
+                <tr>
+                  <td>macOS</td>
+                  <td>Clash Verge Rev</td>
+                  <td><a href="https://github.com/clash-verge-rev/clash-verge-rev/releases" target="_blank">GitHub
+                      Releases</a></td>
+                  <td>推荐，跨平台</td>
+                </tr>
+                <tr>
+                  <td>macOS</td>
+                  <td>ClashX Meta</td>
+                  <td><a href="https://github.com/MetaCubeX/ClashX.Meta/releases" target="_blank">GitHub Releases</a>
+                  </td>
+                  <td>原生 macOS 客户端</td>
+                </tr>
+                <tr>
+                  <td>Linux</td>
+                  <td>Clash Verge Rev</td>
+                  <td><a href="https://github.com/clash-verge-rev/clash-verge-rev/releases" target="_blank">GitHub
+                      Releases</a></td>
+                  <td>推荐，GUI 客户端</td>
+                </tr>
+                <tr>
+                  <td>Linux</td>
+                  <td>mihomo (CLI)</td>
+                  <td><a href="https://github.com/MetaCubeX/mihomo/releases" target="_blank">GitHub Releases</a></td>
+                  <td>命令行，需手动配置</td>
+                </tr>
+                <tr>
+                  <td>iOS</td>
+                  <td>Shadowrocket</td>
+                  <td>App Store 搜索</td>
+                  <td>付费，支持订阅导入</td>
+                </tr>
+                <tr>
+                  <td>iOS</td>
+                  <td>Stash</td>
+                  <td>App Store 搜索</td>
+                  <td>付费，Clash 兼容</td>
+                </tr>
+                <tr>
+                  <td>Android</td>
+                  <td>Clash Meta for Android</td>
+                  <td><a href="https://github.com/MetaCubeX/ClashMetaForAndroid/releases" target="_blank">GitHub
+                      Releases</a></td>
+                  <td>推荐，免费</td>
+                </tr>
+                <tr>
+                  <td>Android</td>
+                  <td>NekoBox</td>
+                  <td><a href="https://github.com/MatsuriDay/NekoBoxForAndroid/releases" target="_blank">GitHub
+                      Releases</a></td>
+                  <td>支持 VLESS/Reality</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="help-section">
+            <h3>导入订阅</h3>
+            <ol>
+              <li>在「我的订阅」页面复制<strong>基础订阅地址</strong>或<strong>完整配置导出</strong>URL</li>
+              <li>打开客户端，找到「订阅」或「Profiles」设置</li>
+              <li>粘贴订阅 URL，点击「更新」或「Import」</li>
+              <li>选择导入的配置作为活动配置</li>
+              <li>选择节点并连接</li>
+            </ol>
+            <div class="tip">基础订阅地址仅包含节点列表（Proxies YAML），需配合模板使用。完整配置导出可直接导入 Clash.Meta 客户端使用。</div>
+          </div>
+        </div>
+
+        <!-- Tab: Platform Setup -->
+        <div class="help-pane" id="help-platform">
+          <div class="help-section">
+            <h3>Windows</h3>
+            <h4>系统全局代理（HTTP）</h4>
+            <ol>
+              <li>打开 <strong>设置</strong> → <strong>网络和 Internet</strong> → <strong>代理</strong></li>
+              <li>在「手动设置代理」中<strong>开启</strong></li>
+              <li><strong>地址</strong>填入 <code>127.0.0.1</code>，<strong>端口</strong>填入客户端混合端口（通常 7890）</li>
+              <li>点击保存</li>
+            </ol>
+            <div class="warn">Windows 系统代理仅支持 HTTP，不支持 SOCKS5 认证。建议使用浏览器插件或客户端内置的 TUN 模式。</div>
+            <h4>浏览器代理（SwitchyOmega）</h4>
+            <ol>
+              <li>安装 <a
+                  href="https://chrome.google.com/webstore/detail/proxy-switchyomega/padekgcemlokbadohgkifijomclgjgif"
+                  target="_blank">Proxy SwitchyOmega</a> 扩展</li>
+              <li>新建情景模式，选择代理服务器</li>
+              <li>协议选 <strong>SOCKS5</strong> 或 <strong>HTTP</strong>，地址 <code>127.0.0.1</code>，端口填客户端端口</li>
+              <li>点击「应用选项」</li>
+            </ol>
+            <h4>命令行</h4>
+            <pre><code># PowerShell — 设置 HTTP 代理（当前会话）
 $env:HTTP_PROXY = "http://127.0.0.1:7890"
 $env:HTTPS_PROXY = "http://127.0.0.1:7890"
 
 # CMD
 set HTTP_PROXY=http://127.0.0.1:7890
 set HTTPS_PROXY=http://127.0.0.1:7890</code></pre>
-    </div>
-    <div class="help-section">
-      <h3>macOS</h3>
-      <h4>系统全局代理</h4>
-      <ol>
-        <li>打开 <strong>系统设置</strong> → <strong>网络</strong> → 选择当前网络 → <strong>详细信息</strong> → <strong>代理</strong></li>
-        <li><strong>SOCKS 代理</strong>：地址 <code>127.0.0.1</code>，端口填客户端 SOCKS 端口</li>
-        <li><strong>Web 代理（HTTP）</strong>：地址 <code>127.0.0.1</code>，端口填客户端 HTTP 端口</li>
-      </ol>
-      <h4>终端</h4>
-      <pre><code># 在 ~/.zshrc 中添加（永久生效）：
+          </div>
+          <div class="help-section">
+            <h3>macOS</h3>
+            <h4>系统全局代理</h4>
+            <ol>
+              <li>打开 <strong>系统设置</strong> → <strong>网络</strong> → 选择当前网络 → <strong>详细信息</strong> → <strong>代理</strong>
+              </li>
+              <li><strong>SOCKS 代理</strong>：地址 <code>127.0.0.1</code>，端口填客户端 SOCKS 端口</li>
+              <li><strong>Web 代理（HTTP）</strong>：地址 <code>127.0.0.1</code>，端口填客户端 HTTP 端口</li>
+            </ol>
+            <h4>终端</h4>
+            <pre><code># 在 ~/.zshrc 中添加（永久生效）：
 export http_proxy="http://127.0.0.1:7890"
 export https_proxy="http://127.0.0.1:7890"
 export all_proxy="socks5://127.0.0.1:7890"
 
 # 临时使用（仅当前终端）：
 export ALL_PROXY="socks5h://127.0.0.1:7890"</code></pre>
-      <div class="tip"><code>socks5h://</code> 表示 DNS 也通过代理，推荐使用。</div>
-    </div>
-    <div class="help-section">
-      <h3>Linux</h3>
-      <h4>环境变量</h4>
-      <pre><code># 在 ~/.bashrc 或 ~/.profile 中添加：
+            <div class="tip"><code>socks5h://</code> 表示 DNS 也通过代理，推荐使用。</div>
+          </div>
+          <div class="help-section">
+            <h3>Linux</h3>
+            <h4>环境变量</h4>
+            <pre><code># 在 ~/.bashrc 或 ~/.profile 中添加：
 export http_proxy="http://127.0.0.1:7890"
 export https_proxy="http://127.0.0.1:7890"
 export all_proxy="socks5://127.0.0.1:7890"
 export no_proxy="localhost,127.0.0.1,::1,10.0.0.0/8,192.168.0.0/16"</code></pre>
-      <h4>Git</h4>
-      <pre><code>git config --global http.proxy "socks5://127.0.0.1:7890"
+            <h4>Git</h4>
+            <pre><code>git config --global http.proxy "socks5://127.0.0.1:7890"
 git config --global https.proxy "socks5://127.0.0.1:7890"
 
 # 取消代理：
 git config --global --unset http.proxy
 git config --global --unset https.proxy</code></pre>
-    </div>
-    <div class="help-section">
-      <h3>iOS</h3>
-      <h4>Shadowrocket（推荐）</h4>
-      <ol>
-        <li>打开 Shadowrocket → 点击右上角 <strong>+</strong></li>
-        <li>类型选择 <strong>Subscribe</strong></li>
-        <li>URL 填入订阅地址</li>
-        <li>保存并更新</li>
-      </ol>
-      <h4>WiFi 代理（HTTP）</h4>
-      <ol>
-        <li>打开 <strong>设置</strong> → <strong>WiFi</strong> → 点击已连接网络旁的 <strong>(i)</strong></li>
-        <li>滚动到最下方 → <strong>HTTP 代理</strong> → 选择 <strong>手动</strong></li>
-        <li><strong>服务器</strong>填入 <code>127.0.0.1</code>，<strong>端口</strong>填客户端 HTTP 端口</li>
-      </ol>
-      <div class="warn">iOS 原生不支持 SOCKS5 代理。如需 SOCKS5 或 VLESS，请使用 Shadowrocket 等第三方客户端。</div>
-    </div>
-    <div class="help-section">
-      <h3>Android</h3>
-      <h4>Clash Meta for Android（推荐）</h4>
-      <ol>
-        <li>打开应用 → <strong>配置</strong> → <strong>新增配置</strong></li>
-        <li>选择 <strong>URL</strong> 方式</li>
-        <li>填入订阅地址并更新</li>
-        <li>返回主界面，选择配置并启动</li>
-      </ol>
-      <h4>WiFi 代理（HTTP）</h4>
-      <ol>
-        <li>打开 <strong>设置</strong> → <strong>WiFi</strong> → 长按已连接的网络 → <strong>修改网络</strong></li>
-        <li>展开 <strong>高级选项</strong> → 代理选择 <strong>手动</strong></li>
-        <li><strong>代理主机</strong> <code>127.0.0.1</code>，<strong>端口</strong>填客户端端口</li>
-      </ol>
-    </div>
-  </div>
+          </div>
+          <div class="help-section">
+            <h3>iOS</h3>
+            <h4>Shadowrocket（推荐）</h4>
+            <ol>
+              <li>打开 Shadowrocket → 点击右上角 <strong>+</strong></li>
+              <li>类型选择 <strong>Subscribe</strong></li>
+              <li>URL 填入订阅地址</li>
+              <li>保存并更新</li>
+            </ol>
+            <h4>WiFi 代理（HTTP）</h4>
+            <ol>
+              <li>打开 <strong>设置</strong> → <strong>WiFi</strong> → 点击已连接网络旁的 <strong>(i)</strong></li>
+              <li>滚动到最下方 → <strong>HTTP 代理</strong> → 选择 <strong>手动</strong></li>
+              <li><strong>服务器</strong>填入 <code>127.0.0.1</code>，<strong>端口</strong>填客户端 HTTP 端口</li>
+            </ol>
+            <div class="warn">iOS 原生不支持 SOCKS5 代理。如需 SOCKS5 或 VLESS，请使用 Shadowrocket 等第三方客户端。</div>
+          </div>
+          <div class="help-section">
+            <h3>Android</h3>
+            <h4>Clash Meta for Android（推荐）</h4>
+            <ol>
+              <li>打开应用 → <strong>配置</strong> → <strong>新增配置</strong></li>
+              <li>选择 <strong>URL</strong> 方式</li>
+              <li>填入订阅地址并更新</li>
+              <li>返回主界面，选择配置并启动</li>
+            </ol>
+            <h4>WiFi 代理（HTTP）</h4>
+            <ol>
+              <li>打开 <strong>设置</strong> → <strong>WiFi</strong> → 长按已连接的网络 → <strong>修改网络</strong></li>
+              <li>展开 <strong>高级选项</strong> → 代理选择 <strong>手动</strong></li>
+              <li><strong>代理主机</strong> <code>127.0.0.1</code>，<strong>端口</strong>填客户端端口</li>
+            </ol>
+          </div>
+        </div>
 
-  <!-- Tab: CLI Tools -->
-  <div class="help-pane" id="help-cli">
-    <div class="help-section">
-      <h3>curl / wget</h3>
-      <pre><code># curl 通过 SOCKS5
+        <!-- Tab: CLI Tools -->
+        <div class="help-pane" id="help-cli">
+          <div class="help-section">
+            <h3>curl / wget</h3>
+            <pre><code># curl 通过 SOCKS5
 curl -x socks5h://127.0.0.1:7890 https://example.com
 
 # curl 通过 HTTP
@@ -502,10 +1285,10 @@ wget -e use_proxy=yes \
      -e http_proxy="http://127.0.0.1:7890" \
      -e https_proxy="http://127.0.0.1:7890" \
      https://example.com</code></pre>
-    </div>
-    <div class="help-section">
-      <h3>npm / pip / Go</h3>
-      <pre><code># npm
+          </div>
+          <div class="help-section">
+            <h3>npm / pip / Go</h3>
+            <pre><code># npm
 npm config set proxy http://127.0.0.1:7890
 npm config set https-proxy http://127.0.0.1:7890
 # 取消：npm config delete proxy && npm config delete https-proxy
@@ -517,10 +1300,10 @@ pip install --proxy http://127.0.0.1:7890 包名
 export HTTP_PROXY="http://127.0.0.1:7890"
 export HTTPS_PROXY="http://127.0.0.1:7890"
 export GOPROXY="https://proxy.golang.org,direct"</code></pre>
-    </div>
-    <div class="help-section">
-      <h3>Docker</h3>
-      <pre><code># ~/.docker/config.json
+          </div>
+          <div class="help-section">
+            <h3>Docker</h3>
+            <pre><code># ~/.docker/config.json
 {
   "proxies": {
     "default": {
@@ -530,14 +1313,14 @@ export GOPROXY="https://proxy.golang.org,direct"</code></pre>
     }
   }
 }</code></pre>
-    </div>
-    <div class="help-section">
-      <h3>SSH（通过 SOCKS5 跳板）</h3>
-      <pre><code>ssh -o ProxyCommand='nc -x 127.0.0.1:7890 -X 5 %h %p' user@target-host</code></pre>
-    </div>
-    <div class="help-section">
-      <h3>proxychains（强制任意应用走代理）</h3>
-      <pre><code># 安装 (macOS)
+          </div>
+          <div class="help-section">
+            <h3>SSH（通过 SOCKS5 跳板）</h3>
+            <pre><code>ssh -o ProxyCommand='nc -x 127.0.0.1:7890 -X 5 %h %p' user@target-host</code></pre>
+          </div>
+          <div class="help-section">
+            <h3>proxychains（强制任意应用走代理）</h3>
+            <pre><code># 安装 (macOS)
 brew install proxychains-ng
 # 安装 (Linux)
 apt install proxychains4
@@ -548,418 +1331,455 @@ socks5  127.0.0.1  7890
 # 使用
 proxychains4 curl https://www.google.com
 proxychains4 npm install</code></pre>
-    </div>
-    <div class="help-section">
-      <h3>常见应用代理设置</h3>
-      <h4>Telegram</h4>
-      <ol>
-        <li>打开 Telegram → <strong>设置</strong> → <strong>高级</strong> → <strong>代理设置</strong> → <strong>添加代理</strong></li>
-        <li>选择 <strong>SOCKS5</strong>，服务器 <code>127.0.0.1</code>，端口填客户端 SOCKS 端口</li>
-      </ol>
-      <h4>VS Code</h4>
-      <p><strong>设置</strong>（Ctrl+,）→ 搜索 <code>proxy</code> → <strong>Http: Proxy</strong> 填入 <code>http://127.0.0.1:7890</code></p>
-      <h4>Homebrew (macOS)</h4>
-      <pre><code>export ALL_PROXY=socks5h://127.0.0.1:7890
+          </div>
+          <div class="help-section">
+            <h3>常见应用代理设置</h3>
+            <h4>Telegram</h4>
+            <ol>
+              <li>打开 Telegram → <strong>设置</strong> → <strong>高级</strong> → <strong>代理设置</strong> →
+                <strong>添加代理</strong></li>
+              <li>选择 <strong>SOCKS5</strong>，服务器 <code>127.0.0.1</code>，端口填客户端 SOCKS 端口</li>
+            </ol>
+            <h4>VS Code</h4>
+            <p><strong>设置</strong>（Ctrl+,）→ 搜索 <code>proxy</code> → <strong>Http: Proxy</strong> 填入
+              <code>http://127.0.0.1:7890</code></p>
+            <h4>Homebrew (macOS)</h4>
+            <pre><code>export ALL_PROXY=socks5h://127.0.0.1:7890
 brew update && brew upgrade</code></pre>
-    </div>
-  </div>
+          </div>
+        </div>
 
-  <!-- Tab: FAQ -->
-  <div class="help-pane" id="help-faq">
-    <div class="help-section">
-      <h3>常见问题</h3>
-      <h4>Q: 基础订阅和完整配置导出有什么区别？</h4>
-      <p>基础订阅仅返回节点列表（proxies YAML 段），需要配合模板使用或手动粘贴到配置文件中。完整配置导出包含完整的 Clash.Meta 配置（包括代理组、规则等），可直接导入客户端使用。</p>
-      <h4>Q: HTTP 代理和 SOCKS5 代理有什么区别？</h4>
-      <p>HTTP 代理工作在应用层，只代理 HTTP/HTTPS 流量，兼容性最好。SOCKS5 代理工作在传输层，可代理所有 TCP/UDP 流量（包括游戏、DNS 等），功能更强。</p>
-      <h4>Q: 设置了代理后无法连接？</h4>
-      <p>请逐步检查： 1. 客户端是否正在运行且已选择节点 2. 端口是否正确（通常 7890） 3. 防火墙是否允许本地连接 4. 节点本身是否可用</p>
-      <h4>Q: 什么是 VLESS+Reality？</h4>
-      <p>VLESS+Reality 是目前最强的抗审查代理协议，流量伪装为访问合法网站（如 microsoft.com），极难被检测和封锁。需要使用支持该协议的客户端。</p>
-      <h4>Q: 如何取消代理设置？</h4>
-      <p>删除或注释掉对应的环境变量，或在系统/浏览器设置中关闭代理。重启终端或浏览器使更改生效。</p>
-      <h4>Q: socks5:// 和 socks5h:// 有什么区别？</h4>
-      <p><code>socks5://</code> 表示本地解析 DNS 后通过代理连接；<code>socks5h://</code> 表示 DNS 也通过代理解析，后者更安全，推荐使用。</p>
-      <h4>Q: 订阅地址无法更新？</h4>
-      <p>请检查： 1. 订阅 URL 是否完整复制 2. 网络是否能访问订阅服务器 3. 账号是否已启用 4. 联系管理员确认节点配置是否正常</p>
-    </div>
-  </div>
-</div>
-
-</div>
-</div>
-
-<!-- Node Detail Popover -->
-<div class="popover-overlay" id="popoverOverlay" onclick="hidePopover()"></div>
-<div class="popover" id="nodePopover">
-  <div class="popover-header"><span id="popoverTitle">节点详情</span><button class="btn btn-gray btn-sm" onclick="hidePopover()">&times;</button></div>
-  <div class="popover-body" id="popoverBody"></div>
-</div>
-
-<!-- Node Modal -->
-<div class="modal-overlay" id="nodeModal">
-  <div class="modal">
-    <div class="modal-header"><span id="nodeModalTitle">新增节点</span><button class="btn btn-gray btn-sm" onclick="closeModal('nodeModal')">&times;</button></div>
-    <div class="modal-body">
-      <input type="hidden" id="nodeId">
-      <div class="form-row">
-        <div class="form-group"><label>名称 *</label><input id="nodeName" placeholder="us-east-1"></div>
-        <div class="form-group"><label>显示名 *</label><input id="nodeDisplayName" placeholder="美国东部 1"></div>
+        <!-- Tab: FAQ -->
+        <div class="help-pane" id="help-faq">
+          <div class="help-section">
+            <h3>常见问题</h3>
+            <h4>Q: 基础订阅和完整配置导出有什么区别？</h4>
+            <p>基础订阅仅返回节点列表（proxies YAML 段），需要配合模板使用或手动粘贴到配置文件中。完整配置导出包含完整的 Clash.Meta 配置（包括代理组、规则等），可直接导入客户端使用。</p>
+            <h4>Q: HTTP 代理和 SOCKS5 代理有什么区别？</h4>
+            <p>HTTP 代理工作在应用层，只代理 HTTP/HTTPS 流量，兼容性最好。SOCKS5 代理工作在传输层，可代理所有 TCP/UDP 流量（包括游戏、DNS 等），功能更强。</p>
+            <h4>Q: 设置了代理后无法连接？</h4>
+            <p>请逐步检查： 1. 客户端是否正在运行且已选择节点 2. 端口是否正确（通常 7890） 3. 防火墙是否允许本地连接 4. 节点本身是否可用</p>
+            <h4>Q: 什么是 VLESS+Reality？</h4>
+            <p>VLESS+Reality 是目前最强的抗审查代理协议，流量伪装为访问合法网站（如 microsoft.com），极难被检测和封锁。需要使用支持该协议的客户端。</p>
+            <h4>Q: 如何取消代理设置？</h4>
+            <p>删除或注释掉对应的环境变量，或在系统/浏览器设置中关闭代理。重启终端或浏览器使更改生效。</p>
+            <h4>Q: socks5:// 和 socks5h:// 有什么区别？</h4>
+            <p><code>socks5://</code> 表示本地解析 DNS 后通过代理连接；<code>socks5h://</code> 表示 DNS 也通过代理解析，后者更安全，推荐使用。</p>
+            <h4>Q: 订阅地址无法更新？</h4>
+            <p>请检查： 1. 订阅 URL 是否完整复制 2. 网络是否能访问订阅服务器 3. 账号是否已启用 4. 联系管理员确认节点配置是否正常</p>
+          </div>
+        </div>
       </div>
-      <div class="form-row">
-        <div class="form-group"><label>类型 *</label>
-          <select id="nodeType" onchange="toggleNodeFields()">
-            <option value="vless-reality">VLESS-Reality</option>
-            <option value="vmess">VMess</option>
+
+    </div>
+  </div>
+
+  <!-- Node Detail Popover -->
+  <div class="popover-overlay" id="popoverOverlay" onclick="hidePopover()"></div>
+  <div class="popover" id="nodePopover">
+    <div class="popover-header"><span id="popoverTitle">节点详情</span><button class="btn btn-gray btn-sm"
+        onclick="hidePopover()">&times;</button></div>
+    <div class="popover-body" id="popoverBody"></div>
+  </div>
+
+  <!-- Node Modal -->
+  <div class="modal-overlay" id="nodeModal">
+    <div class="modal">
+      <div class="modal-header"><span id="nodeModalTitle">新增节点</span><button class="btn btn-gray btn-sm"
+          onclick="closeModal('nodeModal')">&times;</button></div>
+      <div class="modal-body">
+        <input type="hidden" id="nodeId">
+        <div class="form-row">
+          <div class="form-group"><label>名称 *</label><input id="nodeName" placeholder="us-east-1"></div>
+          <div class="form-group"><label>显示名 *</label><input id="nodeDisplayName" placeholder="美国东部 1"></div>
+        </div>
+        <div class="form-row">
+          <div class="form-group"><label>类型 *</label>
+            <select id="nodeType" onchange="toggleNodeFields()">
+              <option value="vless-reality">VLESS-Reality</option>
+              <option value="vmess">VMess</option>
+            </select>
+          </div>
+          <div class="form-group"><label>排序</label><input type="number" id="nodeSortOrder" value="0"></div>
+        </div>
+        <div class="form-row">
+          <div class="form-group"><label>服务器地址 *</label><input id="nodeServer" placeholder="example.com"></div>
+          <div class="form-group"><label>端口 *</label><input type="number" id="nodePort" placeholder="443"></div>
+        </div>
+
+        <div id="vlessFields">
+          <div class="form-group"><label>Public Key *</label><input id="nodePubkey" placeholder="x_xxx..."></div>
+          <div class="form-row">
+            <div class="form-group"><label>Short ID</label><input id="nodeShortid" placeholder="ab12cd34"></div>
+            <div class="form-group"><label>SNI *</label><input id="nodeSni" placeholder="www.microsoft.com"></div>
+          </div>
+          <div class="form-row">
+            <div class="form-group"><label>Flow</label><input id="nodeFlow" value="xtls-rprx-vision"></div>
+            <div class="form-group"><label>Fingerprint</label><input id="nodeFingerprint" value="chrome"></div>
+          </div>
+        </div>
+
+        <div id="vmessFields" style="display:none">
+          <div class="form-row">
+            <div class="form-group"><label>Alter ID</label><input type="number" id="nodeAlterId" value="0"></div>
+            <div class="form-group"><label>Cipher</label>
+              <select id="nodeCipher">
+                <option value="auto">auto</option>
+                <option value="aes-128-gcm">aes-128-gcm</option>
+                <option value="chacha20-poly1305">chacha20-poly1305</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group"><label>Network</label>
+              <select id="nodeNetwork" onchange="toggleWsFields()">
+                <option value="tcp">tcp</option>
+                <option value="ws">ws</option>
+              </select>
+            </div>
+            <div class="form-group"><label>TLS</label>
+              <select id="nodeTls">
+                <option value="0">否</option>
+                <option value="1">是</option>
+              </select>
+            </div>
+          </div>
+          <div id="wsFields">
+            <div class="form-row">
+              <div class="form-group"><label>WS Path</label><input id="nodeWsPath" placeholder="/path"></div>
+              <div class="form-group"><label>WS Host</label><input id="nodeWsHost" placeholder=""></div>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group"><label>TLS SNI</label><input id="nodeTlsSni" placeholder=""></div>
+            <div class="form-group"><label>跳过证书验证</label>
+              <select id="nodeSkipCert">
+                <option value="0">否</option>
+                <option value="1">是</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div style="margin-top:12px;border-top:1px solid #2d3748;padding-top:12px">
+          <div class="form-group"><label>上游同步（SmartXray API）</label></div>
+          <div class="form-row">
+            <div class="form-group"><label>API 地址</label><input id="nodeApiHost" placeholder="留空则同服务器地址"></div>
+            <div class="form-group"><label>API 端口</label><input type="number" id="nodeApiPort" placeholder="2088"></div>
+          </div>
+          <div class="form-row">
+            <div class="form-group"><label>API Token</label><input id="nodeApiToken" placeholder="SmartXray 管理密码"></div>
+            <div class="form-group"><label>启用上游同步</label>
+              <select id="nodeHasUpstreamApi">
+                <option value="0">否</option>
+                <option value="1">是</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div class="form-group"><label>启用</label>
+          <select id="nodeEnabled">
+            <option value="1">是</option>
+            <option value="0">否</option>
           </select>
         </div>
-        <div class="form-group"><label>排序</label><input type="number" id="nodeSortOrder" value="0"></div>
       </div>
-      <div class="form-row">
-        <div class="form-group"><label>服务器地址 *</label><input id="nodeServer" placeholder="example.com"></div>
-        <div class="form-group"><label>端口 *</label><input type="number" id="nodePort" placeholder="443"></div>
+      <div class="modal-footer">
+        <button class="btn btn-gray" onclick="closeModal('nodeModal')">取消</button>
+        <button class="btn btn-primary" onclick="saveNode()">保存</button>
       </div>
-
-      <div id="vlessFields">
-        <div class="form-group"><label>Public Key *</label><input id="nodePubkey" placeholder="x_xxx..."></div>
-        <div class="form-row">
-          <div class="form-group"><label>Short ID</label><input id="nodeShortid" placeholder="ab12cd34"></div>
-          <div class="form-group"><label>SNI *</label><input id="nodeSni" placeholder="www.microsoft.com"></div>
-        </div>
-        <div class="form-row">
-          <div class="form-group"><label>Flow</label><input id="nodeFlow" value="xtls-rprx-vision"></div>
-          <div class="form-group"><label>Fingerprint</label><input id="nodeFingerprint" value="chrome"></div>
-        </div>
-      </div>
-
-      <div id="vmessFields" style="display:none">
-        <div class="form-row">
-          <div class="form-group"><label>Alter ID</label><input type="number" id="nodeAlterId" value="0"></div>
-          <div class="form-group"><label>Cipher</label>
-            <select id="nodeCipher"><option value="auto">auto</option><option value="aes-128-gcm">aes-128-gcm</option><option value="chacha20-poly1305">chacha20-poly1305</option></select>
-          </div>
-        </div>
-        <div class="form-row">
-          <div class="form-group"><label>Network</label>
-            <select id="nodeNetwork" onchange="toggleWsFields()"><option value="tcp">tcp</option><option value="ws">ws</option></select>
-          </div>
-          <div class="form-group"><label>TLS</label>
-            <select id="nodeTls"><option value="0">否</option><option value="1">是</option></select>
-          </div>
-        </div>
-        <div id="wsFields">
-          <div class="form-row">
-            <div class="form-group"><label>WS Path</label><input id="nodeWsPath" placeholder="/path"></div>
-            <div class="form-group"><label>WS Host</label><input id="nodeWsHost" placeholder=""></div>
-          </div>
-        </div>
-        <div class="form-row">
-          <div class="form-group"><label>TLS SNI</label><input id="nodeTlsSni" placeholder=""></div>
-          <div class="form-group"><label>跳过证书验证</label>
-            <select id="nodeSkipCert"><option value="0">否</option><option value="1">是</option></select>
-          </div>
-        </div>
-      </div>
-
-      <div style="margin-top:12px;border-top:1px solid #2d3748;padding-top:12px">
-        <div class="form-group"><label>上游同步（SmartXray API）</label></div>
-        <div class="form-row">
-          <div class="form-group"><label>API 地址</label><input id="nodeApiHost" placeholder="留空则同服务器地址"></div>
-          <div class="form-group"><label>API 端口</label><input type="number" id="nodeApiPort" placeholder="2088"></div>
-        </div>
-        <div class="form-row">
-          <div class="form-group"><label>API Token</label><input id="nodeApiToken" placeholder="SmartXray 管理密码"></div>
-          <div class="form-group"><label>启用上游同步</label>
-            <select id="nodeHasUpstreamApi"><option value="0">否</option><option value="1">是</option></select>
-          </div>
-        </div>
-      </div>
-
-      <div class="form-group"><label>启用</label>
-        <select id="nodeEnabled"><option value="1">是</option><option value="0">否</option></select>
-      </div>
-    </div>
-    <div class="modal-footer">
-      <button class="btn btn-gray" onclick="closeModal('nodeModal')">取消</button>
-      <button class="btn btn-primary" onclick="saveNode()">保存</button>
     </div>
   </div>
-</div>
 
-<!-- User Modal -->
-<div class="modal-overlay" id="userModal">
-  <div class="modal" style="width:460px">
-    <div class="modal-header"><span id="userModalTitle">新增用户</span><button class="btn btn-gray btn-sm" onclick="closeModal('userModal')">&times;</button></div>
-    <div class="modal-body">
-      <div class="form-group"><label>显示名称 *</label><input id="userName" placeholder="用户001"></div>
-      <div class="form-row">
-        <div class="form-group"><label>用户名（登录用）*</label><input id="userUsername" placeholder="user001" oninput="this.value=this.value.replace(/\s+/g,'')"></div>
-        <div class="form-group"><label>角色</label>
-          <select id="userRole"><option value="user">普通用户</option><option value="admin">管理员</option></select>
+  <!-- User Modal -->
+  <div class="modal-overlay" id="userModal">
+    <div class="modal" style="width:460px">
+      <div class="modal-header"><span id="userModalTitle">新增用户</span><button class="btn btn-gray btn-sm"
+          onclick="closeModal('userModal')">&times;</button></div>
+      <div class="modal-body">
+        <div class="form-group"><label>显示名称 *</label><input id="userName" placeholder="用户001"></div>
+        <div class="form-row">
+          <div class="form-group"><label>用户名（登录用）*</label><input id="userUsername" placeholder="user001"
+              oninput="this.value=this.value.replace(/\s+/g,'')"></div>
+          <div class="form-group"><label>角色</label>
+            <select id="userRole">
+              <option value="user">普通用户</option>
+              <option value="admin">管理员</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-group" id="userPasswordField"><label>密码 *</label><input type="password" id="userPassword"
+            placeholder="至少 6 个字符"></div>
+        <div class="form-group"><label>备注</label><input id="userNote" placeholder=""></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-gray" onclick="closeModal('userModal')">取消</button>
+        <button class="btn btn-primary" onclick="saveUser()">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Template Modal -->
+  <div class="modal-overlay" id="tplModal">
+    <div class="modal" style="width:680px">
+      <div class="modal-header"><span id="tplModalTitle">新增模板</span><button class="btn btn-gray btn-sm"
+          onclick="closeModal('tplModal')">&times;</button></div>
+      <div class="modal-body">
+        <input type="hidden" id="tplId">
+        <div class="form-row">
+          <div class="form-group"><label>名称 *</label><input id="tplName" placeholder="default"></div>
+          <div class="form-group"><label>启用</label>
+            <select id="tplEnabled">
+              <option value="1">是</option>
+              <option value="0">否</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-group"><label>描述</label><input id="tplDesc" placeholder="模板描述"></div>
+        <div class="form-group">
+          <label>模板内容（YAML）*</label>
+          <textarea id="tplContent" placeholder="mixed-port: 7890&#10;...&#10;{{PROXIES}}&#10;..."></textarea>
+        </div>
+        <div class="form-hint">占位符：{{PROXIES}} — proxies 段，{{PROXY_NAMES}} — 逗号分隔节点名，{{PROXY_NAMES_INLINE}} — 换行缩进列表
         </div>
       </div>
-      <div class="form-group" id="userPasswordField"><label>密码 *</label><input type="password" id="userPassword" placeholder="至少 6 个字符"></div>
-      <div class="form-group"><label>备注</label><input id="userNote" placeholder=""></div>
-    </div>
-    <div class="modal-footer">
-      <button class="btn btn-gray" onclick="closeModal('userModal')">取消</button>
-      <button class="btn btn-primary" onclick="saveUser()">保存</button>
-    </div>
-  </div>
-</div>
-
-<!-- Template Modal -->
-<div class="modal-overlay" id="tplModal">
-  <div class="modal" style="width:680px">
-    <div class="modal-header"><span id="tplModalTitle">新增模板</span><button class="btn btn-gray btn-sm" onclick="closeModal('tplModal')">&times;</button></div>
-    <div class="modal-body">
-      <input type="hidden" id="tplId">
-      <div class="form-row">
-        <div class="form-group"><label>名称 *</label><input id="tplName" placeholder="default"></div>
-        <div class="form-group"><label>启用</label>
-          <select id="tplEnabled"><option value="1">是</option><option value="0">否</option></select>
-        </div>
+      <div class="modal-footer">
+        <button class="btn btn-gray" onclick="closeModal('tplModal')">取消</button>
+        <button class="btn btn-primary" onclick="saveTpl()">保存</button>
       </div>
-      <div class="form-group"><label>描述</label><input id="tplDesc" placeholder="模板描述"></div>
-      <div class="form-group">
-        <label>模板内容（YAML）*</label>
-        <textarea id="tplContent" placeholder="mixed-port: 7890&#10;...&#10;{{PROXIES}}&#10;..."></textarea>
+    </div>
+  </div>
+
+  <!-- YAML Preview Modal -->
+  <div class="modal-overlay" id="yamlPreviewModal">
+    <div class="modal" style="width:780px">
+      <div class="modal-header"><span>YAML 配置预览</span><button class="btn btn-gray btn-sm"
+          onclick="closeModal('yamlPreviewModal')">&times;</button></div>
+      <div class="modal-body">
+        <pre id="yamlPreviewContent"
+          style="background:#131720;border:1px solid #2d3748;border-radius:6px;padding:14px 16px;font-family:'SF Mono',Consolas,monospace;font-size:12px;line-height:1.6;color:#e2e8f0;max-height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-all"></pre>
       </div>
-      <div class="form-hint">占位符：{{PROXIES}} — proxies 段，{{PROXY_NAMES}} — 逗号分隔节点名，{{PROXY_NAMES_INLINE}} — 换行缩进列表</div>
-    </div>
-    <div class="modal-footer">
-      <button class="btn btn-gray" onclick="closeModal('tplModal')">取消</button>
-      <button class="btn btn-primary" onclick="saveTpl()">保存</button>
-    </div>
-  </div>
-</div>
-
-<!-- YAML Preview Modal -->
-<div class="modal-overlay" id="yamlPreviewModal">
-  <div class="modal" style="width:780px">
-    <div class="modal-header"><span>YAML 配置预览</span><button class="btn btn-gray btn-sm" onclick="closeModal('yamlPreviewModal')">&times;</button></div>
-    <div class="modal-body">
-      <pre id="yamlPreviewContent" style="background:#131720;border:1px solid #2d3748;border-radius:6px;padding:14px 16px;font-family:'SF Mono',Consolas,monospace;font-size:12px;line-height:1.6;color:#e2e8f0;max-height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-all"></pre>
-    </div>
-    <div class="modal-footer">
-      <button class="btn btn-gray" onclick="closeModal('yamlPreviewModal')">关闭</button>
-      <button class="btn btn-primary" onclick="copyText(document.getElementById('yamlPreviewContent').textContent)">复制内容</button>
+      <div class="modal-footer">
+        <button class="btn btn-gray" onclick="closeModal('yamlPreviewModal')">关闭</button>
+        <button class="btn btn-primary"
+          onclick="copyText(document.getElementById('yamlPreviewContent').textContent)">复制内容</button>
+      </div>
     </div>
   </div>
-</div>
 
-<script>
-const TOKEN_KEY = 'subserver_session';
-let sessionToken = localStorage.getItem(TOKEN_KEY) || '';
-let currentUser = null;
-let nodesCache = [], usersCache = [], templatesCache = [];
-let myToken = '';
-let myNodesCache = [];
+  <script>
+    const TOKEN_KEY = 'subserver_session';
+    let sessionToken = localStorage.getItem(TOKEN_KEY) || '';
+    let currentUser = null;
+    let nodesCache = [], usersCache = [], templatesCache = [];
+    let myToken = '';
+    let myNodesCache = [];
 
-// HTML 转义，防止 XSS
-function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+    // HTML 转义，防止 XSS
+    function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
 
-// ── Auth ──────────────────────────────────────────────────────
-async function doLogin() {
-  const username = document.getElementById('loginUser').value.replace(/\s+/g, '');
-  const password = document.getElementById('loginPass').value;
-  if (!username || !password) { showLoginErr('请输入用户名和密码'); return; }
-  try {
-    const r = await fetch('/api/auth/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password })
-    });
-    const data = await r.json();
-    if (!r.ok) { showLoginErr(data.error || '登录失败'); return; }
-    sessionToken = data.token;
-    currentUser = data.user;
-    localStorage.setItem(TOKEN_KEY, sessionToken);
-    init();
-  } catch (e) {
-    showLoginErr('连接失败: ' + e.message);
-  }
-}
-
-function showLoginErr(msg) {
-  const e = document.getElementById('loginErr');
-  e.textContent = msg; e.style.display = 'block';
-}
-
-function hideAllForms() {
-  ['loginForm','registerForm','forgotForm','resetForm','verifyResult'].forEach(id => {
-    document.getElementById(id).style.display = 'none';
-  });
-}
-
-function showRegister() {
-  hideAllForms();
-  document.getElementById('registerForm').style.display = 'block';
-  document.getElementById('regInviteCode').focus();
-}
-
-function showLogin() {
-  hideAllForms();
-  document.getElementById('loginForm').style.display = 'block';
-  document.getElementById('loginUser').focus();
-}
-
-function showForgot() {
-  hideAllForms();
-  document.getElementById('forgotForm').style.display = 'block';
-  document.getElementById('forgotEmail').focus();
-}
-
-function showReset(token) {
-  hideAllForms();
-  document.getElementById('resetToken').value = token || '';
-  document.getElementById('resetForm').style.display = 'block';
-  document.getElementById('resetPass').focus();
-}
-
-function showVerify() {
-  hideAllForms();
-  document.getElementById('verifyResult').style.display = 'block';
-}
-
-async function doRegister() {
-  const inviteCode = document.getElementById('regInviteCode').value.trim().toUpperCase();
-  const username = document.getElementById('regUsername').value.replace(/\s+/g, '');
-  const email = document.getElementById('regEmail').value.trim();
-  const password = document.getElementById('regPassword').value;
-  const password2 = document.getElementById('regPassword2').value;
-  const errEl = document.getElementById('regErr');
-  const okEl = document.getElementById('regOk');
-  errEl.style.display = 'none'; okEl.style.display = 'none';
-
-  if (!inviteCode) { errEl.textContent = '请输入邀请码'; errEl.style.display = 'block'; return; }
-  if (!username || username.length < 3) { errEl.textContent = '用户名至少 3 个字符'; errEl.style.display = 'block'; return; }
-  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { errEl.textContent = '请输入有效的邮箱'; errEl.style.display = 'block'; return; }
-  if (!password || password.length < 6) { errEl.textContent = '密码至少 6 个字符'; errEl.style.display = 'block'; return; }
-  if (password !== password2) { errEl.textContent = '两次密码不一致'; errEl.style.display = 'block'; return; }
-
-  try {
-    const r = await fetch('/api/auth/register', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ inviteCode, username, email, password })
-    });
-    const data = await r.json();
-    if (!r.ok) { errEl.textContent = data.error || '注册失败'; errEl.style.display = 'block'; return; }
-    okEl.textContent = data.message || '注册成功！'; okEl.style.display = 'block';
-    setTimeout(() => {
-      showLogin();
-      document.getElementById('loginUser').value = username;
-      document.getElementById('loginPass').focus();
-    }, 2000);
-  } catch (e) {
-    errEl.textContent = '连接失败: ' + e.message; errEl.style.display = 'block';
-  }
-}
-
-async function doForgotPassword() {
-  const email = document.getElementById('forgotEmail').value.trim();
-  const msgEl = document.getElementById('forgotMsg');
-  msgEl.style.display = 'none';
-  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    msgEl.textContent = '请输入有效的邮箱'; msgEl.style.color = '#fc8181'; msgEl.style.display = 'block'; return;
-  }
-  try {
-    const r = await fetch('/api/auth/forgot-password', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email })
-    });
-    const data = await r.json();
-    if (!r.ok) { msgEl.textContent = data.error || '请求失败'; msgEl.style.color = '#fc8181'; msgEl.style.display = 'block'; return; }
-    msgEl.textContent = data.message || '重置邮件已发送'; msgEl.style.color = '#68d391'; msgEl.style.display = 'block';
-  } catch (e) {
-    msgEl.textContent = '连接失败: ' + e.message; msgEl.style.color = '#fc8181'; msgEl.style.display = 'block';
-  }
-}
-
-async function doResetPassword() {
-  const token = document.getElementById('resetToken').value;
-  const password = document.getElementById('resetPass').value;
-  const password2 = document.getElementById('resetPass2').value;
-  const msgEl = document.getElementById('resetMsg');
-  msgEl.style.display = 'none';
-  if (!password || password.length < 6) { msgEl.textContent = '密码至少 6 个字符'; msgEl.style.color = '#fc8181'; msgEl.style.display = 'block'; return; }
-  if (password !== password2) { msgEl.textContent = '两次密码不一致'; msgEl.style.color = '#fc8181'; msgEl.style.display = 'block'; return; }
-  try {
-    const r = await fetch('/api/auth/reset-password', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token, password })
-    });
-    const data = await r.json();
-    if (!r.ok) { msgEl.textContent = data.error || '重置失败'; msgEl.style.color = '#fc8181'; msgEl.style.display = 'block'; return; }
-    msgEl.textContent = (data.message || '密码重置成功') + '，正在跳转登录…'; msgEl.style.color = '#68d391'; msgEl.style.display = 'block';
-    setTimeout(() => { showLogin(); }, 2000);
-  } catch (e) {
-    msgEl.textContent = '连接失败: ' + e.message; msgEl.style.color = '#fc8181'; msgEl.style.display = 'block';
-  }
-}
-
-async function doVerify(token) {
-  showVerify();
-  const msgEl = document.getElementById('verifyMsg');
-  msgEl.textContent = '正在验证…'; msgEl.style.color = '#a0aec0';
-  try {
-    const r = await fetch('/api/auth/verify?token=' + encodeURIComponent(token));
-    const data = await r.json();
-    if (r.ok && data.ok) {
-      msgEl.textContent = data.message || '邮箱验证成功'; msgEl.style.color = '#68d391';
-    } else {
-      msgEl.textContent = data.error || '验证失败'; msgEl.style.color = '#fc8181';
+    // ── Auth ──────────────────────────────────────────────────────
+    async function doLogin() {
+      const username = document.getElementById('loginUser').value.replace(/\s+/g, '');
+      const password = document.getElementById('loginPass').value;
+      if (!username || !password) { showLoginErr('请输入用户名和密码'); return; }
+      try {
+        const r = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password })
+        });
+        const data = await r.json();
+        if (!r.ok) { showLoginErr(data.error || '登录失败'); return; }
+        sessionToken = data.token;
+        currentUser = data.user;
+        localStorage.setItem(TOKEN_KEY, sessionToken);
+        init();
+      } catch (e) {
+        showLoginErr('连接失败: ' + e.message);
+      }
     }
-  } catch (e) {
-    msgEl.textContent = '连接失败: ' + e.message; msgEl.style.color = '#fc8181';
-  }
-}
 
-async function logout() {
-  try { await api('POST', '/api/auth/logout'); } catch {}
-  localStorage.removeItem(TOKEN_KEY);
-  sessionToken = ''; currentUser = null;
-  location.reload();
-}
+    function showLoginErr(msg) {
+      const e = document.getElementById('loginErr');
+      e.textContent = msg; e.style.display = 'block';
+    }
 
-// ── API helper ────────────────────────────────────────────────
-async function api(method, path, body) {
-  const opts = { method, headers: { 'Authorization': 'Bearer ' + sessionToken, 'Content-Type': 'application/json' } };
-  if (body) opts.body = JSON.stringify(body);
-  try {
-    const r = await fetch(path, opts);
-    const data = await r.json();
-    if (!r.ok) { toast(data.error || '请求失败', 'error'); return { ok: false, error: data.error }; }
-    return { ok: true, data };
-  } catch (e) {
-    toast('网络错误: ' + e.message, 'error');
-    return { ok: false, error: e.message };
-  }
-}
+    function hideAllForms() {
+      ['loginForm', 'registerForm', 'forgotForm', 'resetForm', 'verifyResult'].forEach(id => {
+        document.getElementById(id).style.display = 'none';
+      });
+    }
 
-function toast(msg, type) {
-  const t = document.createElement('div');
-  t.className = 'toast ' + (type || 'success');
-  t.textContent = msg;
-  document.body.appendChild(t);
-  setTimeout(() => t.remove(), 3000);
-}
+    function showRegister() {
+      hideAllForms();
+      document.getElementById('registerForm').style.display = 'block';
+      document.getElementById('regInviteCode').focus();
+    }
 
-// ── Init ───────────────────────────────────────────────────────
-async function init() {
-  document.getElementById('loginPage').style.display = 'none';
-  document.getElementById('dash').style.display = 'block';
+    function showLogin() {
+      hideAllForms();
+      document.getElementById('loginForm').style.display = 'block';
+      document.getElementById('loginUser').focus();
+    }
 
-  const isAdmin = currentUser.role === 'admin';
-  document.getElementById('userBadge').textContent = isAdmin ? '订阅分发管理' : currentUser.name;
+    function showForgot() {
+      hideAllForms();
+      document.getElementById('forgotForm').style.display = 'block';
+      document.getElementById('forgotEmail').focus();
+    }
 
-  // 构建侧边栏
-  const nav = document.getElementById('navMenu');
-  if (isAdmin) {
-    nav.innerHTML = `
+    function showReset(token) {
+      hideAllForms();
+      document.getElementById('resetToken').value = token || '';
+      document.getElementById('resetForm').style.display = 'block';
+      document.getElementById('resetPass').focus();
+    }
+
+    function showVerify() {
+      hideAllForms();
+      document.getElementById('verifyResult').style.display = 'block';
+    }
+
+    async function doRegister() {
+      const inviteCode = document.getElementById('regInviteCode').value.trim().toUpperCase();
+      const username = document.getElementById('regUsername').value.replace(/\s+/g, '');
+      const email = document.getElementById('regEmail').value.trim();
+      const password = document.getElementById('regPassword').value;
+      const password2 = document.getElementById('regPassword2').value;
+      const errEl = document.getElementById('regErr');
+      const okEl = document.getElementById('regOk');
+      errEl.style.display = 'none'; okEl.style.display = 'none';
+
+      if (!inviteCode) { errEl.textContent = '请输入邀请码'; errEl.style.display = 'block'; return; }
+      if (!username || username.length < 3) { errEl.textContent = '用户名至少 3 个字符'; errEl.style.display = 'block'; return; }
+      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { errEl.textContent = '请输入有效的邮箱'; errEl.style.display = 'block'; return; }
+      if (!password || password.length < 6) { errEl.textContent = '密码至少 6 个字符'; errEl.style.display = 'block'; return; }
+      if (password !== password2) { errEl.textContent = '两次密码不一致'; errEl.style.display = 'block'; return; }
+
+      try {
+        const r = await fetch('/api/auth/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ inviteCode, username, email, password })
+        });
+        const data = await r.json();
+        if (!r.ok) { errEl.textContent = data.error || '注册失败'; errEl.style.display = 'block'; return; }
+        okEl.textContent = data.message || '注册成功！'; okEl.style.display = 'block';
+        setTimeout(() => {
+          showLogin();
+          document.getElementById('loginUser').value = username;
+          document.getElementById('loginPass').focus();
+        }, 2000);
+      } catch (e) {
+        errEl.textContent = '连接失败: ' + e.message; errEl.style.display = 'block';
+      }
+    }
+
+    async function doForgotPassword() {
+      const email = document.getElementById('forgotEmail').value.trim();
+      const msgEl = document.getElementById('forgotMsg');
+      msgEl.style.display = 'none';
+      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        msgEl.textContent = '请输入有效的邮箱'; msgEl.style.color = '#fc8181'; msgEl.style.display = 'block'; return;
+      }
+      try {
+        const r = await fetch('/api/auth/forgot-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email })
+        });
+        const data = await r.json();
+        if (!r.ok) { msgEl.textContent = data.error || '请求失败'; msgEl.style.color = '#fc8181'; msgEl.style.display = 'block'; return; }
+        msgEl.textContent = data.message || '重置邮件已发送'; msgEl.style.color = '#68d391'; msgEl.style.display = 'block';
+      } catch (e) {
+        msgEl.textContent = '连接失败: ' + e.message; msgEl.style.color = '#fc8181'; msgEl.style.display = 'block';
+      }
+    }
+
+    async function doResetPassword() {
+      const token = document.getElementById('resetToken').value;
+      const password = document.getElementById('resetPass').value;
+      const password2 = document.getElementById('resetPass2').value;
+      const msgEl = document.getElementById('resetMsg');
+      msgEl.style.display = 'none';
+      if (!password || password.length < 6) { msgEl.textContent = '密码至少 6 个字符'; msgEl.style.color = '#fc8181'; msgEl.style.display = 'block'; return; }
+      if (password !== password2) { msgEl.textContent = '两次密码不一致'; msgEl.style.color = '#fc8181'; msgEl.style.display = 'block'; return; }
+      try {
+        const r = await fetch('/api/auth/reset-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token, password })
+        });
+        const data = await r.json();
+        if (!r.ok) { msgEl.textContent = data.error || '重置失败'; msgEl.style.color = '#fc8181'; msgEl.style.display = 'block'; return; }
+        msgEl.textContent = (data.message || '密码重置成功') + '，正在跳转登录…'; msgEl.style.color = '#68d391'; msgEl.style.display = 'block';
+        setTimeout(() => { showLogin(); }, 2000);
+      } catch (e) {
+        msgEl.textContent = '连接失败: ' + e.message; msgEl.style.color = '#fc8181'; msgEl.style.display = 'block';
+      }
+    }
+
+    async function doVerify(token) {
+      showVerify();
+      const msgEl = document.getElementById('verifyMsg');
+      msgEl.textContent = '正在验证…'; msgEl.style.color = '#a0aec0';
+      try {
+        const r = await fetch('/api/auth/verify?token=' + encodeURIComponent(token));
+        const data = await r.json();
+        if (r.ok && data.ok) {
+          msgEl.textContent = data.message || '邮箱验证成功'; msgEl.style.color = '#68d391';
+        } else {
+          msgEl.textContent = data.error || '验证失败'; msgEl.style.color = '#fc8181';
+        }
+      } catch (e) {
+        msgEl.textContent = '连接失败: ' + e.message; msgEl.style.color = '#fc8181';
+      }
+    }
+
+    async function logout() {
+      try { await api('POST', '/api/auth/logout'); } catch { }
+      localStorage.removeItem(TOKEN_KEY);
+      sessionToken = ''; currentUser = null;
+      location.reload();
+    }
+
+    // ── API helper ────────────────────────────────────────────────
+    async function api(method, path, body) {
+      const opts = { method, headers: { 'Authorization': 'Bearer ' + sessionToken, 'Content-Type': 'application/json' } };
+      if (body) opts.body = JSON.stringify(body);
+      try {
+        const r = await fetch(path, opts);
+        const data = await r.json();
+        if (!r.ok) { toast(data.error || '请求失败', 'error'); return { ok: false, error: data.error }; }
+        return { ok: true, data };
+      } catch (e) {
+        toast('网络错误: ' + e.message, 'error');
+        return { ok: false, error: e.message };
+      }
+    }
+
+    function toast(msg, type) {
+      const t = document.createElement('div');
+      t.className = 'toast ' + (type || 'success');
+      t.textContent = msg;
+      document.body.appendChild(t);
+      setTimeout(() => t.remove(), 3000);
+    }
+
+    // ── Init ───────────────────────────────────────────────────────
+    async function init() {
+      document.getElementById('loginPage').style.display = 'none';
+      document.getElementById('dash').style.display = 'block';
+
+      const isAdmin = currentUser.role === 'admin';
+      document.getElementById('userBadge').textContent = isAdmin ? '订阅分发管理' : currentUser.name;
+
+      // 构建侧边栏
+      const nav = document.getElementById('navMenu');
+      if (isAdmin) {
+        nav.innerHTML = `
       <a class="active" onclick="showPage('nodes',this)"><span class="ico">&#9881;</span> 节点管理</a>
       <a onclick="showPage('users',this)"><span class="ico">&#9786;</span> 用户管理</a>
       <a onclick="showPage('mappings',this)"><span class="ico">&#128279;</span> UUID 映射</a>
@@ -967,40 +1787,40 @@ async function init() {
       <a onclick="showPage('invites',this)"><span class="ico">&#127873;</span> 邀请码</a>
       <a onclick="showPage('help',this)"><span class="ico">&#128218;</span> 使用帮助</a>
     `;
-    loadNodes();
-    loadUsers();
-    loadTemplates();
-  } else {
-    nav.innerHTML = `
+        loadNodes();
+        loadUsers();
+        loadTemplates();
+      } else {
+        nav.innerHTML = `
       <a class="active" onclick="showPage('mysub',this)"><span class="ico">&#128230;</span> 我的订阅</a>
       <a onclick="showPage('help',this)"><span class="ico">&#128218;</span> 使用帮助</a>
     `;
-    loadMySubscription();
-  }
-}
+        loadMySubscription();
+      }
+    }
 
-function showPage(name, el) {
-  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-  document.getElementById('page-' + name).classList.add('active');
-  document.querySelectorAll('nav a').forEach(a => a.classList.remove('active'));
-  if (el) el.classList.add('active');
-  if (name === 'mappings') loadUsersForSelect();
-if (name === 'invites') loadInviteCodes();
-}
+    function showPage(name, el) {
+      document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+      document.getElementById('page-' + name).classList.add('active');
+      document.querySelectorAll('nav a').forEach(a => a.classList.remove('active'));
+      if (el) el.classList.add('active');
+      if (name === 'mappings') loadUsersForSelect();
+      if (name === 'invites') loadInviteCodes();
+    }
 
-// ── Nodes (Admin) ─────────────────────────────────────────────
-async function loadNodes() {
-  const r = await api('GET', '/api/nodes');
-  if (!r.ok) return;
-  nodesCache = r.data;
-  const tb = document.getElementById('nodesTbody');
-  if (r.data.length === 0) { tb.innerHTML = '<tr><td colspan="8" class="empty">暂无节点，点击右上角新增</td></tr>'; }
-  else {
-    tb.innerHTML = r.data.map(n => `
+    // ── Nodes (Admin) ─────────────────────────────────────────────
+    async function loadNodes() {
+      const r = await api('GET', '/api/nodes');
+      if (!r.ok) return;
+      nodesCache = r.data;
+      const tb = document.getElementById('nodesTbody');
+      if (r.data.length === 0) { tb.innerHTML = '<tr><td colspan="8" class="empty">暂无节点，点击右上角新增</td></tr>'; }
+      else {
+        tb.innerHTML = r.data.map(n => `
       <tr style="cursor:pointer" onclick="showNodeDetail(event,${n.id})">
         <td class="mono">${esc(n.name)}</td>
         <td>${esc(n.display_name)}</td>
-        <td><span class="badge ${n.type==='vless-reality'?'blue':'gray'}">${n.type}</span></td>
+        <td><span class="badge ${n.type === 'vless-reality' ? 'blue' : 'gray'}">${n.type}</span></td>
         <td class="mono">${esc(n.server)}</td>
         <td>${n.port}</td>
         <td>${n.enabled ? '<span class="badge green">启用</span>' : '<span class="badge red">禁用</span>'}</td>
@@ -1010,138 +1830,138 @@ async function loadNodes() {
           <button class="btn btn-red btn-sm" onclick="delNode(${n.id})">删除</button>
         </td>
       </tr>`).join('');
-  }
-  document.getElementById('statNodesTotal').textContent = r.data.length;
-  document.getElementById('statNodesEnabled').textContent = r.data.filter(n => n.enabled).length;
-  document.getElementById('statNodesVless').textContent = r.data.filter(n => n.type === 'vless-reality').length;
-  document.getElementById('statNodesVmess').textContent = r.data.filter(n => n.type === 'vmess').length;
-}
+      }
+      document.getElementById('statNodesTotal').textContent = r.data.length;
+      document.getElementById('statNodesEnabled').textContent = r.data.filter(n => n.enabled).length;
+      document.getElementById('statNodesVless').textContent = r.data.filter(n => n.type === 'vless-reality').length;
+      document.getElementById('statNodesVmess').textContent = r.data.filter(n => n.type === 'vmess').length;
+    }
 
-function openNodeModal(id) {
-  const modal = document.getElementById('nodeModal');
-  document.getElementById('nodeId').value = id || '';
-  if (id) {
-    const n = nodesCache.find(x => x.id === id);
-    if (!n) return;
-    document.getElementById('nodeModalTitle').textContent = '编辑节点';
-    document.getElementById('nodeName').value = n.name;
-    document.getElementById('nodeDisplayName').value = n.display_name;
-    document.getElementById('nodeType').value = n.type;
-    document.getElementById('nodeSortOrder').value = n.sort_order;
-    document.getElementById('nodeServer').value = n.server;
-    document.getElementById('nodePort').value = n.port;
-    document.getElementById('nodePubkey').value = n.pubkey || '';
-    document.getElementById('nodeShortid').value = n.shortid || '';
-    document.getElementById('nodeSni').value = n.sni || '';
-    document.getElementById('nodeFlow').value = n.flow || 'xtls-rprx-vision';
-    document.getElementById('nodeFingerprint').value = n.fingerprint || 'chrome';
-    document.getElementById('nodeAlterId').value = n.alter_id;
-    document.getElementById('nodeCipher').value = n.cipher || 'auto';
-    document.getElementById('nodeNetwork').value = n.network || 'tcp';
-    document.getElementById('nodeWsPath').value = n.ws_path || '';
-    document.getElementById('nodeWsHost').value = n.ws_host || '';
-    document.getElementById('nodeTls').value = String(n.tls);
-    document.getElementById('nodeTlsSni').value = n.tls_sni || '';
-    document.getElementById('nodeSkipCert').value = String(n.skip_cert);
-    document.getElementById('nodeEnabled').value = String(n.enabled);
-    document.getElementById('nodeApiHost').value = n.api_host || '';
-    document.getElementById('nodeApiPort').value = n.api_port || 2088;
-    document.getElementById('nodeApiToken').value = n.api_token || '';
-    document.getElementById('nodeHasUpstreamApi').value = String(n.has_upstream_api || 0);
-  } else {
-    document.getElementById('nodeModalTitle').textContent = '新增节点';
-    ['nodeName','nodeDisplayName','nodeServer','nodePort','nodePubkey','nodeShortid','nodeSni','nodeWsPath','nodeWsHost','nodeTlsSni'].forEach(f => document.getElementById(f).value = '');
-    document.getElementById('nodeType').value = 'vless-reality';
-    document.getElementById('nodeSortOrder').value = '0';
-    document.getElementById('nodePort').value = '';
-    document.getElementById('nodeFlow').value = 'xtls-rprx-vision';
-    document.getElementById('nodeFingerprint').value = 'chrome';
-    document.getElementById('nodeAlterId').value = '0';
-    document.getElementById('nodeCipher').value = 'auto';
-    document.getElementById('nodeNetwork').value = 'tcp';
-    document.getElementById('nodeTls').value = '0';
-    document.getElementById('nodeSkipCert').value = '0';
-    document.getElementById('nodeEnabled').value = '1';
-    document.getElementById('nodeApiHost').value = '';
-    document.getElementById('nodeApiPort').value = '2088';
-    document.getElementById('nodeApiToken').value = '';
-    document.getElementById('nodeHasUpstreamApi').value = '0';
-  }
-  toggleNodeFields();
-  modal.classList.add('show');
-}
+    function openNodeModal(id) {
+      const modal = document.getElementById('nodeModal');
+      document.getElementById('nodeId').value = id || '';
+      if (id) {
+        const n = nodesCache.find(x => x.id === id);
+        if (!n) return;
+        document.getElementById('nodeModalTitle').textContent = '编辑节点';
+        document.getElementById('nodeName').value = n.name;
+        document.getElementById('nodeDisplayName').value = n.display_name;
+        document.getElementById('nodeType').value = n.type;
+        document.getElementById('nodeSortOrder').value = n.sort_order;
+        document.getElementById('nodeServer').value = n.server;
+        document.getElementById('nodePort').value = n.port;
+        document.getElementById('nodePubkey').value = n.pubkey || '';
+        document.getElementById('nodeShortid').value = n.shortid || '';
+        document.getElementById('nodeSni').value = n.sni || '';
+        document.getElementById('nodeFlow').value = n.flow || 'xtls-rprx-vision';
+        document.getElementById('nodeFingerprint').value = n.fingerprint || 'chrome';
+        document.getElementById('nodeAlterId').value = n.alter_id;
+        document.getElementById('nodeCipher').value = n.cipher || 'auto';
+        document.getElementById('nodeNetwork').value = n.network || 'tcp';
+        document.getElementById('nodeWsPath').value = n.ws_path || '';
+        document.getElementById('nodeWsHost').value = n.ws_host || '';
+        document.getElementById('nodeTls').value = String(n.tls);
+        document.getElementById('nodeTlsSni').value = n.tls_sni || '';
+        document.getElementById('nodeSkipCert').value = String(n.skip_cert);
+        document.getElementById('nodeEnabled').value = String(n.enabled);
+        document.getElementById('nodeApiHost').value = n.api_host || '';
+        document.getElementById('nodeApiPort').value = n.api_port || 2088;
+        document.getElementById('nodeApiToken').value = n.api_token || '';
+        document.getElementById('nodeHasUpstreamApi').value = String(n.has_upstream_api || 0);
+      } else {
+        document.getElementById('nodeModalTitle').textContent = '新增节点';
+        ['nodeName', 'nodeDisplayName', 'nodeServer', 'nodePort', 'nodePubkey', 'nodeShortid', 'nodeSni', 'nodeWsPath', 'nodeWsHost', 'nodeTlsSni'].forEach(f => document.getElementById(f).value = '');
+        document.getElementById('nodeType').value = 'vless-reality';
+        document.getElementById('nodeSortOrder').value = '0';
+        document.getElementById('nodePort').value = '';
+        document.getElementById('nodeFlow').value = 'xtls-rprx-vision';
+        document.getElementById('nodeFingerprint').value = 'chrome';
+        document.getElementById('nodeAlterId').value = '0';
+        document.getElementById('nodeCipher').value = 'auto';
+        document.getElementById('nodeNetwork').value = 'tcp';
+        document.getElementById('nodeTls').value = '0';
+        document.getElementById('nodeSkipCert').value = '0';
+        document.getElementById('nodeEnabled').value = '1';
+        document.getElementById('nodeApiHost').value = '';
+        document.getElementById('nodeApiPort').value = '2088';
+        document.getElementById('nodeApiToken').value = '';
+        document.getElementById('nodeHasUpstreamApi').value = '0';
+      }
+      toggleNodeFields();
+      modal.classList.add('show');
+    }
 
-function toggleNodeFields() {
-  const type = document.getElementById('nodeType').value;
-  document.getElementById('vlessFields').style.display = type === 'vless-reality' ? 'block' : 'none';
-  document.getElementById('vmessFields').style.display = type === 'vmess' ? 'block' : 'none';
-  if (type === 'vmess') toggleWsFields();
-}
+    function toggleNodeFields() {
+      const type = document.getElementById('nodeType').value;
+      document.getElementById('vlessFields').style.display = type === 'vless-reality' ? 'block' : 'none';
+      document.getElementById('vmessFields').style.display = type === 'vmess' ? 'block' : 'none';
+      if (type === 'vmess') toggleWsFields();
+    }
 
-function toggleWsFields() {
-  const net = document.getElementById('nodeNetwork').value;
-  document.getElementById('wsFields').style.display = net === 'ws' ? 'block' : 'none';
-}
+    function toggleWsFields() {
+      const net = document.getElementById('nodeNetwork').value;
+      document.getElementById('wsFields').style.display = net === 'ws' ? 'block' : 'none';
+    }
 
-async function saveNode() {
-  const id = document.getElementById('nodeId').value;
-  const type = document.getElementById('nodeType').value;
-  const data = {
-    name: document.getElementById('nodeName').value.trim(),
-    display_name: document.getElementById('nodeDisplayName').value.trim(),
-    type, server: document.getElementById('nodeServer').value.trim(),
-    port: parseInt(document.getElementById('nodePort').value),
-    sort_order: parseInt(document.getElementById('nodeSortOrder').value) || 0,
-    enabled: parseInt(document.getElementById('nodeEnabled').value),
-  };
-  if (type === 'vless-reality') {
-    data.pubkey = document.getElementById('nodePubkey').value.trim();
-    data.shortid = document.getElementById('nodeShortid').value.trim();
-    data.sni = document.getElementById('nodeSni').value.trim();
-    data.flow = document.getElementById('nodeFlow').value.trim();
-    data.fingerprint = document.getElementById('nodeFingerprint').value.trim();
-  } else {
-    data.alter_id = parseInt(document.getElementById('nodeAlterId').value) || 0;
-    data.cipher = document.getElementById('nodeCipher').value;
-    data.network = document.getElementById('nodeNetwork').value;
-    data.ws_path = document.getElementById('nodeWsPath').value.trim();
-    data.ws_host = document.getElementById('nodeWsHost').value.trim();
-    data.tls = parseInt(document.getElementById('nodeTls').value);
-    data.tls_sni = document.getElementById('nodeTlsSni').value.trim();
-    data.skip_cert = parseInt(document.getElementById('nodeSkipCert').value);
-  }
-  // 上游同步字段
-  data.api_host = document.getElementById('nodeApiHost').value.trim();
-  data.api_port = parseInt(document.getElementById('nodeApiPort').value) || 2088;
-  data.api_token = document.getElementById('nodeApiToken').value.trim();
-  data.has_upstream_api = parseInt(document.getElementById('nodeHasUpstreamApi').value);
-  if (!data.name || !data.display_name || !data.server || !data.port) { toast('请填写必填字段', 'error'); return; }
-  const r = await api(id ? 'PUT' : 'POST', id ? '/api/nodes/' + id : '/api/nodes', data);
-  if (r.ok) {
-    toast(id ? '节点已更新' : '节点已创建');
-    closeModal('nodeModal');
-    loadNodes();
-  }
-}
+    async function saveNode() {
+      const id = document.getElementById('nodeId').value;
+      const type = document.getElementById('nodeType').value;
+      const data = {
+        name: document.getElementById('nodeName').value.trim(),
+        display_name: document.getElementById('nodeDisplayName').value.trim(),
+        type, server: document.getElementById('nodeServer').value.trim(),
+        port: parseInt(document.getElementById('nodePort').value),
+        sort_order: parseInt(document.getElementById('nodeSortOrder').value) || 0,
+        enabled: parseInt(document.getElementById('nodeEnabled').value),
+      };
+      if (type === 'vless-reality') {
+        data.pubkey = document.getElementById('nodePubkey').value.trim();
+        data.shortid = document.getElementById('nodeShortid').value.trim();
+        data.sni = document.getElementById('nodeSni').value.trim();
+        data.flow = document.getElementById('nodeFlow').value.trim();
+        data.fingerprint = document.getElementById('nodeFingerprint').value.trim();
+      } else {
+        data.alter_id = parseInt(document.getElementById('nodeAlterId').value) || 0;
+        data.cipher = document.getElementById('nodeCipher').value;
+        data.network = document.getElementById('nodeNetwork').value;
+        data.ws_path = document.getElementById('nodeWsPath').value.trim();
+        data.ws_host = document.getElementById('nodeWsHost').value.trim();
+        data.tls = parseInt(document.getElementById('nodeTls').value);
+        data.tls_sni = document.getElementById('nodeTlsSni').value.trim();
+        data.skip_cert = parseInt(document.getElementById('nodeSkipCert').value);
+      }
+      // 上游同步字段
+      data.api_host = document.getElementById('nodeApiHost').value.trim();
+      data.api_port = parseInt(document.getElementById('nodeApiPort').value) || 2088;
+      data.api_token = document.getElementById('nodeApiToken').value.trim();
+      data.has_upstream_api = parseInt(document.getElementById('nodeHasUpstreamApi').value);
+      if (!data.name || !data.display_name || !data.server || !data.port) { toast('请填写必填字段', 'error'); return; }
+      const r = await api(id ? 'PUT' : 'POST', id ? '/api/nodes/' + id : '/api/nodes', data);
+      if (r.ok) {
+        toast(id ? '节点已更新' : '节点已创建');
+        closeModal('nodeModal');
+        loadNodes();
+      }
+    }
 
-async function delNode(id) {
-  const n = nodesCache.find(x => x.id === id);
-  if (!confirm('确认删除节点 "' + (n ? n.name : id) + '"？\n关联的 UUID 映射也会被删除。')) return;
-  const r = await api('DELETE', '/api/nodes/' + id);
-  if (r.ok) { toast('节点已删除'); loadNodes(); }
-}
+    async function delNode(id) {
+      const n = nodesCache.find(x => x.id === id);
+      if (!confirm('确认删除节点 "' + (n ? n.name : id) + '"？\n关联的 UUID 映射也会被删除。')) return;
+      const r = await api('DELETE', '/api/nodes/' + id);
+      if (r.ok) { toast('节点已删除'); loadNodes(); }
+    }
 
-// ── Users (Admin) ─────────────────────────────────────────────
-async function loadUsers() {
-  const r = await api('GET', '/api/users');
-  if (!r.ok) return;
-  usersCache = r.data;
-  const tb = document.getElementById('usersTbody');
-  if (r.data.length === 0) { tb.innerHTML = '<tr><td colspan="8" class="empty">暂无用户</td></tr>'; }
-  else {
-    tb.innerHTML = r.data.map(u => {
-      const subUrl = location.origin + '/sub/' + u.token;
-      return `
+    // ── Users (Admin) ─────────────────────────────────────────────
+    async function loadUsers() {
+      const r = await api('GET', '/api/users');
+      if (!r.ok) return;
+      usersCache = r.data;
+      const tb = document.getElementById('usersTbody');
+      if (r.data.length === 0) { tb.innerHTML = '<tr><td colspan="8" class="empty">暂无用户</td></tr>'; }
+      else {
+        tb.innerHTML = r.data.map(u => {
+          const subUrl = location.origin + '/sub/' + u.token;
+          return `
       <tr>
         <td>${u.id}</td>
         <td class="mono">${esc(u.name)}</td>
@@ -1152,127 +1972,134 @@ async function loadUsers() {
         <td>${u.enabled ? '<span class="badge green">启用</span>' : '<span class="badge red">禁用</span>'}</td>
         <td>
           <button class="btn btn-gray btn-sm" onclick="openUserModal(${u.id})">编辑</button>
-          <button class="btn btn-gray btn-sm" onclick="toggleUser(${u.id},${u.enabled?0:1})">${u.enabled?'禁用':'启用'}</button>
+          <button class="btn btn-gray btn-sm" onclick="toggleUser(${u.id},${u.enabled ? 0 : 1})">${u.enabled ? '禁用' : '启用'}</button>
           <button class="btn btn-red btn-sm" onclick="delUser(${u.id})">删除</button>
         </td>
       </tr>`;
-    }).join('');
-  }
-  document.getElementById('statUsersTotal').textContent = r.data.length;
-  document.getElementById('statUsersEnabled').textContent = r.data.filter(u => u.enabled).length;
-  document.getElementById('statUsersAdmin').textContent = r.data.filter(u => u.role === 'admin').length;
-}
-
-function openUserModal(id) {
-  const modal = document.getElementById('userModal');
-  if (id) {
-    const u = usersCache.find(x => x.id === id);
-    if (!u) return;
-    document.getElementById('userModalTitle').textContent = '编辑用户';
-    document.getElementById('userName').value = u.name;
-    document.getElementById('userUsername').value = u.username || '';
-    document.getElementById('userRole').value = u.role || 'user';
-    document.getElementById('userNote').value = u.note || '';
-    const pwField = document.getElementById('userPasswordField');
-    pwField.querySelector('label').textContent = '密码（留空不修改）';
-    document.getElementById('userPassword').value = '';
-    modal.dataset.editId = id;
-  } else {
-    document.getElementById('userModalTitle').textContent = '新增用户';
-    ['userName','userUsername','userNote','userPassword'].forEach(f => document.getElementById(f).value = '');
-    document.getElementById('userRole').value = 'user';
-    const pwField = document.getElementById('userPasswordField');
-    pwField.querySelector('label').textContent = '密码 *';
-    delete modal.dataset.editId;
-  }
-  modal.classList.add('show');
-}
-
-async function saveUser() {
-  const modal = document.getElementById('userModal');
-  const editId = modal.dataset.editId;
-  const name = document.getElementById('userName').value.trim();
-  const username = document.getElementById('userUsername').value.replace(/\s+/g, '');
-  const role = document.getElementById('userRole').value;
-  const note = document.getElementById('userNote').value.trim();
-  const password = document.getElementById('userPassword').value;
-
-  if (!name) { toast('请填写显示名称', 'error'); return; }
-  if (!username) { toast('请填写用户名', 'error'); return; }
-  if (username.length < 3) { toast('用户名至少 3 个字符', 'error'); return; }
-
-  if (editId) {
-    const data = { name, username, role, note };
-    if (password) {
-      if (password.length < 6) { toast('密码至少 6 个字符', 'error'); return; }
-      data.password = password;
+        }).join('');
+      }
+      document.getElementById('statUsersTotal').textContent = r.data.length;
+      document.getElementById('statUsersEnabled').textContent = r.data.filter(u => u.enabled).length;
+      document.getElementById('statUsersAdmin').textContent = r.data.filter(u => u.role === 'admin').length;
     }
-    const r = await api('PUT', '/api/users/' + editId, data);
-    if (r.ok) { toast('用户已更新'); closeModal('userModal'); loadUsers(); }
-  } else {
-    if (!password || password.length < 6) { toast('密码至少 6 个字符', 'error'); return; }
-    const r = await api('POST', '/api/users', { name, username, password, role, note });
-    if (r.ok) { toast('用户已创建'); closeModal('userModal'); loadUsers(); }
-  }
-}
 
-async function toggleUser(id, enabled) {
-  const r = await api('PUT', '/api/users/' + id, { enabled });
-  if (r.ok) { toast(enabled ? '已启用' : '已禁用'); loadUsers(); }
-}
+    function openUserModal(id) {
+      const modal = document.getElementById('userModal');
+      if (id) {
+        const u = usersCache.find(x => x.id === id);
+        if (!u) return;
+        document.getElementById('userModalTitle').textContent = '编辑用户';
+        document.getElementById('userName').value = u.name;
+        document.getElementById('userUsername').value = u.username || '';
+        document.getElementById('userRole').value = u.role || 'user';
+        document.getElementById('userNote').value = u.note || '';
+        const pwField = document.getElementById('userPasswordField');
+        pwField.querySelector('label').textContent = '密码（留空不修改）';
+        document.getElementById('userPassword').value = '';
+        modal.dataset.editId = id;
+      } else {
+        document.getElementById('userModalTitle').textContent = '新增用户';
+        ['userName', 'userUsername', 'userNote', 'userPassword'].forEach(f => document.getElementById(f).value = '');
+        document.getElementById('userRole').value = 'user';
+        const pwField = document.getElementById('userPasswordField');
+        pwField.querySelector('label').textContent = '密码 *';
+        delete modal.dataset.editId;
+      }
+      modal.classList.add('show');
+    }
 
-async function delUser(id) {
-  const u = usersCache.find(x => x.id === id);
-  if (!confirm('确认删除用户 "' + (u ? u.name : id) + '"？')) return;
-  const r = await api('DELETE', '/api/users/' + id);
-  if (r.ok) { toast('用户已删除'); loadUsers(); }
-}
+    async function saveUser() {
+      const modal = document.getElementById('userModal');
+      const editId = modal.dataset.editId;
+      const name = document.getElementById('userName').value.trim();
+      const username = document.getElementById('userUsername').value.replace(/\s+/g, '');
+      const role = document.getElementById('userRole').value;
+      const note = document.getElementById('userNote').value.trim();
+      const password = document.getElementById('userPassword').value;
 
-// ── Mappings (Admin) ──────────────────────────────────────────
-function loadUsersForSelect() {
-  const sel = document.getElementById('mapUserSelect');
-  sel.innerHTML = '<option value="">-- 选择用户 --</option>' + usersCache.map(u => `<option value="${u.id}">${esc(u.name)}</option>`).join('');
-}
+      if (!name) { toast('请填写显示名称', 'error'); return; }
+      if (!username) { toast('请填写用户名', 'error'); return; }
+      if (username.length < 3) { toast('用户名至少 3 个字符', 'error'); return; }
 
-async function loadMappings() {
-  const userId = document.getElementById('mapUserSelect').value;
-  const tb = document.getElementById('mappingsTbody');
-  if (!userId) { tb.innerHTML = ''; return; }
-  const r = await api('GET', '/api/mappings/' + userId);
-  if (!r.ok) return;
-  if (r.data.length === 0) { tb.innerHTML = '<tr><td colspan="6" class="empty">暂无映射，点击"批量分配"自动生成</td></tr>'; return; }
-  tb.innerHTML = r.data.map(m => `
+      if (editId) {
+        const data = { name, username, role, note };
+        if (password) {
+          if (password.length < 6) { toast('密码至少 6 个字符', 'error'); return; }
+          data.password = password;
+        }
+        const r = await api('PUT', '/api/users/' + editId, data);
+        if (r.ok) { toast('用户已更新'); closeModal('userModal'); loadUsers(); }
+      } else {
+        if (!password || password.length < 6) { toast('密码至少 6 个字符', 'error'); return; }
+        const r = await api('POST', '/api/users', { name, username, password, role, note });
+        if (r.ok) { toast('用户已创建'); closeModal('userModal'); loadUsers(); }
+      }
+    }
+
+    async function toggleUser(id, enabled) {
+      const r = await api('PUT', '/api/users/' + id, { enabled });
+      if (r.ok) { toast(enabled ? '已启用' : '已禁用'); loadUsers(); }
+    }
+
+    async function delUser(id) {
+      const u = usersCache.find(x => x.id === id);
+      if (!confirm('确认删除用户 "' + (u ? u.name : id) + '"？')) return;
+      const r = await api('DELETE', '/api/users/' + id);
+      if (r.ok) { toast('用户已删除'); loadUsers(); }
+    }
+
+    // ── Mappings (Admin) ──────────────────────────────────────────
+    function loadUsersForSelect() {
+      const sel = document.getElementById('mapUserSelect');
+      sel.innerHTML = '<option value="">-- 选择用户 --</option>' + usersCache.map(u => `<option value="${u.id}">${esc(u.name)}</option>`).join('');
+    }
+
+    async function loadMappings() {
+      const userId = document.getElementById('mapUserSelect').value;
+      const tb = document.getElementById('mappingsTbody');
+      if (!userId) { tb.innerHTML = ''; return; }
+      const r = await api('GET', '/api/mappings/' + userId);
+      if (!r.ok) return;
+      if (r.data.length === 0) { tb.innerHTML = '<tr><td colspan="7" class="empty">暂无映射，点击“批量分配”自动生成</td></tr>'; return; }
+      tb.innerHTML = r.data.map(m => `
     <tr>
       <td class="mono">${esc(m.node_name)}</td>
       <td>${esc(m.display_name)}</td>
-      <td><span class="badge ${m.type==='vless-reality'?'blue':'gray'}">${m.type}</span></td>
+      <td><span class="badge ${m.type === 'vless-reality' ? 'blue' : 'gray'}">${m.type}</span></td>
       <td class="mono" style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="${esc(m.uuid)}">${esc(m.uuid)}</td>
       <td>${m.node_enabled ? '<span class="badge green">启用</span>' : '<span class="badge red">禁用</span>'}</td>
+      <td><label class="switch" title="${m.enabled ? '点击禁用该映射' : '点击启用该映射'}"><input type="checkbox" ${m.enabled ? 'checked' : ''} onchange="toggleMapping(${userId},${m.node_id},this.checked?1:0)"><span class="slider"></span></label></td>
       <td><button class="btn btn-red btn-sm" onclick="delMapping(${userId},${m.node_id})">删除</button></td>
     </tr>`).join('');
-}
+    }
 
-async function bulkMap() {
-  const userId = parseInt(document.getElementById('mapUserSelect').value);
-  if (!userId) { toast('请先选择用户', 'error'); return; }
-  const r = await api('POST', '/api/mappings/' + userId + '/bulk');
-  if (r.ok) { toast('已为 ' + r.data.total + ' 个节点分配 UUID'); loadMappings(); }
-}
+    async function bulkMap() {
+      const userId = parseInt(document.getElementById('mapUserSelect').value);
+      if (!userId) { toast('请先选择用户', 'error'); return; }
+      const r = await api('POST', '/api/mappings/' + userId + '/bulk');
+      if (r.ok) { toast('已为 ' + r.data.total + ' 个节点分配 UUID'); loadMappings(); }
+    }
 
-async function delMapping(userId, nodeId) {
-  const r = await api('DELETE', `/api/mappings/${userId}/${nodeId}`);
-  if (r.ok) { toast('映射已删除'); loadMappings(); }
-}
+    async function delMapping(userId, nodeId) {
+      const r = await api('DELETE', `/api/mappings/${userId}/${nodeId}`);
+      if (r.ok) { toast('映射已删除'); loadMappings(); }
+    }
 
-// ── Templates (Admin) ─────────────────────────────────────────
-async function loadTemplates() {
-  const r = await api('GET', '/api/templates');
-  if (!r.ok) return;
-  templatesCache = r.data;
-  const tb = document.getElementById('tplTbody');
-  if (r.data.length === 0) { tb.innerHTML = '<tr><td colspan="6" class="empty">暂无模板</td></tr>'; }
-  else {
-    tb.innerHTML = r.data.map(t => `
+    async function toggleMapping(userId, nodeId, enabled) {
+      const r = await api('PATCH', `/api/mappings/${userId}/${nodeId}`, { enabled });
+      if (r.ok) { toast(enabled ? '映射已启用' : '映射已禁用'); loadMappings(); }
+      else loadMappings();
+    }
+
+    // ── Templates (Admin) ─────────────────────────────────────────
+    async function loadTemplates() {
+      const r = await api('GET', '/api/templates');
+      if (!r.ok) return;
+      templatesCache = r.data;
+      const tb = document.getElementById('tplTbody');
+      if (r.data.length === 0) { tb.innerHTML = '<tr><td colspan="6" class="empty">暂无模板</td></tr>'; }
+      else {
+        tb.innerHTML = r.data.map(t => `
       <tr>
         <td>${t.id}</td>
         <td class="mono">${esc(t.name)}</td>
@@ -1284,64 +2111,64 @@ async function loadTemplates() {
           <button class="btn btn-red btn-sm" onclick="delTpl(${t.id})">删除</button>
         </td>
       </tr>`).join('');
-  }
-}
+      }
+    }
 
-function openTplModal(id) {
-  const modal = document.getElementById('tplModal');
-  if (id) {
-    const t = templatesCache.find(x => x.id === id);
-    if (!t) return;
-    document.getElementById('tplModalTitle').textContent = '编辑模板';
-    document.getElementById('tplId').value = t.id;
-    document.getElementById('tplName').value = t.name;
-    document.getElementById('tplDesc').value = t.description || '';
-    document.getElementById('tplEnabled').value = String(t.enabled);
-    api('GET', '/api/templates/' + t.id).then(r => {
-      if (r.ok) document.getElementById('tplContent').value = r.data.content || '';
-    });
-  } else {
-    document.getElementById('tplModalTitle').textContent = '新增模板';
-    document.getElementById('tplId').value = '';
-    document.getElementById('tplName').value = '';
-    document.getElementById('tplDesc').value = '';
-    document.getElementById('tplEnabled').value = '1';
-    document.getElementById('tplContent').value = '';
-  }
-  modal.classList.add('show');
-}
+    function openTplModal(id) {
+      const modal = document.getElementById('tplModal');
+      if (id) {
+        const t = templatesCache.find(x => x.id === id);
+        if (!t) return;
+        document.getElementById('tplModalTitle').textContent = '编辑模板';
+        document.getElementById('tplId').value = t.id;
+        document.getElementById('tplName').value = t.name;
+        document.getElementById('tplDesc').value = t.description || '';
+        document.getElementById('tplEnabled').value = String(t.enabled);
+        api('GET', '/api/templates/' + t.id).then(r => {
+          if (r.ok) document.getElementById('tplContent').value = r.data.content || '';
+        });
+      } else {
+        document.getElementById('tplModalTitle').textContent = '新增模板';
+        document.getElementById('tplId').value = '';
+        document.getElementById('tplName').value = '';
+        document.getElementById('tplDesc').value = '';
+        document.getElementById('tplEnabled').value = '1';
+        document.getElementById('tplContent').value = '';
+      }
+      modal.classList.add('show');
+    }
 
-async function saveTpl() {
-  const id = document.getElementById('tplId').value;
-  const data = {
-    name: document.getElementById('tplName').value.trim(),
-    description: document.getElementById('tplDesc').value.trim(),
-    content: document.getElementById('tplContent').value,
-    enabled: parseInt(document.getElementById('tplEnabled').value),
-  };
-  if (!data.name || !data.content) { toast('请填写名称和内容', 'error'); return; }
-  const r = await api(id ? 'PUT' : 'POST', id ? '/api/templates/' + id : '/api/templates', data);
-  if (r.ok) { toast(id ? '模板已更新' : '模板已创建'); closeModal('tplModal'); loadTemplates(); }
-}
+    async function saveTpl() {
+      const id = document.getElementById('tplId').value;
+      const data = {
+        name: document.getElementById('tplName').value.trim(),
+        description: document.getElementById('tplDesc').value.trim(),
+        content: document.getElementById('tplContent').value,
+        enabled: parseInt(document.getElementById('tplEnabled').value),
+      };
+      if (!data.name || !data.content) { toast('请填写名称和内容', 'error'); return; }
+      const r = await api(id ? 'PUT' : 'POST', id ? '/api/templates/' + id : '/api/templates', data);
+      if (r.ok) { toast(id ? '模板已更新' : '模板已创建'); closeModal('tplModal'); loadTemplates(); }
+    }
 
-async function delTpl(id) {
-  const t = templatesCache.find(x => x.id === id);
-  if (!confirm('确认删除模板 "' + (t ? t.name : id) + '"？')) return;
-  const r = await api('DELETE', '/api/templates/' + id);
-  if (r.ok) { toast('模板已删除'); loadTemplates(); }
-}
+    async function delTpl(id) {
+      const t = templatesCache.find(x => x.id === id);
+      if (!confirm('确认删除模板 "' + (t ? t.name : id) + '"？')) return;
+      const r = await api('DELETE', '/api/templates/' + id);
+      if (r.ok) { toast('模板已删除'); loadTemplates(); }
+    }
 
-// ── Invite Codes (Admin) ─────────────────────────────────────
-let codesCache = [];
+    // ── Invite Codes (Admin) ─────────────────────────────────────
+    let codesCache = [];
 
-async function loadInviteCodes() {
-  const r = await api('GET', '/api/invite-codes');
-  if (!r.ok) return;
-  codesCache = r.data.codes;
-  const tb = document.getElementById('codesTbody');
-  if (codesCache.length === 0) { tb.innerHTML = '<tr><td colspan="6" class="empty">暂无邀请码</td></tr>'; }
-  else {
-    tb.innerHTML = codesCache.map(c => `
+    async function loadInviteCodes() {
+      const r = await api('GET', '/api/invite-codes');
+      if (!r.ok) return;
+      codesCache = r.data.codes;
+      const tb = document.getElementById('codesTbody');
+      if (codesCache.length === 0) { tb.innerHTML = '<tr><td colspan="6" class="empty">暂无邀请码</td></tr>'; }
+      else {
+        tb.innerHTML = codesCache.map(c => `
       <tr>
         <td>${c.id}</td>
         <td class="mono" style="cursor:pointer" onclick="copyText('${c.code}')" title="点击复制">${esc(c.code)}</td>
@@ -1350,260 +2177,261 @@ async function loadInviteCodes() {
         <td class="mono">${esc(c.used_at || '-')}</td>
         <td class="mono">${esc(c.created_at)}</td>
       </tr>`).join('');
-  }
-  document.getElementById('statCodesTotal').textContent = r.data.stats.total;
-  document.getElementById('statCodesUsed').textContent = r.data.stats.used;
-  document.getElementById('statCodesAvail').textContent = r.data.stats.available;
-}
+      }
+      document.getElementById('statCodesTotal').textContent = r.data.stats.total;
+      document.getElementById('statCodesUsed').textContent = r.data.stats.used;
+      document.getElementById('statCodesAvail').textContent = r.data.stats.available;
+    }
 
-async function genCodes() {
-  const count = parseInt(document.getElementById('genCount').value) || 10;
-  const r = await api('POST', '/api/invite-codes', { count });
-  if (r.ok) { toast('已生成 ' + r.data.created + ' 个邀请码'); loadInviteCodes(); }
-}
+    async function genCodes() {
+      const count = parseInt(document.getElementById('genCount').value) || 10;
+      const r = await api('POST', '/api/invite-codes', { count });
+      if (r.ok) { toast('已生成 ' + r.data.created + ' 个邀请码'); loadInviteCodes(); }
+    }
 
-function copyAllCodes() {
-  const available = codesCache.filter(c => !c.used_by).map(c => c.code);
-  if (available.length === 0) { toast('没有可用邀请码', 'error'); return; }
-  copyText(available.join('\n'));
-}
+    function copyAllCodes() {
+      const available = codesCache.filter(c => !c.used_by).map(c => c.code);
+      if (available.length === 0) { toast('没有可用邀请码', 'error'); return; }
+      copyText(available.join('\n'));
+    }
 
-// ── My Subscription (User) ────────────────────────────────────
-let myTemplatesCache = [];
+    // ── My Subscription (User) ────────────────────────────────────
+    let myTemplatesCache = [];
 
-async function loadMySubscription() {
-  const r = await api('GET', '/api/me/subscription');
-  if (!r.ok) return;
-  const data = r.data;
+    async function loadMySubscription() {
+      const r = await api('GET', '/api/me/subscription');
+      if (!r.ok) return;
+      const data = r.data;
 
-  const fullSubUrl = location.origin + data.subscriptionUrl;
-  document.getElementById('mySubUrl').textContent = fullSubUrl;
-  myToken = data.token;
-  myNodesCache = data.nodes;
-  myTemplatesCache = data.templates;
+      const fullSubUrl = location.origin + data.subscriptionUrl;
+      document.getElementById('mySubUrl').textContent = fullSubUrl;
+      myToken = data.token;
+      myNodesCache = data.nodes;
+      myTemplatesCache = data.templates;
 
-  const sel = document.getElementById('myTplSelect');
-  if (data.templates.length === 0) {
-    sel.innerHTML = '<option value="">暂无可用模板</option>';
-    document.getElementById('myTplDesc').textContent = '请联系管理员添加模板';
-  } else {
-    sel.innerHTML = data.templates.map(t => `<option value="${esc(t.name)}">${esc(t.name)}</option>`).join('');
-  }
-  onTemplateChange();
+      const sel = document.getElementById('myTplSelect');
+      if (data.templates.length === 0) {
+        sel.innerHTML = '<option value="">暂无可用模板</option>';
+        document.getElementById('myTplDesc').textContent = '请联系管理员添加模板';
+      } else {
+        sel.innerHTML = data.templates.map(t => `<option value="${esc(t.name)}">${esc(t.name)}</option>`).join('');
+      }
+      onTemplateChange();
 
-  const tb = document.getElementById('myNodesTbody');
-  if (data.nodes.length === 0) {
-    tb.innerHTML = '<tr><td colspan="5" class="empty">暂无已分配节点</td></tr>';
-  } else {
-    tb.innerHTML = data.nodes.map((n, i) => `
+      const tb = document.getElementById('myNodesTbody');
+      if (data.nodes.length === 0) {
+        tb.innerHTML = '<tr><td colspan="5" class="empty">暂无已分配节点</td></tr>';
+      } else {
+        tb.innerHTML = data.nodes.map((n, i) => `
       <tr style="cursor:pointer" onclick="showNodeDetailUser(event,${i})">
         <td class="mono">${esc(n.name)}</td>
         <td>${esc(n.display_name)}</td>
-        <td><span class="badge ${n.type==='vless-reality'?'blue':'gray'}">${n.type}</span></td>
+        <td><span class="badge ${n.type === 'vless-reality' ? 'blue' : 'gray'}">${n.type}</span></td>
         <td class="mono">${esc(n.server)}</td>
         <td>${n.port}</td>
       </tr>`).join('');
-  }
-}
-
-function onTemplateChange() {
-  const sel = document.getElementById('myTplSelect');
-  const tplName = sel.value;
-  const tpl = myTemplatesCache.find(t => t.name === tplName);
-  const urlEl = document.getElementById('myExportUrl');
-  const nameEl = document.getElementById('myTplName');
-  const descEl = document.getElementById('myTplDesc');
-
-  if (!tplName || !myToken) {
-    urlEl.textContent = '请选择模板';
-    nameEl.textContent = '-';
-    if (!descEl.textContent) descEl.textContent = '';
-    return;
-  }
-  urlEl.textContent = location.origin + '/sub/' + myToken + '/' + tplName + '/full';
-  nameEl.textContent = tplName;
-  descEl.textContent = tpl ? (tpl.description || '无描述') : '';
-}
-
-async function downloadYaml(type) {
-  if (!myToken) { toast('订阅未加载', 'error'); return; }
-  let url;
-  if (type === 'sub') {
-    url = location.origin + '/sub/' + myToken;
-  } else {
-    const tplName = document.getElementById('myTplSelect').value;
-    if (!tplName) { toast('请先选择模板', 'error'); return; }
-    url = location.origin + '/sub/' + myToken + '/' + tplName + '/full';
-  }
-  try {
-    const resp = await fetch(url);
-    const text = await resp.text();
-    if (!resp.ok) { toast('下载失败: ' + text, 'error'); return; }
-    const blob = new Blob([text], { type: 'text/yaml;charset=utf-8' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = type === 'sub' ? 'proxies.yaml' : 'clash-config.yaml';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(a.href);
-    toast('YAML 已下载');
-  } catch (e) {
-    toast('下载失败: ' + e.message, 'error');
-  }
-}
-
-async function previewYaml() {
-  if (!myToken) { toast('订阅未加载', 'error'); return; }
-  const tplName = document.getElementById('myTplSelect').value;
-  if (!tplName) { toast('请先选择模板', 'error'); return; }
-  const url = location.origin + '/sub/' + myToken + '/' + tplName + '/full';
-  try {
-    const resp = await fetch(url);
-    const text = await resp.text();
-    if (!resp.ok) { toast('预览失败: ' + text, 'error'); return; }
-    document.getElementById('yamlPreviewContent').textContent = text;
-    document.getElementById('yamlPreviewModal').classList.add('show');
-  } catch (e) {
-    toast('预览失败: ' + e.message, 'error');
-  }
-}
-
-// ── Utils ──────────────────────────────────────────────────────
-function closeModal(id) { document.getElementById(id).classList.remove('show'); }
-function copyText(text) {
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).then(() => toast('已复制到剪贴板')).catch(() => fallbackCopy(text));
-  } else {
-    fallbackCopy(text);
-  }
-}
-function fallbackCopy(text) {
-  const el = document.createElement('textarea');
-  el.value = text; document.body.appendChild(el);
-  el.select(); try { document.execCommand('copy'); } catch {}
-  document.body.removeChild(el);
-  toast('已复制到剪贴板');
-}
-// 点击 modal 遮罩层关闭弹窗
-document.querySelectorAll('.modal-overlay').forEach(m => {
-  m.addEventListener('click', e => { if (e.target === m) m.classList.remove('show'); });
-});
-
-// ── Help Tabs ────────────────────────────────────────────────
-function showHelpTab(name, el) {
-  document.querySelectorAll('.help-tab').forEach(t => t.classList.remove('active'));
-  document.querySelectorAll('.help-pane').forEach(p => p.classList.remove('active'));
-  el.classList.add('active');
-  document.getElementById('help-' + name).classList.add('active');
-}
-
-// ── Node Detail Popover ──────────────────────────────────────
-function showNodeDetail(event, nodeId) {
-  const n = nodesCache.find(x => x.id === nodeId);
-  if (!n) return;
-  const rows = [
-    ['名称', n.name, true],
-    ['显示名', n.display_name, false],
-    ['类型', n.type, false],
-    ['服务器', n.server, true],
-    ['端口', n.port, false],
-    ['状态', n.enabled ? '启用' : '禁用', false],
-    ['排序', n.sort_order, false],
-  ];
-  if (n.type === 'vless-reality') {
-    rows.push(['Public Key', n.pubkey || '-', true]);
-    rows.push(['Short ID', n.shortid || '-', true]);
-    rows.push(['SNI', n.sni || '-', true]);
-    rows.push(['Flow', n.flow || '-', false]);
-    rows.push(['Fingerprint', n.fingerprint || '-', false]);
-  } else {
-    rows.push(['Alter ID', n.alter_id, false]);
-    rows.push(['Cipher', n.cipher || '-', false]);
-    rows.push(['Network', n.network || '-', false]);
-    if (n.network === 'ws') {
-      rows.push(['WS Path', n.ws_path || '-', true]);
-      rows.push(['WS Host', n.ws_host || '-', true]);
+      }
     }
-    rows.push(['TLS', n.tls ? '是' : '否', false]);
-    if (n.tls) rows.push(['TLS SNI', n.tls_sni || '-', true]);
-    rows.push(['跳过证书', n.skip_cert ? '是' : '否', false]);
-  }
-  const html = rows.map(([k, v, mono]) =>
-    `<div class="detail-row"><span class="dk">${esc(k)}</span><span class="dv${mono ? ' mono' : ''}">${esc(v)}</span></div>`
-  ).join('');
-  showPopover(event, n.display_name || n.name, html);
-}
 
-function showNodeDetailUser(event, idx) {
-  const n = myNodesCache[idx];
-  if (!n) return;
-  const rows = [
-    ['名称', n.name, true],
-    ['显示名', n.display_name, false],
-    ['类型', n.type, false],
-    ['服务器', n.server, true],
-    ['端口', n.port, false],
-  ];
-  const html = rows.map(([k, v, mono]) =>
-    `<div class="detail-row"><span class="dk">${esc(k)}</span><span class="dv${mono ? ' mono' : ''}">${esc(v)}</span></div>`
-  ).join('');
-  showPopover(event, n.display_name || n.name, html);
-}
+    function onTemplateChange() {
+      const sel = document.getElementById('myTplSelect');
+      const tplName = sel.value;
+      const tpl = myTemplatesCache.find(t => t.name === tplName);
+      const urlEl = document.getElementById('myExportUrl');
+      const nameEl = document.getElementById('myTplName');
+      const descEl = document.getElementById('myTplDesc');
 
-function showPopover(event, title, bodyHtml) {
-  const popover = document.getElementById('nodePopover');
-  const overlay = document.getElementById('popoverOverlay');
-  document.getElementById('popoverTitle').textContent = title;
-  document.getElementById('popoverBody').innerHTML = bodyHtml;
-  popover.classList.add('show');
-  overlay.classList.add('show');
-  const x = event.clientX;
-  const y = event.clientY;
-  const pw = 420, ph = 400;
-  let px = x + 12;
-  let py = y + 12;
-  if (px + pw > window.innerWidth) px = x - pw - 12;
-  if (py + ph > window.innerHeight) py = window.innerHeight - ph - 12;
-  if (py < 12) py = 12;
-  popover.style.left = px + 'px';
-  popover.style.top = py + 'px';
-}
+      if (!tplName || !myToken) {
+        urlEl.textContent = '请选择模板';
+        nameEl.textContent = '-';
+        if (!descEl.textContent) descEl.textContent = '';
+        return;
+      }
+      urlEl.textContent = location.origin + '/sub/' + myToken + '/' + tplName + '/full';
+      nameEl.textContent = tplName;
+      descEl.textContent = tpl ? (tpl.description || '无描述') : '';
+    }
 
-function hidePopover() {
-  document.getElementById('nodePopover').classList.remove('show');
-  document.getElementById('popoverOverlay').classList.remove('show');
-}
+    async function downloadYaml(type) {
+      if (!myToken) { toast('订阅未加载', 'error'); return; }
+      let url;
+      if (type === 'sub') {
+        url = location.origin + '/sub/' + myToken;
+      } else {
+        const tplName = document.getElementById('myTplSelect').value;
+        if (!tplName) { toast('请先选择模板', 'error'); return; }
+        url = location.origin + '/sub/' + myToken + '/' + tplName + '/full';
+      }
+      try {
+        const resp = await fetch(url);
+        const text = await resp.text();
+        if (!resp.ok) { toast('下载失败: ' + text, 'error'); return; }
+        const blob = new Blob([text], { type: 'text/yaml;charset=utf-8' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = type === 'sub' ? 'proxies.yaml' : 'clash-config.yaml';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(a.href);
+        toast('YAML 已下载');
+      } catch (e) {
+        toast('下载失败: ' + e.message, 'error');
+      }
+    }
 
-document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') {
-    hidePopover();
-    document.querySelectorAll('.modal-overlay.show').forEach(m => m.classList.remove('show'));
-  }
-});
+    async function previewYaml() {
+      if (!myToken) { toast('订阅未加载', 'error'); return; }
+      const tplName = document.getElementById('myTplSelect').value;
+      if (!tplName) { toast('请先选择模板', 'error'); return; }
+      const url = location.origin + '/sub/' + myToken + '/' + tplName + '/full';
+      try {
+        const resp = await fetch(url);
+        const text = await resp.text();
+        if (!resp.ok) { toast('预览失败: ' + text, 'error'); return; }
+        document.getElementById('yamlPreviewContent').textContent = text;
+        document.getElementById('yamlPreviewModal').classList.add('show');
+      } catch (e) {
+        toast('预览失败: ' + e.message, 'error');
+      }
+    }
 
-// ── URL routing for verify / reset-password ──────────────────
-(function() {
-  const path = window.location.pathname;
-  const params = new URLSearchParams(window.location.search);
-  if (path === '/verify') {
-    const token = params.get('token');
-    if (token) { doVerify(token); return; }
-  } else if (path === '/reset-password') {
-    const token = params.get('token');
-    if (token) { showReset(token); return; }
-  }
-  // ── Auto login if session exists ────────────────────────────
-  if (sessionToken) {
-  fetch('/api/auth/me', { headers: { 'Authorization': 'Bearer ' + sessionToken } })
-    .then(r => r.json())
-    .then(data => {
-      if (data.id) { currentUser = data; init(); }
-      else { sessionToken = ''; localStorage.removeItem(TOKEN_KEY); }
-    })
-    .catch(() => { sessionToken = ''; localStorage.removeItem(TOKEN_KEY); });
-  }
-})();
-</script>
+    // ── Utils ──────────────────────────────────────────────────────
+    function closeModal(id) { document.getElementById(id).classList.remove('show'); }
+    function copyText(text) {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(() => toast('已复制到剪贴板')).catch(() => fallbackCopy(text));
+      } else {
+        fallbackCopy(text);
+      }
+    }
+    function fallbackCopy(text) {
+      const el = document.createElement('textarea');
+      el.value = text; document.body.appendChild(el);
+      el.select(); try { document.execCommand('copy'); } catch { }
+      document.body.removeChild(el);
+      toast('已复制到剪贴板');
+    }
+    // 点击 modal 遮罩层关闭弹窗
+    document.querySelectorAll('.modal-overlay').forEach(m => {
+      m.addEventListener('click', e => { if (e.target === m) m.classList.remove('show'); });
+    });
+
+    // ── Help Tabs ────────────────────────────────────────────────
+    function showHelpTab(name, el) {
+      document.querySelectorAll('.help-tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.help-pane').forEach(p => p.classList.remove('active'));
+      el.classList.add('active');
+      document.getElementById('help-' + name).classList.add('active');
+    }
+
+    // ── Node Detail Popover ──────────────────────────────────────
+    function showNodeDetail(event, nodeId) {
+      const n = nodesCache.find(x => x.id === nodeId);
+      if (!n) return;
+      const rows = [
+        ['名称', n.name, true],
+        ['显示名', n.display_name, false],
+        ['类型', n.type, false],
+        ['服务器', n.server, true],
+        ['端口', n.port, false],
+        ['状态', n.enabled ? '启用' : '禁用', false],
+        ['排序', n.sort_order, false],
+      ];
+      if (n.type === 'vless-reality') {
+        rows.push(['Public Key', n.pubkey || '-', true]);
+        rows.push(['Short ID', n.shortid || '-', true]);
+        rows.push(['SNI', n.sni || '-', true]);
+        rows.push(['Flow', n.flow || '-', false]);
+        rows.push(['Fingerprint', n.fingerprint || '-', false]);
+      } else {
+        rows.push(['Alter ID', n.alter_id, false]);
+        rows.push(['Cipher', n.cipher || '-', false]);
+        rows.push(['Network', n.network || '-', false]);
+        if (n.network === 'ws') {
+          rows.push(['WS Path', n.ws_path || '-', true]);
+          rows.push(['WS Host', n.ws_host || '-', true]);
+        }
+        rows.push(['TLS', n.tls ? '是' : '否', false]);
+        if (n.tls) rows.push(['TLS SNI', n.tls_sni || '-', true]);
+        rows.push(['跳过证书', n.skip_cert ? '是' : '否', false]);
+      }
+      const html = rows.map(([k, v, mono]) =>
+        `<div class="detail-row"><span class="dk">${esc(k)}</span><span class="dv${mono ? ' mono' : ''}">${esc(v)}</span></div>`
+      ).join('');
+      showPopover(event, n.display_name || n.name, html);
+    }
+
+    function showNodeDetailUser(event, idx) {
+      const n = myNodesCache[idx];
+      if (!n) return;
+      const rows = [
+        ['名称', n.name, true],
+        ['显示名', n.display_name, false],
+        ['类型', n.type, false],
+        ['服务器', n.server, true],
+        ['端口', n.port, false],
+      ];
+      const html = rows.map(([k, v, mono]) =>
+        `<div class="detail-row"><span class="dk">${esc(k)}</span><span class="dv${mono ? ' mono' : ''}">${esc(v)}</span></div>`
+      ).join('');
+      showPopover(event, n.display_name || n.name, html);
+    }
+
+    function showPopover(event, title, bodyHtml) {
+      const popover = document.getElementById('nodePopover');
+      const overlay = document.getElementById('popoverOverlay');
+      document.getElementById('popoverTitle').textContent = title;
+      document.getElementById('popoverBody').innerHTML = bodyHtml;
+      popover.classList.add('show');
+      overlay.classList.add('show');
+      const x = event.clientX;
+      const y = event.clientY;
+      const pw = 420, ph = 400;
+      let px = x + 12;
+      let py = y + 12;
+      if (px + pw > window.innerWidth) px = x - pw - 12;
+      if (py + ph > window.innerHeight) py = window.innerHeight - ph - 12;
+      if (py < 12) py = 12;
+      popover.style.left = px + 'px';
+      popover.style.top = py + 'px';
+    }
+
+    function hidePopover() {
+      document.getElementById('nodePopover').classList.remove('show');
+      document.getElementById('popoverOverlay').classList.remove('show');
+    }
+
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') {
+        hidePopover();
+        document.querySelectorAll('.modal-overlay.show').forEach(m => m.classList.remove('show'));
+      }
+    });
+
+    // ── URL routing for verify / reset-password ──────────────────
+    (function () {
+      const path = window.location.pathname;
+      const params = new URLSearchParams(window.location.search);
+      if (path === '/verify') {
+        const token = params.get('token');
+        if (token) { doVerify(token); return; }
+      } else if (path === '/reset-password') {
+        const token = params.get('token');
+        if (token) { showReset(token); return; }
+      }
+      // ── Auto login if session exists ────────────────────────────
+      if (sessionToken) {
+        fetch('/api/auth/me', { headers: { 'Authorization': 'Bearer ' + sessionToken } })
+          .then(r => r.json())
+          .then(data => {
+            if (data.id) { currentUser = data; init(); }
+            else { sessionToken = ''; localStorage.removeItem(TOKEN_KEY); }
+          })
+          .catch(() => { sessionToken = ''; localStorage.removeItem(TOKEN_KEY); });
+      }
+    })();
+  </script>
 </body>
+
 </html>

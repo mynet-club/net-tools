@@ -7,9 +7,12 @@
 'use strict';
 
 const http = require('http');
-const fs   = require('fs');
+const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
+
+// 版本号（与 package.json 保持一致）
+const VERSION = '1.5.2';
 
 const { config, requireAuth, requireAdmin } = require('./auth');
 const { apiResponse, parseBody } = require('./utils');
@@ -22,18 +25,18 @@ const isBundle = __dirname.includes('/usr/local/lib/') || __dirname.includes('\\
 const UI_DIR = isBundle ? path.join(__dirname, 'ui') : path.join(__dirname, '..', 'ui');
 
 // 路由模块
-const sub       = require('./routes/sub');
-const authRt    = require('./routes/auth');
-const me        = require('./routes/me');
-const users     = require('./routes/users');
-const nodes     = require('./routes/nodes');
-const mappings  = require('./routes/mappings');
+const sub = require('./routes/sub');
+const authRt = require('./routes/auth');
+const me = require('./routes/me');
+const users = require('./routes/users');
+const nodes = require('./routes/nodes');
+const mappings = require('./routes/mappings');
 const templates = require('./routes/templates');
-const register  = require('./routes/register');
+const register = require('./routes/register');
 const { getUserTraffic, syncAll } = require('./upstream-sync');
 
 // 初始化数据库（确保 schema 就绪）
-require('./db').db();
+const { initDb } = require('./db');
 
 // 初始化邮件模块配置
 mailer.init(config);
@@ -162,7 +165,7 @@ async function handleRequest(req, res) {
       }
       const a = requireAdmin(req);
       if (!a.ok) return apiResponse(res, a.code, { error: a.error });
-      if (method === 'PUT')    return templates.handleUpdate(req, res, id, json);
+      if (method === 'PUT') return templates.handleUpdate(req, res, id, json);
       if (method === 'DELETE') return templates.handleDelete(req, res, id);
     }
 
@@ -190,8 +193,8 @@ async function handleRequest(req, res) {
     const userMatch = pathname.match(/^\/api\/users\/(\d+)$/);
     if (userMatch) {
       const id = parseInt(userMatch[1]);
-      if (method === 'GET')   return users.handleGet(req, res, id);
-      if (method === 'PUT')   return users.handleUpdate(req, res, id, json);
+      if (method === 'GET') return users.handleGet(req, res, id);
+      if (method === 'PUT') return users.handleUpdate(req, res, id, json);
       if (method === 'DELETE') return users.handleDelete(req, res, id);
     }
 
@@ -209,8 +212,8 @@ async function handleRequest(req, res) {
     const nodeMatch = pathname.match(/^\/api\/nodes\/(\d+)$/);
     if (nodeMatch) {
       const id = parseInt(nodeMatch[1]);
-      if (method === 'GET')    return nodes.handleGet(req, res, id);
-      if (method === 'PUT')    return nodes.handleUpdate(req, res, id, json);
+      if (method === 'GET') return nodes.handleGet(req, res, id);
+      if (method === 'PUT') return nodes.handleUpdate(req, res, id, json);
       if (method === 'DELETE') return nodes.handleDelete(req, res, id);
     }
 
@@ -235,6 +238,10 @@ async function handleRequest(req, res) {
     const mapDelMatch = pathname.match(/^\/api\/mappings\/(\d+)\/(\d+)$/);
     if (method === 'DELETE' && mapDelMatch) {
       return mappings.handleDelete(req, res, parseInt(mapDelMatch[1]), parseInt(mapDelMatch[2]));
+    }
+    // PATCH /api/mappings/:userId/:nodeId
+    if (method === 'PATCH' && mapDelMatch) {
+      return mappings.handleToggle(req, res, parseInt(mapDelMatch[1]), parseInt(mapDelMatch[2]), json);
     }
 
     // ── Invite Codes（管理员）─────────────────────────────────
@@ -288,7 +295,7 @@ async function handleRequest(req, res) {
     const resolved = path.resolve(UI_DIR, pathname);
     if (resolved.startsWith(UI_DIR) && fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
       const ext = path.extname(resolved);
-      const ct = { '.html':'text/html', '.css':'text/css', '.js':'application/javascript', '.json':'application/json', '.png':'image/png', '.svg':'image/svg+xml' }[ext] || 'application/octet-stream';
+      const ct = { '.html': 'text/html', '.css': 'text/css', '.js': 'application/javascript', '.json': 'application/json', '.png': 'image/png', '.svg': 'image/svg+xml' }[ext] || 'application/octet-stream';
       res.writeHead(200, { 'Content-Type': ct, 'X-Content-Type-Options': 'nosniff' });
       return res.end(fs.readFileSync(resolved));
     }
@@ -314,8 +321,14 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.listen(config.port, config.host, () => {
-  console.log(`subserver listening on ${config.host}:${config.port}`);
+server.listen(config.port, config.host, async () => {
+  try {
+    await initDb();
+  } catch (e) {
+    console.error(`✗ 数据库初始化失败: ${e.message}`);
+    process.exit(1);
+  }
+  console.log(`subserver v${VERSION} listening on ${config.host}:${config.port}`);
   console.log(`  订阅: http://${config.host}:${config.port}/sub/<token>`);
   console.log(`  健康: http://${config.host}:${config.port}/health`);
   if (!config.adminToken) {

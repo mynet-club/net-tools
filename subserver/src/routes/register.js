@@ -60,7 +60,7 @@ async function handleRegister(req, res, json) {
   }
 
   // 验证邀请码
-  const code = getInviteCode(inviteCode.toUpperCase().trim());
+  const code = await getInviteCode(inviteCode.toUpperCase().trim());
   if (!code) {
     return apiResponse(res, 400, { error: '邀请码无效' });
   }
@@ -69,13 +69,13 @@ async function handleRegister(req, res, json) {
   }
 
   // 检查用户名是否已存在
-  const existingUser = getUserByName(username);
+  const existingUser = await getUserByName(username);
   if (existingUser) {
     return apiResponse(res, 409, { error: '用户名已存在' });
   }
 
   // 检查邮箱是否已存在
-  const existingEmail = getUserByEmail(email.toLowerCase().trim());
+  const existingEmail = await getUserByEmail(email.toLowerCase().trim());
   if (existingEmail) {
     return apiResponse(res, 409, { error: '邮箱已被使用' });
   }
@@ -83,7 +83,7 @@ async function handleRegister(req, res, json) {
   // 创建用户
   let user;
   try {
-    user = createUser({
+    user = await createUser({
       name: name || username,
       username,
       password,
@@ -99,11 +99,11 @@ async function handleRegister(req, res, json) {
   }
 
   // 标记邀请码已使用
-  useInviteCode(inviteCode.toUpperCase().trim(), user.id);
+  await useInviteCode(inviteCode.toUpperCase().trim(), user.id);
 
   // 自动为所有节点生成 UUID 映射
   try {
-    bulkSetMappings(user.id);
+    await bulkSetMappings(user.id);
   } catch (e) {
     console.error('自动映射失败:', e.message);
   }
@@ -112,7 +112,7 @@ async function handleRegister(req, res, json) {
   const mailOk = isMailEnabled();
   if (mailOk) {
     try {
-      const tokenRow = createEmailToken(user.id, 'verify', 24);
+      const tokenRow = await createEmailToken(user.id, 'verify', 24);
       const verifyUrl = `${getBaseUrl()}/verify?token=${tokenRow.token}`;
       await sendVerificationEmail(user.email, verifyUrl);
     } catch (e) {
@@ -125,7 +125,7 @@ async function handleRegister(req, res, json) {
     }
   } else {
     // SMTP 未配置，自动激活
-    verifyUserEmail(user.id);
+    await verifyUserEmail(user.id);
     // 自动激活后同步到上游节点
     syncUserCreate(user.id).catch(e => console.error('[upstream-sync] register auto-verify:', e.message));
   }
@@ -144,22 +144,22 @@ async function handleRegister(req, res, json) {
  * GET /api/auth/verify?token=xxx
  * 邮箱验证激活
  */
-function handleVerify(req, res, url) {
+async function handleVerify(req, res, url) {
   const token = url.searchParams.get('token');
   if (!token) {
     return apiResponse(res, 400, { error: '缺少验证令牌' });
   }
 
-  const tokenRow = getEmailToken(token);
+  const tokenRow = await getEmailToken(token);
   if (!tokenRow || tokenRow.type !== 'verify') {
     return apiResponse(res, 400, { error: '验证链接无效或已过期' });
   }
 
   // 标记令牌已使用
-  useEmailToken(token);
+  await useEmailToken(token);
 
   // 激活用户邮箱
-  verifyUserEmail(tokenRow.user_id);
+  await verifyUserEmail(tokenRow.user_id);
 
   // 邮箱验证后同步到上游节点
   syncUserCreate(tokenRow.user_id).catch(e => console.error('[upstream-sync] verify:', e.message));
@@ -173,9 +173,9 @@ function handleVerify(req, res, url) {
 /**
  * GET /api/invite-codes — 管理员：列出所有邀请码
  */
-function handleListCodes(req, res) {
-  const codes = getInviteCodes();
-  const stats = getInviteCodeStats();
+async function handleListCodes(req, res) {
+  const codes = await getInviteCodes();
+  const stats = await getInviteCodeStats();
   return apiResponse(res, 200, { stats, codes });
 }
 
@@ -183,12 +183,12 @@ function handleListCodes(req, res) {
  * POST /api/invite-codes — 管理员：批量生成邀请码
  * body: { count }
  */
-function handleCreateCodes(req, res, json) {
+async function handleCreateCodes(req, res, json) {
   const count = parseInt(json.count);
   if (!count || count < 1 || count > 500) {
     return apiResponse(res, 400, { error: '数量需在 1-500 之间' });
   }
-  const codes = batchCreateInviteCodes(count);
+  const codes = await batchCreateInviteCodes(count);
   return apiResponse(res, 201, { created: codes.length, codes });
 }
 

@@ -99,8 +99,8 @@ migrateOldPaths();
 
 // ==================== 版本和仓库 ====================
 
-const VERSION = '3.0.7';
-const GITHUB_REPO = 'luoyueliang/smartxray';
+const VERSION = '3.0.9';
+const GITHUB_REPO = 'luoyueliang/net-tools';
 const API_PORT = 2088;
 
 // ==================== 端口范围默认值 ====================

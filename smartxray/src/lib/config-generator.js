@@ -7,10 +7,79 @@ const fs   = require('fs');
 const path = require('path');
 
 const { getSetting } = require('./database');
-const { XRAY_CONF, LOG_FILE } = require('./config');
+const { XRAY_CONF, LOG_FILE, MIHOMO_OUT, getServerHost } = require('./config');
 const { getRealityConfig } = require('./reality');
 
 const { db } = require('./database');
+
+// ==================== Mihomo Proxies YAML 生成 ====================
+
+/**
+ * YAML 字符串转义
+ * 包含特殊字符的值需要用双引号包裹
+ */
+function yamlStr(val) {
+  if (val === null || val === undefined) return '""';
+  const s = String(val);
+  if (s.includes('\n') || s.includes('\r') || s.includes('---')) {
+    throw new Error(`YAML 值包含非法字符: ${s.slice(0, 20)}...`);
+  }
+  if (/[:#\[\]{}&*!|>'"%@`,\n\r]/.test(s)) {
+    return `"${s.replace(/"/g, '\\"')}"`;
+  }
+  return s;
+}
+
+/**
+ * 生成 mihomo proxies YAML 并写入 MIHOMO_OUT 文件
+ * 为每个启用且有 UUID 的 VLESS+Reality 用户生成一个 proxy 条目
+ */
+function generateMihomoProxies() {
+  const reality = getRealityConfig();
+  if (!reality.enabled || !reality.publicKey) {
+    try { fs.writeFileSync(MIHOMO_OUT, '# Reality 未启用，无可用 proxies\n'); } catch (e) { console.error(`[config] 写入 mihomo-proxies.yaml 失败: ${e.message}`); }
+    return;
+  }
+
+  const users = db().prepare('SELECT * FROM users WHERE enabled=1 AND uuid IS NOT NULL ORDER BY port').all();
+  if (!users.length) {
+    try { fs.writeFileSync(MIHOMO_OUT, '# 无启用用户\n'); } catch (e) { console.error(`[config] 写入 mihomo-proxies.yaml 失败: ${e.message}`); }
+    return;
+  }
+
+  const serverHost = getServerHost(getSetting);
+  const sni = reality.serverNames[0] || '';
+  const pubkey = reality.publicKey;
+  const shortId = reality.shortIds[0] || '';
+  const port = reality.port;
+
+  const entries = users.map(u => {
+    const lines = [
+      `  - name: ${yamlStr(u.name)}`,
+      `    type: vless`,
+      `    server: ${yamlStr(serverHost)}`,
+      `    port: ${port}`,
+      `    uuid: ${yamlStr(u.uuid)}`,
+      `    network: tcp`,
+      `    tls: true`,
+      `    udp: true`,
+      `    flow: xtls-rprx-vision`,
+      `    servername: ${yamlStr(sni)}`,
+      `    reality-opts:`,
+      `      public-key: ${yamlStr(pubkey)}`,
+      `      short-id: ${yamlStr(shortId)}`,
+      `    client-fingerprint: chrome`,
+    ];
+    return lines.join('\n');
+  });
+
+  const yaml = `proxies:\n${entries.join('\n')}\n`;
+  try {
+    fs.writeFileSync(MIHOMO_OUT, yaml);
+  } catch (e) {
+    console.error(`[config] 生成 mihomo-proxies.yaml 失败: ${e.message}`);
+  }
+}
 
 /**
  * 构建完整的 Xray 配置并写入文件
@@ -226,13 +295,15 @@ function buildConfig() {
 
       fs.mkdirSync(path.dirname(XRAY_CONF), { recursive: true });
       fs.writeFileSync(XRAY_CONF, JSON.stringify(merged, null, 2));
+      generateMihomoProxies();
       return merged;
     }
   }
 
   fs.mkdirSync(path.dirname(XRAY_CONF), { recursive: true });
   fs.writeFileSync(XRAY_CONF, JSON.stringify(config, null, 2));
+  generateMihomoProxies();
   return config;
 }
 
-module.exports = { buildConfig };
+module.exports = { buildConfig, generateMihomoProxies };

@@ -19,13 +19,13 @@ const {
  * GET /api/me/subscription
  * 返回当前用户的订阅地址、可用模板及各模板的完整配置导出地址
  */
-function handleSubscription(req, res) {
+async function handleSubscription(req, res) {
   const sessionUser = getSessionUser(req);
   if (!sessionUser) {
     return apiResponse(res, 401, { error: '未认证' });
   }
 
-  const user = getUserById(sessionUser.id);
+  const user = await getUserById(sessionUser.id);
   if (!user) {
     return apiResponse(res, 404, { error: '用户不存在' });
   }
@@ -34,7 +34,7 @@ function handleSubscription(req, res) {
   }
 
   // 获取可用模板
-  const templates = getTemplates();
+  const templates = await getTemplates();
   const subUrl = `/sub/${user.token}`;
 
   // 构建各模板的完整配置导出地址
@@ -46,7 +46,7 @@ function handleSubscription(req, res) {
   }
 
   // 获取已分配的节点数据
-  const nodes = getSubscriptionData(user.token);
+  const nodes = await getSubscriptionData(user.token);
 
   return apiResponse(res, 200, {
     token: user.token,
@@ -72,18 +72,18 @@ function handleSubscription(req, res) {
  * GET /api/me/mappings
  * 返回当前用户的节点映射列表（只读）
  */
-function handleMappings(req, res) {
+async function handleMappings(req, res) {
   const sessionUser = getSessionUser(req);
   if (!sessionUser) {
     return apiResponse(res, 401, { error: '未认证' });
   }
 
-  const user = getUserById(sessionUser.id);
+  const user = await getUserById(sessionUser.id);
   if (!user) {
     return apiResponse(res, 404, { error: '用户不存在' });
   }
 
-  const mappings = getMappings(sessionUser.id);
+  const mappings = await getMappings(sessionUser.id);
   return apiResponse(res, 200, mappings);
 }
 

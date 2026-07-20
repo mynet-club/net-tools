@@ -2,6 +2,18 @@
 
 This file provides guidance to Qoder (qoder.com) when working with code in this repository.
 
+## Ops 核心定位原则（所有 Agent 必须遵守）
+
+**从规范文件入手 → 找到架构文档 → 快速定位 → 尽早排除干扰。**
+
+执行任何运维任务前：
+1. 先读 `copilot-instructions.md` / `AGENTS.md` / `README.md` 等规范文件，建立全局认知
+2. 通过架构文档中的网络拓扑、服务器清单、服务映射快速定位目标
+3. 查阅凭证文件时，参考 `credentials/README.md` 的目录索引，按 IP / 服务名 / 产品名精准匹配
+4. 排除无关目录和文件的干扰，只在目标范围内操作
+
+---
+
 ## Repository Overview
 
 **net-tools** is a monorepo of independent cross-platform (macOS/Linux/FreeBSD/Alpine/OpenWrt/Windows) network proxy management CLI tools. Each top-level directory is a standalone tool with its own `src/`, `scripts/`, `config/`, `data/`, `logs/` directories. Tools are written in Node.js and manage downstream binaries (mihomo, xray-core).

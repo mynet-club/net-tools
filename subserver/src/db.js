@@ -1,37 +1,14 @@
 /**
  * 数据库模块
- * 封装所有 SQLite 数据库操作
+ * 封装所有 MariaDB/MySQL 数据库操作（mysql2/promise 连接池）
  */
 
 'use strict';
 
-const path   = require('path');
-const fs     = require('fs');
 const crypto = require('crypto');
+const mysql = require('mysql2/promise');
 
-const { getBaseDir } = require('./paths');
-
-const BASE_DIR  = getBaseDir();
-const DATA_DIR  = path.join(BASE_DIR, 'data');
-const DB_FILE   = path.join(DATA_DIR, 'subserver.db');
-
-// 确保数据目录存在
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-
-// 清理上次崩溃可能残留的 SQLite 锁目录
-const LOCK_DIR = `${DB_FILE}.lock`;
-try { if (fs.statSync(LOCK_DIR).isDirectory()) fs.rmdirSync(LOCK_DIR); } catch { }
-
-
-// ── 加载 node-sqlite3-wasm ──────────────────────────────────────
-let Database;
-try {
-  const sqlite3 = require('node-sqlite3-wasm');
-  Database = sqlite3.Database;
-} catch {
-  console.error('✗ node-sqlite3-wasm 未安装，请运行: cd subserver && npm install');
-  process.exit(1);
-}
+const { config } = require('./config');
 
 // ── 默认模板内容 ────────────────────────────────────────────────
 const DEFAULT_TEMPLATE_CONTENT = `mixed-port: 7890
@@ -121,163 +98,168 @@ rules:
   - MATCH,默认出口
 `;
 
-// ── 初始化数据库 ────────────────────────────────────────────────
-let _db;
+// ── 连接池 ──────────────────────────────────────────────────────
+let pool = null;
 
-function db() {
-  if (!_db) {
-    _db = new Database(DB_FILE);
-    _db.exec(`
-      PRAGMA journal_mode = WAL;
-      PRAGMA foreign_keys = ON;
-    `);
-    initSchema();
+function getPool() {
+  if (!pool) {
+    const dbCfg = config.db || {};
+    pool = mysql.createPool({
+      host: dbCfg.host || 'localhost',
+      port: dbCfg.port || 3306,
+      user: dbCfg.user || 'root',
+      password: dbCfg.password || '',
+      database: dbCfg.database || 'subserver',
+      waitForConnections: true,
+      connectionLimit: 10,
+      queueLimit: 0,
+      charset: 'utf8mb4',
+    });
   }
-  return _db;
+  return pool;
 }
 
-/**
- * 初始化数据库 schema
- */
-function initSchema() {
-  _db.exec(`
+/** 快捷查询：返回行数组 */
+async function query(sql, params) {
+  const [rows] = await getPool().execute(sql, params);
+  return rows;
+}
+
+/** 快捷查询：返回单行或 null */
+async function queryOne(sql, params) {
+  const rows = await query(sql, params);
+  return rows[0] || null;
+}
+
+/** 快捷执行：返回 ResultSetHeader (含 insertId, affectedRows) */
+async function execute(sql, params) {
+  const [result] = await getPool().execute(sql, params);
+  return result;
+}
+
+// ── 初始化数据库 schema ─────────────────────────────────────────
+
+let _schemaReady = null; // Promise，确保只初始化一次
+
+function initDb() {
+  if (!_schemaReady) {
+    _schemaReady = _doInitSchema();
+  }
+  return _schemaReady;
+}
+
+async function _doInitSchema() {
+  await getPool().execute(`
     CREATE TABLE IF NOT EXISTS users (
-      id         INTEGER PRIMARY KEY AUTOINCREMENT,
-      token      TEXT NOT NULL UNIQUE,
-      name       TEXT NOT NULL,
-      note       TEXT DEFAULT '',
-      enabled    INTEGER DEFAULT 1,
-      created_at TEXT DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS nodes (
-      id            INTEGER PRIMARY KEY AUTOINCREMENT,
-      name          TEXT NOT NULL UNIQUE,
-      display_name  TEXT NOT NULL,
-      type          TEXT NOT NULL CHECK(type IN ('vless-reality','vmess')),
-      server        TEXT NOT NULL,
-      port          INTEGER NOT NULL,
-      -- VLESS Reality
-      pubkey        TEXT,
-      shortid       TEXT,
-      sni           TEXT,
-      flow          TEXT DEFAULT 'xtls-rprx-vision',
-      fingerprint   TEXT DEFAULT 'chrome',
-      -- VMess
-      alter_id      INTEGER DEFAULT 0,
-      cipher        TEXT DEFAULT 'auto',
-      network       TEXT DEFAULT 'tcp',
-      ws_path       TEXT DEFAULT '',
-      ws_host       TEXT DEFAULT '',
-      tls           INTEGER DEFAULT 0,
-      tls_sni       TEXT DEFAULT '',
-      skip_cert     INTEGER DEFAULT 0,
-      -- 通用
-      enabled       INTEGER DEFAULT 1,
-      sort_order    INTEGER DEFAULT 0
-    );
-
-    CREATE TABLE IF NOT EXISTS user_node_uuids (
-      id       INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      node_id  INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
-      uuid     TEXT NOT NULL,
-      UNIQUE(user_id, node_id)
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_user_node_uuids_user
-      ON user_node_uuids(user_id);
-    CREATE INDEX IF NOT EXISTS idx_user_node_uuids_node
-      ON user_node_uuids(node_id);
-    CREATE INDEX IF NOT EXISTS idx_nodes_sort
-      ON nodes(sort_order);
-
-    CREATE TABLE IF NOT EXISTS templates (
-      id          INTEGER PRIMARY KEY AUTOINCREMENT,
-      name        TEXT NOT NULL UNIQUE,
-      description TEXT DEFAULT '',
-      content     TEXT NOT NULL,
-      enabled     INTEGER DEFAULT 1,
-      created_at  TEXT DEFAULT (datetime('now')),
-      updated_at  TEXT DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS invite_codes (
-      id         INTEGER PRIMARY KEY AUTOINCREMENT,
-      code       TEXT NOT NULL UNIQUE,
-      created_by INTEGER DEFAULT 0,
-      used_by    INTEGER,
-      used_at    TEXT,
-      enabled    INTEGER DEFAULT 1,
-      created_at TEXT DEFAULT (datetime('now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_invite_codes_code
-      ON invite_codes(code);
-
-    CREATE TABLE IF NOT EXISTS email_tokens (
-      id         INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      token      TEXT NOT NULL UNIQUE,
-      type       TEXT NOT NULL CHECK(type IN ('verify','reset')),
-      expires    TEXT NOT NULL,
-      used       INTEGER DEFAULT 0,
-      created_at TEXT DEFAULT (datetime('now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_email_tokens_token ON email_tokens(token);
-    CREATE INDEX IF NOT EXISTS idx_email_tokens_user ON email_tokens(user_id);
+      id             INT AUTO_INCREMENT PRIMARY KEY,
+      token          VARCHAR(64) NOT NULL UNIQUE,
+      name           VARCHAR(100) NOT NULL,
+      note           TEXT,
+      enabled        TINYINT(1) DEFAULT 1,
+      username       VARCHAR(50) DEFAULT NULL,
+      password_hash  VARCHAR(255) DEFAULT NULL,
+      role           VARCHAR(10) DEFAULT 'user',
+      email          VARCHAR(255) DEFAULT NULL,
+      email_verified TINYINT(1) DEFAULT 0,
+      created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE KEY idx_users_username (username),
+      UNIQUE KEY idx_users_email (email)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `);
 
-  // ── 迁移：为 users 表新增 username / password_hash / role 列 ──
-  const cols = _db.prepare('PRAGMA table_info(users)').all();
-  const colNames = cols.map(c => c.name);
-  if (!colNames.includes('username')) {
-    _db.exec('ALTER TABLE users ADD COLUMN username TEXT');
-  }
-  if (!colNames.includes('password_hash')) {
-    _db.exec('ALTER TABLE users ADD COLUMN password_hash TEXT');
-  }
-  if (!colNames.includes('role')) {
-    _db.exec("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user'");
-  }
-  // 唯一索引（允许 NULL，即旧用户暂无 username 时不冲突）
-  _db.exec(
-    'CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username) WHERE username IS NOT NULL'
-  );
+  await getPool().execute(`
+    CREATE TABLE IF NOT EXISTS nodes (
+      id              INT AUTO_INCREMENT PRIMARY KEY,
+      name            VARCHAR(100) NOT NULL UNIQUE,
+      display_name    VARCHAR(100) NOT NULL DEFAULT '',
+      type            VARCHAR(20) NOT NULL,
+      server          VARCHAR(255) NOT NULL,
+      port            INT NOT NULL,
+      pubkey          VARCHAR(255) DEFAULT NULL,
+      shortid         VARCHAR(64) DEFAULT NULL,
+      sni             VARCHAR(255) DEFAULT NULL,
+      flow            VARCHAR(50) DEFAULT 'xtls-rprx-vision',
+      fingerprint     VARCHAR(20) DEFAULT 'chrome',
+      alter_id        INT DEFAULT 0,
+      cipher          VARCHAR(20) DEFAULT 'auto',
+      network         VARCHAR(10) DEFAULT 'tcp',
+      ws_path         VARCHAR(255) DEFAULT '',
+      ws_host         VARCHAR(255) DEFAULT '',
+      tls             TINYINT(1) DEFAULT 0,
+      tls_sni         VARCHAR(255) DEFAULT '',
+      skip_cert       TINYINT(1) DEFAULT 0,
+      enabled         TINYINT(1) DEFAULT 1,
+      sort_order      INT DEFAULT 0,
+      api_host        VARCHAR(255) DEFAULT NULL,
+      api_port        INT DEFAULT 2088,
+      api_token       VARCHAR(255) DEFAULT NULL,
+      has_upstream_api TINYINT(1) DEFAULT 0,
+      INDEX idx_nodes_sort (sort_order)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `);
 
-  // ── 迁移：为 users 表新增 email / email_verified 列 ──
-  if (!colNames.includes('email')) {
-    _db.exec('ALTER TABLE users ADD COLUMN email TEXT');
-  }
-  if (!colNames.includes('email_verified')) {
-    _db.exec('ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 0');
-  }
-  // email 唯一索引（允许 NULL / 空）
-  _db.exec(
-    'CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email IS NOT NULL AND email != \'\''
-  );
+  await getPool().execute(`
+    CREATE TABLE IF NOT EXISTS user_node_uuids (
+      id       INT AUTO_INCREMENT PRIMARY KEY,
+      user_id  INT NOT NULL,
+      node_id  INT NOT NULL,
+      uuid     VARCHAR(64) NOT NULL,
+      enabled  TINYINT(1) NOT NULL DEFAULT 1,
+      UNIQUE KEY uk_user_node (user_id, node_id),
+      INDEX idx_user_node_uuids_user (user_id),
+      INDEX idx_user_node_uuids_node (node_id),
+      CONSTRAINT fk_mapping_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      CONSTRAINT fk_mapping_node FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `);
 
-  // ── 迁移：为 nodes 表新增上游 API 字段 ──
-  const nodeCols = _db.prepare('PRAGMA table_info(nodes)').all();
-  const nodeColNames = nodeCols.map(c => c.name);
-  if (!nodeColNames.includes('api_host')) {
-    _db.exec('ALTER TABLE nodes ADD COLUMN api_host TEXT');
-  }
-  if (!nodeColNames.includes('api_port')) {
-    _db.exec('ALTER TABLE nodes ADD COLUMN api_port INTEGER DEFAULT 2088');
-  }
-  if (!nodeColNames.includes('api_token')) {
-    _db.exec('ALTER TABLE nodes ADD COLUMN api_token TEXT');
-  }
-  if (!nodeColNames.includes('has_upstream_api')) {
-    _db.exec('ALTER TABLE nodes ADD COLUMN has_upstream_api INTEGER DEFAULT 0');
-  }
+  await getPool().execute(`
+    CREATE TABLE IF NOT EXISTS templates (
+      id          INT AUTO_INCREMENT PRIMARY KEY,
+      name        VARCHAR(100) NOT NULL UNIQUE,
+      description TEXT,
+      content     MEDIUMTEXT NOT NULL,
+      enabled     TINYINT(1) DEFAULT 1,
+      created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `);
+
+  await getPool().execute(`
+    CREATE TABLE IF NOT EXISTS invite_codes (
+      id         INT AUTO_INCREMENT PRIMARY KEY,
+      code       VARCHAR(16) NOT NULL UNIQUE,
+      created_by INT DEFAULT 0,
+      used_by    INT DEFAULT NULL,
+      used_at    TIMESTAMP NULL DEFAULT NULL,
+      enabled    TINYINT(1) DEFAULT 1,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_invite_codes_code (code)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `);
+
+  await getPool().execute(`
+    CREATE TABLE IF NOT EXISTS email_tokens (
+      id         INT AUTO_INCREMENT PRIMARY KEY,
+      user_id    INT NOT NULL,
+      token      VARCHAR(64) NOT NULL UNIQUE,
+      type       VARCHAR(10) NOT NULL,
+      expires    DATETIME NOT NULL,
+      used       TINYINT(1) DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_email_tokens_token (token),
+      INDEX idx_email_tokens_user (user_id),
+      CONSTRAINT fk_email_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+  `);
 
   // 自动插入默认模板
-  const existing = _db.prepare('SELECT id FROM templates WHERE name = ?').get('default');
+  const existing = await queryOne('SELECT id FROM templates WHERE name = ?', ['default']);
   if (!existing) {
-    _db.prepare(
-      'INSERT INTO templates (name, description, content) VALUES (?, ?, ?)'
-    ).run(['default', '默认完整 Clash.Meta 配置模板', DEFAULT_TEMPLATE_CONTENT]);
+    await execute(
+      'INSERT INTO templates (name, description, content) VALUES (?, ?, ?)',
+      ['default', '默认完整 Clash.Meta 配置模板', DEFAULT_TEMPLATE_CONTENT]
+    );
   }
 }
 
@@ -288,11 +270,6 @@ const SCRYPT_R = 8;
 const SCRYPT_P = 1;
 const SCRYPT_KEYLEN = 32;
 
-/**
- * 哈希密码
- * @param {string} plain — 明文密码
- * @returns {string} 格式: "scrypt:N:r:p:saltHex:hashHex"
- */
 function hashPassword(plain) {
   const salt = crypto.randomBytes(16);
   const hash = crypto.scryptSync(plain, salt, SCRYPT_KEYLEN, {
@@ -301,12 +278,6 @@ function hashPassword(plain) {
   return `scrypt:${SCRYPT_N}:${SCRYPT_R}:${SCRYPT_P}:${salt.toString('hex')}:${hash.toString('hex')}`;
 }
 
-/**
- * 验证密码（时序安全）
- * @param {string} plain — 明文密码
- * @param {string} stored — 存储的哈希字符串
- * @returns {boolean}
- */
 function verifyPassword(plain, stored) {
   if (!stored || !stored.startsWith('scrypt:')) return false;
   const parts = stored.split(':');
@@ -327,14 +298,9 @@ function verifyPassword(plain, stored) {
 
 // ── 会话存储（内存 Map + TTL）──────────────────────────────────────
 
-const SESSION_TTL = 7200 * 1000; // 2 小时（毫秒）
-const sessions = new Map(); // sessionToken → { userId, role, username, name, expires }
+const SESSION_TTL = 7200 * 1000;
+const sessions = new Map();
 
-/**
- * 创建会话
- * @param {Object} user — 用户对象（含 id, role, username, name）
- * @returns {string} sessionToken
- */
 function createSession(user) {
   const token = crypto.randomBytes(32).toString('hex');
   sessions.set(token, {
@@ -347,11 +313,6 @@ function createSession(user) {
   return token;
 }
 
-/**
- * 获取会话（自动清理过期）
- * @param {string} token — sessionToken
- * @returns {Object|null}
- */
 function getSession(token) {
   const s = sessions.get(token);
   if (!s) return null;
@@ -362,43 +323,36 @@ function getSession(token) {
   return s;
 }
 
-/**
- * 删除会话
- * @param {string} token — sessionToken
- */
 function deleteSession(token) {
   sessions.delete(token);
 }
 
 // ── Users CRUD ──────────────────────────────────────────────────
 
-function getUsers() {
-  return db().prepare('SELECT * FROM users ORDER BY id').all();
+async function getUsers() {
+  return query('SELECT * FROM users ORDER BY id');
 }
 
-function getUserById(id) {
-  return db().prepare('SELECT * FROM users WHERE id = ?').get(id);
+async function getUserById(id) {
+  return queryOne('SELECT * FROM users WHERE id = ?', [id]);
 }
 
-function getUserByToken(token) {
-  return db().prepare('SELECT * FROM users WHERE token = ?').get(token);
+async function getUserByToken(token) {
+  return queryOne('SELECT * FROM users WHERE token = ?', [token]);
 }
 
-function getUserByName(username) {
-  return db().prepare('SELECT * FROM users WHERE username = ?').get(username);
+async function getUserByName(username) {
+  return queryOne('SELECT * FROM users WHERE username = ?', [username]);
 }
 
-/**
- * 创建用户
- * @param {Object} opts — { name, username, password, note, role }
- * @returns {Object} 创建的用户
- */
-function createUser(opts) {
-  // 兼容旧签名 createUser(name, note)
+async function getUserByEmail(email) {
+  return queryOne('SELECT * FROM users WHERE email = ?', [email]);
+}
+
+async function createUser(opts) {
   if (typeof opts === 'string') {
     opts = { name: opts, note: arguments[1] || '' };
   }
-  // 防御性清洗：确保用户名不含空白字符
   if (opts.username && typeof opts.username === 'string') {
     opts.username = opts.username.replace(/\s+/g, '');
   }
@@ -406,15 +360,15 @@ function createUser(opts) {
   const passwordHash = opts.password ? hashPassword(opts.password) : null;
   const role = opts.role || 'user';
   const email = opts.email || null;
-  const emailVerified = opts.email ? 0 : 1; // 有邮箱则需验证，无邮箱则默认已验证
-  // node-sqlite3-wasm 的 .run()/.get() 不支持多位置参数，需传数组
-  const info = db().prepare(
-    'INSERT INTO users (token, name, note, username, password_hash, role, email, email_verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-  ).run([token, opts.name, opts.note || '', opts.username || null, passwordHash, role, email, emailVerified]);
-  return getUserById(info.lastInsertRowid);
+  const emailVerified = opts.email ? 0 : 1;
+  const result = await execute(
+    'INSERT INTO users (token, name, note, username, password_hash, role, email, email_verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    [token, opts.name, opts.note || '', opts.username || null, passwordHash, role, email, emailVerified]
+  );
+  return getUserById(result.insertId);
 }
 
-function updateUser(id, fields) {
+async function updateUser(id, fields) {
   const allowed = ['name', 'note', 'enabled', 'username', 'password_hash', 'role', 'email', 'email_verified'];
   const sets = [];
   const vals = [];
@@ -426,45 +380,35 @@ function updateUser(id, fields) {
   }
   if (sets.length === 0) return getUserById(id);
   vals.push(id);
-  db().prepare(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`).run(vals);
+  await execute(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`, vals);
   return getUserById(id);
 }
 
-/**
- * 更新用户密码
- * @param {number} id — 用户 ID
- * @param {string} newPassword — 新明文密码
- */
-function updateUserPassword(id, newPassword) {
+async function updateUserPassword(id, newPassword) {
   const hash = hashPassword(newPassword);
-  db().prepare('UPDATE users SET password_hash = ? WHERE id = ?').run([hash, id]);
+  await execute('UPDATE users SET password_hash = ? WHERE id = ?', [hash, id]);
   return getUserById(id);
 }
 
-/**
- * 更新用户角色
- * @param {number} id — 用户 ID
- * @param {string} role — 'admin' 或 'user'
- */
-function updateUserRole(id, role) {
-  db().prepare('UPDATE users SET role = ? WHERE id = ?').run([role, id]);
+async function updateUserRole(id, role) {
+  await execute('UPDATE users SET role = ? WHERE id = ?', [role, id]);
   return getUserById(id);
 }
 
-function deleteUser(id) {
-  db().prepare('DELETE FROM users WHERE id = ?').run(id);
+async function verifyUserEmail(userId) {
+  await execute('UPDATE users SET email_verified = 1 WHERE id = ?', [userId]);
+  return getUserById(userId);
 }
 
-/**
- * 批量创建用户
- * @param {Array} users — [{ name, note }] 数组
- * @returns {Array} 创建结果
- */
-function batchCreateUsers(users) {
+async function deleteUser(id) {
+  await execute('DELETE FROM users WHERE id = ?', [id]);
+}
+
+async function batchCreateUsers(users) {
   const results = [];
   for (const u of users) {
     try {
-      const created = createUser(u);
+      const created = await createUser(u);
       results.push({ ok: true, user: created });
     } catch (e) {
       results.push({ ok: false, name: u.name, error: e.message });
@@ -475,20 +419,19 @@ function batchCreateUsers(users) {
 
 // ── Nodes CRUD ──────────────────────────────────────────────────
 
-function getNodes() {
-  return db().prepare('SELECT * FROM nodes ORDER BY sort_order, id').all();
+async function getNodes() {
+  return query('SELECT * FROM nodes ORDER BY sort_order, id');
 }
 
-function getNodeById(id) {
-  return db().prepare('SELECT * FROM nodes WHERE id = ?').get(id);
+async function getNodeById(id) {
+  return queryOne('SELECT * FROM nodes WHERE id = ?', [id]);
 }
 
-function getNodeByName(name) {
-  return db().prepare('SELECT * FROM nodes WHERE name = ?').get(name);
+async function getNodeByName(name) {
+  return queryOne('SELECT * FROM nodes WHERE name = ?', [name]);
 }
 
-function createNode(data) {
-  // 只插入已提供的字段，未提供的字段由 schema DEFAULT 填充
+async function createNode(data) {
   const allCols = [
     'name', 'display_name', 'type', 'server', 'port',
     'pubkey', 'shortid', 'sni', 'flow', 'fingerprint',
@@ -500,13 +443,13 @@ function createNode(data) {
   const cols = allCols.filter(c => data[c] !== undefined);
   const vals = cols.map(c => data[c]);
   const placeholders = cols.map(() => '?').join(', ');
-  const info = db().prepare(
-    `INSERT INTO nodes (${cols.join(', ')}) VALUES (${placeholders})`
-  ).run(vals);
-  return getNodeById(info.lastInsertRowid);
+  const result = await execute(
+    `INSERT INTO nodes (${cols.join(', ')}) VALUES (${placeholders})`, vals
+  );
+  return getNodeById(result.insertId);
 }
 
-function updateNode(id, fields) {
+async function updateNode(id, fields) {
   const allowed = [
     'name', 'display_name', 'type', 'server', 'port',
     'pubkey', 'shortid', 'sni', 'flow', 'fingerprint',
@@ -525,109 +468,154 @@ function updateNode(id, fields) {
   }
   if (sets.length === 0) return getNodeById(id);
   vals.push(id);
-  db().prepare(`UPDATE nodes SET ${sets.join(', ')} WHERE id = ?`).run(vals);
+  await execute(`UPDATE nodes SET ${sets.join(', ')} WHERE id = ?`, vals);
   return getNodeById(id);
 }
 
-function deleteNode(id) {
-  db().prepare('DELETE FROM nodes WHERE id = ?').run(id);
+async function deleteNode(id) {
+  await execute('DELETE FROM nodes WHERE id = ?', [id]);
 }
 
 // ── User-Node UUID Mappings ─────────────────────────────────────
 
-function getMappings(userId) {
-  return db().prepare(`
+async function getMappings(userId) {
+  return query(`
     SELECT m.*, n.name as node_name, n.display_name, n.type, n.enabled as node_enabled
     FROM user_node_uuids m
     JOIN nodes n ON m.node_id = n.id
     WHERE m.user_id = ?
     ORDER BY n.sort_order, n.id
-  `).all(userId);
+  `, [userId]);
 }
 
-function getMapping(userId, nodeId) {
-  return db().prepare(
-    'SELECT * FROM user_node_uuids WHERE user_id = ? AND node_id = ?'
-  ).get([userId, nodeId]);
+async function getMapping(userId, nodeId) {
+  return queryOne(
+    'SELECT * FROM user_node_uuids WHERE user_id = ? AND node_id = ?',
+    [userId, nodeId]
+  );
 }
 
-function upsertMapping(userId, nodeId, uuid) {
-  db().prepare(`
+async function upsertMapping(userId, nodeId, uuid) {
+  await execute(`
     INSERT INTO user_node_uuids (user_id, node_id, uuid)
     VALUES (?, ?, ?)
-    ON CONFLICT(user_id, node_id) DO UPDATE SET uuid = excluded.uuid
-  `).run([userId, nodeId, uuid]);
+    ON DUPLICATE KEY UPDATE uuid = VALUES(uuid)
+  `, [userId, nodeId, uuid]);
   return getMapping(userId, nodeId);
 }
 
-function deleteMapping(userId, nodeId) {
-  db().prepare(
-    'DELETE FROM user_node_uuids WHERE user_id = ? AND node_id = ?'
-  ).run([userId, nodeId]);
+async function setMappingEnabled(userId, nodeId, enabled) {
+  await execute(
+    'UPDATE user_node_uuids SET enabled = ? WHERE user_id = ? AND node_id = ?',
+    [enabled ? 1 : 0, userId, nodeId]
+  );
+  return getMapping(userId, nodeId);
 }
 
-/**
- * 批量为用户设置所有启用节点的 UUID
- * 已有 UUID 的保留，缺失的自动生成
- */
-function bulkSetMappings(userId) {
-  const user = getUserById(userId);
+async function deleteMapping(userId, nodeId) {
+  await execute(
+    'DELETE FROM user_node_uuids WHERE user_id = ? AND node_id = ?',
+    [userId, nodeId]
+  );
+}
+
+async function getMappingsByNode(nodeId) {
+  return query(`
+    SELECT m.*, u.name as user_name
+    FROM user_node_uuids m
+    JOIN users u ON m.user_id = u.id
+    WHERE m.node_id = ?
+  `, [nodeId]);
+}
+
+async function bulkSetMappings(userId) {
+  const user = await getUserById(userId);
   if (!user) throw new Error('用户不存在');
 
-  const nodes = db().prepare('SELECT * FROM nodes WHERE enabled = 1 ORDER BY sort_order, id').all();
+  const nodes = await query('SELECT * FROM nodes WHERE enabled = 1 ORDER BY sort_order, id');
   const results = [];
 
   for (const node of nodes) {
-    const existing = getMapping(userId, node.id);
+    const existing = await getMapping(userId, node.id);
     if (existing) {
       results.push({ node_id: node.id, node_name: node.name, uuid: existing.uuid, action: 'kept' });
     } else {
       const uuid = crypto.randomUUID();
-      upsertMapping(userId, node.id, uuid);
+      await upsertMapping(userId, node.id, uuid);
       results.push({ node_id: node.id, node_name: node.name, uuid, action: 'created' });
     }
   }
   return results;
 }
 
-/**
- * 获取用户订阅所需的所有节点 + UUID
- */
-function getSubscriptionData(userToken) {
-  return db().prepare(`
+// ── Subscription ────────────────────────────────────────────────
+
+async function getSubscriptionData(userToken) {
+  return query(`
     SELECT n.*, m.uuid
     FROM user_node_uuids m
     JOIN nodes n ON m.node_id = n.id
     JOIN users u ON m.user_id = u.id
-    WHERE u.token = ? AND u.enabled = 1 AND n.enabled = 1
+    WHERE u.token = ? AND u.enabled = 1 AND n.enabled = 1 AND m.enabled = 1
     ORDER BY n.sort_order, n.id
-  `).all(userToken);
+  `, [userToken]);
+}
+
+// ── Upstream helpers (供 upstream-sync.js 使用) ─────────────────
+
+async function getUpstreamMappings(userId) {
+  return query(`
+    SELECT m.uuid, m.node_id,
+           n.name as node_name, n.server, n.api_host, n.api_port, n.api_token
+    FROM user_node_uuids m
+    JOIN nodes n ON m.node_id = n.id
+    WHERE m.user_id = ? AND n.has_upstream_api = 1 AND n.enabled = 1
+    ORDER BY n.sort_order, n.id
+  `, [userId]);
+}
+
+async function getUpstreamNode(nodeId) {
+  return queryOne(
+    'SELECT * FROM nodes WHERE id = ? AND has_upstream_api = 1 AND enabled = 1',
+    [nodeId]
+  );
+}
+
+async function getUpstreamNodes() {
+  return query(
+    'SELECT * FROM nodes WHERE has_upstream_api = 1 AND enabled = 1 ORDER BY sort_order, id'
+  );
+}
+
+async function getEnabledUserIds() {
+  return query('SELECT id FROM users WHERE enabled = 1 ORDER BY id');
 }
 
 // ── Templates CRUD ──────────────────────────────────────────────
 
-function getTemplates() {
-  return db().prepare(
+async function getTemplates() {
+  return query(
     'SELECT id, name, description, enabled, created_at, updated_at FROM templates ORDER BY id'
-  ).all();
+  );
 }
 
-function getTemplateById(id) {
-  return db().prepare('SELECT * FROM templates WHERE id = ?').get(id);
+async function getTemplateById(id) {
+  return queryOne('SELECT * FROM templates WHERE id = ?', [id]);
 }
 
-function getTemplateByName(name) {
-  return db().prepare('SELECT * FROM templates WHERE name = ?').get(name);
+async function getTemplateByName(name) {
+  return queryOne('SELECT * FROM templates WHERE name = ?', [name]);
 }
 
-function createTemplate(data) {
-  const info = db().prepare(
-    'INSERT INTO templates (name, description, content) VALUES (?, ?, ?)'
-  ).run([data.name, data.description || '', data.content]);
-  return getTemplateById(info.lastInsertRowid);
+async function createTemplate(data) {
+  const result = await execute(
+    'INSERT INTO templates (name, description, content) VALUES (?, ?, ?)',
+    [data.name, data.description || '', data.content]
+  );
+  return getTemplateById(result.insertId);
 }
 
-function updateTemplate(id, fields) {
+async function updateTemplate(id, fields) {
   const allowed = ['name', 'description', 'content', 'enabled'];
   const sets = [];
   const vals = [];
@@ -638,97 +626,57 @@ function updateTemplate(id, fields) {
     }
   }
   if (sets.length === 0) return getTemplateById(id);
-  sets.push(`updated_at = datetime('now')`);
   vals.push(id);
-  db().prepare(`UPDATE templates SET ${sets.join(', ')} WHERE id = ?`).run(vals);
+  await execute(`UPDATE templates SET ${sets.join(', ')} WHERE id = ?`, vals);
   return getTemplateById(id);
 }
 
-function deleteTemplate(id) {
-  db().prepare('DELETE FROM templates WHERE id = ?').run(id);
+async function deleteTemplate(id) {
+  await execute('DELETE FROM templates WHERE id = ?', [id]);
 }
 
 // ── Email Tokens ──────────────────────────────────────────────
 
-/**
- * 创建邮箱令牌（验证 / 重置密码）
- * @param {number} userId - 用户 ID
- * @param {string} type - 'verify' | 'reset'
- * @param {number} ttlHours - 有效期（小时）
- * @returns {Object} 含 token 字段的记录
- */
-function createEmailToken(userId, type, ttlHours = 24) {
-  // 使该用户同类型的旧令牌全部失效
-  db().prepare(
-    'UPDATE email_tokens SET used = 1 WHERE user_id = ? AND type = ? AND used = 0'
-  ).run([userId, type]);
-
+async function createEmailToken(userId, type, ttlHours = 24) {
+  await execute(
+    'UPDATE email_tokens SET used = 1 WHERE user_id = ? AND type = ? AND used = 0',
+    [userId, type]
+  );
   const token = crypto.randomBytes(32).toString('hex');
   const expires = new Date(Date.now() + ttlHours * 3600 * 1000)
     .toISOString().replace('T', ' ').slice(0, 19);
-  db().prepare(
-    'INSERT INTO email_tokens (user_id, token, type, expires) VALUES (?, ?, ?, ?)'
-  ).run([userId, token, type, expires]);
-  return db().prepare('SELECT * FROM email_tokens WHERE token = ?').get(token);
+  await execute(
+    'INSERT INTO email_tokens (user_id, token, type, expires) VALUES (?, ?, ?, ?)',
+    [userId, token, type, expires]
+  );
+  return queryOne('SELECT * FROM email_tokens WHERE token = ?', [token]);
 }
 
-/**
- * 查询令牌（须未使用且未过期）
- * @param {string} token
- * @returns {Object|null}
- */
-function getEmailToken(token) {
-  const row = db().prepare('SELECT * FROM email_tokens WHERE token = ?').get(token);
+async function getEmailToken(token) {
+  const row = await queryOne('SELECT * FROM email_tokens WHERE token = ?', [token]);
   if (!row) return null;
   if (row.used) return null;
-  // 检查过期
-  const exp = new Date(row.expires.replace(' ', 'T') + 'Z').getTime();
+  const exp = new Date(row.expires).getTime();
   if (Date.now() > exp) return null;
   return row;
 }
 
-/**
- * 使用令牌（标记为已用，返回是否成功）
- * @param {string} token
- * @returns {boolean}
- */
-function useEmailToken(token) {
-  const info = db().prepare(
-    'UPDATE email_tokens SET used = 1 WHERE token = ? AND used = 0'
-  ).run([token]);
-  return info.changes > 0;
-}
-
-/**
- * 按邮箱查找用户
- * @param {string} email
- * @returns {Object|null}
- */
-function getUserByEmail(email) {
-  return db().prepare('SELECT * FROM users WHERE email = ?').get(email);
-}
-
-/**
- * 标记用户邮箱已验证
- * @param {number} userId
- */
-function verifyUserEmail(userId) {
-  db().prepare('UPDATE users SET email_verified = 1 WHERE id = ?').run([userId]);
-  return getUserById(userId);
+async function useEmailToken(token) {
+  const result = await execute(
+    'UPDATE email_tokens SET used = 1 WHERE token = ? AND used = 0',
+    [token]
+  );
+  return result.affectedRows > 0;
 }
 
 // ── Invite Codes ──────────────────────────────────────────────
 
 const INVITE_CODE_LEN = 8;
-const INVITE_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 去除易混淆字符
+const INVITE_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
-/**
- * 生成单个邀请码
- * @returns {string} 8位随机邀请码
- */
-function createInviteCode(createdBy = 0) {
+async function createInviteCode(createdBy = 0) {
   let code;
- let attempts = 0;
+  let attempts = 0;
   do {
     code = '';
     const bytes = crypto.randomBytes(INVITE_CODE_LEN);
@@ -737,24 +685,19 @@ function createInviteCode(createdBy = 0) {
     }
     attempts++;
     if (attempts > 10) break;
-  } while (db().prepare('SELECT id FROM invite_codes WHERE code = ?').get(code));
-  db().prepare(
-    'INSERT INTO invite_codes (code, created_by) VALUES (?, ?)'
-  ).run([code, createdBy]);
-  return db().prepare('SELECT * FROM invite_codes WHERE code = ?').get(code);
+  } while (await queryOne('SELECT id FROM invite_codes WHERE code = ?', [code]));
+  await execute(
+    'INSERT INTO invite_codes (code, created_by) VALUES (?, ?)',
+    [code, createdBy]
+  );
+  return queryOne('SELECT * FROM invite_codes WHERE code = ?', [code]);
 }
 
-/**
- * 批量生成邀请码
- * @param {number} count — 生成数量
- * @param {number} createdBy — 创建者用户 ID
- * @returns {Array} 生成的邀请码列表
- */
-function batchCreateInviteCodes(count, createdBy = 0) {
+async function batchCreateInviteCodes(count, createdBy = 0) {
   const results = [];
   for (let i = 0; i < count; i++) {
     try {
-      results.push(createInviteCode(createdBy));
+      results.push(await createInviteCode(createdBy));
     } catch (e) {
       results.push({ error: e.message });
     }
@@ -762,49 +705,36 @@ function batchCreateInviteCodes(count, createdBy = 0) {
   return results;
 }
 
-/**
- * 查询邀请码
- * @param {string} code — 邀请码
- * @returns {Object|null}
- */
-function getInviteCode(code) {
-  return db().prepare('SELECT * FROM invite_codes WHERE code = ?').get(code);
+async function getInviteCode(code) {
+  return queryOne('SELECT * FROM invite_codes WHERE code = ?', [code]);
 }
 
-/**
- * 使用邀请码（标记为已使用）
- * @param {string} code — 邀请码
- * @param {number} userId — 使用者用户 ID
- * @returns {boolean} 是否成功
- */
-function useInviteCode(code, userId) {
-  const info = db().prepare(
-    'UPDATE invite_codes SET used_by = ?, used_at = datetime(\'now\'), enabled = 0 WHERE code = ? AND used_by IS NULL AND enabled = 1'
-  ).run([userId, code]);
-  return info.changes > 0;
+async function useInviteCode(code, userId) {
+  const result = await execute(
+    'UPDATE invite_codes SET used_by = ?, used_at = NOW(), enabled = 0 WHERE code = ? AND used_by IS NULL AND enabled = 1',
+    [userId, code]
+  );
+  return result.affectedRows > 0;
 }
 
-/**
- * 获取所有邀请码
- * @returns {Array}
- */
-function getInviteCodes() {
-  return db().prepare('SELECT * FROM invite_codes ORDER BY id DESC').all();
+async function getInviteCodes() {
+  return query('SELECT * FROM invite_codes ORDER BY id DESC');
 }
 
-/**
- * 获取邀请码统计
- * @returns {Object} { total, used, available }
- */
-function getInviteCodeStats() {
-  const total = db().prepare('SELECT COUNT(*) as c FROM invite_codes').get().c;
-  const used = db().prepare('SELECT COUNT(*) as c FROM invite_codes WHERE used_by IS NOT NULL').get().c;
+async function getInviteCodeStats() {
+  const totalRow = await queryOne('SELECT COUNT(*) as c FROM invite_codes');
+  const usedRow = await queryOne('SELECT COUNT(*) as c FROM invite_codes WHERE used_by IS NOT NULL');
+  const total = totalRow.c;
+  const used = usedRow.c;
   return { total, used, available: total - used };
 }
 
 module.exports = {
-  db,
-  DB_FILE,
+  initDb,
+  getPool,
+  query,
+  queryOne,
+  execute,
   // Password
   hashPassword,
   verifyPassword,
@@ -838,12 +768,19 @@ module.exports = {
   deleteNode,
   // Mappings
   getMappings,
+  getMappingsByNode,
   getMapping,
   upsertMapping,
+  setMappingEnabled,
   deleteMapping,
   bulkSetMappings,
   // Subscription
   getSubscriptionData,
+  // Upstream helpers
+  getUpstreamMappings,
+  getUpstreamNode,
+  getUpstreamNodes,
+  getEnabledUserIds,
   // Templates
   getTemplates,
   getTemplateById,

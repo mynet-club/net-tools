@@ -17,7 +17,9 @@ const {
   createNode,
   updateNode,
   deleteNode,
+  getMappingsByNode,
 } = require('../db');
+const { syncMappingDelete } = require('../upstream-sync');
 
 const VALID_TYPES = ['vless-reality', 'vmess'];
 const VALID_CIPHERS = ['auto', 'aes-128-gcm', 'chacha20-poly1305', 'none'];
@@ -47,8 +49,8 @@ function validateNodeData(json, isCreate) {
 /**
  * GET /api/nodes
  */
-function handleList(req, res) {
-  const nodes = getNodes();
+async function handleList(req, res) {
+  const nodes = await getNodes();
   return apiResponse(res, 200, nodes);
 }
 
@@ -59,7 +61,7 @@ async function handleCreate(req, res, json) {
   const err = validateNodeData(json, true);
   if (err) return apiResponse(res, 400, { error: err });
   try {
-    const node = createNode(json);
+    const node = await createNode(json);
     return apiResponse(res, 201, node);
   } catch (e) {
     if (e.message.includes('UNIQUE')) {
@@ -72,8 +74,8 @@ async function handleCreate(req, res, json) {
 /**
  * GET /api/nodes/:id
  */
-function handleGet(req, res, id) {
-  const node = getNodeById(id);
+async function handleGet(req, res, id) {
+  const node = await getNodeById(id);
   if (!node) {
     return apiResponse(res, 404, { error: '节点不存在' });
   }
@@ -84,14 +86,14 @@ function handleGet(req, res, id) {
  * PUT /api/nodes/:id
  */
 async function handleUpdate(req, res, id, json) {
-  const node = getNodeById(id);
+  const node = await getNodeById(id);
   if (!node) {
     return apiResponse(res, 404, { error: '节点不存在' });
   }
   const err = validateNodeData({ ...node, ...json }, false);
   if (err) return apiResponse(res, 400, { error: err });
   try {
-    const updated = updateNode(id, json);
+    const updated = await updateNode(id, json);
     return apiResponse(res, 200, updated);
   } catch (e) {
     if (e.message.includes('UNIQUE')) {
@@ -103,11 +105,17 @@ async function handleUpdate(req, res, id, json) {
 
 /**
  * DELETE /api/nodes/:id
+ * 删除节点前先同步清理上游 smartxray 节点上的孤儿 UUID
  */
-function handleDelete(req, res, id) {
-  const node = getNodeById(id);
+async function handleDelete(req, res, id) {
+  const node = await getNodeById(id);
   if (!node) {
     return apiResponse(res, 404, { error: '节点不存在' });
+  }
+  // 先查询该节点的所有用户映射，逐一同步删除上游 UUID
+  const mappings = getMappingsByNode(id);
+  for (const m of mappings) {
+    try { await syncMappingDelete(m.user_id, id); } catch (e) { console.error(`[upstream-sync] nodeDelete cleanup: ${e.message}`); }
   }
   deleteNode(id);
   return apiResponse(res, 200, { ok: true });

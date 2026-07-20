@@ -638,6 +638,7 @@ function startApiServer() {
           if (!uuid || !name) return apiResponse(res, 400, { error: 'uuid 和 name 必填' });
           try {
             const user = addUpstreamUser({ uuid, name });
+            if (_commands.cmdReload) _commands.cmdReload();
             return apiResponse(res, 200, { ok: true, user: { id: user.id, name: user.name, uuid: user.uuid, enabled: !!user.enabled } });
           } catch (e) {
             return apiResponse(res, 500, { error: e.message });
@@ -649,6 +650,7 @@ function startApiServer() {
         if (method === 'DELETE' && upstreamUserDelMatch) {
           const uuid = decodeURIComponent(upstreamUserDelMatch[1]);
           const ok = removeUpstreamUser(uuid);
+          if (ok && _commands.cmdReload) _commands.cmdReload();
           return apiResponse(res, ok ? 200 : 404, ok ? { ok: true } : { error: '用户不存在' });
         }
 
@@ -660,6 +662,7 @@ function startApiServer() {
           if (typeof enabled === 'undefined') return apiResponse(res, 400, { error: '缺少 enabled 字段' });
           const user = setUserEnabledByUuid(uuid, !!enabled);
           if (!user) return apiResponse(res, 404, { error: '用户不存在' });
+          if (_commands.cmdReload) _commands.cmdReload();
           return apiResponse(res, 200, { ok: true, user: { id: user.id, name: user.name, uuid: user.uuid, enabled: !!user.enabled } });
         }
 
