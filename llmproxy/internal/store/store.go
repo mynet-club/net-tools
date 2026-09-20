@@ -1,0 +1,695 @@
+// Package store 用 SQLite 记录请求明细、供应商状态与每日消耗汇总。
+//
+// 设计约束：**不记录任何请求/响应内容**，只落元数据（模型名、延迟、token 数、
+// 状态码、错误类型等）。客户端凭证也只存不可逆的哈希前缀。
+package store
+
+import (
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	_ "modernc.org/sqlite"
+)
+
+// RequestRecord 是一次下游请求的元数据。请求/响应内容永远不落库。
+type RequestRecord struct {
+	Ts               time.Time
+	RequestID        string
+	ClientKeyHash    string
+	ClientLabel      string
+	ClientIP         string
+	UserName         string // 多用户模式下归属的用户名；空 = 静态 key 或未启用多用户
+	Model            string
+	Provider         string
+	UpstreamModel    string
+	Stream           bool
+	StatusCode       int
+	OK               bool
+	LatencyMs        int64
+	TTFTMs           *int64
+	PromptTokens     *int64
+	CompletionTokens *int64
+	TotalTokens      *int64
+	Attempts         int
+	ErrorType        string
+	ErrorMsg         string
+
+	// 消费模式相关：
+	//   SystemPaid 表示这次消耗由网关（系统上游）付费，要计入该用户的配额与金额。
+	//   缓存拆分只在上游（如 DeepSeek）回报时才有值；两个都为 0 而 prompt>0 时，
+	//   计费按「输入全部未命中」处理，属于偏保守的估计。
+	SystemPaid      bool
+	CacheHitTokens  int64
+	CacheMissTokens int64
+}
+
+// ProviderStatus 是持久化的供应商运行期状态。
+// Scope 为空表示全局配置里的供应商，否则是某个用户名（多用户各自的上游）。
+type ProviderStatus struct {
+	Scope               string
+	Name                string
+	Enabled             bool
+	ConsecutiveFailures int
+	UnhealthyUntil      time.Time
+	LastError           string
+	LastSuccessAt       time.Time
+	LastFailureAt       time.Time
+	TotalRequests       int64
+	TotalFailures       int64
+}
+
+// UsageRow 是统计查询的一行结果。
+type UsageRow struct {
+	Day              string
+	Provider         string
+	Model            string
+	UpstreamModel    string
+	Requests         int64
+	OK               int64
+	Failed           int64
+	PromptTokens     int64
+	CompletionTokens int64
+	TotalTokens      int64
+	CacheHitTokens   int64
+	CacheMissTokens  int64
+	AvgLatencyMs     float64
+	// SystemPaid 表示这一行的消耗由网关（系统上游）付费 —— 只有这些行才计金额
+	SystemPaid bool
+}
+
+// Stats 是 `llmproxy stats` 的汇总输出。
+type Stats struct {
+	TotalRequests int64
+	TotalOK       int64
+	TotalFailed   int64
+	TotalTokens   int64
+	ByProvider    []UsageRow
+	ByDay         []UsageRow
+	Recent        []RequestRecord
+}
+
+type Store struct {
+	db *sql.DB
+}
+
+const schema = `
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+-- CLI 与运行中的服务会同时开库（用户管理命令走 CLI），给它一点重试窗口
+PRAGMA busy_timeout=5000;
+
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT    PRIMARY KEY,
+  value INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS requests (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts                INTEGER NOT NULL,
+  request_id        TEXT    NOT NULL,
+  client_key_hash   TEXT,
+  client_label      TEXT,
+  client_ip         TEXT,
+  model             TEXT    NOT NULL,
+  provider          TEXT,
+  upstream_model    TEXT,
+  stream            INTEGER NOT NULL DEFAULT 0,
+  status_code       INTEGER,
+  ok                INTEGER NOT NULL DEFAULT 0,
+  latency_ms        INTEGER,
+  ttft_ms           INTEGER,
+  prompt_tokens     INTEGER,
+  completion_tokens INTEGER,
+  total_tokens      INTEGER,
+  attempts          INTEGER NOT NULL DEFAULT 0,
+  error_type        TEXT,
+  error_msg         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
+CREATE INDEX IF NOT EXISTS idx_requests_provider_ts ON requests(provider, ts);
+CREATE INDEX IF NOT EXISTS idx_requests_model_ts ON requests(model, ts);
+
+CREATE TABLE IF NOT EXISTS provider_stats (
+  scope                TEXT    NOT NULL DEFAULT '',
+  name                 TEXT    NOT NULL,
+  enabled              INTEGER NOT NULL DEFAULT 1,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  unhealthy_until      INTEGER NOT NULL DEFAULT 0,
+  last_error           TEXT,
+  last_success_at      INTEGER,
+  last_failure_at      INTEGER,
+  total_requests       INTEGER NOT NULL DEFAULT 0,
+  total_failures       INTEGER NOT NULL DEFAULT 0,
+  updated_at           INTEGER NOT NULL,
+  PRIMARY KEY (scope, name)
+);
+
+CREATE TABLE IF NOT EXISTS usage_daily (
+  day                TEXT    NOT NULL,
+  provider           TEXT    NOT NULL,
+  model              TEXT    NOT NULL,
+  requests           INTEGER NOT NULL DEFAULT 0,
+  ok                 INTEGER NOT NULL DEFAULT 0,
+  failed             INTEGER NOT NULL DEFAULT 0,
+  prompt_tokens      INTEGER NOT NULL DEFAULT 0,
+  completion_tokens  INTEGER NOT NULL DEFAULT 0,
+  total_tokens       INTEGER NOT NULL DEFAULT 0,
+  latency_sum_ms     INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, provider, model)
+);
+`
+
+// Open 打开（必要时创建）SQLite 数据库。文件权限强制 0600。
+func Open(path string) (*Store, error) {
+	if path == "" {
+		return nil, errors.New("数据库路径为空")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("创建数据库目录失败: %w", err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, fmt.Errorf("打开 SQLite 失败: %w", err)
+	}
+	// modernc.org/sqlite 是单连接语义，开多了反而容易 SQLITE_BUSY
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+
+	if _, err := db.Exec(schema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("初始化数据库结构失败: %w", err)
+	}
+	// 单用户时代的 provider_stats 主键只有 name，这里补上 scope 维度
+	if err := migrateProviderStatsScope(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("迁移 provider_stats 失败: %w", err)
+	}
+	if _, err := db.Exec(userSchema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("初始化多用户表结构失败: %w", err)
+	}
+	// 消费模式：users 加列 + usage_user_daily 重建（主键要加 system_paid）
+	if err := migrateConsumption(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("迁移消费模式表结构失败: %w", err)
+	}
+	// WAL 模式下会生成 -wal/-shm 文件，一并收紧权限
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		if _, err := os.Stat(p); err == nil {
+			_ = os.Chmod(p, 0o600)
+		}
+	}
+	return &Store{db: db}, nil
+}
+
+// migrateProviderStatsScope 把单用户时代的 provider_stats（主键只有 name）
+// 升级成 (scope, name)：已有行归入 scope=”，也就是「全局配置里的供应商」。
+//
+// SQLite 不能改主键，只能重建。用列是否存在来判断，重复调用无副作用。
+func migrateProviderStatsScope(db *sql.DB) error {
+	var n int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info('provider_stats') WHERE name='scope'`).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	cols := `scope, name, enabled, consecutive_failures, unhealthy_until,
+	         last_error, last_success_at, last_failure_at, total_requests, total_failures, updated_at`
+	for _, q := range []string{
+		`ALTER TABLE provider_stats RENAME TO _provider_stats_legacy`,
+		`CREATE TABLE provider_stats (
+		   scope                TEXT    NOT NULL DEFAULT '',
+		   name                 TEXT    NOT NULL,
+		   enabled              INTEGER NOT NULL DEFAULT 1,
+		   consecutive_failures INTEGER NOT NULL DEFAULT 0,
+		   unhealthy_until      INTEGER NOT NULL DEFAULT 0,
+		   last_error           TEXT,
+		   last_success_at      INTEGER,
+		   last_failure_at      INTEGER,
+		   total_requests       INTEGER NOT NULL DEFAULT 0,
+		   total_failures       INTEGER NOT NULL DEFAULT 0,
+		   updated_at           INTEGER NOT NULL,
+		   PRIMARY KEY (scope, name)
+		 )`,
+		`INSERT INTO provider_stats (` + cols + `)
+		 SELECT '', name, enabled, consecutive_failures, unhealthy_until,
+		        last_error, last_success_at, last_failure_at, total_requests, total_failures, updated_at
+		 FROM _provider_stats_legacy`,
+		`DROP TABLE _provider_stats_legacy`,
+	} {
+		if _, err := tx.Exec(q); err != nil {
+			return fmt.Errorf("迁移步骤失败: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Close()
+}
+
+func (s *Store) DB() *sql.DB { return s.db }
+
+func nowMs(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixMilli()
+}
+
+func int64Val(p *int64) int64 {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
+func ptrVal(p *int64) any {
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+func nullable(v int64) any {
+	if v == 0 {
+		return nil
+	}
+	return v
+}
+
+// InsertRequest 写入一条请求明细，并同步更新 usage_daily 汇总。
+func (s *Store) InsertRequest(rec RequestRecord) error {
+	if rec.Ts.IsZero() {
+		rec.Ts = time.Now()
+	}
+	day := rec.Ts.Format("2006-01-02")
+	stream := 0
+	if rec.Stream {
+		stream = 1
+	}
+	okInc, failedInc := 0, 1
+	if rec.OK {
+		okInc, failedInc = 1, 0
+	}
+	provider := rec.Provider
+	if provider == "" {
+		provider = "-"
+	}
+	model := rec.Model
+	if model == "" {
+		model = "-"
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.Exec(`
+INSERT INTO requests (
+  ts, request_id, client_key_hash, client_label, client_ip,
+  model, provider, upstream_model, stream,
+  status_code, ok, latency_ms, ttft_ms,
+  prompt_tokens, completion_tokens, total_tokens,
+  attempts, error_type, error_msg
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		nowMs(rec.Ts), rec.RequestID, rec.ClientKeyHash, rec.ClientLabel, rec.ClientIP,
+		model, provider, rec.UpstreamModel, stream,
+		nullable(int64(rec.StatusCode)), map[bool]int{true: 1, false: 0}[rec.OK],
+		nullable(rec.LatencyMs), ptrVal(rec.TTFTMs),
+		ptrVal(rec.PromptTokens), ptrVal(rec.CompletionTokens), ptrVal(rec.TotalTokens),
+		rec.Attempts, rec.ErrorType, rec.ErrorMsg,
+	)
+	if err != nil {
+		return fmt.Errorf("写入 requests 失败: %w", err)
+	}
+
+	if provider != "-" {
+		_, err = tx.Exec(`
+INSERT INTO usage_daily (
+  day, provider, model, requests, ok, failed,
+  prompt_tokens, completion_tokens, total_tokens, latency_sum_ms
+) VALUES (?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(day, provider, model) DO UPDATE SET
+  requests          = requests + excluded.requests,
+  ok                = ok + excluded.ok,
+  failed            = failed + excluded.failed,
+  prompt_tokens     = prompt_tokens + excluded.prompt_tokens,
+  completion_tokens = completion_tokens + excluded.completion_tokens,
+  total_tokens      = total_tokens + excluded.total_tokens,
+  latency_sum_ms    = latency_sum_ms + excluded.latency_sum_ms`,
+			day, provider, model, 1, okInc, failedInc,
+			int64Val(rec.PromptTokens), int64Val(rec.CompletionTokens), int64Val(rec.TotalTokens),
+			rec.LatencyMs,
+		)
+		if err != nil {
+			return fmt.Errorf("写入 usage_daily 失败: %w", err)
+		}
+	}
+
+	// 多用户模式下额外记一份「按用户」的汇总；静态 key 没有归属用户，不记
+	if rec.UserName != "" {
+		systemPaid := 0
+		if rec.SystemPaid {
+			systemPaid = 1
+		}
+		// 上游模型名决定单价；取不到时退化成下游名（同名直通的情况下两者相同）
+		upstream := rec.UpstreamModel
+		if upstream == "" {
+			upstream = model
+		}
+		_, err = tx.Exec(`
+INSERT INTO usage_user_daily (
+  day, user_name, provider, model, upstream_model, system_paid,
+  requests, ok, failed,
+  prompt_tokens, cache_hit_tokens, cache_miss_tokens, completion_tokens, total_tokens, latency_sum_ms
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(day, user_name, provider, model, upstream_model, system_paid) DO UPDATE SET
+  requests          = requests + excluded.requests,
+  ok                = ok + excluded.ok,
+  failed            = failed + excluded.failed,
+  prompt_tokens     = prompt_tokens + excluded.prompt_tokens,
+  cache_hit_tokens  = cache_hit_tokens + excluded.cache_hit_tokens,
+  cache_miss_tokens = cache_miss_tokens + excluded.cache_miss_tokens,
+  completion_tokens = completion_tokens + excluded.completion_tokens,
+  total_tokens      = total_tokens + excluded.total_tokens,
+  latency_sum_ms    = latency_sum_ms + excluded.latency_sum_ms`,
+			day, rec.UserName, provider, model, upstream, systemPaid, 1, okInc, failedInc,
+			int64Val(rec.PromptTokens), rec.CacheHitTokens, rec.CacheMissTokens,
+			int64Val(rec.CompletionTokens), int64Val(rec.TotalTokens),
+			rec.LatencyMs,
+		)
+		if err != nil {
+			return fmt.Errorf("写入 usage_user_daily 失败: %w", err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// SaveProviderStatus 批量写入供应商运行期状态。
+func (s *Store) SaveProviderStatus(statuses []ProviderStatus) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	stmt, err := tx.Prepare(`
+INSERT INTO provider_stats (
+  scope, name, enabled, consecutive_failures, unhealthy_until,
+  last_error, last_success_at, last_failure_at,
+  total_requests, total_failures, updated_at
+) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(scope, name) DO UPDATE SET
+  enabled              = excluded.enabled,
+  consecutive_failures = excluded.consecutive_failures,
+  unhealthy_until      = excluded.unhealthy_until,
+  last_error           = excluded.last_error,
+  last_success_at      = excluded.last_success_at,
+  last_failure_at      = excluded.last_failure_at,
+  total_requests       = excluded.total_requests,
+  total_failures       = excluded.total_failures,
+  updated_at           = excluded.updated_at`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	now := time.Now().UnixMilli()
+	for _, st := range statuses {
+		enabled := 0
+		if st.Enabled {
+			enabled = 1
+		}
+		if _, err := stmt.Exec(
+			st.Scope, st.Name, enabled, st.ConsecutiveFailures, nowMs(st.UnhealthyUntil),
+			st.LastError, nowMs(st.LastSuccessAt), nowMs(st.LastFailureAt),
+			st.TotalRequests, st.TotalFailures, now,
+		); err != nil {
+			return fmt.Errorf("写入 provider_stats %s 失败: %w", st.Name, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// scopeKey 把 (作用域, 供应商) 拼成 map 的键。
+// 全局作用域直接用供应商名，这样单用户时代的调用方和已有测试不受影响。
+func scopeKey(scope, name string) string {
+	if scope == "" {
+		return name
+	}
+	return scope + "/" + name
+}
+
+// SplitScopeKey 是 scopeKey 的逆运算，供需要还原作用域的调用方使用。
+func SplitScopeKey(k string) (scope, name string) {
+	if i := strings.IndexByte(k, '/'); i >= 0 {
+		return k[:i], k[i+1:]
+	}
+	return "", k
+}
+
+// LoadProviderStatus 读取全部供应商状态（含各用户自己的上游），重启后恢复熔断。
+func (s *Store) LoadProviderStatus() (map[string]ProviderStatus, error) {
+	rows, err := s.db.Query(`
+SELECT COALESCE(scope,''), name, enabled, consecutive_failures, unhealthy_until,
+       COALESCE(last_error,''), COALESCE(last_success_at,0), COALESCE(last_failure_at,0),
+       total_requests, total_failures
+FROM provider_stats`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string]ProviderStatus)
+	for rows.Next() {
+		var st ProviderStatus
+		var enabled, unhealthyUntil, lastOK, lastFail int64
+		if err := rows.Scan(&st.Scope, &st.Name, &enabled, &st.ConsecutiveFailures, &unhealthyUntil,
+			&st.LastError, &lastOK, &lastFail,
+			&st.TotalRequests, &st.TotalFailures); err != nil {
+			return nil, err
+		}
+		st.Enabled = enabled != 0
+		if unhealthyUntil != 0 {
+			st.UnhealthyUntil = time.UnixMilli(unhealthyUntil)
+		}
+		if lastOK != 0 {
+			st.LastSuccessAt = time.UnixMilli(lastOK)
+		}
+		if lastFail != 0 {
+			st.LastFailureAt = time.UnixMilli(lastFail)
+		}
+		out[scopeKey(st.Scope, st.Name)] = st
+	}
+	return out, rows.Err()
+}
+
+// Prune 删除 retainDays 天前的请求明细；usage_daily 保留（体积很小，且是长期消耗视图）。
+func (s *Store) Prune(retainDays int) (int64, error) {
+	if retainDays <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().AddDate(0, 0, -retainDays).UnixMilli()
+	res, err := s.db.Exec(`DELETE FROM requests WHERE ts < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// Revision 返回用户与上游配置的修订号：任何一次增删改都会 +1。
+// 运行中的服务靠轮询它发现「CLI 在另一个进程里改了配置」。
+func (s *Store) Revision() (int64, error) {
+	var v int64
+	err := s.db.QueryRow(`SELECT COALESCE((SELECT value FROM meta WHERE key='revision'),0)`).Scan(&v)
+	return v, err
+}
+
+// bumpRevision 在事务里把修订号 +1。
+func bumpRevision(tx *sql.Tx) error {
+	_, err := tx.Exec(`INSERT INTO meta(key,value) VALUES('revision',1)
+	  ON CONFLICT(key) DO UPDATE SET value = value + 1`)
+	return err
+}
+
+// isUniqueViolation 判断是否撞了唯一约束（modernc sqlite 的错误文本里带这个）。
+func isUniqueViolation(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
+}
+
+// Stats 查询消耗统计。since 为零值表示不限起始时间。
+func (s *Store) Stats(since time.Time, recentLimit int) (*Stats, error) {
+	out := &Stats{
+		ByProvider: []UsageRow{},
+		ByDay:      []UsageRow{},
+		Recent:     []RequestRecord{},
+	}
+
+	where := ""
+	args := []any{}
+	if !since.IsZero() {
+		where = " WHERE ts >= ?"
+		args = append(args, since.UnixMilli())
+	}
+	err := s.db.QueryRow(`
+SELECT COUNT(*),
+       COALESCE(SUM(CASE WHEN ok=1 THEN 1 ELSE 0 END),0),
+       COALESCE(SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END),0),
+       COALESCE(SUM(COALESCE(total_tokens,0)),0)
+FROM requests`+where, args...).Scan(
+		&out.TotalRequests, &out.TotalOK, &out.TotalFailed, &out.TotalTokens)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := s.db.Query(`
+SELECT day, provider, model,
+       SUM(requests), SUM(ok), SUM(failed),
+       SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
+       CASE WHEN SUM(requests)>0 THEN CAST(SUM(latency_sum_ms) AS REAL)/SUM(requests) ELSE 0 END
+FROM usage_daily
+GROUP BY provider, model
+ORDER BY SUM(requests) DESC, provider, model
+LIMIT 200`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var r UsageRow
+		if err := rows.Scan(&r.Day, &r.Provider, &r.Model,
+			&r.Requests, &r.OK, &r.Failed,
+			&r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.AvgLatencyMs); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		out.ByProvider = append(out.ByProvider, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	rows2, err := s.db.Query(`
+SELECT day, '-', '-',
+       SUM(requests), SUM(ok), SUM(failed),
+       SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
+       CASE WHEN SUM(requests)>0 THEN CAST(SUM(latency_sum_ms) AS REAL)/SUM(requests) ELSE 0 END
+FROM usage_daily
+GROUP BY day
+ORDER BY day DESC
+LIMIT 90`)
+	if err != nil {
+		return nil, err
+	}
+	for rows2.Next() {
+		var r UsageRow
+		if err := rows2.Scan(&r.Day, &r.Provider, &r.Model,
+			&r.Requests, &r.OK, &r.Failed,
+			&r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.AvgLatencyMs); err != nil {
+			rows2.Close()
+			return nil, err
+		}
+		out.ByDay = append(out.ByDay, r)
+	}
+	rows2.Close()
+	if err := rows2.Err(); err != nil {
+		return nil, err
+	}
+
+	if recentLimit > 0 {
+		if err := s.loadRecent(out, recentLimit); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) loadRecent(out *Stats, limit int) error {
+	rows, err := s.db.Query(`
+SELECT ts, request_id, COALESCE(client_key_hash,''), COALESCE(client_label,''), COALESCE(client_ip,''),
+       model, COALESCE(provider,''), COALESCE(upstream_model,''), stream,
+       status_code, ok, latency_ms, ttft_ms,
+       prompt_tokens, completion_tokens, total_tokens,
+       attempts, COALESCE(error_type,''), COALESCE(error_msg,'')
+FROM requests
+ORDER BY ts DESC
+LIMIT ?`, limit)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var rec RequestRecord
+		var ts, status, okFlag, stream, latency, attempts sql.NullInt64
+		var ttft, pt, ct, tt sql.NullInt64
+		if err := rows.Scan(&ts, &rec.RequestID, &rec.ClientKeyHash, &rec.ClientLabel, &rec.ClientIP,
+			&rec.Model, &rec.Provider, &rec.UpstreamModel, &stream,
+			&status, &okFlag, &latency, &ttft,
+			&pt, &ct, &tt,
+			&attempts, &rec.ErrorType, &rec.ErrorMsg); err != nil {
+			return err
+		}
+		if ts.Valid {
+			rec.Ts = time.UnixMilli(ts.Int64)
+		}
+		rec.Stream = stream.Int64 != 0
+		rec.StatusCode = int(status.Int64)
+		rec.OK = okFlag.Int64 != 0
+		rec.LatencyMs = latency.Int64
+		rec.Attempts = int(attempts.Int64)
+		if ttft.Valid {
+			v := ttft.Int64
+			rec.TTFTMs = &v
+		}
+		if pt.Valid {
+			v := pt.Int64
+			rec.PromptTokens = &v
+		}
+		if ct.Valid {
+			v := ct.Int64
+			rec.CompletionTokens = &v
+		}
+		if tt.Valid {
+			v := tt.Int64
+			rec.TotalTokens = &v
+		}
+		out.Recent = append(out.Recent, rec)
+	}
+	return rows.Err()
+}
+
+// KeyHash 对下游 API key 做不可逆摘要，日志里只存这个前缀。
+// 用 SHA-256；对自用场景的长随机 key 来说足够，且不引入额外密钥管理。
+func KeyHash(key string) string {
+	if key == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:6])
+}

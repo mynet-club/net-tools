@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llmproxy · 我的上游</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='7'%20fill='%234f46e5'/%3E%3Cpath%20d='M9%2016h12M17%2011l5%205-5%205'%20fill='none'%20stroke='%23fff'%20stroke-width='3'%20stroke-linecap='round'%20stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<!-- ── 登录 ───────────────────────────────────────────────────────── -->
+<main id="login" class="login-wrap" hidden>
+  <form class="card login-card" id="login-form">
+    <h1>llmproxy</h1>
+    <p class="sub">用你的下游 token 登录，管理自己的上游与用量。<br>
+       token 只存在这个标签页的会话里（sessionStorage），关闭标签即失效，
+       不会进 URL、Cookie 或 localStorage。</p>
+
+    <label for="login-base">网关地址</label>
+    <input id="login-base" type="text" spellcheck="false" autocomplete="off"
+           placeholder="http://127.0.0.1:8787">
+
+    <label for="login-token">下游 token</label>
+    <input id="login-token" type="password" spellcheck="false" autocomplete="off"
+           placeholder="sk-…" required>
+
+    <button type="submit" id="login-btn" class="primary">登录</button>
+    <p class="err" id="login-err" hidden></p>
+    <p class="hint" id="login-hint"></p>
+  </form>
+</main>
+
+<!-- ── 主界面 ─────────────────────────────────────────────────────── -->
+<div id="app" hidden>
+  <header class="bar">
+    <div class="bar-in">
+      <strong>llmproxy</strong>
+      <span class="sep">·</span>
+      <span id="who" class="mono"></span>
+      <span id="badge" class="badge" hidden></span>
+      <span class="grow"></span>
+      <span id="base-label" class="mono muted" title="当前网关地址"></span>
+      <button type="button" id="logout" class="ghost">退出</button>
+    </div>
+  </header>
+
+  <main class="wrap">
+
+    <p class="banner" id="banner" hidden></p>
+
+    <!-- 概览 -->
+    <section class="card">
+      <h2>概览</h2>
+      <div class="grid4" id="overview"><p class="muted">加载中…</p></div>
+    </section>
+
+    <!-- 消费模式的配额（只对 consumption 用户显示） -->
+    <section class="card" id="quota-card" hidden>
+      <h2>本月消费额度</h2>
+      <p class="sub">只统计走<strong>系统上游</strong>的消耗 —— 你自己的上游由你自己和供应商结算，不占这里的额度。</p>
+      <div class="grid4" id="quota"></div>
+      <div id="quota-bars"></div>
+    </section>
+
+    <!-- 可用模型（消费模式，只读） -->
+    <section class="card" id="models-card" hidden>
+      <h2>可用模型</h2>
+      <p class="sub">这是管理员给你的白名单。没在列表里的模型会被直接拒绝（403），请求不会打到上游。</p>
+      <div id="models" class="chips"></div>
+      <p class="muted" id="models-empty" hidden>还没有可用模型 —— 需要用哪些模型请联系管理员。</p>
+    </section>
+
+    <!-- 我的上游 -->
+    <section class="card">
+      <div class="head">
+        <h2>我的上游</h2>
+        <button type="button" id="add-open" class="primary sm">新增上游</button>
+      </div>
+      <p class="sub">自己配了上游，请求就只走自己的 —— 不会落到网关的系统上游上。</p>
+      <p class="banner warn" id="broken" hidden></p>
+
+      <!-- 新增 / 编辑表单 -->
+      <form id="pform" class="pform" hidden>
+        <div class="pform-grid">
+          <div>
+            <label for="f-name">上游名</label>
+            <input id="f-name" type="text" spellcheck="false" autocomplete="off"
+                   placeholder="my-deepseek" required>
+          </div>
+          <div>
+            <label for="f-base">上游地址（OpenAI 兼容根地址）</label>
+            <input id="f-base" type="text" spellcheck="false" autocomplete="off"
+                   placeholder="https://api.deepseek.com/v1" required>
+          </div>
+          <div class="wide">
+            <label for="f-key">上游密钥</label>
+            <input id="f-key" type="password" spellcheck="false" autocomplete="off"
+                   placeholder="sk-…">
+            <span class="hint">编辑时留空 = 不修改。密钥加密后落库，页面上只会显示尾 4 位。</span>
+          </div>
+          <div class="wide">
+            <label>承接的模型</label>
+            <div class="mmode">
+              <label class="inline"><input type="radio" name="mmode" id="m-all" value="all"> 全部直通（任何模型名都转发）</label>
+              <label class="inline"><input type="radio" name="mmode" id="m-pick" value="pick" checked> 指定模型（勾选，可起别名）</label>
+            </div>
+            <div id="mpick">
+              <div class="row mhead">
+                <button type="button" id="m-sync" class="sm">从上游同步模型列表</button>
+                <span class="muted" id="m-sync-state">还没同步</span>
+                <span class="grow"></span>
+                <input id="m-filter" class="search" placeholder="搜索模型名…" autocomplete="off">
+              </div>
+              <div id="m-cands" class="cands"></div>
+              <p class="muted" id="m-cands-empty" hidden>还没有候选模型。点上面的「同步」从上游拉一次；
+                拉不到（上游不提供 /v1/models）就往下用「手动添加」。</p>
+
+              <div class="picked-head" id="m-picked-head" hidden>
+                已选 <span id="m-picked-count">0</span> 个 —— 下游名是客户端请求时 <code>model</code> 字段要填的名字
+              </div>
+              <div class="tablewrap" id="m-picked-wrap" hidden>
+                <table id="m-picked">
+                  <thead><tr><th>上游模型</th><th>下游名</th><th></th></tr></thead>
+                  <tbody></tbody>
+                </table>
+              </div>
+
+              <label class="inline mt" id="m-catchall-wrap"><input type="checkbox" id="m-catchall">
+                其余模型也放行（上面没列出的模型名原样转发）</label>
+
+              <div class="row">
+                <input id="m-manual" class="mono" placeholder="手动添加模型名（上游没有 /v1/models 时用）"
+                       autocomplete="off" spellcheck="false">
+                <button type="button" id="m-manual-add" class="ghost sm">添加</button>
+              </div>
+            </div>
+          </div>
+          <div>
+            <label for="f-weight">权重</label>
+            <input id="f-weight" type="number" min="0.1" step="0.1" value="1">
+          </div>
+          <div>
+            <label for="f-timeout">超时（毫秒）</label>
+            <input id="f-timeout" type="number" min="1000" step="1000" value="120000">
+          </div>
+          <div class="wide">
+            <label for="f-proxy">代理</label>
+            <input id="f-proxy" type="text" spellcheck="false" autocomplete="off" placeholder="direct">
+            <span class="hint">direct、网关配置里代理池的名字，或内联 URL（http:// / socks5://）。</span>
+          </div>
+        </div>
+        <div class="row">
+          <button type="submit" class="primary">保存</button>
+          <button type="button" id="add-cancel" class="ghost">取消</button>
+          <span class="grow"></span>
+          <label class="inline"><input type="checkbox" id="f-enabled" checked> 启用</label>
+          <span class="err" id="pform-err" hidden></span>
+        </div>
+      </form>
+
+      <div class="tablewrap">
+        <table id="ptable">
+          <thead>
+            <tr><th>名称</th><th>上游地址</th><th>模型</th><th>权重</th><th>代理</th>
+                <th>超时</th><th>密钥</th><th>状态</th><th></th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="muted" id="pempty" hidden>还没有配置上游。这种方式下没有上游时请求会直接失败（不会回退到系统上游）——
+        要么自己配一个，要么让管理员把你的模式改成 consumption 来使用系统上游。</p>
+    </section>
+
+    <!-- 我的模型：按下游模型名聚合 -->
+    <section class="card" id="my-models-card" hidden>
+      <h2>我的模型</h2>
+      <p class="sub">按客户端请求里 <code>model</code> 字段的名字汇总，看它现在挂在哪些上游上。
+        同一个模型挂在两家以上，就是负载均衡 + 失败自动切换。</p>
+      <div class="tablewrap">
+        <table id="my-models">
+          <thead><tr><th>下游模型名</th><th>承接的上游</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="muted" id="my-models-empty" hidden>还没有映射到具体模型名的上游。</p>
+      <p class="muted" id="my-models-pass" hidden></p>
+    </section>
+
+    <!-- 用量 -->
+    <section class="card">
+      <div class="head">
+        <h2>我的用量</h2>
+        <div class="seg" id="days">
+          <button type="button" data-days="7" class="on">7 天</button>
+          <button type="button" data-days="30">30 天</button>
+          <button type="button" data-days="90">90 天</button>
+        </div>
+      </div>
+      <div id="utotals" class="grid4"></div>
+      <div class="tablewrap">
+        <table id="utable">
+          <thead>
+            <tr><th>日期</th><th>上游</th><th>模型</th><th>请求</th><th>成功</th><th>失败</th>
+                <th>输入 tok</th><th>输出 tok</th><th>合计 tok</th><th>平均耗时</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="muted" id="uempty" hidden>这个时间段没有记录。</p>
+    </section>
+
+    <!-- 试一下 -->
+    <section class="card">
+      <h2>试一下</h2>
+      <p class="sub">用你自己的 token 从网关发一条请求，看看能不能通、被哪个上游接走了。</p>
+      <div class="try-grid">
+        <div>
+          <label for="t-model">模型</label>
+          <input id="t-model" type="text" spellcheck="false" autocomplete="off" value="deepseek-chat">
+        </div>
+        <div class="wide">
+          <label for="t-prompt">内容</label>
+          <input id="t-prompt" type="text" autocomplete="off" value="你好，请只回两个字：收到">
+        </div>
+      </div>
+      <div class="row">
+        <button type="button" id="t-send" class="primary">发送</button>
+        <span class="grow"></span>
+        <span class="muted mono" id="t-meta"></span>
+      </div>
+      <pre id="t-out" class="out" hidden></pre>
+    </section>
+
+  </main>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

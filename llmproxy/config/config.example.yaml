@@ -1,0 +1,84 @@
+# llmproxy 配置示例
+#
+# 安装后本文件会被复制到运行时目录（macOS/Linux: ~/.config/llmproxy/config.yaml）。
+# 修改保存后自动热加载，不需要重启；也可以 `llmproxy reload` 或 `kill -HUP <pid>`。
+# 新配置校验失败时保留旧配置继续服务，错误写入日志。
+
+server:
+  host: 127.0.0.1          # 默认只听本机。改成 0.0.0.0 前请务必先设置 api_keys
+  port: 8787
+  api_keys:                # 下游客户端凭证（Bearer token）。留空且 host 非本机时拒绝启动
+    - sk-local-change-me
+  max_body_mb: 16          # 请求体上限，超过返回 413
+  request_timeout_ms: 300000  # 单个请求（含流式输出）总时长上限
+
+  # 多用户（中转器）模式的管理凭证：设了才有 /v1/_admin，留空则管理接口整体关闭。
+  # 用户本身用 llmproxy user add 管理（存在数据库里），不写在这份配置里。
+  # admin_token: ${LLMPROXY_ADMIN_TOKEN}
+
+routing:
+  retry: 2                 # 首次失败后再换多少个供应商重试（0 = 不重试）
+  failure_threshold: 3     # 连续失败达到几次后临时摘除该供应商
+  cooldown_seconds: 60     # 摘除后多少秒自动恢复，恢复后重新参与权重选择
+
+# 代理池：供应商通过 proxy 字段按名字引用
+# 支持 http://  socks5://  socks5h://（h = 由代理解析域名）
+# 也支持直接写内联地址：proxy: "http://127.0.0.1:7890"
+proxies:
+  - name: us-http
+    url: http://127.0.0.1:7890
+  - name: jp-socks
+    url: socks5://user:password@127.0.0.1:1081
+
+providers:
+  # ---- OpenAI 官方 ----
+  - name: openai-main
+    enabled: true
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY}      # 支持 ${ENV_VAR} 展开，避免密钥写进文件
+    weight: 10                      # 相对权重，越大被选中概率越高
+    proxy: us-http                  # direct / 留空 = 直连；也可写代理名或内联 URL
+    timeout_ms: 120000
+    models:                         # 下游模型名 → 上游真实模型名
+      gpt-4o: gpt-4o-2024-11-20
+      gpt-4o-mini: gpt-4o-mini
+    extra_headers:                  # 可选：附加到上游请求头
+      X-Title: llmproxy
+
+  # ---- 同模型池的第二个供应商，按权重分摊 ----
+  - name: openai-backup
+    enabled: true
+    base_url: https://api.openai.com/v1
+    api_key: ${OPENAI_API_KEY_BACKUP}
+    weight: 3
+    proxy: direct
+    models:
+      gpt-4o: gpt-4o-2024-11-20
+
+  # ---- 直通型供应商：下游模型名原样发给上游 ----
+  - name: deepseek
+    enabled: true
+    base_url: https://api.deepseek.com/v1
+    api_key: ${DEEPSEEK_API_KEY}
+    weight: 5
+    proxy: direct
+    models: ["*"]                   # "*" = 任意模型名直通
+    timeout_ms: 180000
+
+  # ---- 已停用的供应商：保留配置但不参与选择 ----
+  - name: some-broken-vendor
+    enabled: false
+    base_url: https://example.com/v1
+    api_key: sk-xxx
+    weight: 1
+    models:
+      gpt-4o: some-model
+
+database:
+  path: ""             # 留空 = 运行时目录下的 data/llmproxy.db
+  retain_days: 90      # 请求明细保留天数，超期自动清理；0 = 永久保留
+
+log:
+  level: info          # debug | info | warn | error
+  max_mb: 10           # 单个日志文件上限
+  keep: 5              # 轮转保留份数

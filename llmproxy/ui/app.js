@@ -1,0 +1,644 @@
+'use strict';
+
+/* llmproxy 用户控制台（无框架、无外部资源，随二进制一起分发）
+   安全取向：
+   - token 只放 sessionStorage，不进 URL、不进日志、不落 localStorage
+   - 所有来自接口的字符串一律走 textContent 渲染，不用 innerHTML ——
+     上游名、地址、模型名、错误信息都是用户可控的，拼 HTML 就是 XSS */
+
+const $ = (id) => document.getElementById(id);
+const state = { base: '', token: '', me: null, days: 7, editing: null };
+
+/* ── 小工具 ───────────────────────────────────────────────────────── */
+
+function h(tag, props, ...kids) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v == null || v === false) continue;
+    if (k === 'class') n.className = v;
+    else if (k === 'text') n.textContent = v;
+    else if (k.startsWith('on')) n.addEventListener(k.slice(2).toLowerCase(), v);
+    else n.setAttribute(k, v);
+  }
+  for (const kid of kids.flat()) {
+    if (kid == null || kid === false) continue;
+    n.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+  }
+  return n;
+}
+
+const num = (v) => (v == null ? '—' : Number(v).toLocaleString('zh-CN'));
+// 金额：小额给 4 位小数，否则 0.00002 会被四舍五入成 0.00，看着像没花钱
+const money = (v, cur) => {
+  const n = Number(v || 0);
+  return (n >= 1 ? n.toFixed(2) : n.toFixed(4)) + (cur ? ' ' + cur : '');
+};
+const ms = (v) => (v == null || v === 0 ? '—' : Math.round(v) + 'ms');
+
+function defaultBase() {
+  if (location.protocol === 'http:' || location.protocol === 'https:') return location.origin;
+  return 'http://127.0.0.1:8787';
+}
+
+function showErr(node, msg) {
+  node.textContent = msg || '';
+  node.hidden = !msg;
+}
+
+/* ── 接口 ─────────────────────────────────────────────────────────── */
+
+async function api(path, opts = {}) {
+  const headers = { Authorization: 'Bearer ' + state.token, ...(opts.headers || {}) };
+  if (opts.body) headers['Content-Type'] = 'application/json';
+  let res;
+  try {
+    res = await fetch(state.base + path, { ...opts, headers });
+  } catch (e) {
+    throw new Error('连不上网关 ' + state.base + '：' + e.message +
+      '（若页面是从文件打开的，浏览器会拦跨源请求；建议直接访问网关自带的 /ui/）');
+  }
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = null; }
+  if (!res.ok) {
+    const m = (data && data.error && (data.error.message || data.error.type)) || res.status + ' ' + res.statusText;
+    const err = new Error(m);
+    err.status = res.status;
+    throw err;
+  }
+  return { data, res };
+}
+
+/* ── 登录 ─────────────────────────────────────────────────────────── */
+
+function renderLogin(msg) {
+  $('app').hidden = true;
+  $('login').hidden = false;
+  $('login-base').value = state.base || defaultBase();
+  showErr($('login-err'), msg);
+  $('login-hint').textContent = location.protocol === 'file:'
+    ? '当前是从本地文件打开的：接口调用需要跨源，浏览器通常会拦。要用真实数据请访问网关的 /ui/。'
+    : '地址默认就是当前站点的来源（同源，不需要 CORS）。';
+  $('login-token').focus();
+}
+
+async function login(base, token) {
+  state.base = base.replace(/\/+$/, '');
+  state.token = token;
+  try {
+    const { data } = await api('/v1/_me');
+    state.me = data;
+    sessionStorage.setItem('llmproxy.base', state.base);
+    sessionStorage.setItem('llmproxy.token', state.token);
+    renderApp();
+    await Promise.all([loadProviders(), loadModelOverview(), loadUsage()]);
+  } catch (e) {
+    state.token = '';
+    if (e.status === 401) renderLogin('token 无效。');
+    else if (e.status === 403) renderLogin('这个 token 没有用户身份（可能是网关的静态 key），不能使用自助接口。');
+    else if (e.status === 501) renderLogin('网关没启用多用户模式（服务端缺少主密钥）。');
+    else renderLogin(e.message);
+  }
+}
+
+function logout() {
+  sessionStorage.removeItem('llmproxy.token');
+  state.token = '';
+  state.me = null;
+  renderLogin('');
+}
+
+/* ── 概览 ─────────────────────────────────────────────────────────── */
+
+function stat(k, v, cls) {
+  return h('div', null,
+    h('div', { class: 'k', text: k }),
+    h('div', { class: cls ? 'v ' + cls : 'v', text: v }));
+}
+
+function renderApp() {
+  $('login').hidden = true;
+  $('app').hidden = false;
+  const me = state.me || {};
+  const u = me.usage || {};
+
+  $('who').textContent = me.name || '';
+  $('base-label').textContent = state.base;
+
+  const consumption = me.mode === 'consumption';
+  const badge = $('badge');
+  badge.hidden = false;
+  badge.textContent = (consumption ? '消费模式 · ' : '') + (me.enabled ? '已启用' : '已停用');
+  badge.className = 'badge' + (me.enabled ? '' : ' off');
+
+  const broken = $('broken');
+  if (me.broken_providers && me.broken_providers.length) {
+    broken.textContent = '这些上游当前不可用：' + me.broken_providers.join('、') +
+      '（常见原因：master.key 被换过导致解密失败，或地址/模型配置非法）。';
+    broken.hidden = false;
+  } else {
+    broken.hidden = true;
+  }
+
+  $('overview').replaceChildren(
+    stat('请求总数', num(u.requests)),
+    stat('成功 / 失败', num(u.ok) + ' / ' + num(u.failed)),
+    stat('token 合计', num(u.total_tokens)),
+    stat('记录区间', (u.first_day || '—') + ' ~ ' + (u.last_day || '—'), 'sm'),
+  );
+
+  renderMode(me);
+
+  $('t-model').value = $('t-model').value || 'deepseek-chat';
+}
+
+// 消费模式：配额与可用模型；byo 模式：这两张卡收起来
+function renderMode(me) {
+  const consumption = me.mode === 'consumption';
+  $('quota-card').hidden = !consumption;
+  $('models-card').hidden = !consumption;
+  if (!consumption) return;
+
+  const q = me.quota || {};
+  const cur = q.currency || 'CNY';
+  const lim = (v) => (v > 0 ? v : null);
+
+  const tokLim = lim(q.month_tokens);
+  const costLim = lim(q.month_cost);
+  $('quota').replaceChildren(
+    stat('可用模型', String((me.models || []).length)),
+    stat('本月已用 token', num(q.used_tokens) + (tokLim ? ' / ' + num(tokLim) : '（不限）')),
+    stat('本月估算金额', (costLim
+      ? money(q.used_cost) + ' / ' + costLim.toFixed(2)
+      : money(q.used_cost)) + ' ' + cur),
+    stat('剩余额度', tokLim ? num(q.left_tokens) + ' token' : (costLim ? money(q.left_cost, cur) : '不限'), 'sm'),
+  );
+
+  // 有上限时给一条细进度条：数字看不出「还剩多少」，条看得出来
+  const bars = [];
+  if (tokLim) bars.push(bar('token', q.used_tokens, tokLim));
+  if (costLim) bars.push(bar('金额 ' + cur, q.used_cost, costLim));
+  $('quota-bars').replaceChildren(...bars);
+
+  const ms = me.models || [];
+  const box = $('models');
+  box.replaceChildren(...ms.map((m) => h('span', { class: 'chip', text: m })));
+  $('models-empty').hidden = ms.length > 0;
+
+  // 「试一下」的默认模型必须是白名单里的，否则用户一点就吃 403
+  const t = $('t-model');
+  if (ms.length && !ms.includes(t.value.trim())) t.value = ms[0];
+}
+
+function bar(label, used, limit) {
+  const pct = Math.min(100, limit > 0 ? (used / limit) * 100 : 0);
+  return h('div', { class: 'barrow' },
+    h('div', { class: 'barlabel', text: label }),
+    h('div', { class: 'bartrack' }, h('div', {
+      class: 'barfill' + (pct >= 100 ? ' full' : pct >= 80 ? ' warn' : ''),
+      style: 'width:' + pct.toFixed(1) + '%',
+    })),
+    h('div', { class: 'barpct', text: pct.toFixed(0) + '%' }),
+  );
+}
+
+/* ── 我的上游 ─────────────────────────────────────────────────────── */
+
+function modelsChips(m) {
+  if (!m) return [h('span', { class: 'muted', text: '—' })];
+  if (m.passthrough) return [h('code', { class: 'k', text: '* 全部直通' })];
+  const out = Object.entries(m.map || {}).map(([down, up]) =>
+    h('span', { class: 'chip', text: down === up ? down : down + ' → ' + up }));
+  if (m.catch_all) out.push(h('span', { class: 'chip', text: '其余直通' }));
+  return out.length ? out : [h('span', { class: 'muted', text: '—' })];
+}
+
+async function loadProviders() {
+  const { data } = await api('/v1/_me/providers');
+  const list = (data && data.providers) || [];
+  const tb = $('ptable').querySelector('tbody');
+  tb.replaceChildren();
+  $('pempty').hidden = list.length > 0;
+
+  for (const p of list) {
+    tb.append(h('tr', null,
+      h('td', null, h('code', { class: 'k', text: p.name })),
+      h('td', null, h('code', { class: 'k', text: p.base_url })),
+      h('td', null, modelsChips(p.models)),
+      h('td', { class: 'num', text: String(p.weight) }),
+      h('td', null, h('code', { class: 'k', text: p.proxy || 'direct' })),
+      h('td', { class: 'num', text: ms(p.timeout_ms) }),
+      h('td', null, h('code', { class: 'k', text: p.api_key || '—' })),
+      h('td', null, h('span', { class: 'dot' + (p.enabled ? '' : ' off') }), p.enabled ? '启用' : '停用'),
+      h('td', null,
+        h('button', { type: 'button', class: 'link', text: '编辑', onclick: () => openForm(p) }),
+        h('button', { type: 'button', class: 'link danger', text: '删除', onclick: () => delProvider(p) })),
+    ));
+  }
+}
+
+function openForm(p) {
+  state.editing = p || null;
+  $('pform').hidden = false;
+  $('pform-err').hidden = true;
+  $('f-name').value = p ? p.name : '';
+  $('f-name').disabled = !!p;
+  $('f-base').value = p ? p.base_url : '';
+  $('f-key').value = '';
+  $('f-key').placeholder = p ? '留空 = 不修改（当前 ' + (p.api_key || '已设置') + '）' : 'sk-…';
+  mmReset(p ? p.models : null, p ? p.name : $('f-name').value.trim());
+  $('f-weight').value = p ? p.weight : 1;
+  $('f-timeout').value = p ? p.timeout_ms : 120000;
+  $('f-proxy').value = p ? (p.proxy || 'direct') : 'direct';
+  $('f-enabled').checked = p ? !!p.enabled : true;
+  ($('f-base').value ? $('f-key') : $('f-name')).focus();
+  $('f-name').scrollIntoView({ block: 'center', behavior: 'smooth' });
+}
+
+function closeForm() {
+  $('pform').hidden = true;
+  state.editing = null;
+}
+
+async function saveProvider(ev) {
+  ev.preventDefault();
+  const name = $('f-name').value.trim();
+  if (!name) return showErr($('pform-err'), '上游名必填');
+
+  const models = mmCollect();
+  if (models === null) return;
+
+  const body = {
+    base_url: $('f-base').value.trim(),
+    models,
+    weight: Number($('f-weight').value) || 1,
+    timeout_ms: Number($('f-timeout').value) || 120000,
+    proxy: $('f-proxy').value.trim() || 'direct',
+    enabled: $('f-enabled').checked,
+  };
+  // 编辑时留空表示「不修改」：绝不能把页面上的脱敏值 ****1234 当成新密钥提交上去
+  const key = $('f-key').value;
+  if (key) body.api_key = key;
+  else if (!state.editing) return showErr($('pform-err'), '新建上游必须填上游密钥');
+
+  const btn = $('pform').querySelector('button[type=submit]');
+  btn.disabled = true;
+  try {
+    await api('/v1/_me/providers/' + encodeURIComponent(name), {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    });
+    closeForm();
+    await Promise.all([loadProviders(), loadModelOverview(), refreshMe()]);
+  } catch (e) {
+    showErr($('pform-err'), e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function delProvider(p) {
+  if (!confirm('删除上游 ' + p.name + '？之后使用它承接的模型会失败。')) return;
+  try {
+    await api('/v1/_me/providers/' + encodeURIComponent(p.name), { method: 'DELETE' });
+    await Promise.all([loadProviders(), loadModelOverview(), refreshMe()]);
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+async function refreshMe() {
+  const { data } = await api('/v1/_me');
+  state.me = data;
+  renderApp();
+}
+
+/* ── 模型编辑器：同步 + 勾选 + 别名 ───────────────────────────────────
+   参照的理念：不让人手写映射 JSON，而是从上游把模型列表同步下来勾选。
+   三条必须守住的：
+     1. 已选但不在候选列表里的目标要**保留**（上游没同步、或名字是自定义的），
+        否则「编辑一次就丢映射」；
+     2. 别名（下游名）在已选表里直接改，改完即时反映到 chip 上；
+     3. 同步失败不能把已选清空 —— 候选到底只是「候选」。 */
+
+function mmReset(models, providerName) {
+  // 候选列表按上游名缓存在本次会话里：编辑已有上游时勾选框能立刻回来，
+  // 不用每打开一次表单就去打一次上游；要刷新点「同步」。
+  let cached = null;
+  try {
+    const raw = sessionStorage.getItem('llmproxy.cands.' + (providerName || ''));
+    if (raw) cached = JSON.parse(raw);
+  } catch { cached = null; }
+
+  const mm = (state.mm = {
+    passthrough: !!(models && models.passthrough),
+    catchAll: !!(models && models.catch_all),
+    selected: [],
+    candidates: cached || [],
+    synced: !!cached,
+    filter: '',
+  });
+  const map = (models && models.map) || {};
+  for (const [down, up] of Object.entries(map)) {
+    if (down === '*') { mm.catchAll = true; continue; }   // "*" 是 catch-all 的存储形态
+    mm.selected.push({ up, down });
+  }
+  $('m-all').checked = mm.passthrough;
+  $('m-pick').checked = !mm.passthrough;
+  $('m-catchall').checked = mm.catchAll;
+  $('m-filter').value = '';
+  $('m-manual').value = '';
+  mmRender();
+}
+
+// 当前是用「全部直通」还是「指定模型」
+function mmMode() { return $('m-all').checked ? 'all' : 'pick'; }
+
+function mmHas(up) { return state.mm.selected.some((x) => x.up === up); }
+
+function mmRender() {
+  const mm = state.mm;
+  const pick = mmMode() === 'pick';
+  $('mpick').hidden = !pick;
+  if (!pick) return;
+
+  // 候选勾选列表
+  const q = mm.filter.trim().toLowerCase();
+  const cands = mm.candidates.filter((m) => !q || m.toLowerCase().includes(q));
+  const box = $('m-cands');
+  box.replaceChildren(...cands.map((m) => {
+    const cb = h('input', { type: 'checkbox' });
+    cb.checked = mmHas(m);
+    cb.addEventListener('change', () => {
+      if (cb.checked) {
+        if (!mmHas(m)) mm.selected.push({ up: m, down: m });
+      } else {
+        mm.selected = mm.selected.filter((x) => x.up !== m);
+      }
+      mmRender();
+    });
+    return h('label', { class: 'cand' }, cb, h('span', { class: 'mono', text: m }));
+  }));
+  box.hidden = cands.length === 0;
+  $('m-cands-empty').hidden = mm.candidates.length > 0;
+
+  // 同步状态
+  $('m-sync-state').textContent = mm.synced
+    ? '已同步 ' + mm.candidates.length + ' 个模型'
+    : '还没同步（候选为空不影响已选）';
+
+  // 已选表：别名在这里改
+  const tb = $('m-picked').querySelector('tbody');
+  tb.replaceChildren();
+  const inCands = (up) => mm.candidates.includes(up);
+  for (const item of mm.selected) {
+    const alias = h('input', { type: 'text', class: 'mono alias', value: item.down, spellcheck: 'false' });
+    alias.addEventListener('input', () => {
+      item.down = alias.value.trim() || item.up;
+    });
+    const tag = mm.synced && !inCands(item.up)
+      ? h('span', { class: 'tag', title: '不在同步到的候选列表里（自定义名或那家还没同步），不会被丢掉' , text: '手动' })
+      : null;
+    tb.append(h('tr', null,
+      h('td', null, h('code', { class: 'k', text: item.up }), tag),
+      h('td', null, alias),
+      h('td', null, h('button', {
+        type: 'button', class: 'link danger', text: '移除',
+        onclick: () => { mm.selected = mm.selected.filter((x) => x !== item); mmRender(); },
+      })),
+    ));
+  }
+  $('m-picked-wrap').hidden = mm.selected.length === 0;
+  $('m-picked-head').hidden = mm.selected.length === 0;
+  $('m-picked-count').textContent = String(mm.selected.length);
+}
+
+// 产出 models 声明；校验不过返回 null 并提示在表单上
+function mmCollect() {
+  if (mmMode() === 'all') return ['*'];
+  const mm = state.mm;
+  const map = {};
+  for (const it of mm.selected) {
+    const down = (it.down || it.up).trim();
+    if (!down) continue;
+    map[down] = it.up;
+  }
+  if (mm.catchAll) map['*'] = '*';
+  if (Object.keys(map).length === 0) {
+    showErr($('pform-err'), '至少选一个模型，或者把模式改成「全部直通」');
+    return null;
+  }
+  return map;
+}
+
+async function mmSync() {
+  const name = $('f-name').value.trim();
+  if (!name) return showErr($('pform-err'), '先填上游名，再同步模型列表');
+  const base = $('f-base').value.trim();
+  if (!base) return showErr($('pform-err'), '先填上游地址，再同步模型列表');
+
+  const btn = $('m-sync');
+  btn.disabled = true;
+  const prev = $('m-sync-state').textContent;
+  $('m-sync-state').textContent = '同步中…';
+  try {
+    // 已保存过的上游可以不重复传密钥；刚填还没保存的要带上
+    const body = { base_url: base };
+    const key = $('f-key').value;
+    if (key) body.api_key = key;
+    const { data } = await api('/v1/_me/providers/' + encodeURIComponent(name) + '/discover', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+    // 已经在用「全部直通」的话，同步完就切到指定模式：用户点同步显然是想挑模型
+    $('m-pick').checked = true;
+    state.mm.candidates = data.models || [];
+    state.mm.synced = true;
+    try {
+      sessionStorage.setItem('llmproxy.cands.' + name, JSON.stringify(state.mm.candidates));
+    } catch { /* 存不下就算了，只影响下次打开的勾选回显 */ }
+    showErr($('pform-err'), '');
+    mmRender();
+  } catch (e) {
+    // 同步失败只提示，绝不动已选 —— 候选失败不该影响用户已有的配置
+    $('m-sync-state').textContent = prev;
+    showErr($('pform-err'), '同步失败：' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function mmAddManual() {
+  const input = $('m-manual');
+  const v = input.value.trim();
+  if (!v) return;
+  if (!mmHas(v)) state.mm.selected.push({ up: v, down: v });
+  input.value = '';
+  $('m-pick').checked = true;
+  mmRender();
+}
+
+/* ── 我的模型：按下游模型名，看它挂在哪些上游上 ─────────────────────── */
+
+async function loadModelOverview() {
+  const { data } = await api('/v1/_me/providers');
+  const list = (data && data.providers) || [];
+  const byModel = new Map();
+  const passthrough = [];
+
+  for (const p of list) {
+    const m = p.models || {};
+    if (m.passthrough) { passthrough.push(p.name); continue; }
+    for (const [down, up] of Object.entries(m.map || {})) {
+      if (down === '*') continue;
+      if (!byModel.has(down)) byModel.set(down, []);
+      byModel.get(down).push({ provider: p.name, up });
+    }
+  }
+
+  const rows = [];
+  for (const [down, ups] of [...byModel.entries()].sort()) {
+    rows.push(h('tr', null,
+      h('td', null, h('code', { class: 'k', text: down })),
+      h('td', null, ...ups.map((u) => h('span', { class: 'chip', text: u.provider + ' → ' + u.up }))),
+      // 多路就是「同一模型挂多个上游」，也就是负载均衡 + 失败自动切换
+      h('td', null, ups.length > 1
+        ? h('span', { class: 'tag ok', text: '负载均衡 + 失败切换' })
+        : h('span', { class: 'muted', text: '单路' })),
+    ));
+  }
+
+  const card = $('my-models-card');
+  const has = rows.length > 0 || passthrough.length > 0;
+  card.hidden = !has;
+  if (!has) return;
+
+  const tb = $('my-models').querySelector('tbody');
+  tb.replaceChildren(...rows);
+  const note = $('my-models-pass');
+  if (passthrough.length) {
+    note.textContent = '这些上游接受任意模型名（全部直通），不逐个列出：' + passthrough.join('、');
+    note.hidden = false;
+  } else {
+    note.hidden = true;
+  }
+  $('my-models-empty').hidden = rows.length > 0;
+}
+
+/* ── 用量 ─────────────────────────────────────────────────────────── */
+
+async function loadUsage() {
+  const { data } = await api('/v1/_me/usage?days=' + state.days);
+  const rows = (data && data.rows) || [];
+  const t = (data && data.totals) || {};
+
+  const c = (data && data.cost) || {};
+  $('utotals').replaceChildren(
+    stat('请求', num(t.requests)),
+    stat('成功 / 失败', num(t.ok) + ' / ' + num(t.failed)),
+    stat('输入 / 输出 tok', num(t.prompt_tokens) + ' / ' + num(t.completion_tokens)),
+    c.priced
+      ? stat('本月系统消费', money(c.month_system, c.currency || 'CNY'), 'sm')
+      : stat('token 合计', num(t.total_tokens)),
+  );
+
+  const tb = $('utable').querySelector('tbody');
+  tb.replaceChildren();
+  $('uempty').hidden = rows.length > 0;
+
+  for (const r of rows) {
+    tb.append(h('tr', null,
+      h('td', null, h('code', { class: 'k', text: r.day })),
+      h('td', null, h('code', { class: 'k', text: r.provider })),
+      h('td', null, h('code', { class: 'k', text: r.model })),
+      h('td', { class: 'num', text: num(r.requests) }),
+      h('td', { class: 'num', text: num(r.ok) }),
+      h('td', { class: 'num', text: num(r.failed) }),
+      h('td', { class: 'num', text: num(r.prompt_tokens) }),
+      h('td', { class: 'num', text: num(r.cache_hit_tokens) }),
+      h('td', { class: 'num', text: num(r.completion_tokens) }),
+      h('td', { class: 'num', text: num(r.total_tokens) }),
+      h('td', { class: 'num', text: ms(r.avg_latency_ms) }),
+      // 只有系统付费的行才有金额；用自己的上游时是你和供应商之间的事，这里显示 —
+      h('td', { class: 'num', text: r.cost != null ? r.cost.toFixed(4) : '—' }),
+    ));
+  }
+}
+
+/* ── 试一下 ───────────────────────────────────────────────────────── */
+
+async function trySend() {
+  const out = $('t-out');
+  const btn = $('t-send');
+  out.hidden = false;
+  out.textContent = '请求中…';
+  $('t-meta').textContent = '';
+  btn.disabled = true;
+  const t0 = performance.now();
+  try {
+    const { data, res } = await api('/v1/chat/completions', {
+      method: 'POST',
+      headers: { Accept: 'application/json' },
+      body: JSON.stringify({
+        model: $('t-model').value.trim() || 'deepseek-chat',
+        messages: [{ role: 'user', content: $('t-prompt').value }],
+      }),
+    });
+    const elapsed = Math.round(performance.now() - t0);
+    const content = data && data.choices && data.choices[0] &&
+      data.choices[0].message && data.choices[0].message.content;
+
+    $('t-meta').textContent =
+      '上游 ' + (res.headers.get('X-LLMProxy-Provider') || '?') +
+      ' · ' + elapsed + 'ms' +
+      (res.headers.get('X-LLMProxy-Request-Id') ? ' · id ' + res.headers.get('X-LLMProxy-Request-Id') : '');
+    out.textContent = content != null ? content : JSON.stringify(data, null, 2);
+    await Promise.all([loadUsage(), refreshMe()]);
+  } catch (e) {
+    out.textContent = '失败：' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ── 事件绑定 ─────────────────────────────────────────────────────── */
+
+$('login-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const btn = $('login-btn');
+  btn.disabled = true;
+  showErr($('login-err'), '');
+  login($('login-base').value.trim() || defaultBase(), $('login-token').value.trim())
+    .finally(() => { btn.disabled = false; });
+});
+
+$('logout').addEventListener('click', logout);
+$('add-open').addEventListener('click', () => openForm(null));
+$('add-cancel').addEventListener('click', closeForm);
+$('pform').addEventListener('submit', saveProvider);
+$('t-send').addEventListener('click', trySend);
+$('m-sync').addEventListener('click', mmSync);
+$('m-manual-add').addEventListener('click', mmAddManual);
+$('m-manual').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); mmAddManual(); } });
+$('m-filter').addEventListener('input', () => { state.mm.filter = $('m-filter').value; mmRender(); });
+$('m-catchall').addEventListener('change', () => { state.mm.catchAll = $('m-catchall').checked; });
+for (const id of ['m-all', 'm-pick']) {
+  $(id).addEventListener('change', () => { state.mm.passthrough = $('m-all').checked; mmRender(); });
+}
+$('t-prompt').addEventListener('keydown', (e) => { if (e.key === 'Enter') trySend(); });
+
+$('days').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-days]');
+  if (!b) return;
+  state.days = Number(b.dataset.days);
+  for (const x of $('days').querySelectorAll('button')) x.classList.toggle('on', x === b);
+  loadUsage().catch((err) => alert(err.message));
+});
+
+/* 启动：有会话就直接进，否则显示登录 */
+(function boot() {
+  const base = sessionStorage.getItem('llmproxy.base') || defaultBase();
+  const token = sessionStorage.getItem('llmproxy.token');
+  if (token) login(base, token);
+  else renderLogin('');
+})();
