@@ -1,16 +1,18 @@
-# 编译产物：单文件 16MB 二进制，不入库（用 go build 现编）
-llmproxy
-cmd/*/llmproxy
+# 编译产物：单文件二进制，不入库（用 go build 现编）
+# 注意必须写「/llmproxy」而不是「llmproxy」——裸名会匹配任意层级的同名文件或目录，
+# 那样连 cmd/llmproxy/ 这个**源码目录**也会被一起忽略掉。
+/llmproxy
 dist/
 
 # 实际配置含上游密钥与网关访问密钥，不入库；模板见 config/config.example.yaml
-config/config.yaml
+/config/config.yaml
 
 # 运行时数据与日志
-data/*
-!data/.gitkeep
-logs/*
-!logs/.gitkeep
+/data/*
+!/data/.gitkeep
+/logs/*
+!/logs/.gitkeep
 
 # 主密钥是用户上游密钥的加密根，丢了解不开、泄了全暴露，绝不能进仓库
-master.key
+/master.key
+/data/master.key
