@@ -46,7 +46,7 @@
 
 ```bash
 cd llmproxy
-go build -o llmproxy ./cmd/llmproxy
+go build -o llmproxy ./cmd/llmproxy      # 本机平台
 ```
 
 依赖：Go ≥ 1.22。模块依赖只有两个：`gopkg.in/yaml.v3` 与 `modernc.org/sqlite`（纯 Go，不需要 cgo）。
@@ -55,6 +55,52 @@ go build -o llmproxy ./cmd/llmproxy
 
 ```bash
 export GOPROXY=https://goproxy.cn,direct
+```
+
+### 交叉编译四平台
+
+```bash
+cd llmproxy
+./scripts/build.sh            # 版本号取自最近的 llmproxy-v* tag，没有则 dev-<sha>
+./scripts/build.sh 1.2.3      # 或指定版本
+```
+
+产出 `dist/`：
+
+```
+llmproxy-v1.2.3-darwin-arm64.tar.gz     # 每个包里是 llmproxy + config/config.example.yaml + README.md
+llmproxy-v1.2.3-darwin-amd64.tar.gz
+llmproxy-v1.2.3-linux-arm64.tar.gz
+llmproxy-v1.2.3-linux-amd64.tar.gz
+SHA256SUMS
+```
+
+三点值得说明：
+
+- **不需要交叉工具链**：`CGO_ENABLED=0`，因为 SQLite 用的是 `modernc.org/sqlite`（纯 Go 实现）。
+  一条命令就能出四个平台，脚本还会把 `GOOS/GOARCH/CGO_ENABLED` 从二进制里读回来核对一遍。
+- **脚本先 `go vet` + `go test` 再编译**：宁可在这里失败，也不要产出一个跑不起来的发行包。
+- **版本号由构建注入**：`config.Version` 是 `var`，脚本用
+  `-ldflags "-X .../internal/config.Version=v1.2.3"` 把 tag 写进去，
+  所以 `llmproxy version` 报的永远是发布时的 tag，不用手工改源码。
+  工作区有未提交改动时会自动标成 `1.2.3-dirty`，防止把半成品当正式版发出去。
+
+### 发布
+
+推一个 `llmproxy-vX.Y.Z` 标签即可，`.github/workflows/release-llmproxy.yml` 会：
+先跑测试 → 交叉编译四平台 → 建 Release → 上传四个 tar.gz 与 `SHA256SUMS`。
+
+```bash
+git tag llmproxy-v1.2.3 && git push origin llmproxy-v1.2.3
+```
+
+也可以在 Actions 页面手动触发（`workflow_dispatch`）：只构建、不发 Release，
+产物作为 workflow artifact 下载。
+
+macOS 上从浏览器/curl 下载的二进制会带隔离标记，首次运行若被拦下：
+
+```bash
+xattr -d com.apple.quarantine ./llmproxy
 ```
 
 ## 快速开始
@@ -433,6 +479,7 @@ llmproxy/
   config/
     config.example.yaml
   ui/                网页控制台的源文件（index.html / app.css / app.js），编译时嵌入二进制
+  scripts/           交叉编译脚本（build.sh）与端到端验证脚本（e2e-multiuser.sh）
   data/                运行时数据（.gitkeep）
   logs/                日志目录（.gitkeep）
   go.mod / go.sum

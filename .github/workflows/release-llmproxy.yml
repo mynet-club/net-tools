@@ -1,0 +1,107 @@
+name: Release llmproxy
+
+# 触发方式：
+#   - 推 llmproxy-vX.Y.Z 标签：构建四平台产物 + 发 GitHub Release
+#   - 手动触发：只构建，产物作为 workflow artifact 下载（不发 Release）
+on:
+  push:
+    tags:
+      - 'llmproxy-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（只影响产物命名与二进制里报的版本；手动触发不会发 Release）'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # gh release create / upload 需要
+    steps:
+      - uses: actions/checkout@v4
+
+      # 用 go.mod 里声明的最低版本编译，顺便验证 README 里那句「Go >= 1.22」是真的
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: llmproxy/go.mod
+          cache-dependency-path: llmproxy/go.sum
+
+      - name: 取版本号
+        id: ver
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            echo "tag=${TAG}"                  >> "$GITHUB_OUTPUT"
+            echo "version=${TAG#llmproxy-v}"   >> "$GITHUB_OUTPUT"
+          else
+            echo "tag="                        >> "$GITHUB_OUTPUT"
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 构建脚本自带 go vet 与 go test：产物不合格就不要往下走，
+      # 尤其不要在测试没过的情况下先把 Release 建出来（那样会留下一个空 Release）
+      - name: 交叉编译四平台
+        working-directory: llmproxy
+        run: bash scripts/build.sh "${{ steps.ver.outputs.version }}"
+
+      - name: 展示产物与校验和
+        working-directory: llmproxy
+        run: |
+          ls -lh dist
+          echo
+          cat dist/SHA256SUMS
+
+      - name: 上传 workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llmproxy-${{ steps.ver.outputs.version || 'dev' }}
+          path: llmproxy/dist/*
+          if-no-files-found: error
+
+      - name: 发 Release 并上传产物（仅标签触发）
+        if: steps.ver.outputs.tag != ''
+        working-directory: llmproxy
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.ver.outputs.tag }}"
+          VER="${{ steps.ver.outputs.version }}"
+          BASE="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+
+          {
+            echo "## llmproxy v${VER}"
+            echo
+            echo "单二进制、零运行时依赖（网页控制台与 SQLite 都在里面）。按平台下一个："
+            echo
+            echo '```bash'
+            echo "VER=${VER}"
+            echo "OS=\$(uname -s | tr 'A-Z' 'a-z')        # darwin / linux"
+            echo "ARCH=\$(uname -m)                       # arm64 / x86_64"
+            echo "[ \"\$ARCH\" = x86_64 ] && ARCH=amd64"
+            echo
+            echo "curl -LO ${BASE}/llmproxy-v\${VER}-\${OS}-\${ARCH}.tar.gz"
+            echo "tar xzf llmproxy-v\${VER}-\${OS}-\${ARCH}.tar.gz"
+            echo "cd llmproxy-v\${VER}-\${OS}-\${ARCH}"
+            echo
+            echo "./llmproxy init     # 生成 ~/.config/llmproxy/config.yaml，按提示填上游密钥"
+            echo "./llmproxy start    # 前台启动，网页控制台在 http://127.0.0.1:8787/ui/"
+            echo '```'
+            echo
+            echo "> macOS 首次运行若被 Gatekeeper 拦下：\`xattr -d com.apple.quarantine ./llmproxy\`"
+            echo
+            echo "### 校验和"
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } > /tmp/notes.md
+
+          gh release create "${TAG}" \
+            --title "llmproxy v${VER}" \
+            --notes-file /tmp/notes.md || \
+            echo "Release 已存在，改为追加产物"
+
+          gh release upload "${TAG}" dist/*.tar.gz dist/SHA256SUMS --clobber

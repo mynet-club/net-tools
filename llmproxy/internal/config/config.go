@@ -17,10 +17,13 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const (
-	Version  = "v0.1.0"
-	ToolName = "llmproxy"
-)
+const ToolName = "llmproxy"
+
+// Version 是发行版本号。刻意用 var 而不是 const：交叉编译脚本与 CI 用
+// -ldflags "-X .../internal/config.Version=v1.2.3" 把 git tag 注进来，
+// 这样二进制里报的版本永远等于发布时的 tag，不用手工改这里。
+// 直接 go build 时会保持下面这个默认值。
+var Version = "v0.1.0"
 
 var loopbackHosts = map[string]bool{
 	"127.0.0.1":        true,
