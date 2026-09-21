@@ -277,9 +277,19 @@ func (s *Server) consumptionVerdict(scope, model string) (consumption, narrowed,
 
 // scopedSystemProviders 把系统池按用户的模型映射收窄。
 //
-// 做法是给每个候选供应商换上一份「只含这一个模型」的映射声明，
-// 这样后面的选路逻辑（PickFrom）不用为消费模式写任何特例：
-// 没映射的模型自然选不出候选，映射则顺带完成了改名。
+// 明确匹配，三层：
+//
+//	第 1 层  客户端发来的名字（user_models.model）
+//	第 2 层  供应商侧的模型名（user_models.upstream，留空 = 与第 1 层同名）
+//	第 3 层  这家真实打出去的上游模型名（取它自己 models 映射的值）
+//
+// 判候选的依据是**这家自己声明了没有**：`models` 里点名了这个第 2 层名字（或它是直通/catch-all）
+// 才算候选，否则这家直接出局。映射完再把 ModelSpec 收成「只有这一个模型」，
+// 后面的选路逻辑（PickFrom）不用为消费模式写任何特例。
+//
+// 早先的做法是把用户的 upstream 硬套到**每一家**身上 —— 等于对每一家都说「你承接这个模型」，
+// 于是池里全都成了候选、按权重随机打，其中大部分其实没有这个模型，就随机 400。
+// 现在没声明就是没声明，选不出候选时明确失败，不再硬转发出去让上游回错。
 func (s *Server) scopedSystemProviders(e *userEntry, model string) []config.Provider {
 	var (
 		mapped   bool
@@ -298,7 +308,7 @@ func (s *Server) scopedSystemProviders(e *userEntry, model string) []config.Prov
 		return nil
 	}
 	if upstream == "" {
-		upstream = model
+		upstream = model // 第 2 层留空 = 与第 1 层同名
 	}
 
 	sys := s.globalProviders()
@@ -310,8 +320,13 @@ func (s *Server) scopedSystemProviders(e *userEntry, model string) []config.Prov
 		if onlyFor != "" && !strings.EqualFold(onlyFor, p.Name) {
 			continue
 		}
+		// 这家自己认不认这个第 2 层名字？不认就不是候选（直通/catch-all 算认，但是最低优先级）
+		real, ok := p.UpstreamModel(upstream)
+		if !ok {
+			continue
+		}
 		cp := p
-		cp.Models = config.ModelSpec{Map: map[string]string{model: upstream}}
+		cp.Models = config.ModelSpec{Map: map[string]string{model: real}}
 		out = append(out, cp)
 	}
 	return out

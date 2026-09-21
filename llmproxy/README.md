@@ -471,7 +471,7 @@ token 只存这个标签页的会话里，关掉标签就失效，不进 URL、C
 # 1) 把用户切成消费模式
 ./llmproxy user mode alice consumption
 
-# 2) 给他能用的模型（这既是白名单，也是「下游名 → 系统模型」的映射）
+# 2) 给他能用的模型（这既是白名单，也是「下游名 → 供应商侧模型名」的映射）
 ./llmproxy user add-model alice fast -upstream deepseek-flash
 ./llmproxy user add-model alice pro  -upstream deepseek-v4-pro -provider deepseek   # 限定某家供应商
 
@@ -494,6 +494,41 @@ token 只存这个标签页的会话里，关掉标签就失效，不进 URL、C
 ```
 
 要放开回继承，清空映射即可（控制台里把「模型范围」切回「继承系统池」，或 `DELETE /v1/_admin/users/{name}/models`）。
+
+**收窄模式下的一条映射是三层里的前两层**，第三层由供应商自己那层负责：
+
+```
+第 1 层  客户端发来的名字        user_models.model      ← 白名单，必须命中，否则 403
+第 2 层  供应商侧的模型名        user_models.upstream   ← 留空 = 与第 1 层同名
+第 3 层  真正打出去的上游模型名  供应商 models 映射的值   ← 各供应商可以各不相同
+```
+
+**候选资格由「这家自己声明了没有」决定**：某家供应商的 `models` 里点名了第 2 层那个名字
+（或它是直通 / catch-all），它才是候选；没声明的直接出局，**不会**被硬套上一个模型名转发出去。
+映射完再把这家收成「只承接这一个模型」，交给统一的选路逻辑按权重分流 + 失败切换。
+
+所以「让一个名字同时走多家」的写法是：**每家各自声明同名映射**，行里不限供应商：
+
+```yaml
+providers:
+  - name: deepseek-official
+    models: { deepseek: deepseek-chat }     # 第 2→3 层：deepseek 在这家叫 deepseek-chat
+  - name: neolink
+    models: { deepseek: gp-5.6-so }         # 同一个第 2 层名字，在这家叫 gp-5.6-so
+```
+
+```bash
+./llmproxy user add-model arthur deepseek      # 两家都是候选，按权重分流
+./llmproxy user add-model arthur deepseek -provider neolink   # 只想走一家就点名
+```
+
+`deepseek` 这个下游名客户端直接发；到了供应商那层仍是 `deepseek`（第 2 层留空=同名），
+再被各家映射成自己的真实名（第 3 层）。要**真三层**就显式写第 2 层：
+`add-model arthur fast -upstream deepseek` —— 客户端发 `fast`，供应商侧看的是 `deepseek`。
+
+**没人声明就明确失败。** 如果池子里一家都没声明这个名字（也没有直通兜底的那家），
+请求会返回 `502 upstream_unavailable` 并说清「系统池里没有一家供应商声明了模型 X」，
+而不是硬转发出去、让上游回一个 400。这是刻意的：错误更早、更清楚，代价是映射要写全。
 
 **继承列表里只会出现「系统池里显式声明过」的模型名**，所以直通型上游（`models: ["*"]`）
 的模型天然不在里面 —— 它们在 config.yaml 里一个名字都没声明，不是漏了，是声明里就没有。

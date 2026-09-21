@@ -785,24 +785,25 @@ async function loadUserModels(name) {
   $('ud-models-empty').hidden = list.length > 0;
 }
 
-// 代用户配映射时，上游模型名得填真实存在的 —— 探测选中的那家系统上游
+// 「供应商侧模型名」这一列要填的是：某家供应商在它自己的 models 里**声明过的**名字。
+// 所以候选来源是「这家的声明」，而不是它上游 /v1/models 的真实列表 ——
+// 后者是写进那家 models 里的东西，不是这一列要填的。
 async function probeForMapping() {
   const picked = $('ud-new-provider').value;
   const fallback = (ADM.cfg.providers[0] || {}).name;
   const name = picked || fallback;
   if (!name) return showErr($('ud-err'), '先在右边选一个系统上游');
-  showErr($('ud-err'), '正在探测 ' + name + ' …');
-  try {
-    const { data } = await adminApi('/v1/_admin/providers/' + encodeURIComponent(name) + '/discover', { method: 'POST' });
-    $('ud-cands').replaceChildren(...(data.models || []).map((m) => h('option', { value: m })));
-    showErr($('ud-err'), '');
-    const banner = $('admin-banner');
-    banner.hidden = false;
-    banner.textContent = name + ' 返回 ' + data.count + ' 个模型，已填成「上游模型」的候选：' +
-      (data.models || []).slice(0, 6).join('、') + (data.count > 6 ? ' …' : '');
-  } catch (e) {
-    showErr($('ud-err'), '探测失败：' + e.message);
-  }
+  const p = (ADM.cfg.providers || []).find((x) => x.name === name);
+  if (!p) return showErr($('ud-err'), '系统池里没有 ' + name);
+  const names = (p.map || []).map((pair) => pair[0]).filter(Boolean);
+  $('ud-cands').replaceChildren(...names.map((m) => h('option', { value: m })));
+  showErr($('ud-err'), '');
+  const banner = $('admin-banner');
+  banner.hidden = false;
+  banner.textContent = p.passthrough
+    ? name + ' 是「全部直通」：没声明任何模型名，任何名字都会原样转给它（这一列留空即可）。'
+    : name + ' 声明了 ' + names.length + ' 个模型名，已填成候选：' +
+      names.slice(0, 8).join('、') + (names.length > 8 ? ' …' : '');
 }
 
 async function addModel() {

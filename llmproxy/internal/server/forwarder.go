@@ -129,6 +129,11 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 				"或者让管理员把你的模式改成 consumption 来使用系统上游（那部分按配额计费）"
 		} else if note := s.unusableNote(scope); note != "" {
 			msg = note
+		} else if consumption, narrowed, listed := s.consumptionVerdict(scope, probe.Model); consumption && narrowed && listed {
+			// 名单里有这个名字（所以不是权限问题），但池子里没有一家声明它。
+			// 明确说清是「池子缺这个模型」，别让它混在一句含糊的「没有可用的上游」里。
+			msg = fmt.Sprintf("系统池里没有一家供应商声明了模型 %q："+
+				"在某家供应商的 models 里加上这个名字，或者把它从这个用户的模型范围里去掉", probe.Model)
 		}
 		s.fail(w, rec, http.StatusBadGateway, "upstream_unavailable", msg, 0, started)
 		return

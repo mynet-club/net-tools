@@ -198,9 +198,12 @@
 
       <div id="ud-models-box" hidden>
       <p class="sub">没在这张表里的模型，该用户的请求会被直接拒（403），不会打到上游。</p>
+      <p class="sub">「供应商侧模型名」是<b>要交给供应商的那一层名字</b>：留空表示与下游名同名。
+        这一层必须被某家供应商的 <code>models</code> 显式声明，否则这个模型用不了 ——
+        声明了之后，再由那家自己的映射翻成它真实的上游模型名（这就是「1 层或 2 层映射」）。</p>
       <div class="tablewrap">
         <table id="ud-models">
-          <thead><tr><th>下游模型名（客户端填这个）</th><th>上游模型</th><th>限定供应商</th><th>状态</th><th>快速测试</th><th></th></tr></thead>
+          <thead><tr><th>下游模型名（客户端填这个）</th><th>供应商侧模型名</th><th>限定供应商</th><th>状态</th><th>快速测试</th><th></th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
@@ -208,10 +211,10 @@
 
       <div class="row mm-add">
         <input id="ud-new-model" class="mono" placeholder="下游模型名，如 fast" autocomplete="off">
-        <input id="ud-new-upstream" class="mono" placeholder="上游模型名（留空=同名）" autocomplete="off" list="ud-cands">
+        <input id="ud-new-upstream" class="mono" placeholder="供应商侧模型名（留空=同名）" autocomplete="off" list="ud-cands">
         <datalist id="ud-cands"></datalist>
         <select id="ud-new-provider"><option value="">（系统池按权重）</option></select>
-        <button type="button" id="ud-probe" class="ghost sm">探测</button>
+        <button type="button" id="ud-probe" class="ghost sm">列出该供应商声明的模型</button>
         <button type="button" id="ud-add-model" class="sm">添加映射</button>
       </div>
 
