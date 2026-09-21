@@ -286,7 +286,8 @@ SELECT '', provider, model, upstream_model, system_paid,
        SUM(requests), SUM(ok), SUM(failed),
        SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
        0,
-       SUM(cache_hit_tokens), SUM(cache_miss_tokens)
+       SUM(cache_hit_tokens), SUM(cache_miss_tokens),
+       COALESCE(SUM(charge),0), COALESCE(SUM(frozen_charges),0)
 FROM usage_user_daily
 WHERE user_name = ? AND system_paid = 1 AND day >= ?
 GROUP BY provider, model, upstream_model`, userName, since.Format("2006-01-02"))
@@ -302,7 +303,7 @@ GROUP BY provider, model, upstream_model`, userName, since.Format("2006-01-02"))
 		if err := rows.Scan(&r.Day, &r.Provider, &r.Model, &r.UpstreamModel, &systemPaid,
 			&r.Requests, &r.OK, &r.Failed,
 			&r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.AvgLatencyMs,
-			&r.CacheHitTokens, &r.CacheMissTokens); err != nil {
+			&r.CacheHitTokens, &r.CacheMissTokens, &r.Charge, &r.FrozenCharges); err != nil {
 			return nil, err
 		}
 		r.SystemPaid = systemPaid != 0

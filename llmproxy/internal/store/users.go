@@ -88,6 +88,10 @@ const usageUserDailyBody = `  day               TEXT    NOT NULL,
   completion_tokens INTEGER NOT NULL DEFAULT 0,
   total_tokens      INTEGER NOT NULL DEFAULT 0,
   latency_sum_ms    INTEGER NOT NULL DEFAULT 0,
+  -- 计价冻结：分发价算出来的金额合计，以及其中已冻结的请求数
+  -- （与 requests 相减是还没冻结、只能估算的部分）
+  charge            REAL    NOT NULL DEFAULT 0,
+  frozen_charges    INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (day, user_name, provider, model, upstream_model, system_paid)`
 
 // usageUserDailyDDL 是重建该表时用的完整语句。
@@ -492,7 +496,8 @@ SELECT day, provider, model, upstream_model, system_paid,
        SUM(requests), SUM(ok), SUM(failed),
        SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
        CASE WHEN SUM(requests)>0 THEN CAST(SUM(latency_sum_ms) AS REAL)/SUM(requests) ELSE 0 END,
-       SUM(cache_hit_tokens), SUM(cache_miss_tokens)
+       SUM(cache_hit_tokens), SUM(cache_miss_tokens),
+       COALESCE(SUM(charge),0), COALESCE(SUM(frozen_charges),0)
 FROM usage_user_daily `+where+`
 GROUP BY day, provider, model, upstream_model, system_paid
 ORDER BY day DESC, model
@@ -509,7 +514,7 @@ LIMIT 500`, args...)
 		if err := rows.Scan(&r.Day, &r.Provider, &r.Model, &r.UpstreamModel, &systemPaid,
 			&r.Requests, &r.OK, &r.Failed,
 			&r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.AvgLatencyMs,
-			&r.CacheHitTokens, &r.CacheMissTokens); err != nil {
+			&r.CacheHitTokens, &r.CacheMissTokens, &r.Charge, &r.FrozenCharges); err != nil {
 			return nil, err
 		}
 		r.SystemPaid = systemPaid != 0

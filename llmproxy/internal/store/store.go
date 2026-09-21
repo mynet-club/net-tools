@@ -48,6 +48,18 @@ type RequestRecord struct {
 	SystemPaid      bool
 	CacheHitTokens  int64
 	CacheMissTokens int64
+	// CacheWriteTokens 是「写入缓存」的输入 token（第三档，neolink 等会报）。
+	// 上游不报时为 0 —— 此时写入部分被算进未命中档，属于偏保守的估计。
+	CacheWriteTokens int64
+
+	// 计价冻结（见 docs/pricing-design.md §4）：落库时按**请求开始时刻**生效的价目行
+	// 算好金额写死。CostUpstream / Charge 为 nil = 这一行没有冻结金额（切换前的历史行、
+	// 或当时没有价目可用），报表据此把它归入「估算段」。两个 id 指向当时用的价目行，供回溯。
+	PriceUpstreamID   int64
+	CostUpstream      *float64
+	PriceDownstreamID int64
+	Charge            *float64
+	Currency          string
 }
 
 // ProviderStatus 是持久化的供应商运行期状态。
@@ -80,6 +92,13 @@ type UsageRow struct {
 	CacheHitTokens   int64
 	CacheMissTokens  int64
 	AvgLatencyMs     float64
+	// CostUpstream 是**冻结**的上游成本合计（按请求开始时刻的价目算好写死的那些）；
+	// FrozenRequests 是其中已冻结的请求数，与 Requests 相减就是还没冻结（估算段）的部分。
+	CostUpstream   float64
+	FrozenRequests int64
+	// Charge / FrozenCharges 是**分发价**（向用户收多少）的同一对：冻结金额与已冻结请求数。
+	Charge        float64
+	FrozenCharges int64
 	// SystemPaid 表示这一行的消耗由网关（系统上游）付费 —— 只有这些行才计金额
 	SystemPaid bool
 }
@@ -130,7 +149,17 @@ CREATE TABLE IF NOT EXISTS requests (
   total_tokens      INTEGER,
   attempts          INTEGER NOT NULL DEFAULT 0,
   error_type        TEXT,
-  error_msg         TEXT
+  error_msg         TEXT,
+  -- 第三档缓存：写入缓存的输入 token（neolink 等会报；用于复核冻结金额）
+  cache_write_tokens INTEGER,
+  -- 计价冻结（见 docs/pricing-design.md）：落库时按**请求开始时刻**生效的价目行算好写死。
+  -- cost_upstream / charge 为 NULL 表示这一行没有冻结金额（切换前的历史行、或当时没有价目
+  -- 可用）—— 报表据此把它归入「估算段」，不要与冻结段混在一个合计里。
+  price_upstream_id   INTEGER NOT NULL DEFAULT 0,
+  cost_upstream       REAL,
+  price_downstream_id INTEGER NOT NULL DEFAULT 0,
+  charge              REAL,
+  currency            TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
 CREATE INDEX IF NOT EXISTS idx_requests_provider_ts ON requests(provider, ts);
@@ -162,6 +191,9 @@ CREATE TABLE IF NOT EXISTS usage_daily (
   completion_tokens  INTEGER NOT NULL DEFAULT 0,
   total_tokens       INTEGER NOT NULL DEFAULT 0,
   latency_sum_ms     INTEGER NOT NULL DEFAULT 0,
+  -- 冻结的上游成本合计，以及其中「已冻结」的请求数（其余是估算段）
+  cost_upstream      REAL    NOT NULL DEFAULT 0,
+  frozen_requests    INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (day, provider, model)
 );
 `
@@ -200,6 +232,16 @@ func Open(path string) (*Store, error) {
 	if err := migrateConsumption(db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("迁移消费模式表结构失败: %w", err)
+	}
+	// 计价与成本模型：provider_prices（上游价）+ user_prices（分发价），都带历史
+	if _, err := db.Exec(pricingSchema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("初始化计价表结构失败: %w", err)
+	}
+	// 已有库补上请求行的冻结列（新库在上面的 DDL 里就有了）
+	if err := migratePricingColumns(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("迁移计价冻结列失败: %w", err)
 	}
 	// WAL 模式下会生成 -wal/-shm 文件，一并收紧权限
 	for _, p := range []string{path, path + "-wal", path + "-shm"} {
@@ -298,6 +340,13 @@ func nullable(v int64) any {
 	return v
 }
 
+func f64Val(p *float64) any {
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
 // InsertRequest 写入一条请求明细，并同步更新 usage_daily 汇总。
 func (s *Store) InsertRequest(rec RequestRecord) error {
 	if rec.Ts.IsZero() {
@@ -333,25 +382,36 @@ INSERT INTO requests (
   model, provider, upstream_model, stream,
   status_code, ok, latency_ms, ttft_ms,
   prompt_tokens, completion_tokens, total_tokens,
-  attempts, error_type, error_msg
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+  attempts, error_type, error_msg,
+  cache_write_tokens, price_upstream_id, cost_upstream, price_downstream_id, charge, currency
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		nowMs(rec.Ts), rec.RequestID, rec.ClientKeyHash, rec.ClientLabel, rec.ClientIP,
 		model, provider, rec.UpstreamModel, stream,
 		nullable(int64(rec.StatusCode)), map[bool]int{true: 1, false: 0}[rec.OK],
 		nullable(rec.LatencyMs), ptrVal(rec.TTFTMs),
 		ptrVal(rec.PromptTokens), ptrVal(rec.CompletionTokens), ptrVal(rec.TotalTokens),
 		rec.Attempts, rec.ErrorType, rec.ErrorMsg,
+		nullable(rec.CacheWriteTokens), rec.PriceUpstreamID, f64Val(rec.CostUpstream),
+		rec.PriceDownstreamID, f64Val(rec.Charge), rec.Currency,
 	)
 	if err != nil {
 		return fmt.Errorf("写入 requests 失败: %w", err)
 	}
 
 	if provider != "-" {
+		// 冻结段与估算段要能分开看：frozen_requests 记「已冻结金额的请求数」，
+		// 与 requests 相减就是还没冻结（估算）的那些。
+		frozen := 0
+		cost := 0.0
+		if rec.CostUpstream != nil {
+			frozen, cost = 1, *rec.CostUpstream
+		}
 		_, err = tx.Exec(`
 INSERT INTO usage_daily (
   day, provider, model, requests, ok, failed,
-  prompt_tokens, completion_tokens, total_tokens, latency_sum_ms
-) VALUES (?,?,?,?,?,?,?,?,?,?)
+  prompt_tokens, completion_tokens, total_tokens, latency_sum_ms,
+  cost_upstream, frozen_requests
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(day, provider, model) DO UPDATE SET
   requests          = requests + excluded.requests,
   ok                = ok + excluded.ok,
@@ -359,10 +419,12 @@ ON CONFLICT(day, provider, model) DO UPDATE SET
   prompt_tokens     = prompt_tokens + excluded.prompt_tokens,
   completion_tokens = completion_tokens + excluded.completion_tokens,
   total_tokens      = total_tokens + excluded.total_tokens,
-  latency_sum_ms    = latency_sum_ms + excluded.latency_sum_ms`,
+  latency_sum_ms    = latency_sum_ms + excluded.latency_sum_ms,
+  cost_upstream     = cost_upstream + excluded.cost_upstream,
+  frozen_requests   = frozen_requests + excluded.frozen_requests`,
 			day, provider, model, 1, okInc, failedInc,
 			int64Val(rec.PromptTokens), int64Val(rec.CompletionTokens), int64Val(rec.TotalTokens),
-			rec.LatencyMs,
+			rec.LatencyMs, cost, frozen,
 		)
 		if err != nil {
 			return fmt.Errorf("写入 usage_daily 失败: %w", err)
@@ -380,12 +442,17 @@ ON CONFLICT(day, provider, model) DO UPDATE SET
 		if upstream == "" {
 			upstream = model
 		}
+		chargeVal, chargeFrozen := 0.0, 0
+		if rec.Charge != nil {
+			chargeVal, chargeFrozen = *rec.Charge, 1
+		}
 		_, err = tx.Exec(`
 INSERT INTO usage_user_daily (
   day, user_name, provider, model, upstream_model, system_paid,
   requests, ok, failed,
-  prompt_tokens, cache_hit_tokens, cache_miss_tokens, completion_tokens, total_tokens, latency_sum_ms
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  prompt_tokens, cache_hit_tokens, cache_miss_tokens, completion_tokens, total_tokens, latency_sum_ms,
+  charge, frozen_charges
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(day, user_name, provider, model, upstream_model, system_paid) DO UPDATE SET
   requests          = requests + excluded.requests,
   ok                = ok + excluded.ok,
@@ -395,11 +462,13 @@ ON CONFLICT(day, user_name, provider, model, upstream_model, system_paid) DO UPD
   cache_miss_tokens = cache_miss_tokens + excluded.cache_miss_tokens,
   completion_tokens = completion_tokens + excluded.completion_tokens,
   total_tokens      = total_tokens + excluded.total_tokens,
-  latency_sum_ms    = latency_sum_ms + excluded.latency_sum_ms`,
+  latency_sum_ms    = latency_sum_ms + excluded.latency_sum_ms,
+  charge            = charge + excluded.charge,
+  frozen_charges    = frozen_charges + excluded.frozen_charges`,
 			day, rec.UserName, provider, model, upstream, systemPaid, 1, okInc, failedInc,
 			int64Val(rec.PromptTokens), rec.CacheHitTokens, rec.CacheMissTokens,
 			int64Val(rec.CompletionTokens), int64Val(rec.TotalTokens),
-			rec.LatencyMs,
+			rec.LatencyMs, chargeVal, chargeFrozen,
 		)
 		if err != nil {
 			return fmt.Errorf("写入 usage_user_daily 失败: %w", err)
@@ -571,7 +640,8 @@ FROM requests`+where, args...).Scan(
 SELECT day, provider, model,
        SUM(requests), SUM(ok), SUM(failed),
        SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
-       CASE WHEN SUM(requests)>0 THEN CAST(SUM(latency_sum_ms) AS REAL)/SUM(requests) ELSE 0 END
+       CASE WHEN SUM(requests)>0 THEN CAST(SUM(latency_sum_ms) AS REAL)/SUM(requests) ELSE 0 END,
+       COALESCE(SUM(cost_upstream),0), COALESCE(SUM(frozen_requests),0)
 FROM usage_daily
 GROUP BY provider, model
 ORDER BY SUM(requests) DESC, provider, model
@@ -583,7 +653,8 @@ LIMIT 200`)
 		var r UsageRow
 		if err := rows.Scan(&r.Day, &r.Provider, &r.Model,
 			&r.Requests, &r.OK, &r.Failed,
-			&r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.AvgLatencyMs); err != nil {
+			&r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.AvgLatencyMs,
+			&r.CostUpstream, &r.FrozenRequests); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -598,7 +669,8 @@ LIMIT 200`)
 SELECT day, '-', '-',
        SUM(requests), SUM(ok), SUM(failed),
        SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
-       CASE WHEN SUM(requests)>0 THEN CAST(SUM(latency_sum_ms) AS REAL)/SUM(requests) ELSE 0 END
+       CASE WHEN SUM(requests)>0 THEN CAST(SUM(latency_sum_ms) AS REAL)/SUM(requests) ELSE 0 END,
+       COALESCE(SUM(cost_upstream),0), COALESCE(SUM(frozen_requests),0)
 FROM usage_daily
 GROUP BY day
 ORDER BY day DESC
@@ -610,7 +682,8 @@ LIMIT 90`)
 		var r UsageRow
 		if err := rows2.Scan(&r.Day, &r.Provider, &r.Model,
 			&r.Requests, &r.OK, &r.Failed,
-			&r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.AvgLatencyMs); err != nil {
+			&r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.AvgLatencyMs,
+			&r.CostUpstream, &r.FrozenRequests); err != nil {
 			rows2.Close()
 			return nil, err
 		}

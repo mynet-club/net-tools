@@ -3,6 +3,7 @@ package router
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/config"
 )
@@ -187,5 +188,45 @@ func TestPreferringDoesNotStickWhenInPoolButUnhealthy(t *testing.T) {
 	}
 	if seen["beta"] == 0 {
 		t.Errorf("两家都在冷却时应当按权重随机（既不硬粘也不硬换），实际 %v", seen)
+	}
+}
+
+// CoolFor / Cooling：402、429 这类明确信号要能"一次就让位"，不走连续失败攒阈值那条路。
+func TestCoolForAndCooling(t *testing.T) {
+	r := New(config.RoutingConfig{FailureThreshold: 3, CooldownSeconds: 60}, []config.Provider{
+		passthrough("a", 1),
+		passthrough("b", 1),
+	})
+	if r.Cooling("", "a") {
+		t.Fatal("初始不该在冷却")
+	}
+	r.CoolFor("", "a", 5*time.Minute)
+	if !r.Cooling("", "a") {
+		t.Fatal("CoolFor 之后应当在冷却")
+	}
+	// 只延长不缩短：再用一个更短的，恢复时间不能被拉前
+	before := r.SnapshotFor("")["a"].UnhealthyUntil
+	r.CoolFor("", "a", time.Second)
+	if got := r.SnapshotFor("")["a"].UnhealthyUntil; !got.Equal(before) {
+		t.Errorf("更短的冷却不该把恢复时间拉前：%s → %s", before, got)
+	}
+	// 作用域隔离：别的 scope 不受影响
+	if r.Cooling("other", "a") {
+		t.Error("别的 scope 不该被牵连")
+	}
+	// 冷却中的 a 会被选路跳过
+	for i := 0; i < 20; i++ {
+		c, err := r.Pick("m", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.Provider.Name != "b" {
+			t.Fatalf("冷却中的 a 不该被选中，实际 %q", c.Provider.Name)
+		}
+	}
+	// 冷却时长为 0 或负数 = 什么都不做
+	r.CoolFor("", "b", 0)
+	if r.Cooling("", "b") {
+		t.Error("CoolFor(0) 不该压冷却")
 	}
 }

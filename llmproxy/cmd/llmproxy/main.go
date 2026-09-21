@@ -708,11 +708,14 @@ func cmdStats(paths config.Paths, args []string) error {
 		st.TotalRequests, st.TotalOK, st.TotalFailed, st.TotalTokens)
 
 	fmt.Printf("\n按供应商/模型消耗:\n")
-	fmt.Printf("%-20s %-24s %8s %8s %8s %12s %10s\n",
-		"PROVIDER", "MODEL", "REQ", "OK", "FAIL", "TOKENS", "AVG_MS")
+	// COST 是**冻结**的上游成本（按请求开始时刻的价目算好写死的）；FROZEN 是其中已冻结的
+	// 请求数，与 REQ 相减就是还没冻结的行 —— 那部分只能估算，别和冻结值混着看。
+	fmt.Printf("%-20s %-24s %8s %8s %8s %12s %10s %10s %8s\n",
+		"PROVIDER", "MODEL", "REQ", "OK", "FAIL", "TOKENS", "AVG_MS", "COST", "FROZEN")
 	for _, r := range st.ByProvider {
-		fmt.Printf("%-20s %-24s %8d %8d %8d %12d %10.0f\n",
-			r.Provider, r.Model, r.Requests, r.OK, r.Failed, r.TotalTokens, r.AvgLatencyMs)
+		fmt.Printf("%-20s %-24s %8d %8d %8d %12d %10.0f %10.4f %8d\n",
+			r.Provider, r.Model, r.Requests, r.OK, r.Failed, r.TotalTokens, r.AvgLatencyMs,
+			r.CostUpstream, r.FrozenRequests)
 	}
 
 	fmt.Printf("\n按日消耗:\n")

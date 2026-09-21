@@ -116,7 +116,12 @@ func (m *meterSet) CheckQuota(user string, quotaTokens int64, quotaCost float64)
 //
 // upstreamModel 用来查单价；hit/miss 为 0 而 prompt>0 时按「输入全部未命中」计，
 // 这是上游不回报缓存拆分时的保守口径 —— 宁可高估，不要漏计。
-func (m *meterSet) Add(user, upstreamModel string, prompt, cacheHit, cacheMiss, output int64, at time.Time) {
+// Add 累加一次系统付费的消耗。
+//
+// frozen 是这次请求**冻结**的分发金额（nil = 没冻上，按 legacy 单价表估算兜底）。
+// 两个口径都要能用：配额必须一直有效，不能因为"还没录价目"就整段失效；
+// 而内存计数与跨月重载（meterForLocked 从库里读）必须用同一套口径，否则两边会对不上。
+func (m *meterSet) Add(user, upstreamModel string, prompt, cacheHit, cacheMiss, output int64, at time.Time, frozen *float64) {
 	if user == "" {
 		return
 	}
@@ -128,6 +133,10 @@ func (m *meterSet) Add(user, upstreamModel string, prompt, cacheHit, cacheMiss, 
 
 	um := m.meterForLocked(user, 0)
 	um.tokens += prompt + output
+	if frozen != nil {
+		um.cost += *frozen
+		return
+	}
 	if p := m.price(); p.Enabled() {
 		if c, ok := p.Cost(upstreamModel, cacheHit, cacheMiss, output, at); ok {
 			um.cost += c
@@ -168,15 +177,7 @@ func (m *meterSet) meterForLocked(user string, rpm int) *userMeter {
 			p := m.price()
 			for _, r := range rows {
 				um.tokens += r.PromptTokens + r.CompletionTokens
-				hit, miss := r.CacheHitTokens, r.CacheMissTokens
-				if hit+miss == 0 && r.PromptTokens > 0 {
-					miss = r.PromptTokens
-				}
-				if p.Enabled() {
-					if c, ok := p.Cost(r.UpstreamModel, hit, miss, r.CompletionTokens, now); ok {
-						um.cost += c
-					}
-				}
+				um.cost += rowCharge(r, p, now)
 			}
 		}
 	}

@@ -900,16 +900,15 @@ func (s *Server) writeUsageReport(w http.ResponseWriter, scope string, days int)
 		AvgLatencyMs     float64  `json:"avg_latency_ms"`
 		SystemPaid       bool     `json:"system_paid"`
 		Cost             *float64 `json:"cost,omitempty"`
+		// 冻结的分发金额与已冻结请求数：Cost 是"冻结优先 + 估算兜底"的合计，
+		// 想分清两段就看这两个（FrozenCharges < Requests 的部分是估算的）。
+		Charge        float64 `json:"charge,omitempty"`
+		FrozenCharges int64   `json:"frozen_charges,omitempty"`
 	}
 	out := make([]row, 0, len(rows))
 	now := time.Now()
 	pricing := s.cfgStore.Current().Pricing
 	for _, r := range rows {
-		// 上游没报缓存拆分时按「输入全部未命中」估，宁可高估不漏计
-		hit, miss := r.CacheHitTokens, r.CacheMissTokens
-		if hit+miss == 0 && r.PromptTokens > 0 {
-			miss = r.PromptTokens
-		}
 		item := row{
 			Day: r.Day, Provider: r.Provider, Model: r.Model, UpstreamModel: r.UpstreamModel,
 			Requests: r.Requests, OK: r.OK, Failed: r.Failed,
@@ -918,26 +917,22 @@ func (s *Server) writeUsageReport(w http.ResponseWriter, scope string, days int)
 			TotalTokens: r.TotalTokens, AvgLatencyMs: r.AvgLatencyMs,
 			SystemPaid: r.SystemPaid,
 		}
-		// 只有网关自己掏钱的那部分才谈得上金额；用户用自己的上游是他自己跟供应商结算
-		if r.SystemPaid && pricing.Enabled() {
-			if c, ok := pricing.Cost(r.UpstreamModel, hit, miss, r.CompletionTokens, now); ok {
-				item.Cost = &c
-			}
+		// 只有网关自己掏钱的那部分才谈得上金额；用户用自己的上游是他自己跟供应商结算。
+		// 金额口径与配额一致：冻结优先、未冻结按 legacy 单价表估算兜底。
+		if r.SystemPaid && (r.FrozenCharges > 0 || pricing.Enabled()) {
+			c := rowCharge(r, &pricing, now)
+			item.Cost = &c
+			item.Charge = r.Charge
+			item.FrozenCharges = r.FrozenCharges
 		}
 		out = append(out, item)
 	}
 
 	// 汇总金额同样只算系统付费的部分，和配额口径保持一致
 	var monthCost float64
-	if rows, err := s.db.SystemUsageRowsSince(scope, store.MonthStart(now)); err == nil && pricing.Enabled() {
+	if rows, err := s.db.SystemUsageRowsSince(scope, store.MonthStart(now)); err == nil {
 		for _, r := range rows {
-			hit, miss := r.CacheHitTokens, r.CacheMissTokens
-			if hit+miss == 0 && r.PromptTokens > 0 {
-				miss = r.PromptTokens
-			}
-			if c, ok := pricing.Cost(r.UpstreamModel, hit, miss, r.CompletionTokens, now); ok {
-				monthCost += c
-			}
+			monthCost += rowCharge(r, &pricing, now)
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -975,6 +970,8 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		s.adminUsersRoute(w, r, strings.Trim(strings.TrimPrefix(rest, "users"), "/"))
 	case rest == "config" || strings.HasPrefix(rest, "config/"):
 		s.handleAdminConfig(w, r, strings.Trim(strings.TrimPrefix(rest, "config"), "/"))
+	case rest == "prices" || strings.HasPrefix(rest, "prices/"):
+		s.adminPricesRoute(w, r, strings.Trim(strings.TrimPrefix(rest, "prices"), "/"))
 	case rest == "providers":
 		s.adminListSystemProviders(w, r)
 	case strings.HasPrefix(rest, "providers/"):

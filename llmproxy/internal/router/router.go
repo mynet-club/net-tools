@@ -287,6 +287,42 @@ func (r *Router) PickFromPreferring(scope string, candidates []config.Provider, 
 	return &c, nil
 }
 
+// Cooling 报告某个 (作用域, 供应商) 此刻是否在冷却中。
+//
+// 只读、不创建状态 —— 规则 B 的路由排序要用它跳过正在冷却的家，
+// 而"看一眼"不该给没跑过的供应商建一条记录。
+func (r *Router) Cooling(scope, name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m, ok := r.scoped[scope]
+	if !ok {
+		return false
+	}
+	st, ok := m[name]
+	if !ok {
+		return false
+	}
+	return r.now().Before(st.UnhealthyUntil)
+}
+
+// CoolFor 直接给某个 (作用域, 供应商) 压一段冷却，不走"连续失败达阈值"那条路。
+//
+// 给 402 / 429 这类**明确的额度或限流信号**用：它们不需要攒够次数，
+// 一次就该让这家让位（次便宜的顶上），否则规则 B 会一遍遍把请求送到已经没额度的家。
+// 冷却只延长不缩短：已有更晚的恢复时间就保留。
+func (r *Router) CoolFor(scope, name string, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	st := r.stateLocked(scope, name)
+	until := r.now().Add(d)
+	if until.After(st.UnhealthyUntil) {
+		st.UnhealthyUntil = until
+	}
+}
+
 // ReportSuccess 是 ReportSuccessFor 在全局作用域上的快捷方式。
 func (r *Router) ReportSuccess(name string) { r.ReportSuccessFor("", name) }
 

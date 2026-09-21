@@ -11,57 +11,67 @@ import (
 	"github.com/mynet-club/net-tools/llmproxy/internal/store"
 )
 
-// 两套缓存字段都要认得：DeepSeek 显式报 hit/miss；OpenAI / Azure 及其兼容实现
-// （不少聚合商是这个形状）只报 cached_tokens，未命中得自己减出来。
-// 认不出来的后果不是「少记一笔」，而是命中率凭空变成 0、金额按全未命中高估。
-func TestUsageCacheHitMissNormalization(t *testing.T) {
+// 三档缓存都要认：DeepSeek 显式报 hit/miss；OpenAI / Azure 及其兼容实现（不少聚合商
+// 是这个形状）报 cached_tokens（命中）与 cache_write_tokens（写入），未命中要自己减出来。
+// 认不出来的后果不是「少记一笔」，而是命中率凭空变成 0、金额按全未命中高估；
+// 而写入档的单价（如 Anthropic 系约 1.25×）比未命中还贵，漏了它会低估成本。
+func TestUsageCacheSplitNormalization(t *testing.T) {
 	i64 := func(v int64) *int64 { return &v }
+	type detailsT = struct {
+		CachedTokens     *int64 `json:"cached_tokens"`
+		CacheWriteTokens *int64 `json:"cache_write_tokens"`
+	}
+	details := func(cached, write *int64) *detailsT {
+		return &detailsT{CachedTokens: cached, CacheWriteTokens: write}
+	}
 	cases := []struct {
-		name string
-		u    usageInfo
-		hit  int64
-		miss int64
-		ok   bool
+		name             string
+		u                usageInfo
+		hit, write, miss int64
+		ok               bool
 	}{
 		{name: "DeepSeek 显式字段",
 			u:   usageInfo{PromptTokens: i64(1000), PromptCacheHitTokens: i64(800), PromptCacheMissTokens: i64(200)},
 			hit: 800, miss: 200, ok: true},
 		{name: "OpenAI 形状：cached 就是命中数",
-			u: usageInfo{PromptTokens: i64(1000),
-				PromptTokensDetails: &struct {
-					CachedTokens *int64 `json:"cached_tokens"`
-				}{CachedTokens: i64(800)}},
-			hit: 800, miss: 200, ok: true},
-		{name: "OpenAI 形状：没命中",
-			u: usageInfo{PromptTokens: i64(1000),
-				PromptTokensDetails: &struct {
-					CachedTokens *int64 `json:"cached_tokens"`
-				}{CachedTokens: i64(0)}},
-			hit: 0, miss: 1000, ok: true},
+			u:    usageInfo{PromptTokens: i64(1000), PromptTokensDetails: details(i64(800), nil)},
+			hit:  800,
+			miss: 200, ok: true},
+		{name: "OpenAI 形状：首次请求，全部写入、没有命中",
+			u:     usageInfo{PromptTokens: i64(1000), PromptTokensDetails: details(i64(0), i64(900))},
+			write: 900,
+			miss:  100, ok: true},
+		{name: "OpenAI 形状：命中 + 写入 + 未命中三档并存",
+			u:     usageInfo{PromptTokens: i64(1000), PromptTokensDetails: details(i64(600), i64(300))},
+			hit:   600,
+			write: 300,
+			miss:  100, ok: true},
 		{name: "两套都没报 → ok=false（交给计费侧按全未命中保守估）",
-			u: usageInfo{PromptTokens: i64(1000)}, hit: 0, miss: 0, ok: false},
+			u: usageInfo{PromptTokens: i64(1000)}, ok: false},
 		{name: "cached 比 prompt 还大（上游报错）→ 夹住",
-			u: usageInfo{PromptTokens: i64(1000),
-				PromptTokensDetails: &struct {
-					CachedTokens *int64 `json:"cached_tokens"`
-				}{CachedTokens: i64(5000)}},
-			hit: 1000, miss: 0, ok: true},
+			u:    usageInfo{PromptTokens: i64(1000), PromptTokensDetails: details(i64(5000), nil)},
+			hit:  1000,
+			miss: 0, ok: true},
+		{name: "hit+write 超过 prompt → 未命中夹成 0",
+			u:     usageInfo{PromptTokens: i64(1000), PromptTokensDetails: details(i64(800), i64(900))},
+			hit:   800,
+			write: 900,
+			miss:  0, ok: true},
 		{name: "负数夹成 0",
-			u:   usageInfo{PromptTokens: i64(1000), PromptCacheHitTokens: i64(-5), PromptCacheMissTokens: i64(-7)},
-			hit: 0, miss: 0, ok: true},
-		{name: "nil 接收者",
-			u: usageInfo{}, hit: 0, miss: 0, ok: false},
+			u:  usageInfo{PromptTokens: i64(1000), PromptCacheHitTokens: i64(-5), PromptCacheMissTokens: i64(-7)},
+			ok: true},
+		{name: "nil 接收者", u: usageInfo{}, ok: false},
 	}
 	for _, c := range cases {
-		u := c.u // 取地址，便于 nil 语义一致
-		hit, miss, ok := u.cacheHitMiss()
-		if ok != c.ok || (ok && (hit != c.hit || miss != c.miss)) {
-			t.Errorf("%s: 得到 (%d, %d, %v)，期望 (%d, %d, %v)", c.name, hit, miss, ok, c.hit, c.miss, c.ok)
+		u := c.u
+		got := u.cacheSplit()
+		if got.ok != c.ok || (c.ok && (got.hit != c.hit || got.write != c.write || got.miss != c.miss)) {
+			t.Errorf("%s: 得到 (hit=%d write=%d miss=%d ok=%v)，期望 (%d, %d, %d, %v)",
+				c.name, got.hit, got.write, got.miss, got.ok, c.hit, c.write, c.miss, c.ok)
 		}
 	}
-	// nil 指针本身也不能炸
 	var p *usageInfo
-	if _, _, ok := p.cacheHitMiss(); ok {
+	if p.cacheSplit().ok {
 		t.Error("nil usageInfo 应当返回 ok=false")
 	}
 }

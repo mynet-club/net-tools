@@ -34,49 +34,66 @@ type usageInfo struct {
 	PromptCacheHitTokens  *int64 `json:"prompt_cache_hit_tokens"`
 	PromptCacheMissTokens *int64 `json:"prompt_cache_miss_tokens"`
 	// OpenAI / Azure 及其兼容实现（不少聚合商都是这个形状）把命中数放在这里：
-	// cached_tokens 是**命中**的那部分，未命中要自己从 prompt_tokens 里减出来。
+	// cached_tokens 是**命中**的那部分，未命中要自己从 prompt_tokens 里减出来；
+	// cache_write_tokens 是**写入**缓存的那部分（第三档，单价常高于未命中）。
 	// 只认上面两个字段的话，这类上游的命中会被记成 0 —— 于是命中率凭空消失，
 	// 金额又按「全部未命中」被高估。
 	PromptTokensDetails *struct {
-		CachedTokens *int64 `json:"cached_tokens"`
+		CachedTokens     *int64 `json:"cached_tokens"`
+		CacheWriteTokens *int64 `json:"cache_write_tokens"`
 	} `json:"prompt_tokens_details"`
 }
 
-// cacheHitMiss 把两套字段归一化成「命中/未命中」两个数，ok=false 表示上游压根没报。
+// usageCache 是一次请求的输入缓存拆分（三档）。
+type usageCache struct {
+	hit   int64 // 命中缓存
+	write int64 // 写入缓存
+	miss  int64 // 既没命中也没写入
+	ok    bool  // 上游是否报了缓存信息；false 时由调用方按「全部未命中」保守处理
+}
+
+// cacheSplit 把两套字段归一化成三档，ok=false 表示上游压根没报。
 //
 // 显式的 hit/miss（DeepSeek 风格）优先；只有 cached_tokens 时，命中 = cached，
-// 未命中 = prompt_tokens - cached。负数一律夹成 0：上游报的数字不可全信，
+// 未命中 = prompt_tokens - cached - write。负数一律夹成 0：上游报的数字不可全信，
 // 让它们进到金额里比丢掉更糟。
-func (u *usageInfo) cacheHitMiss() (hit, miss int64, ok bool) {
+func (u *usageInfo) cacheSplit() usageCache {
 	if u == nil {
-		return 0, 0, false
+		return usageCache{}
+	}
+	clamp := func(v int64) int64 {
+		if v < 0 {
+			return 0
+		}
+		return v
+	}
+	var write int64
+	if u.PromptTokensDetails != nil && u.PromptTokensDetails.CacheWriteTokens != nil {
+		write = clamp(*u.PromptTokensDetails.CacheWriteTokens)
 	}
 	if u.PromptCacheHitTokens != nil || u.PromptCacheMissTokens != nil {
+		c := usageCache{write: write, ok: true}
 		if u.PromptCacheHitTokens != nil {
-			hit = *u.PromptCacheHitTokens
+			c.hit = clamp(*u.PromptCacheHitTokens)
 		}
 		if u.PromptCacheMissTokens != nil {
-			miss = *u.PromptCacheMissTokens
+			c.miss = clamp(*u.PromptCacheMissTokens)
 		}
-		if hit < 0 {
-			hit = 0
-		}
-		if miss < 0 {
-			miss = 0
-		}
-		return hit, miss, true
+		return c
 	}
 	if u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens != nil && u.PromptTokens != nil {
-		hit = *u.PromptTokensDetails.CachedTokens
-		if hit < 0 {
-			hit = 0
+		c := usageCache{write: write, ok: true}
+		c.hit = clamp(*u.PromptTokensDetails.CachedTokens)
+		if c.hit > *u.PromptTokens {
+			c.hit = *u.PromptTokens // cached 比 prompt 还大只可能是上游算错，夹住
 		}
-		if hit > *u.PromptTokens {
-			hit = *u.PromptTokens // cached 比 prompt 还大只可能是上游算错，夹住
+		c.miss = *u.PromptTokens - c.hit - write
+		if c.miss < 0 {
+			c.miss = 0
 		}
-		return hit, *u.PromptTokens - hit, true
+		return c
 	}
-	return 0, 0, false
+	return usageCache{}
 }
 
 // handleUpstreamPost 把 /v1/* 的 POST 请求按模型路由到上游供应商。
@@ -202,10 +219,16 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 	// 这时连观测头都不写，免得留一条永远是 new 的字段来混淆排障。
 	affinityOn := s.affinity.Enabled()
 	affinitySession := ""
-	prefer := ""
+	affinityPrefer := ""
 	if affinityOn {
 		affinitySession = r.Header.Get("X-Session-Affinity")
-		prefer = s.affinity.Get(scope, affinitySession, probe.Model) // 头为空时返回 ""
+		affinityPrefer = s.affinity.Get(scope, affinitySession, probe.Model) // 头为空时返回 ""
+	}
+	// 规则 B：没有粘性可用时（新会话，或粘性那家已不适用）按**当前上游价**挑最便宜的。
+	// 挑不出来就留空、回落到按权重随机 —— 没录价目时行为与以前完全一致。
+	prefer := affinityPrefer
+	if prefer == "" {
+		prefer = s.cheapestProvider(scope, providers, probe.Model)
 	}
 
 	for i := 0; i < maxAttempts; i++ {
@@ -221,13 +244,14 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 		// 观测：告诉调用方这次是按粘性选的（sticky）还是漂移过来的（drift），
 		// 或者本来就没粘性记录（new）。排障与上线验证都要看这一列。
 		if affinityOn && affinitySession != "" {
-			outcome := "new"
-			if prefer != "" {
-				if cand.Provider.Name == prefer {
-					outcome = "sticky"
-				} else {
-					outcome = "drift"
-				}
+			outcome := "new" // 既没粘性也没价目 → 按权重随机
+			switch {
+			case affinityPrefer != "" && cand.Provider.Name == affinityPrefer:
+				outcome = "sticky" // 规则 A：沿用这个会话上次那家
+			case affinityPrefer != "":
+				outcome = "drift" // 粘性那家不能用，漂移了
+			case prefer != "":
+				outcome = "cheapest" // 规则 B：新会话按价格挑的
 			}
 			w.Header().Set("X-Llmproxy-Affinity", outcome)
 		}
@@ -331,6 +355,13 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 			snippet := readSnippet(resp.Body, 300)
 			_ = resp.Body.Close()
 			cancel()
+			if resp.StatusCode == http.StatusPaymentRequired || resp.StatusCode == http.StatusTooManyRequests {
+				// 额度不足 / 被限流：这是**明确**的信号，一次就该让这家让位 ——
+				// 攒够失败次数再冷却太慢，规则 B 会一遍遍把请求送到已经没额度的家。
+				s.router.CoolFor(scope, cand.Provider.Name, ruleBQuotaCooldown)
+				s.log.Warnf("供应商 %s 返回 %d，压 %s 冷却（规则 B 下次改用次便宜的）",
+					cand.Provider.Name, resp.StatusCode, ruleBQuotaCooldown)
+			}
 			s.log.Warnf("供应商 %s 返回 %d: %s", cand.Provider.Name, resp.StatusCode, snippet)
 			s.router.ReportFailureFor(scope, cand.Provider.Name, fmt.Errorf("上游返回 %d: %s", resp.StatusCode, snippet))
 			lastErr = fmt.Errorf("供应商 %s 返回 %d", cand.Provider.Name, resp.StatusCode)
@@ -440,6 +471,7 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 	rec.TotalTokens = scanner.usage.TotalTokens
 	rec.CacheHitTokens = scanner.usage.cacheHit
 	rec.CacheMissTokens = scanner.usage.cacheMiss
+	rec.CacheWriteTokens = scanner.usage.cacheWrite
 	rec.OK = resp.StatusCode < 400 && copyErr == nil
 	if copyErr != nil {
 		if wd.Fired() {
@@ -452,6 +484,10 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 			rec.ErrorMsg = copyErr.Error()
 		}
 	}
+	// 计价冻结：按**请求开始时刻**生效的价目行把成本/收费算好写死（见 freeze.go）。
+	// 上游成本（我们付供应商多少）与分发金额（我们向用户收多少）分别冻结、各自带价目行 id。
+	s.freezeUpstreamCost(rec, started)
+	s.freezeDownstreamCharge(rec, started)
 	s.persist(rec)
 }
 
@@ -503,7 +539,7 @@ func (s *Server) persist(rec *store.RequestRecord) {
 	if s.meters != nil && rec.SystemPaid && rec.UserName != "" {
 		s.meters.Add(rec.UserName, rec.UpstreamModel,
 			int64Or0(rec.PromptTokens), rec.CacheHitTokens, rec.CacheMissTokens,
-			int64Or0(rec.CompletionTokens), rec.Ts)
+			int64Or0(rec.CompletionTokens), rec.Ts, rec.Charge)
 	}
 	if s.db == nil {
 		return
@@ -556,6 +592,8 @@ func retryableStatus(code int) bool {
 		return true
 	case code == 401, code == 403:
 		return true // 该供应商的密钥/权限有问题，换一家试
+	case code == 402:
+		return true // 额度/余额不足：换一家试，并给这家记一段冷却（见下面的 CoolFor）
 	case code == 404:
 		return true // 可能只是这家没这个模型
 	}
@@ -595,6 +633,7 @@ type usageScanner struct {
 		TotalTokens      *int64
 		cacheHit         int64
 		cacheMiss        int64
+		cacheWrite       int64
 	}
 }
 
@@ -639,9 +678,8 @@ func (u *usageScanner) Write(p []byte) (int, error) {
 		if chunk.Usage.TotalTokens != nil {
 			u.usage.TotalTokens = chunk.Usage.TotalTokens
 		}
-		if hit, miss, ok := chunk.Usage.cacheHitMiss(); ok {
-			u.usage.cacheHit = hit
-			u.usage.cacheMiss = miss
+		if c := chunk.Usage.cacheSplit(); c.ok {
+			u.usage.cacheHit, u.usage.cacheMiss, u.usage.cacheWrite = c.hit, c.miss, c.write
 		}
 	}
 	return len(p), nil
@@ -672,9 +710,8 @@ func (u *usageScanner) consumeJSON(b []byte) {
 	if obj.Usage.TotalTokens != nil {
 		u.usage.TotalTokens = obj.Usage.TotalTokens
 	}
-	if hit, miss, ok := obj.Usage.cacheHitMiss(); ok {
-		u.usage.cacheHit = hit
-		u.usage.cacheMiss = miss
+	if c := obj.Usage.cacheSplit(); c.ok {
+		u.usage.cacheHit, u.usage.cacheMiss, u.usage.cacheWrite = c.hit, c.miss, c.write
 	}
 }
 
