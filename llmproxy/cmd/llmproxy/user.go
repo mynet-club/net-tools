@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -46,7 +47,8 @@ add-provider 的参数：
   -timeout-ms 120000  上游超时
   -disabled           配好但先不启用
 
-说明：这些都是直接改数据库；正在运行的服务会在 2 秒内自动加载。
+说明：这些都是直接改数据库，改完会立刻通知正在运行的服务重新加载。
+（通知失败也不要紧：服务每 2 秒还会自己按修订号轮询一次。）
 `
 
 func cmdUser(paths config.Paths, args []string) error {
@@ -56,6 +58,11 @@ func cmdUser(paths config.Paths, args []string) error {
 	}
 	sub := args[0]
 	rest := args[1:]
+	// 写操作结束后推一把运行中的服务，别让它等 2 秒一次的轮询 ——
+	// 窗口期内的请求会吃 401，看起来像"用户根本没建成"。
+	if userMutating(sub) {
+		defer notifyRunningService(paths)
+	}
 	switch sub {
 	case "add":
 		return userAdd(paths, rest)
@@ -121,9 +128,31 @@ func requireName(rest []string, what string) (string, error) {
 	return strings.TrimSpace(rest[0]), nil
 }
 
-// runningHint 提醒：改完最多 2 秒生效。
+// userMutating 报告这个子命令会不会改库。只读的（list / show / usage）不该打扰服务。
+func userMutating(sub string) bool {
+	switch sub {
+	case "add", "rm", "del", "remove", "enable", "disable", "token", "rotate",
+		"mode", "quota", "limits", "add-model", "rm-model", "add-provider", "rm-provider":
+		return true
+	}
+	return false
+}
+
+// notifyRunningService 告诉运行中的服务「用户表变了」，让它立刻重载而不是等轮询。
+//
+// 借的是 SIGHUP 这条现成通道：服务收到后会重载配置并同步用户表。
+// 服务没在跑、或没权限发信号，都静默跳过 —— 还有那个 2 秒的轮询兜底。
+func notifyRunningService(paths config.Paths) {
+	pid, running := readPID(paths.PIDFile)
+	if !running {
+		return
+	}
+	_ = syscall.Kill(pid, syscall.SIGHUP)
+}
+
+// runningHint 提醒：改完立刻生效。
 func runningHint() {
-	fmt.Println("（正在运行的服务会在 2 秒内自动加载这次变更）")
+	fmt.Println("（正在运行的服务会被立即通知，加载这次变更）")
 }
 
 func userAdd(paths config.Paths, rest []string) error {

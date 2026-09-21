@@ -380,20 +380,23 @@ func cmdStart(paths config.Paths) error {
 			} else {
 				lg.Infof("SIGHUP：配置无变化")
 			}
+			// 用户表一并刷新：CLI 的写操作与 `llmproxy reload` 都发 SIGHUP。
+			// 不在这里同步的话，"改完立刻能用"就只能等下面那个 2 秒一次的轮询，
+			// 而窗口期内的请求会吃到 401 —— 看起来像"用户没建成"。
+			srv.SyncUsersIfChanged()
 			// 继续等下一个信号
 			for sig = range sigCh {
 				if sig == syscall.SIGHUP {
 					changed, newCfg, err := storeCfg.Reload()
 					if err != nil {
 						lg.Errorf("SIGHUP 配置重载失败: %v", err)
-						continue
-					}
-					if changed {
+					} else if changed {
 						r.ApplyConfig(newCfg.Routing, newCfg.Normalized)
 						srv.Transports().Reset()
 						cfg = newCfg
 						lg.Infof("SIGHUP 配置已重载")
 					}
+					srv.SyncUsersIfChanged()
 					continue
 				}
 				break

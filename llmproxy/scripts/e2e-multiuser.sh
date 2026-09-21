@@ -215,7 +215,11 @@ echo "=== 9. 消费模式：用系统上游、走白名单、进配额 ==="
 D_TOKEN=$("$BIN" user add dave | sed -n 's/.*下游 token: //p' | tr -d ' ')
 "$BIN" user mode dave consumption >/dev/null
 "$BIN" user add-model dave fast -upstream sys-model >/dev/null
-sleep 2.6
+# 这里刻意不等待：CLI 改完会主动通知服务，新用户与映射应当立刻可用。
+# 以前靠 sleep 2.6 躲开服务那 2 秒一次的轮询 —— 窗口期内拿新 token 请求会吃 401，
+# 看起来像"用户根本没建成"。用只读的 /v1/_me 探，不计量、不打上游。
+chk "CLI 建完用户立刻就能认（不等轮询）" \
+  "$(curl -s -o /dev/null -w '%{http_code}' "$GW/v1/_me" -H "Authorization: Bearer $D_TOKEN")" "200"
 
 r=$(curl -s -X POST "$GW/v1/chat/completions" -H "Authorization: Bearer $D_TOKEN" \
     -H 'Content-Type: application/json' -d '{"model":"fast","messages":[{"role":"user","content":"hi"}]}')
