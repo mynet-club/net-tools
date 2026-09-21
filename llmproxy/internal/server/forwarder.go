@@ -33,6 +33,50 @@ type usageInfo struct {
 	// 计费必须区分；不回报的上游保持为 0，由计费侧按「全部未命中」保守处理。
 	PromptCacheHitTokens  *int64 `json:"prompt_cache_hit_tokens"`
 	PromptCacheMissTokens *int64 `json:"prompt_cache_miss_tokens"`
+	// OpenAI / Azure 及其兼容实现（不少聚合商都是这个形状）把命中数放在这里：
+	// cached_tokens 是**命中**的那部分，未命中要自己从 prompt_tokens 里减出来。
+	// 只认上面两个字段的话，这类上游的命中会被记成 0 —— 于是命中率凭空消失，
+	// 金额又按「全部未命中」被高估。
+	PromptTokensDetails *struct {
+		CachedTokens *int64 `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+}
+
+// cacheHitMiss 把两套字段归一化成「命中/未命中」两个数，ok=false 表示上游压根没报。
+//
+// 显式的 hit/miss（DeepSeek 风格）优先；只有 cached_tokens 时，命中 = cached，
+// 未命中 = prompt_tokens - cached。负数一律夹成 0：上游报的数字不可全信，
+// 让它们进到金额里比丢掉更糟。
+func (u *usageInfo) cacheHitMiss() (hit, miss int64, ok bool) {
+	if u == nil {
+		return 0, 0, false
+	}
+	if u.PromptCacheHitTokens != nil || u.PromptCacheMissTokens != nil {
+		if u.PromptCacheHitTokens != nil {
+			hit = *u.PromptCacheHitTokens
+		}
+		if u.PromptCacheMissTokens != nil {
+			miss = *u.PromptCacheMissTokens
+		}
+		if hit < 0 {
+			hit = 0
+		}
+		if miss < 0 {
+			miss = 0
+		}
+		return hit, miss, true
+	}
+	if u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens != nil && u.PromptTokens != nil {
+		hit = *u.PromptTokensDetails.CachedTokens
+		if hit < 0 {
+			hit = 0
+		}
+		if hit > *u.PromptTokens {
+			hit = *u.PromptTokens // cached 比 prompt 还大只可能是上游算错，夹住
+		}
+		return hit, *u.PromptTokens - hit, true
+	}
+	return 0, 0, false
 }
 
 // handleUpstreamPost 把 /v1/* 的 POST 请求按模型路由到上游供应商。
@@ -183,7 +227,20 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 		if globalTimeout > 0 && globalTimeout < timeout {
 			timeout = globalTimeout
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), timeout)
+		// 流式不用总时限（长回答会被正常掐断），改成「连续多久没数据」的看门狗。
+		// 见 idle.go 的说明。
+		var (
+			ctx    context.Context
+			cancel context.CancelFunc
+			wd     *idleWatchdog
+		)
+		if probe.Stream && cfg.Server.StreamIdleMs() > 0 {
+			ctx, cancel = context.WithCancel(r.Context())
+			wd = newIdleWatchdog(time.Duration(cfg.Server.StreamIdleMs())*time.Millisecond, cancel)
+			defer wd.Stop()
+		} else {
+			ctx, cancel = context.WithTimeout(r.Context(), timeout)
+		}
 
 		upBody, err := rewriteModelBody(raw, cand.UpstreamModel, probe.Stream)
 		if err != nil {
@@ -227,8 +284,11 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 			// 注意：这里才能 cancel。context 会控制整个请求-响应生命周期，
 			// 过早 cancel 会导致后续读 body 失败。
 			cancel()
-			errMsg := err.Error()
-			if strings.Contains(errMsg, "context deadline exceeded") || strings.Contains(errMsg, "Client.Timeout") {
+			if wd.Fired() {
+				// 看门狗掐的：上下文是被 Cancel 而不是超时，不认一下会误报成「客户端断开」
+				err = fmt.Errorf("供应商 %s 连续 %s 没有返回数据（空闲超时）",
+					cand.Provider.Name, wd.Idle())
+			} else if errMsg := err.Error(); strings.Contains(errMsg, "context deadline exceeded") || strings.Contains(errMsg, "Client.Timeout") {
 				err = fmt.Errorf("供应商 %s 请求超时（%s）", cand.Provider.Name, timeout)
 			}
 			s.log.Warnf("供应商 %s 请求失败: %v", cand.Provider.Name, err)
@@ -239,6 +299,7 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 			exclude[cand.Provider.Name] = true
 			continue
 		}
+		wd.Touch() // 响应头到了也算「有数据在动」
 
 		if retryableStatus(resp.StatusCode) {
 			snippet := readSnippet(resp.Body, 300)
@@ -263,7 +324,7 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 
 		func() {
 			defer cancel()
-			s.relay(w, r, resp, &rec, started)
+			s.relay(w, r, resp, &rec, started, wd)
 		}()
 		return
 	}
@@ -283,7 +344,7 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 }
 
 // relay 把上游响应原样写给下游；同时提取 usage / TTFT 元数据。
-func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Response, rec *store.RequestRecord, started time.Time) {
+func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Response, rec *store.RequestRecord, started time.Time, wd *idleWatchdog) {
 	defer resp.Body.Close()
 
 	// 复制响应头（跳过 hop-by-hop）
@@ -311,8 +372,14 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 	var written int64
 	var copyErr error
 	if isSSE {
-		// 流式：边转发边扫 usage，不缓存全文
-		written, copyErr = io.Copy(io.MultiWriter(dest, scanner), resp.Body)
+		// 流式：边转发边扫 usage，不缓存全文。
+		// body 外面包一层，读到字节就喂一次看门狗 —— 于是「上游慢但活着」不会被误杀，
+		// 「上游卡住不动」会在空闲上限处失败。
+		body := io.Reader(resp.Body)
+		if wd != nil {
+			body = &activityReader{r: resp.Body, touch: wd.Touch}
+		}
+		written, copyErr = io.Copy(io.MultiWriter(dest, scanner), body)
 	} else {
 		var buf bytes.Buffer
 		written, copyErr = io.Copy(&buf, resp.Body)
@@ -332,8 +399,15 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 	rec.CacheMissTokens = scanner.usage.cacheMiss
 	rec.OK = resp.StatusCode < 400 && copyErr == nil
 	if copyErr != nil {
-		rec.ErrorType = "relay_error"
-		rec.ErrorMsg = copyErr.Error()
+		if wd.Fired() {
+			// 读操作被 Cancel 掉时报的是 context canceled，和「下游断开」长得一样；
+			// 看门狗标记过就说明是空闲超时，归因要写清楚。
+			rec.ErrorType = "upstream_idle"
+			rec.ErrorMsg = fmt.Sprintf("上游 %s 连续 %s 没有返回数据（空闲超时）", rec.Provider, wd.Idle())
+		} else {
+			rec.ErrorType = "relay_error"
+			rec.ErrorMsg = copyErr.Error()
+		}
 	}
 	s.persist(rec)
 }
@@ -522,11 +596,9 @@ func (u *usageScanner) Write(p []byte) (int, error) {
 		if chunk.Usage.TotalTokens != nil {
 			u.usage.TotalTokens = chunk.Usage.TotalTokens
 		}
-		if v := chunk.Usage.PromptCacheHitTokens; v != nil {
-			u.usage.cacheHit = *v
-		}
-		if v := chunk.Usage.PromptCacheMissTokens; v != nil {
-			u.usage.cacheMiss = *v
+		if hit, miss, ok := chunk.Usage.cacheHitMiss(); ok {
+			u.usage.cacheHit = hit
+			u.usage.cacheMiss = miss
 		}
 	}
 	return len(p), nil
@@ -557,11 +629,9 @@ func (u *usageScanner) consumeJSON(b []byte) {
 	if obj.Usage.TotalTokens != nil {
 		u.usage.TotalTokens = obj.Usage.TotalTokens
 	}
-	if v := obj.Usage.PromptCacheHitTokens; v != nil {
-		u.usage.cacheHit = *v
-	}
-	if v := obj.Usage.PromptCacheMissTokens; v != nil {
-		u.usage.cacheMiss = *v
+	if hit, miss, ok := obj.Usage.cacheHitMiss(); ok {
+		u.usage.cacheHit = hit
+		u.usage.cacheMiss = miss
 	}
 }
 

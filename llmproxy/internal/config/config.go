@@ -112,6 +112,23 @@ type ServerConfig struct {
 	AdminToken       string `yaml:"admin_token"`
 	MaxBodyMB        int    `yaml:"max_body_mb"`
 	RequestTimeoutMs int    `yaml:"request_timeout_ms"`
+	// StreamIdleTimeoutMs 是**流式**请求的空闲上限：连续这么久没收到任何字节就判失败。
+	//
+	// 流式不能用「总时限」来管：一次长回答可能跑几分钟，按总时限掐会把正常的流切断；
+	// 而上游卡住不动时，又该早点失败（否则要耗满总时限）。所以流式改成看「有没有动静」，
+	// 且不设总时限 —— 客户端断开本来就会取消上游。
+	//
+	// 指针是为了区分「没配」（用默认 2 分钟）和「显式写 0」（关闭，退回总时限行为）——
+	// 用普通 int 的话这两者都是 0，没法表达「关掉它」。
+	StreamIdleTimeoutMs *int `yaml:"stream_idle_timeout_ms"`
+}
+
+// StreamIdleMs 给出流式空闲上限（毫秒）。没配 = 默认 2 分钟；显式 0 = 关闭。
+func (c ServerConfig) StreamIdleMs() int {
+	if c.StreamIdleTimeoutMs == nil {
+		return 120000
+	}
+	return *c.StreamIdleTimeoutMs
 }
 
 // APIKey 既支持纯字符串，也支持 {key, label} 对象形式；label 只用于日志，不参与鉴权。
@@ -474,6 +491,9 @@ func (c *Config) normalize(opts LoadOptions) error {
 	}
 	if c.Server.RequestTimeoutMs < 1000 || c.Server.RequestTimeoutMs > 86400000 {
 		return fmt.Errorf("server.request_timeout_ms 需要在 1000~86400000 之间，当前是 %d", c.Server.RequestTimeoutMs)
+	}
+	if v := c.Server.StreamIdleTimeoutMs; v != nil && *v != 0 && (*v < 1000 || *v > 86400000) {
+		return fmt.Errorf("server.stream_idle_timeout_ms 需要是 0（关闭）或 1000~86400000 之间，当前是 %d", *v)
 	}
 
 	seenKey := map[string]bool{}
