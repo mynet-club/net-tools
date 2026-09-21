@@ -112,38 +112,52 @@
       <div class="head">
         <h2 id="ud-title">用户详情</h2>
         <span class="grow"></span>
-        <button type="button" id="ud-token" class="ghost sm">轮换 token</button>
+        <span class="err" id="ud-err" hidden></span>
+        <button type="button" id="ud-save" class="primary">保存设置</button>
         <button type="button" id="ud-close" class="ghost sm">关闭</button>
       </div>
 
-      <div class="pform-grid">
-        <div>
+      <div class="ud-grid">
+        <div class="ud-field">
           <label>模式</label>
           <div class="mmode">
             <label class="inline"><input type="radio" name="udmode" id="ud-byo" value="byo"> byo（自带上游）</label>
             <label class="inline"><input type="radio" name="udmode" id="ud-cons" value="consumption"> consumption（用系统上游）</label>
           </div>
-          <label class="inline mt"><input type="checkbox" id="ud-enabled"> 启用</label>
+          <p class="sub">byo：他用自己的上游，网关不替他付钱，没配上游时请求会失败。<br>
+            consumption：用系统上游，账单归你，受下面的配额与限流约束。</p>
         </div>
-        <div>
-          <label for="ud-qtokens">月度配额（token，0 = 不限）</label>
-          <input id="ud-qtokens" type="number" min="0" step="1000">
-          <label for="ud-qcost" class="mt">月度配额（金额，0 = 不限）</label>
-          <input id="ud-qcost" type="number" min="0" step="0.01">
-        </div>
-        <div>
-          <label for="ud-rpm">限流：次/分钟（0 = 不限）</label>
-          <input id="ud-rpm" type="number" min="0" step="1">
-          <label for="ud-conc" class="mt">限流：并发上限（0 = 不限）</label>
-          <input id="ud-conc" type="number" min="0" step="1">
+        <div class="ud-field">
+          <label>状态与危险操作</label>
+          <div class="ud-actions">
+            <label class="inline"><input type="checkbox" id="ud-enabled"> 启用</label>
+            <button type="button" id="ud-token" class="ghost sm">轮换 token</button>
+            <button type="button" id="ud-delete" class="link danger sm">删除用户</button>
+          </div>
+          <p class="sub">「启用」要和其它设置一起点右上角「保存设置」才生效。<br>
+            轮换 token 与删除用户是立刻生效的操作，不需要保存 —— 轮换会让旧 token 立即失效，
+            删除不可恢复，会连模型映射一起删掉。</p>
         </div>
       </div>
-      <div class="row">
-        <button type="button" id="ud-save" class="primary">保存设置</button>
-        <button type="button" id="ud-enable" class="ghost">启用/停用</button>
-        <button type="button" id="ud-delete" class="link danger">删除用户</button>
-        <span class="grow"></span>
-        <span class="err" id="ud-err" hidden></span>
+
+      <h3 class="sub-h">配额与限流（0 = 不限）</h3>
+      <div class="ud-fields">
+        <div class="ud-field">
+          <label for="ud-qtokens">月度配额（token）</label>
+          <input id="ud-qtokens" type="number" min="0" step="1000">
+        </div>
+        <div class="ud-field">
+          <label for="ud-qcost">月度配额（金额）</label>
+          <input id="ud-qcost" type="number" min="0" step="0.01">
+        </div>
+        <div class="ud-field">
+          <label for="ud-rpm">限流：次/分钟</label>
+          <input id="ud-rpm" type="number" min="0" step="1">
+        </div>
+        <div class="ud-field">
+          <label for="ud-conc">限流：并发上限</label>
+          <input id="ud-conc" type="number" min="0" step="1">
+        </div>
       </div>
 
       <h3 class="sub-h">模型范围（消费模式）</h3>
@@ -155,7 +169,7 @@
           指定模型（收窄）</label>
       </div>
       <div id="ud-inherit-box" hidden>
-      <p class="sub">这些是他从系统池继承到的模型。点「测试」可以逐个确认它们对他真的通
+      <p class="sub" id="ud-inherit-note">这些是他从系统池继承到的模型。点「测试」可以逐个确认它们对他真的通
         —— 继承不代表上游一定可用。</p>
       <div class="tablewrap">
         <table id="ud-inherit-models">
@@ -163,8 +177,23 @@
           <tbody></tbody>
         </table>
       </div>
-      <p class="muted" id="ud-inherit-empty" hidden>系统池当前没有声明具体模型名
-        （可能是直通型上游），因此他什么模型名都能调，只在真实请求时才知道通不通。</p>
+      <p class="muted" id="ud-inherit-empty" hidden>系统池当前没有声明具体模型名，所以上表是空的。</p>
+
+      <div id="ud-inherit-pass" hidden>
+        <h3 class="sub-h">直通型上游（不声明具体模型名）</h3>
+        <p class="sub" id="ud-inherit-pass-note"></p>
+        <div class="row">
+          <button type="button" id="ud-inherit-probe" class="ghost sm">探测它们实际提供的模型</button>
+          <span class="grow"></span>
+          <span class="muted" id="ud-inherit-probe-state"></span>
+        </div>
+        <div id="ud-inherit-probe-wrap" class="tablewrap" hidden>
+          <table id="ud-inherit-probe-list">
+            <thead><tr><th>上游</th><th>模型名</th><th>快速测试</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
       </div>
 
       <div id="ud-models-box" hidden>

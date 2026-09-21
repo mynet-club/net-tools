@@ -569,6 +569,12 @@ async function openUser(name, quiet) {
   await Promise.all([loadUserModels(name), loadUserUsage(name)]);
 }
 
+// 系统池里哪些是「全部直通」。它们在 config.yaml 里**不声明任何模型名**，
+// 所以继承列表里天然看不到它们 —— 不是漏了，是声明里就没有。
+function passthroughProviders() {
+  return (ADM.cfg.providers || []).filter((p) => p.passthrough && p.enabled);
+}
+
 // 模型范围：继承系统池 还是 指定收窄。这是消费模式最常调的一项 ——
 // 默认继承，所以新用户不需要管理员逐条配模型。
 function renderModelScope(data) {
@@ -580,9 +586,15 @@ function renderModelScope(data) {
   if (inherit) renderInheritedModels(ADM.editing, data.models || []);
 
   const pool = systemModelNames();
+  const pass = passthroughProviders();
   $('ud-models-note').textContent = inherit
-    ? '该用户继承系统池声明的全部模型' + (pool.length ? '：' + pool.join('、') : '') +
-      (pool.length ? '' : '（系统池当前没有声明具体模型名）')
+    ? (pool.length
+        ? '他继承系统池声明的全部模型：' + pool.join('、')
+        : '系统池没有声明任何具体模型名，所以上表是空的。') +
+      (pass.length
+        ? ' 另有 ' + pass.length + ' 家是「全部直通」（' + pass.map((p) => p.name || '未命名').join('、') +
+          '）：它们不声明模型名，任何模型名都原样转发，因此不在上表里 —— 见下面第二块。'
+        : '')
     : '该用户被收窄到下面这张表里的模型。要放开就切回「继承系统池」。';
 }
 
@@ -601,6 +613,61 @@ function renderInheritedModels(name, models) {
     );
   }));
   $('ud-inherit-empty').hidden = models.length > 0;
+
+  // 直通型上游：声明里没有模型名，所以继承列表里看不到它们的模型 —— 说清楚为什么，
+  // 再给一个按钮把它们实际提供什么列出来。免得让人以为「deepseek 的模型丢了」。
+  const pass = passthroughProviders();
+  const box = $('ud-inherit-pass');
+  box.hidden = pass.length === 0;
+  if (!pass.length) return;
+  $('ud-inherit-pass-note').textContent =
+    '系统池里有 ' + pass.length + ' 家是「全部直通」：' +
+    pass.map((p) => p.name || '未命名').join('、') +
+    '。它们在 config.yaml 里没有声明具体模型名，所以上表里看不到它们的模型。' +
+    '对这个用户来说，任何模型名都会原样转给它们。点下面的按钮可以列出它们实际提供什么。';
+  $('ud-inherit-probe-state').textContent = '';
+  $('ud-inherit-probe-wrap').hidden = true;
+  $('ud-inherit-probe-list').querySelector('tbody').replaceChildren();
+}
+
+// 探测直通型上游实际提供的模型。这是参考信息，不是白名单 ——
+// 直通上游接受它认得的任何名字，不只是列出来的这些。
+async function probePassthrough() {
+  const pass = passthroughProviders();
+  const user = ADM.editing;
+  const state = $('ud-inherit-probe-state');
+  const wrap = $('ud-inherit-probe-wrap');
+  const tb = $('ud-inherit-probe-list').querySelector('tbody');
+  if (!pass.length) return;
+  state.textContent = '正在探测 ' + pass.length + ' 家…';
+  tb.replaceChildren();
+  wrap.hidden = true;
+
+  const rows = [];
+  for (const p of pass) {
+    try {
+      const { data } = await adminApi('/v1/_admin/providers/' + encodeURIComponent(p.name.trim() || '-') + '/discover', {
+        method: 'POST', body: JSON.stringify(provCreds(p)),
+      });
+      for (const m of (data.models || [])) rows.push({ prov: p.name || '未命名', model: m });
+    } catch (e) {
+      rows.push({ prov: p.name || '未命名', model: '（探测失败：' + e.message + '）', err: true });
+    }
+  }
+  tb.replaceChildren(...rows.map((r) => {
+    const res = h('span', { class: 'testres', text: '—' });
+    return h('tr', null,
+      h('td', null, h('code', { class: 'k', text: r.prov })),
+      h('td', null, h('code', { class: 'k', text: r.model })),
+      h('td', null, r.err ? res :
+        h('button', { type: 'button', class: 'link', text: '测试',
+          onclick: () => testMapping(user, r.model, res) }), ' ', res),
+    );
+  }));
+  wrap.hidden = rows.length === 0;
+  state.textContent = rows.length
+    ? '共 ' + rows.length + ' 条。这是参考信息，不是白名单 —— 直通上游接受它认得的任何名字。'
+    : '这些上游都没有给出模型列表（它们可能只支持对话接口）。';
 }
 
 // 系统池当前声明了哪些逻辑模型名（供上面那句提示用）
@@ -662,18 +729,6 @@ async function saveUser() {
     showErr($('ud-err'), e.message);
   } finally {
     btn.disabled = false;
-  }
-}
-
-async function toggleUser() {
-  const name = ADM.editing;
-  if (!name) return;
-  const next = !($('ud-enabled').checked);
-  try {
-    await adminApi('/v1/_admin/users/' + encodeURIComponent(name) + '/' + (next ? 'enable' : 'disable'), { method: 'POST' });
-    await loadAdminUsers();
-  } catch (e) {
-    showErr($('ud-err'), e.message);
   }
 }
 
@@ -853,12 +908,12 @@ $('nu-cancel').addEventListener('click', () => { $('u-add-form').hidden = true; 
 $('u-add-form').addEventListener('submit', createUser);
 $('ud-close').addEventListener('click', () => { $('u-detail').hidden = true; ADM.editing = null; });
 $('ud-save').addEventListener('click', saveUser);
-$('ud-enable').addEventListener('click', toggleUser);
 $('ud-token').addEventListener('click', rotateToken);
 $('ud-delete').addEventListener('click', deleteUser);
 $('ud-add-model').addEventListener('click', addModel);
 $('ud-inherit').addEventListener('change', switchToInherit);
 $('ud-narrow').addEventListener('change', switchToNarrow);
+$('ud-inherit-probe').addEventListener('click', probePassthrough);
 $('ud-probe').addEventListener('click', probeForMapping);
 $('ud-new-model').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addModel(); } });
 $('ud-new-upstream').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addModel(); } });
