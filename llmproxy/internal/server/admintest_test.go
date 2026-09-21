@@ -158,20 +158,120 @@ func TestAdminTestProvider(t *testing.T) {
 		t.Errorf("应当用声明的第一个模型测通: %+v", out)
 	}
 
-	// 直通型（没声明具体名字）又不给 model：要提示而不是瞎猜
-	h2 := newMUHarnessWith(t, consumptionYAML(stub.srv.URL, testPricing))
+	// 直通型（没声明具体名字）又不给 model：去问上游要一份模型列表，拿第一个真实名字来测。
+	// 上游不给列表时要说清「测不了」以及怎么办，而不是拿个瞎编的名字打过去换 404。
+	stub2 := newUsageStub(t, 0) // 默认不提供 /v1/models
+	h2 := newMUHarnessWith(t, consumptionYAML(stub2.srv.URL, testPricing))
 	resp, raw = h2.post(t, "/v1/_admin/providers/sys-a/test", adminToken, nil)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("应 200，实际 %d", resp.StatusCode)
 	}
 	out = testOutcomeOf(t, raw)
-	if out.OK || !strings.Contains(out.Error, "指定一个 model") {
-		t.Errorf("直通型没给模型时应当提示: %+v", out)
+	if out.OK || !strings.Contains(out.Error, "没给出模型列表") {
+		t.Errorf("上游不给模型列表时应当说清原因: %+v", out)
+	}
+	if stub2.hitCount() != 0 {
+		t.Errorf("连模型名都没有就不该打对话接口，实际打了 %d 次", stub2.hitCount())
 	}
 
 	resp, _ = h.post(t, "/v1/_admin/providers/ghost/test", adminToken, nil)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("不存在的上游应 404，实际 %d", resp.StatusCode)
+	}
+}
+
+// 直通型 + 上游提供 /v1/models：不用给 model 也能测通 —— 服务端自己挑一个真实名字。
+func TestAdminTestPassthroughPicksRealModel(t *testing.T) {
+	stub := newUsageStub(t, 0).withModels("m-alpha", "m-beta")
+	h := newMUHarnessWith(t, consumptionYAML(stub.srv.URL, testPricing)) // 系统池是 ["*"]，即直通
+
+	resp, raw := h.post(t, "/v1/_admin/providers/sys-a/test", adminToken, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("应 200，实际 %d: %s", resp.StatusCode, raw)
+	}
+	out := testOutcomeOf(t, raw)
+	if !out.OK {
+		t.Fatalf("直通型不给 model 也应当测通（自动挑第一个真实模型）: %+v", out)
+	}
+	if out.UpstreamModel != "m-alpha" {
+		t.Errorf("应当用列表里第一个模型 m-alpha，实际 %q", out.UpstreamModel)
+	}
+	if !strings.Contains(stub.lastModel(), "m-alpha") {
+		t.Errorf("上游收到的模型名不对: %q", stub.lastModel())
+	}
+}
+
+// 不给 model 时取声明的**上游**名（映射的右边），不能拿下游名去打上游。
+func TestAdminTestProviderUsesUpstreamName(t *testing.T) {
+	stub := newUsageStub(t, 0)
+	yamlSrc := strings.Replace(consumptionYAML(stub.srv.URL, testPricing), "models: [\"*\"]", "models: {alias-x: real-y}", 1)
+	h := newMUHarnessWith(t, yamlSrc)
+
+	resp, raw := h.post(t, "/v1/_admin/providers/sys-a/test", adminToken, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("应 200，实际 %d: %s", resp.StatusCode, raw)
+	}
+	out := testOutcomeOf(t, raw)
+	if !out.OK {
+		t.Fatalf("应当测通: %+v", out)
+	}
+	if out.UpstreamModel != "real-y" {
+		t.Errorf("应当上游名 real-y，实际 %q（拿下游名 alias-x 打过去就是错的名字）", out.UpstreamModel)
+	}
+	if !strings.Contains(stub.lastModel(), "real-y") {
+		t.Errorf("上游收到的模型名不对: %q", stub.lastModel())
+	}
+}
+
+// 测一个「映射表里还没有」的模型名，也得真的打到上游 ——
+// 这正是「选模型」弹窗里逐条测试的用法：先确认它通不通，再决定要不要加进映射。
+func TestAdminTestProviderProbesUnmappedModel(t *testing.T) {
+	stub := newUsageStub(t, 0)
+	yamlSrc := strings.Replace(consumptionYAML(stub.srv.URL, testPricing), "models: [\"*\"]", "models: {m-one: m-one}", 1)
+	h := newMUHarnessWith(t, yamlSrc)
+
+	resp, raw := h.post(t, "/v1/_admin/providers/sys-a/test", adminToken, map[string]any{"model": "m-nine"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("应 200，实际 %d: %s", resp.StatusCode, raw)
+	}
+	out := testOutcomeOf(t, raw)
+	if !out.OK || out.UpstreamModel != "m-nine" {
+		t.Fatalf("映射里没有的名字也应当原样打给上游: %+v", out)
+	}
+	if !strings.Contains(stub.lastModel(), "m-nine") {
+		t.Errorf("上游收到的模型名不对: %q", stub.lastModel())
+	}
+}
+
+// 还没保存的供应商也要能逐条测试（界面里内联当前编辑区的地址与密钥）。
+func TestAdminTestProviderWithInlineCreds(t *testing.T) {
+	stub := newUsageStub(t, 0)
+	h := newMUHarnessWith(t, consumptionYAML("http://127.0.0.1:1", testPricing)) // 系统池指向一个死地址
+
+	resp, raw := h.post(t, "/v1/_admin/providers/fresh-unsaved/test", adminToken, map[string]any{
+		"model": "m-inline", "base_url": stub.srv.URL, "api_key": "sk-inline",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("内联测试应 200，实际 %d: %s", resp.StatusCode, raw)
+	}
+	if out := testOutcomeOf(t, raw); !out.OK {
+		t.Fatalf("应当测通: %s", raw)
+	}
+	if got := stub.authHeader(); got != "Bearer sk-inline" {
+		t.Errorf("内联密钥没被用上: %q", got)
+	}
+
+	// 没带 base_url 又没有这家：明确 404，而不是猜一个地址去打
+	resp, _ = h.post(t, "/v1/_admin/providers/fresh-unsaved/test", adminToken, map[string]any{"model": "m"})
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("既没保存也没带 base_url 应 404，实际 %d", resp.StatusCode)
+	}
+	// 带了地址但没密钥：报清楚缺什么，别拿空 Bearer 去打上游
+	resp, raw = h.post(t, "/v1/_admin/providers/fresh-unsaved/test", adminToken, map[string]any{
+		"model": "m-inline", "base_url": stub.srv.URL,
+	})
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(raw), "api_key") {
+		t.Errorf("缺密钥应 400 且说明原因，实际 %d: %s", resp.StatusCode, raw)
 	}
 }
 

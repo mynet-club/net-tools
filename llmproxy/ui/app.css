@@ -184,6 +184,9 @@ code.k { font-family: var(--mono); font-size: 12px; color: #4b5563; }
 .cand { display: flex; align-items: center; gap: 7px; font-weight: 400; margin: 0;
         padding: 3px 4px; border-radius: 6px; cursor: pointer; }
 .cand:hover { background: #f0f2f6; }
+/* 选中不能只靠那个小方框：整行加底色，一眼扫得出选了哪些 */
+.cand.on { background: #eef0fe; }
+.cand.on:hover { background: #e6e9fd; }
 .cand span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .picked-head { font-size: 12px; color: var(--muted); margin: 0 0 6px; }
@@ -249,6 +252,13 @@ select:focus { outline: 2px solid #c7c3f7; outline-offset: 1px; }
 #pick-list { max-height: 320px; }
 
 /* 映射行里的测试结果 */
-.testres { font-size: 12px; color: var(--muted); }
+/* inline-block + max-width 是必须的：单元格在自动布局的表里会为内容撑宽，
+   上游的报错又可能很长（404 时它会把可用分组全列出来），不夹住就把整张表撑散。
+   完整内容在 title 里，鼠标停一下能看全。 */
+.testres {
+  display: inline-block; max-width: 320px; vertical-align: bottom;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 12px; color: var(--muted);
+}
 .testres.ok { color: var(--ok); }
 .testres.bad { color: var(--danger); }

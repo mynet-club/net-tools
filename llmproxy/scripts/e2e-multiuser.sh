@@ -328,6 +328,16 @@ chk "非法 base_url 被拒" "$code" "400"
 chk "被拒后文件未改动" "$(shasum -a 256 "$CFGF" | awk '{print $1}')" "$BAD_BEFORE"
 chk "非管理员不能改配置" "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$GW/v1/_admin/config/providers" -H "Authorization: Bearer $A_TOKEN" -H 'Content-Type: application/json' -d '{}')" "403"
 
+# 上面往系统池里留下了一家 second-up（weight 2，代理指向一个真的连不上的地址）。
+# 选路是**按权重随机**的，池子里留着它，后面凡是走系统池的用例都会随机飘 ——
+# 不是每次都飘，所以这种 flaky 最难查。这里把池子收回成只剩 global-up。
+curl -s -X PUT "$GW/v1/_admin/config/providers" -H "Authorization: Bearer $ADMIN" \
+  -H 'Content-Type: application/json' \
+  -d "{\"providers\":[{\"name\":\"global-up\",\"enabled\":true,\"base_url\":\"http://127.0.0.1:$GPORT/v1\",\"api_key\":\"\",\"weight\":1,\"proxy\":\"direct\",\"timeout_ms\":10000,\"models\":[\"*\"]}]}" >/dev/null
+sleep 2.5
+chk "收尾：系统池恢复成只剩 global-up（后续用例才确定可复现）" \
+  "$(curl -s "$GW/healthz" | sed 's/.*"providers":\([0-9]*\).*/\1/')" "1"
+
 echo
 echo "=== 16. 两个界面是两套独立页面 ==="
 curl -s "$GW/ui/" | grep -q '用户控制台' && pass "/ui/ 是用户台" || fail "/ui/ 页面不对"
@@ -417,10 +427,14 @@ chk "不存在的系统上游" "$(curl -s -o /dev/null -w '%{http_code}' -X POST
   -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d '{"model":"x"}')" "404"
 chk "非管理员不能调测试接口" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/_admin/providers/global-up/test" \
   -H "Authorization: Bearer $A_TOKEN" -H 'Content-Type: application/json' -d '{"model":"sys-model"}')" "403"
-# 直通型上游没有可挑的具体模型名：要明确说出来，而不是拿空模型名去打上游
+# 直通型又不给 model：服务端会去问上游要一份模型列表挑一个真名字来测。
+# global-up 这个假上游不提供 /v1/models，所以这里应当明确说「测不了、缺什么、怎么办」，
+# 而不是拿个空名字或瞎编的名字打过去。
 tn=$(curl -s -X POST "$GW/v1/_admin/providers/global-up/test" -H "Authorization: Bearer $ADMIN" \
     -H 'Content-Type: application/json' -d '{}')
-echo "$tn" | grep -q '没有声明具体的模型名' && pass "直通型上游不给模型名时明说原因" || fail "话术不对：$tn"
+echo "    $tn"
+echo "$tn" | grep -q '没给出模型列表' && pass "直通型拿不到模型列表时明说原因与出路" || fail "话术不对：$tn"
+
 
 # 收窄后的归因：和真实请求一样，要能区分「权限不给」而不是「池子没有」
 "$BIN" user add-model inherit1 fast -upstream sys-model >/dev/null
@@ -460,6 +474,15 @@ chk "非 http(s) 的 base_url 被拒" "$(curl -s -o /dev/null -w '%{http_code}' 
   -d '{"base_url":"ftp://bad/v1","api_key":"k"}')" "400"
 chk "非管理员不能探测系统上游" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/_admin/providers/global-up/discover" \
   -H "Authorization: Bearer $A_TOKEN")" "403"
+
+# 每家一次测试：不给 model 时服务端自己去问上游要列表、挑一个真实的模型名来测。
+# 用未保存的 inline-up 顺带验证「内联凭证 + 自动挑名字」这条路。
+tp=$(curl -s -X POST "$GW/v1/_admin/providers/inline-up/test" -H "Authorization: Bearer $ADMIN" \
+    -H 'Content-Type: application/json' \
+    -d "{\"base_url\":\"http://127.0.0.1:$IPORT/v1\",\"api_key\":\"sk-inline\"}")
+echo "    $tp"
+echo "$tp" | grep -q '"ok":true' && pass "未保存的供应商：内联凭证、不给 model 也能测通" || fail "内联测试失败：$tp"
+echo "$tp" | grep -q '"upstream_model":"m-one"' && pass "自动挑的是上游列表里真实的模型名" || fail "挑错模型：$tp"
 
 echo
 echo "================ 结果：通过 $PASS 项，失败 $FAIL 项 ================"

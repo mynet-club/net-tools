@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -184,12 +185,24 @@ func (s *Server) adminTestUser(w http.ResponseWriter, r *http.Request, name stri
 	writeJSON(w, http.StatusOK, out)
 }
 
-// adminTestProvider 直接测某一家系统上游（用来确认「这家配得对不对」）。
+// adminTestProvider 测某一家系统上游的**某一个模型**（界面上就是每条映射右边那个「测试」）。
+//
+// 请求里可以内联 base_url / api_key / proxy，理由与 discover 相同：界面刚改完还没保存时
+// 也要能测，否则又是「先保存才能验」那个别扭的顺序。这不扩大权限 —— 调用方本来就能把
+// 同一个地址配成上游、让网关拿同一把密钥去请求。
 func (s *Server) adminTestProvider(w http.ResponseWriter, r *http.Request, name string) {
 	if r.Method != http.MethodPost {
 		writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error", "只支持 POST")
 		return
 	}
+	var req struct {
+		Model   string `json:"model"`
+		BaseURL string `json:"base_url"`
+		APIKey  string `json:"api_key"`
+		Proxy   string `json:"proxy"`
+	}
+	_ = readJSONBody(w, r, &req)
+
 	providers := s.globalProviders()
 	var found *config.Provider
 	for i := range providers {
@@ -198,36 +211,82 @@ func (s *Server) adminTestProvider(w http.ResponseWriter, r *http.Request, name 
 			break
 		}
 	}
-	if found == nil {
+	inlineBase := strings.TrimSpace(req.BaseURL)
+	if found == nil && inlineBase == "" {
 		writeJSONError(w, http.StatusNotFound, "not_found",
-			fmt.Sprintf("系统上游里没有 %q", name))
+			fmt.Sprintf("系统上游里没有 %q，也没带 base_url（用 GET /v1/_admin/providers 看有哪些）", name))
 		return
 	}
 
-	var req struct {
-		Model string `json:"model"`
+	prov := config.Provider{Name: name, Enabled: true}
+	if found != nil {
+		prov = *found
 	}
-	_ = readJSONBody(w, r, &req)
-	model := strings.TrimSpace(req.Model)
-	if model == "" {
-		// 没指定就用它声明的第一个模型名；直通型没有名字可挑，只能让调用方给
-		names := make([]string, 0, len(found.Models.Map))
-		for down := range found.Models.Map {
-			if down != "*" {
-				names = append(names, down)
-			}
-		}
-		if len(names) > 0 {
-			model = names[0]
-		}
+	if inlineBase != "" {
+		prov.BaseURL = inlineBase
 	}
-	if model == "" {
-		writeJSON(w, http.StatusOK, testOutcome{
-			Error: "这家上游没有声明具体的模型名（可能是直通），测试时要指定一个 model",
-		})
+	if k := strings.TrimSpace(req.APIKey); k != "" {
+		prov.APIKey = k
+	}
+	if v := strings.TrimSpace(req.Proxy); v != "" {
+		ref, err := config.NormalizeProxy(v, s.cfgStore.Current().ProxyIndex)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		prov.Proxy = ref
+	}
+	if strings.TrimSpace(prov.BaseURL) == "" {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "缺 base_url：先填上游地址")
 		return
 	}
-	out := s.runUpstreamTest(r.Context(), "", []config.Provider{*found}, model)
-	s.log.Infof("管理员测试了系统上游 %s（模型 %s，ok=%v）", name, model, out.OK)
+	if strings.TrimSpace(prov.APIKey) == "" {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
+			"缺 api_key：新加的供应商要先填密钥（已存在的留空则沿用保存过的那把）")
+		return
+	}
+
+	model := strings.TrimSpace(req.Model)
+	if model == "" && found != nil {
+		// 没指定就挑它声明过的第一个**上游**模型名（映射的右边）。
+		// 不能拿下游名：映射允许改名（a: b），拿下游名等于把一个上游不认识的名字打过去。
+		ups := make([]string, 0, len(found.Models.Map))
+		for _, up := range found.Models.Map {
+			if up != "" && up != "*" {
+				ups = append(ups, up)
+			}
+		}
+		sort.Strings(ups)
+		if len(ups) > 0 {
+			model = ups[0]
+		}
+	}
+	if model == "" {
+		// 直通型（没声明任何具体模型名）又不给 model：问上游要一份模型列表，拿第一个真实的
+		// 名字去测。直通下「这家通不通、密钥认不认」就是全部要回答的问题，
+		// 而随便编一个名字打过去只会换回一个 404，那不叫测试。
+		proxyURL, err := prov.Proxy.Resolve(s.cfgStore.Current().ProxyIndex)
+		if err != nil {
+			writeJSON(w, http.StatusOK, testOutcome{Error: "上游代理配置有问题：" + err.Error()})
+			return
+		}
+		ids, err := s.fetchModelIDs(r.Context(), prov.BaseURL, prov.APIKey, proxyURL)
+		if err != nil {
+			writeJSON(w, http.StatusOK, testOutcome{
+				Error: "这家上游是直通型、又没声明模型名，想自动挑一个来测，但它没给出模型列表：" +
+					err.Error() + "。改在「指定映射」里加一条带模型名的映射再测",
+			})
+			return
+		}
+		model = ids[0]
+	}
+
+	// 探测的语义是「把这个名字原样打给上游」，所以强制直通：
+	// 上游到底认哪些名字由它自己的 /v1/models 说了算，不该被本地的映射声明挡在前面 ——
+	// 「映射表里还没有这个名字」恰恰是来测它的常见原因。
+	prov.Models = config.ModelSpec{Passthrough: true}
+
+	out := s.runUpstreamTest(r.Context(), "", []config.Provider{prov}, model)
+	s.log.Infof("管理员测试了系统上游 %s 的模型 %s（ok=%v）", name, model, out.OK)
 	writeJSON(w, http.StatusOK, out)
 }

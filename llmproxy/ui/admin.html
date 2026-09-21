@@ -209,7 +209,8 @@
       <span class="grow"></span>
       <button type="button" id="pick-close" class="ghost sm">关闭</button>
     </div>
-    <p class="sub" id="pick-sub">勾选即加入这家上游的映射（下游名默认与上游模型同名，加完可在表里改）。</p>
+    <p class="sub" id="pick-sub">勾选即加入这家上游的映射（下游名默认与上游模型同名，加完可在表里改）。
+      取消勾选会把这条映射去掉。</p>
     <div class="row">
       <input id="pick-filter" class="search" placeholder="搜索模型名…" autocomplete="off">
       <button type="button" id="pick-all" class="ghost sm">全选</button>
@@ -219,6 +220,7 @@
     </div>
     <div id="pick-list" class="cands"></div>
     <p class="muted" id="pick-empty" hidden>没拉到模型列表（这家可能不提供 /v1/models）—— 用表里的「+ 映射」手动填。</p>
+    <p class="muted" id="pick-no-hit" hidden>没有匹配这个关键词的模型。</p>
     <div class="row">
       <button type="button" id="pick-ok" class="primary">加入已选</button>
       <span class="grow"></span>

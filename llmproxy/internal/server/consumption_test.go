@@ -39,23 +39,44 @@ type usageStub struct {
 	hits int
 	// started 在每次开始处理时发一个信号，用来做并发测试的同步点
 	started chan struct{}
+	// auth / model 记下最后一次请求的鉴权头与模型名：
+	// 「探测到底把哪个名字、拿哪把密钥打给了上游」只能从上游这一侧看
+	auth  string
+	model string
+	// models 非 nil 时这个假上游也提供 /v1/models（默认不提供，
+	// 这样「上游没有模型列表」这条路径在别处的测试里保持原样）
+	models []string
+}
+
+// withModels 让这个假上游提供 /v1/models。默认不提供，只有需要时才打开。
+func (s *usageStub) withModels(models ...string) *usageStub {
+	s.mu.Lock()
+	s.models = models
+	s.mu.Unlock()
+	return s
 }
 
 func newUsageStub(t *testing.T, delay time.Duration) *usageStub {
 	t.Helper()
 	s := &usageStub{delay: delay, started: make(chan struct{}, 8)}
 	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		s.mu.Lock()
-		s.hits++
-		s.mu.Unlock()
-		select {
-		case s.started <- struct{}{}:
-		default:
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			s.serveModels(w, r)
+			return
 		}
 		var probe struct {
 			Model string `json:"model"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&probe)
+		s.mu.Lock()
+		s.hits++
+		s.auth = r.Header.Get("Authorization")
+		s.model = probe.Model
+		s.mu.Unlock()
+		select {
+		case s.started <- struct{}{}:
+		default:
+		}
 		if s.delay > 0 {
 			time.Sleep(s.delay)
 		}
@@ -80,6 +101,37 @@ func (s *usageStub) hitCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.hits
+}
+
+// serveModels 按需要提供（或不提供）/v1/models。
+func (s *usageStub) serveModels(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	ms := append([]string(nil), s.models...)
+	s.auth = r.Header.Get("Authorization")
+	s.mu.Unlock()
+	if s.models == nil {
+		http.NotFound(w, r) // 默认就当它是个没有模型列表的上游
+		return
+	}
+	data := make([]map[string]string, 0, len(ms))
+	for _, m := range ms {
+		data = append(data, map[string]string{"id": m})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
+}
+
+// authHeader / lastModel 让测试能从**上游这一侧**确认探测真的按预期发了请求。
+func (s *usageStub) authHeader() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.auth
+}
+
+func (s *usageStub) lastModel() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.model
 }
 
 func consumptionYAML(stubURL string, pricing string) string {

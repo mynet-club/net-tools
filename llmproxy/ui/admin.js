@@ -217,15 +217,18 @@ function filterCands(i, q) {
 
 // ── 选模型弹窗 ───────────────────────────────────────────────────────
 // 上游到底有哪些模型，不该让人猜：先（必要时就近保存）取回列表，再勾选。
-// 新加的、还没保存的供应商也能用 —— 后端探测接口允许内联 base_url / api_key。
+// 新加的、还没保存的供应商也能用 —— 后端探测/测试接口允许内联 base_url / api_key。
 const PICK = { idx: -1, models: [], checked: new Set() };
+
+// 探测与测试都用「当前编辑区」的地址与密钥；密钥留空交给服务端沿用已保存的那把
+function provCreds(p) {
+  return { base_url: p.base_url.trim(), api_key: p.api_key, proxy: p.proxy.trim() };
+}
 
 async function fetchModelsForRow(i) {
   const p = ADM.cfg.providers[i];
-  const body = { base_url: p.base_url.trim(), api_key: p.api_key, proxy: p.proxy.trim() };
-  const name = p.name.trim() || '-';
-  const { data } = await adminApi('/v1/_admin/providers/' + encodeURIComponent(name) + '/discover', {
-    method: 'POST', body: JSON.stringify(body),
+  const { data } = await adminApi('/v1/_admin/providers/' + encodeURIComponent(p.name.trim() || '-') + '/discover', {
+    method: 'POST', body: JSON.stringify(provCreds(p)),
   });
   return data.models || [];
 }
@@ -237,11 +240,13 @@ async function pickModels(i) {
   try {
     // 就近保存：新加的供应商还没入库，探测接口虽然支持内联，但先把改动存下来更省事
     const saved = await ensureSaved();
+    // ensureSaved() 会重建 ADM.cfg.providers，所以索引之后才取，免得拿到旧的
+    const p = ADM.cfg.providers[i];
     const models = await fetchModelsForRow(i);
     PICK.idx = i;
     PICK.models = models;
-    PICK.checked = new Set(ADM.cfg.providers[i].map.map((pair) => pair[0]).filter(Boolean));
-    $('pick-title').textContent = '选择模型 — ' + (ADM.cfg.providers[i].name || '（未命名）');
+    PICK.checked = new Set(p.map.map((pair) => pair[0]).filter(Boolean));
+    $('pick-title').textContent = '选择模型 — ' + (p.name || '（未命名）');
     $('pick-hint').textContent = saved ? '（已先保存本次改动）' : '';
     $('pick-filter').value = '';
     renderPick();
@@ -259,62 +264,112 @@ function renderPick() {
   box.replaceChildren(...list.map((m) => {
     const cb = h('input', { type: 'checkbox' });
     cb.checked = PICK.checked.has(m);
-    // 用 div 而不是 label：label 会把点击**转发**给里面的复选框，
-    // 于是「行处理器 + 复选框处理器」各切一次，净效果为零（表现为点了没反应）。
     const row = h('div', { class: 'cand' }, cb, h('span', { class: 'mono', text: m }));
-    const toggle = () => {
-      if (PICK.checked.has(m)) PICK.checked.delete(m); else PICK.checked.add(m);
-      cb.checked = PICK.checked.has(m);
-      $('pick-count').textContent = '已选 ' + PICK.checked.size + ' / ' + PICK.models.length;
-    };
-    // preventDefault 必须有：复选框的「翻转」是默认动作，在本处理器之后执行，
-    // 不拦掉的话它会把我设的 checked 又翻回去。
-    row.addEventListener('click', (e) => { e.preventDefault(); toggle(); });
+    // 勾选只有这一个来源：复选框自己的 change 事件。
+    // 不要在 click 里 preventDefault 再手动翻转 —— 勾选是复选框的默认动作，
+    // 拦掉之后浏览器还会执行「取消激活步骤」把它翻回去，结果是「记下来了但没勾上」。
+    cb.addEventListener('change', () => {
+      if (cb.checked) PICK.checked.add(m); else PICK.checked.delete(m);
+      paintCand(row, cb.checked);
+      updPickCount();
+    });
+    // 整行可点：点复选框以外的地方就等价于点复选框
+    row.addEventListener('click', (e) => { if (e.target !== cb) cb.click(); });
+    paintCand(row, cb.checked);
     return row;
   }));
   box.hidden = list.length === 0;
   $('pick-empty').hidden = PICK.models.length > 0;
+  $('pick-no-hit').hidden = !(PICK.models.length > 0 && list.length === 0);
+  updPickCount();
+}
+
+// 选中效果不能只靠那个小方框：整行加底色，扫一眼就知道选了哪些
+function paintCand(row, on) { row.classList.toggle('on', on); }
+
+function updPickCount() {
   $('pick-count').textContent = '已选 ' + PICK.checked.size + ' / ' + PICK.models.length;
 }
 
-function closePick() { $('pick-modal').hidden = true; PICK.idx = -1; }
+function closePick() {
+  $('pick-modal').hidden = true;
+  PICK.idx = -1;
+  PICK.name = '';
+  PICK.creds = {};
+}
 
+// 弹窗里那份勾选就是「这家上游的映射表」，所以取消勾选要真的移除 ——
+// 只加不减的话，复选框说「没选」而映射表里还在，两边对不上。
+// 唯一的例外：不在候选列表里的既有映射原样保留（下游名是自定义的，或上游这次没返回它），
+// 候选只是候选，不能因为「这次没列出来」就删掉用户已经配好的东西。
 function applyPick() {
   const i = PICK.idx;
   if (i < 0) return closePick();
   const p = ADM.cfg.providers[i];
-  const exist = new Set(p.map.map((pair) => pair[0]));
+  const cand = new Set(PICK.models);
+  const before = p.map.map((pair) => pair[0]);
+  const beforeSet = new Set(before);
+
+  const next = p.map.filter((pair) => !cand.has(pair[0]));
+  const keptDown = new Set(next.map((pair) => pair[0]));
   for (const m of PICK.checked) {
-    if (!exist.has(m)) p.map.push([m, m]);   // 下游名默认与上游模型同名
+    if (!keptDown.has(m)) next.push([m, m]);   // 下游名默认与上游模型同名
   }
-  // 勾了模型却还停在「全部直通」上就说不通了，直接切成指定映射
-  if (PICK.checked.size > 0) {
-    p.passthrough = false;
-    $('cfg-list').replaceChildren(...ADM.cfg.providers.map(cfgRow));
-  }
+  p.map = next;
+
+  const added = [...PICK.checked].filter((m) => !beforeSet.has(m));
+  const removed = before.filter((m) => cand.has(m) && !PICK.checked.has(m));
+  const keptAside = next.filter((pair) => !cand.has(pair[0])).map((pair) => pair[0]);
+
+  // 有映射却还停在「全部直通」上就说不通了，直接切成指定映射
+  if (p.map.length > 0) p.passthrough = false;
   touchCfg();
   closePick();
+  $('cfg-list').replaceChildren(...ADM.cfg.providers.map(cfgRow));
+
+  const parts = [];
+  if (added.length) parts.push('已加入 ' + added.length + ' 个模型');
+  if (removed.length) parts.push('已移除 ' + removed.length + ' 个');
+  if (!parts.length) parts.push('映射没有变化');
+  let msg = parts.join('，');
+  if (keptAside.length) {
+    msg += '。另有 ' + keptAside.length + ' 条不在这次的候选列表里，已原样保留：' +
+      keptAside.slice(0, 3).join('、') + (keptAside.length > 3 ? ' …' : '');
+  }
+  msg += p.map.length === 0
+    ? '这条供应商现在一条映射都没有 —— 保存后会变成「全部直通」（任何模型名都转发）。'
+    : '（下游名默认同名，可在表里改）。别忘了点右上角「保存」。';
   const banner = $('cfg-result');
   banner.hidden = false;
-  banner.textContent = '已加入 ' + PICK.checked.size + ' 个模型（下游名默认同名，可在表里改）。' +
-    '别忘了点右上角「保存」。';
+  banner.textContent = msg;
 }
 
 // ── 快速测试 ─────────────────────────────────────────────────────────
-// 真发一条极小的请求（最多 8 个 token），用来确认「这家上游 / 这条映射通不通」。
+// 每家供应商**一次**就够：这里的目标是「选模型」，不是「输入模型名」。
+// 一次探针证明这家服务正常（连得上、密钥认不认），模型名交给服务端自己挑：
+// 有映射就用映射里的上游名，直通型就问上游要一份列表、拿第一个真实名字。
+// 结果写在上方横幅里（错误信息可能很长，放行内会把那一行撑变形）。
 async function testProviderRow(i) {
   const p = ADM.cfg.providers[i];
+  const label = p.name || '（未命名）';
   const banner = $('cfg-result');
   banner.hidden = false;
-  banner.textContent = '正在测试 ' + (p.name || '（未命名）') + ' …';
+  banner.className = 'banner';
+  banner.textContent = '正在测试 ' + label + ' …';
   try {
-    await ensureSaved();
-    const model = (p.map.find((pair) => pair[0]) || [])[0] || '';
+    // 有映射就报第一条映射的上游名（哪怕还没保存，免得测试用的是别的模型）；
+    // 没有映射（直通）就不给，让服务端自己问上游要一个真实的模型名
+    const first = p.map.find((pair) => (pair[1] || pair[0] || '').trim());
+    const body = Object.assign({}, provCreds(p));
+    if (first) body.model = (first[1] || first[0]).trim();
+    // 内联当前编辑区的地址与密钥：刚改完还没保存也能测，而且测试本身不改配置
     const { data } = await adminApi('/v1/_admin/providers/' + encodeURIComponent(p.name.trim() || '-') + '/test', {
-      method: 'POST', body: JSON.stringify({ model }),
+      method: 'POST', body: JSON.stringify(body),
     });
-    banner.textContent = describeTest(p.name || '（未命名）', data);
+    banner.textContent = describeTest(label, data);
+    if (!data.ok) banner.className = 'banner err-banner';
   } catch (e) {
+    banner.className = 'banner err-banner';
     banner.textContent = '测试失败：' + e.message;
   }
 }
@@ -329,6 +384,17 @@ function describeTest(label, d) {
 }
 
 // 按用户测某条映射（模型名用下游名，走该用户自己的路由）
+// 上游的错误常常是一大坨 JSON —— 比如 404 时它会把「令牌可用的分组」全列出来。
+// 那样一坨塞进表格单元格会把整张表撑变形，所以单元格里只放一句短的，
+// 完整内容挂到 title 上（鼠标停一下就能看全），信息没丢、表也不会散。
+function shortErr(msg) {
+  const s = String(msg || '失败').replace(/\s+/g, ' ').trim();
+  const m = /^上游返回 HTTP (\d{3})/.exec(s);
+  if (m) return '上游返回 HTTP ' + m[1];
+  return s.length > 40 ? s.slice(0, 40) + '…' : s;
+}
+
+// 按用户测某个模型（用在「模型范围」的模型列表上：继承来的每个模型、以及每条自己的映射）
 async function testMapping(userName, model, cell) {
   cell.textContent = '测试中…';
   cell.className = 'testres';
@@ -342,12 +408,13 @@ async function testMapping(userName, model, cell) {
       cell.title = '上游模型 ' + data.upstream_model + '，回复：' + (data.content || '');
     } else {
       cell.className = 'testres bad';
-      cell.textContent = '✗ ' + (data.error || '失败');
+      cell.textContent = '✗ ' + shortErr(data.error);
       cell.title = data.error || '';
     }
   } catch (e) {
     cell.className = 'testres bad';
-    cell.textContent = '✗ ' + e.message;
+    cell.textContent = '✗ ' + shortErr(e.message);
+    cell.title = e.message || '';
   }
 }
 
