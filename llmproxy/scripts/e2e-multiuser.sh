@@ -114,7 +114,7 @@ echo
 echo "=== 0. 网页控制台的静态资源可用 ==="
 chk "GET /ui/ 返回 200" "$(curl -s -o /dev/null -w '%{http_code}' "$GW/ui/")" "200"
 chk "index.html 的 content-type" "$(curl -s -o /dev/null -w '%{content_type}' "$GW/ui/" | cut -d';' -f1)" "text/html"
-chk "app.js 可加载" "$(curl -s -o /dev/null -w '%{http_code}' "$GW/ui/app.js")" "200"
+chk "user.js 可加载" "$(curl -s -o /dev/null -w '%{http_code}' "$GW/ui/user.js")" "200"
 chk "app.css 可加载" "$(curl -s -o /dev/null -w '%{http_code}' "$GW/ui/app.css")" "200"
 chk "/ui 会跳到 /ui/" "$(curl -s -o /dev/null -w '%{http_code}' "$GW/ui")" "301"
 curl -sI "$GW/ui/" | grep -qi "content-security-policy" && pass "带了 CSP 响应头" || fail "没有 CSP 响应头"
@@ -257,6 +257,209 @@ c=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/chat/completions" \
     -d '{"model":"fast","messages":[{"role":"user","content":"hi"}]}')
 chk "byo 无上游时返回 502" "$c" "502"
 chk "没有偷偷走系统上游" "$(curl -s "http://127.0.0.1:$GPORT/hits")" "$before"
+
+echo
+echo "=== 14. 管理员接口：看全网关 / 改设置 / 代用户配模型 ==="
+code=$(curl -s -o /tmp/adm.json -w '%{http_code}' "$GW/v1/_admin/users" -H "Authorization: Bearer $ADMIN")
+chk "管理员能列用户" "$code" "200"
+grep -q '"mode"' /tmp/adm.json && pass "列表里带模式" || fail "列表里没有模式字段"
+grep -q '"quota"' /tmp/adm.json && pass "列表里带配额与已用量" || fail "列表里没有配额字段"
+
+# 部分更新：只改配额，模式不能被顺带重置
+curl -s -X PUT "$GW/v1/_admin/users/dave" -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"quota_month_tokens": 4242}' >/dev/null
+chk "改配额后模式保持 consumption" "$(sqlite3 "$H/data/llmproxy.db" "SELECT mode FROM users WHERE name='dave';")" "consumption"
+chk "配额已落库" "$(sqlite3 "$H/data/llmproxy.db" "SELECT quota_month_tokens FROM users WHERE name='dave';")" "4242"
+
+# 代用户配一条模型映射（模型名带 / 也要能加，所以走 body 不走路径）
+code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$GW/v1/_admin/users/dave/models" \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"model":"qwen/qwen-max","upstream":"qwen-max"}')
+chk "能代用户加映射（模型名含 /）" "$code" "200"
+curl -s -X DELETE "$GW/v1/_admin/users/dave/models?model=qwen%2Fqwen-max" -H "Authorization: Bearer $ADMIN" >/dev/null
+chk "能删掉这条映射" "$(sqlite3 "$H/data/llmproxy.db" "SELECT COUNT(*) FROM user_models WHERE user_name='dave' AND model='qwen/qwen-max';")" "0"
+
+chk "管理员能看某用户用量" "$(curl -s -o /dev/null -w '%{http_code}' "$GW/v1/_admin/users/dave/usage?days=7" -H "Authorization: Bearer $ADMIN")" "200"
+chk "管理员能看到系统上游" "$(curl -s -o /dev/null -w '%{http_code}' "$GW/v1/_admin/providers" -H "Authorization: Bearer $ADMIN")" "200"
+chk "用户 token 不能碰管理接口" "$(curl -s -o /dev/null -w '%{http_code}' "$GW/v1/_admin/users" -H "Authorization: Bearer $A_TOKEN")" "403"
+
+echo
+echo "=== 15. 控制台编辑 config.yaml（只替换 providers 段，段外不动）==="
+code=$(curl -s -o /tmp/cfg.json -w '%{http_code}' "$GW/v1/_admin/config" -H "Authorization: Bearer $ADMIN")
+chk "能读配置" "$code" "200"
+grep -q '"api_key":""' /tmp/cfg.json && pass "读配置时密钥不下发（空串）" || fail "读了半天把密钥带出来了"
+grep -q '"path"' /tmp/cfg.json && pass "返回了配置文件路径" || fail "没返回路径"
+
+# 记录 providers 段之前的内容，稍后逐字节比对
+CFGF=$(ls "$H"/config.yaml)
+HEAD_BEFORE=$(sed -n '1,/^providers:/p' "$CFGF" | shasum -a 256 | awk '{print $1}')
+TAIL_BEFORE=$(sed -n '/^database:/,$p' "$CFGF" | shasum -a 256 | awk '{print $1}')
+KEY_BEFORE=$(grep -c 'api_key: sk-global' "$CFGF")
+
+# 加一家 + 原样保留另一家（密钥留空 = 沿用）
+cat > /tmp/cfgput.json <<JSON
+{"providers":[
+  {"name":"global-up","enabled":true,"base_url":"http://127.0.0.1:$GPORT/v1","api_key":"","weight":1,"proxy":"direct","timeout_ms":10000,"models":["*"]},
+  {"name":"second-up","enabled":true,"base_url":"http://127.0.0.1:$GPORT/v1","api_key":"sk-second","weight":2,"proxy":"http://192.168.0.3:7890","timeout_ms":20000,"models":{"fast":"m-one"}}
+]}
+JSON
+code=$(curl -s -o /tmp/save.json -w '%{http_code}' -X PUT "$GW/v1/_admin/config/providers" \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' --data @/tmp/cfgput.json)
+chk "保存成功" "$code" "200"
+grep -q '"written":true' /tmp/save.json && pass "返回了写入结果" || fail "没写成功：$(cat /tmp/save.json)"
+grep -q '"strict_ok":true' /tmp/save.json && pass "严格加载能过（改动会生效）" || fail "严格加载过不了"
+
+chk "providers 段之前逐字节未变" "$(sed -n '1,/^providers:/p' "$CFGF" | shasum -a 256 | awk '{print $1}')" "$HEAD_BEFORE"
+chk "providers 段之后逐字节未变" "$(sed -n '/^database:/,$p' "$CFGF" | shasum -a 256 | awk '{print $1}')" "$TAIL_BEFORE"
+chk "原有密钥沿用（没被清空）" "$(grep -c 'api_key: sk-global' "$CFGF")" "$KEY_BEFORE"
+grep -q 'proxy: http://192.168.0.3:7890' "$CFGF" && pass "新供应商的代理写对了（URL 未被加引号）" || fail "代理写错"
+grep -q 'fast: m-one' "$CFGF" && pass "模型映射写成了块状" || fail "映射没写对"
+ls "$H"/config.yaml.bak-* >/dev/null 2>&1 && pass "保存前生成了备份" || fail "没有备份"
+
+sleep 2.5
+chk "热加载生效（运行时 2 家供应商）" "$(curl -s "$GW/healthz" | sed 's/.*"providers":\([0-9]*\).*/\1/')" "2"
+
+# 非法内容要被挡住且不动文件
+BAD_BEFORE=$(shasum -a 256 "$CFGF" | awk '{print $1}')
+code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$GW/v1/_admin/config/providers" \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"providers":[{"name":"x","base_url":"ftp://bad/v1","api_key":"k","models":["*"]}]}')
+chk "非法 base_url 被拒" "$code" "400"
+chk "被拒后文件未改动" "$(shasum -a 256 "$CFGF" | awk '{print $1}')" "$BAD_BEFORE"
+chk "非管理员不能改配置" "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$GW/v1/_admin/config/providers" -H "Authorization: Bearer $A_TOKEN" -H 'Content-Type: application/json' -d '{}')" "403"
+
+echo
+echo "=== 16. 两个界面是两套独立页面 ==="
+curl -s "$GW/ui/" | grep -q '用户控制台' && pass "/ui/ 是用户台" || fail "/ui/ 页面不对"
+curl -s "$GW/admin/" | grep -q 'llmproxy 管理' && pass "/admin/ 是管理台" || fail "/admin/ 页面不对"
+chk "/ui/ 取不到 admin.js" "$(curl -s -o /dev/null -w '%{http_code}' "$GW/ui/admin.js")" "404"
+chk "/admin/ 取不到 user.js" "$(curl -s -o /dev/null -w '%{http_code}' "$GW/admin/user.js")" "404"
+chk "共用资源两边都能取" "$(curl -s -o /dev/null -w '%{http_code}' "$GW/admin/common.js")" "200"
+for f in user.html user.js common.js app.css; do
+  chk "用户台的资源 $f" "$(curl -s -o /dev/null -w '%{http_code}' "$GW/ui/$f")" "200"
+done
+for f in admin.html admin.js common.js app.css; do
+  chk "管理台的资源 $f" "$(curl -s -o /dev/null -w '%{http_code}' "$GW/admin/$f")" "200"
+done
+
+echo
+echo "=== 17. 方案 A：消费用户没配映射 = 继承系统池（开箱可用）==="
+I_TOKEN=$("$BIN" user add inherit1 | sed -n 's/.*下游 token: //p' | tr -d ' ')
+"$BIN" user mode inherit1 consumption >/dev/null
+sleep 2.6
+r=$(curl -s -X POST "$GW/v1/chat/completions" -H "Authorization: Bearer $I_TOKEN" \
+    -H 'Content-Type: application/json' -d '{"model":"sys-model","messages":[{"role":"user","content":"hi"}]}')
+echo "$r" | grep -q "served-by:global-up" && pass "继承模式下直接可用（无需逐用户配模型）" || fail "继承模式不可用：$r"
+me=$(curl -s "$GW/v1/_me" -H "Authorization: Bearer $I_TOKEN")
+echo "$me" | grep -q '"models_source":"inherit"' && pass "/v1/_me 标明来源是继承" || fail "来源标注不对：$me"
+sqlite3 "$H/data/llmproxy.db" "SELECT COUNT(*) FROM user_models WHERE user_name='inherit1';" | grep -q '^0$' \
+  && pass "库里确实没有他的映射" || fail "不该有映射"
+
+echo "=== 18. 收窄 → 拒绝 → 放开（管理端一键回继承）==="
+"$BIN" user add-model inherit1 fast -upstream sys-model >/dev/null
+sleep 2.6
+c=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/chat/completions" \
+    -H "Authorization: Bearer $I_TOKEN" -H 'Content-Type: application/json' \
+    -d '{"model":"sys-model","messages":[{"role":"user","content":"hi"}]}')
+chk "收窄后范围外的模型被拒" "$c" "403"
+c=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/chat/completions" \
+    -H "Authorization: Bearer $I_TOKEN" -H 'Content-Type: application/json' \
+    -d '{"model":"fast","messages":[{"role":"user","content":"hi"}]}')
+chk "收窄范围内的模型可用" "$c" "200"
+code=$(curl -s -o /tmp/clr.json -w '%{http_code}' -X DELETE "$GW/v1/_admin/users/inherit1/models" \
+    -H "Authorization: Bearer $ADMIN")
+chk "管理端清空映射（改回继承）" "$code" "200"
+grep -q '"models_source":"inherit"' /tmp/clr.json && pass "清空后明确回到继承" || fail "没标回继承"
+c=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/chat/completions" \
+    -H "Authorization: Bearer $I_TOKEN" -H 'Content-Type: application/json' \
+    -d '{"model":"sys-model","messages":[{"role":"user","content":"hi"}]}')
+chk "放开后立刻可用" "$c" "200"
+
+echo
+echo "=== 19. 管理台「快速测试」：真发一条极小请求，但不写记账、不报熔断 ==="
+DB="$H/data/llmproxy.db"
+U_BEFORE=$(sqlite3 "$DB" "SELECT COUNT(*) FROM usage_user_daily;")
+R_BEFORE=$(sqlite3 "$DB" "SELECT COUNT(*) FROM requests;")
+PS_BEFORE=$(sqlite3 "$DB" "SELECT COALESCE(SUM(total_requests),0)||'/'||COALESCE(SUM(consecutive_failures),0) FROM provider_stats;")
+USED_BEFORE=$(curl -s "$GW/v1/_admin/users/inherit1" -H "Authorization: Bearer $ADMIN" \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin)["quota"]["used_tokens"])')
+t=$(curl -s -X POST "$GW/v1/_admin/providers/global-up/test" -H "Authorization: Bearer $ADMIN" \
+    -H 'Content-Type: application/json' -d '{"model":"sys-model"}')
+echo "    $t"
+echo "$t" | grep -q '"ok":true' && pass "测一家系统上游：ok" || fail "系统上游测试失败：$t"
+echo "$t" | grep -q '"provider":"global-up"' && pass "回报了是哪家上游接的" || fail "没回报上游：$t"
+echo "$t" | grep -q '"upstream_model":"sys-model"' && pass "回报了真正打出去的上游模型名" || fail "没回报上游模型：$t"
+echo "$t" | grep -q 'served-by:global-up' && pass "带回了上游的真实回复（证明确实发了请求）" || fail "没有上游回复：$t"
+echo "$t" | grep -q '"tokens"' && pass "带回了 token 数（界面用来确认这是真请求）" || fail "没带 token 数：$t"
+
+tu=$(curl -s -X POST "$GW/v1/_admin/users/inherit1/test" -H "Authorization: Bearer $ADMIN" \
+    -H 'Content-Type: application/json' -d '{"model":"sys-model"}')
+echo "    $tu"
+echo "$tu" | grep -q '"ok":true' && pass "按用户测（继承模式）：ok" || fail "用户测试失败：$tu"
+
+# 这是这套接口最要紧的不变量：探测不该污染账本，也不该动熔断状态
+chk "测试不写用量账（usage_user_daily 行数不变）" \
+  "$(sqlite3 "$DB" "SELECT COUNT(*) FROM usage_user_daily;")" "$U_BEFORE"
+chk "测试不落请求日志（requests 行数不变）" \
+  "$(sqlite3 "$DB" "SELECT COUNT(*) FROM requests;")" "$R_BEFORE"
+chk "测试不影响熔断统计（provider_stats 不变）" \
+  "$(sqlite3 "$DB" "SELECT COALESCE(SUM(total_requests),0)||'/'||COALESCE(SUM(consecutive_failures),0) FROM provider_stats;")" "$PS_BEFORE"
+chk "测试不消耗该用户的本月配额" \
+  "$(curl -s "$GW/v1/_admin/users/inherit1" -H "Authorization: Bearer $ADMIN" \
+     | python3 -c 'import json,sys;print(json.load(sys.stdin)["quota"]["used_tokens"])')" "$USED_BEFORE"
+
+# 参数与边界
+chk "缺 model 参数被拒" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/_admin/users/inherit1/test" \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d '{}')" "400"
+chk "不存在的用户" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/_admin/users/nobody/test" \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d '{"model":"x"}')" "404"
+chk "不存在的系统上游" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/_admin/providers/nope/test" \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d '{"model":"x"}')" "404"
+chk "非管理员不能调测试接口" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/_admin/providers/global-up/test" \
+  -H "Authorization: Bearer $A_TOKEN" -H 'Content-Type: application/json' -d '{"model":"sys-model"}')" "403"
+# 直通型上游没有可挑的具体模型名：要明确说出来，而不是拿空模型名去打上游
+tn=$(curl -s -X POST "$GW/v1/_admin/providers/global-up/test" -H "Authorization: Bearer $ADMIN" \
+    -H 'Content-Type: application/json' -d '{}')
+echo "$tn" | grep -q '没有声明具体的模型名' && pass "直通型上游不给模型名时明说原因" || fail "话术不对：$tn"
+
+# 收窄后的归因：和真实请求一样，要能区分「权限不给」而不是「池子没有」
+"$BIN" user add-model inherit1 fast -upstream sys-model >/dev/null
+sleep 2.6
+tn=$(curl -s -X POST "$GW/v1/_admin/users/inherit1/test" -H "Authorization: Bearer $ADMIN" \
+    -H 'Content-Type: application/json' -d '{"model":"sys-model"}')
+echo "    $tn"
+echo "$tn" | grep -q '不在这个用户的可用范围内' && pass "收窄挡住了：报错说明是权限而非故障" || fail "归因不对：$tn"
+tf=$(curl -s -X POST "$GW/v1/_admin/users/inherit1/test" -H "Authorization: Bearer $ADMIN" \
+    -H 'Content-Type: application/json' -d '{"model":"fast"}')
+echo "$tf" | grep -q '"ok":true' && pass "收窄范围内的映射测通" || fail "范围内映射测不通：$tf"
+curl -s -X DELETE "$GW/v1/_admin/users/inherit1/models" -H "Authorization: Bearer $ADMIN" >/dev/null
+
+echo
+echo "=== 19b. 模型列表探测：还没保存的供应商也能先看模型（内联 base_url）==="
+# 这里必须自己起一个假上游：alice 的那台在第 6 节被刻意杀掉了（验证不回退全局），
+# 不能拿它当探测目标。
+IPORT=$(freeport)
+"$STUB" -name inline-up -port "$IPORT" -log "$H/inline-up.log" -models "m-one,m-two" &
+for _ in $(seq 1 20); do
+  curl -sf "http://127.0.0.1:$IPORT/v1/models" >/dev/null 2>&1 && break
+  sleep 0.25
+done
+d=$(curl -s -X POST "$GW/v1/_admin/providers/never-saved/discover" -H "Authorization: Bearer $ADMIN" \
+    -H 'Content-Type: application/json' \
+    -d "{\"base_url\":\"http://127.0.0.1:$IPORT/v1\",\"api_key\":\"sk-inline\"}")
+echo "    $d"
+echo "$d" | grep -q '"count":2' && pass "未保存的供应商凭内联 base_url 也能列出模型" || fail "内联探测失败：$d"
+echo "$d" | grep -q 'm-one' && echo "$d" | grep -q 'm-two' && pass "列表内容正确（勾选界面靠它）" || fail "列表内容不对：$d"
+chk "既没保存也没带 base_url" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/_admin/providers/never-saved/discover" \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d '{}')" "404"
+chk "内联探测也要求 api_key" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/_admin/providers/never-saved/discover" \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+  -d "{\"base_url\":\"http://127.0.0.1:$IPORT/v1\"}")" "400"
+chk "非 http(s) 的 base_url 被拒" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/_admin/providers/some/discover" \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"base_url":"ftp://bad/v1","api_key":"k"}')" "400"
+chk "非管理员不能探测系统上游" "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/_admin/providers/global-up/discover" \
+  -H "Authorization: Bearer $A_TOKEN")" "403"
 
 echo
 echo "================ 结果：通过 $PASS 项，失败 $FAIL 项 ================"

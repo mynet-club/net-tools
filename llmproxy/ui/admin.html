@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llmproxy · 管理控制台</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='7'%20fill='%234f46e5'/%3E%3Cpath%20d='M9%2016h12M17%2011l5%205-5%205'%20fill='none'%20stroke='%23fff'%20stroke-width='3'%20stroke-linecap='round'%20stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<!-- ── 登录（管理台：只认 admin_token）─────────────────────────────── -->
+<main id="login" class="login-wrap" hidden>
+  <form class="card login-card" id="login-form">
+    <h1>llmproxy 管理</h1>
+    <p class="sub">用 <code>server.admin_token</code> 登录，管理整台网关：系统上游、用户、配额、模型范围。</p>
+
+    <label for="login-base">网关地址</label>
+    <input id="login-base" type="text" spellcheck="false" autocomplete="off"
+           placeholder="http://127.0.0.1:8787">
+
+    <label for="login-token">admin_token</label>
+    <input id="login-token" type="password" spellcheck="false" autocomplete="off"
+           placeholder="sk-admin-…" required>
+
+    <button type="submit" id="login-btn" class="primary">登录</button>
+    <p class="err" id="login-err" hidden></p>
+    <p class="hint" id="login-hint"></p>
+    <p class="hint">用户入口在 <a href="/ui/">/ui/</a>（用用户 token 登录）。</p>
+  </form>
+</main>
+
+<!-- ── 管理员视图（admin_token 登录后进入）──────────────────────────── -->
+<div id="admin" hidden>
+  <header class="bar">
+    <div class="bar-in">
+      <strong>llmproxy</strong>
+      <span class="sep">·</span>
+      <span class="badge admin">管理员</span>
+      <span class="grow"></span>
+      <span id="admin-base" class="mono muted"></span>
+      <button type="button" id="admin-logout" class="ghost">退出</button>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <p class="banner" id="admin-banner" hidden></p>
+
+    <!-- 系统上游：直接编辑 config.yaml 的 providers 段 -->
+    <section class="card">
+      <div class="head">
+        <h2>系统上游</h2>
+        <span class="mono muted" id="sys-path"></span>
+        <span class="grow"></span>
+        <button type="button" id="cfg-validate" class="ghost sm">校验</button>
+        <button type="button" id="cfg-save" class="primary sm">保存</button>
+      </div>
+      <p class="sub">这些来自服务器上的 <code>config.yaml</code>，消费模式的用户用的就是它们，账单归你。
+        保存只替换 <code>providers:</code> 这一段，文件其余部分与注释保持原样；保存前自动备份（保留最近 5 份）。</p>
+      <p class="banner" id="cfg-result" hidden></p>
+      <div id="cfg-list"></div>
+      <div class="row">
+        <button type="button" id="cfg-add" class="ghost sm">+ 添加供应商</button>
+        <span class="grow"></span>
+        <span class="muted" id="cfg-hint"></span>
+      </div>
+    </section>
+
+    <!-- 用户列表 -->
+    <section class="card">
+      <div class="head">
+        <h2>用户</h2>
+        <button type="button" id="u-add" class="primary sm">新建用户</button>
+      </div>
+      <form id="u-add-form" class="pform" hidden>
+        <div class="pform-grid">
+          <div>
+            <label for="nu-name">用户名</label>
+            <input id="nu-name" type="text" spellcheck="false" autocomplete="off" placeholder="alice">
+          </div>
+          <div>
+            <label for="nu-mode">模式</label>
+            <select id="nu-mode">
+              <option value="byo">byo —— 自带上游（网关不掏钱）</option>
+              <option value="consumption">consumption —— 消费系统上游（受配额约束）</option>
+            </select>
+          </div>
+        </div>
+        <div class="row">
+          <button type="submit" class="primary">创建</button>
+          <button type="button" id="nu-cancel" class="ghost">取消</button>
+          <span class="err" id="nu-err" hidden></span>
+        </div>
+      </form>
+
+      <pre id="new-token" class="out" hidden></pre>
+
+      <div class="tablewrap">
+        <table id="u-table">
+          <thead>
+            <tr><th>名称</th><th>状态</th><th>模式</th><th>本月 token</th><th>本月金额</th>
+                <th>模型</th><th>限流</th><th></th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="muted" id="u-empty" hidden>还没有用户。</p>
+    </section>
+
+    <!-- 用户详情 -->
+    <section class="card" id="u-detail" hidden>
+      <div class="head">
+        <h2 id="ud-title">用户详情</h2>
+        <span class="grow"></span>
+        <button type="button" id="ud-token" class="ghost sm">轮换 token</button>
+        <button type="button" id="ud-close" class="ghost sm">关闭</button>
+      </div>
+
+      <div class="pform-grid">
+        <div>
+          <label>模式</label>
+          <div class="mmode">
+            <label class="inline"><input type="radio" name="udmode" id="ud-byo" value="byo"> byo（自带上游）</label>
+            <label class="inline"><input type="radio" name="udmode" id="ud-cons" value="consumption"> consumption（用系统上游）</label>
+          </div>
+          <label class="inline mt"><input type="checkbox" id="ud-enabled"> 启用</label>
+        </div>
+        <div>
+          <label for="ud-qtokens">月度配额（token，0 = 不限）</label>
+          <input id="ud-qtokens" type="number" min="0" step="1000">
+          <label for="ud-qcost" class="mt">月度配额（金额，0 = 不限）</label>
+          <input id="ud-qcost" type="number" min="0" step="0.01">
+        </div>
+        <div>
+          <label for="ud-rpm">限流：次/分钟（0 = 不限）</label>
+          <input id="ud-rpm" type="number" min="0" step="1">
+          <label for="ud-conc" class="mt">限流：并发上限（0 = 不限）</label>
+          <input id="ud-conc" type="number" min="0" step="1">
+        </div>
+      </div>
+      <div class="row">
+        <button type="button" id="ud-save" class="primary">保存设置</button>
+        <button type="button" id="ud-enable" class="ghost">启用/停用</button>
+        <button type="button" id="ud-delete" class="link danger">删除用户</button>
+        <span class="grow"></span>
+        <span class="err" id="ud-err" hidden></span>
+      </div>
+
+      <h3 class="sub-h">模型范围（消费模式）</h3>
+      <p class="sub" id="ud-models-note"></p>
+      <div class="mmode">
+        <label class="inline"><input type="radio" name="udms" id="ud-inherit">
+          继承系统池（推荐：不必逐用户配，新用户开箱可用）</label>
+        <label class="inline"><input type="radio" name="udms" id="ud-narrow">
+          指定模型（收窄）</label>
+      </div>
+      <div id="ud-inherit-box" hidden>
+      <p class="sub">这些是他从系统池继承到的模型。点「测试」可以逐个确认它们对他真的通
+        —— 继承不代表上游一定可用。</p>
+      <div class="tablewrap">
+        <table id="ud-inherit-models">
+          <thead><tr><th>模型名</th><th>快速测试</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="muted" id="ud-inherit-empty" hidden>系统池当前没有声明具体模型名
+        （可能是直通型上游），因此他什么模型名都能调，只在真实请求时才知道通不通。</p>
+      </div>
+
+      <div id="ud-models-box" hidden>
+      <p class="sub">没在这张表里的模型，该用户的请求会被直接拒（403），不会打到上游。</p>
+      <div class="tablewrap">
+        <table id="ud-models">
+          <thead><tr><th>下游模型名（客户端填这个）</th><th>上游模型</th><th>限定供应商</th><th>状态</th><th>快速测试</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="muted" id="ud-models-empty" hidden>还没有映射 —— 消费模式下他会一个模型都调不了。</p>
+
+      <div class="row mm-add">
+        <input id="ud-new-model" class="mono" placeholder="下游模型名，如 fast" autocomplete="off">
+        <input id="ud-new-upstream" class="mono" placeholder="上游模型名（留空=同名）" autocomplete="off" list="ud-cands">
+        <datalist id="ud-cands"></datalist>
+        <select id="ud-new-provider"><option value="">（系统池按权重）</option></select>
+        <button type="button" id="ud-probe" class="ghost sm">探测</button>
+        <button type="button" id="ud-add-model" class="sm">添加映射</button>
+      </div>
+
+      </div>
+
+      <h3 class="sub-h">最近用量</h3>
+      <div class="tablewrap">
+        <table id="ud-usage">
+          <thead><tr><th>日期</th><th>上游</th><th>模型</th><th>请求</th><th>成功</th><th>失败</th>
+              <th>输入</th><th>命中缓存</th><th>输出</th><th>合计</th><th>金额</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="muted" id="ud-usage-empty" hidden>最近没有记录。</p>
+    </section>
+  </main>
+</div>
+
+<!-- ── 选模型弹窗：把上游实际提供的模型列出来勾选，不用手写模型名 ── -->
+<div id="pick-modal" class="modal" hidden>
+  <div class="modal-box">
+    <div class="modal-head">
+      <strong id="pick-title">选择模型</strong>
+      <span class="grow"></span>
+      <button type="button" id="pick-close" class="ghost sm">关闭</button>
+    </div>
+    <p class="sub" id="pick-sub">勾选即加入这家上游的映射（下游名默认与上游模型同名，加完可在表里改）。</p>
+    <div class="row">
+      <input id="pick-filter" class="search" placeholder="搜索模型名…" autocomplete="off">
+      <button type="button" id="pick-all" class="ghost sm">全选</button>
+      <button type="button" id="pick-none" class="ghost sm">清空选择</button>
+      <span class="grow"></span>
+      <span class="muted" id="pick-count"></span>
+    </div>
+    <div id="pick-list" class="cands"></div>
+    <p class="muted" id="pick-empty" hidden>没拉到模型列表（这家可能不提供 /v1/models）—— 用表里的「+ 映射」手动填。</p>
+    <div class="row">
+      <button type="button" id="pick-ok" class="primary">加入已选</button>
+      <span class="grow"></span>
+      <span class="muted" id="pick-hint"></span>
+    </div>
+  </div>
+</div>
+
+<script src="common.js"></script>
+<script src="admin.js"></script>
+</body>
+</html>

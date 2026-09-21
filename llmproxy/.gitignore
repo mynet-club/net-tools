@@ -16,3 +16,6 @@ dist/
 # 主密钥是用户上游密钥的加密根，丢了解不开、泄了全暴露，绝不能进仓库
 /master.key
 /data/master.key
+
+# 本地跑 UI 自动化测试时的 playwright 产物
+.playwright-cli/

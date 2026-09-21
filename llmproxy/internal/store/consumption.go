@@ -222,6 +222,28 @@ func (s *Store) DeleteUserModel(userName, model string) (bool, error) {
 	return n > 0, tx.Commit()
 }
 
+// ClearUserModels 清空某用户的全部模型映射。
+// 消费模式下「没有映射」= 继承系统池声明的全部模型，所以这是「放开限制」的动作。
+func (s *Store) ClearUserModels(userName string) (int64, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.Exec(`DELETE FROM user_models WHERE user_name = ?`, userName)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	if n > 0 {
+		if err := bumpRevision(tx); err != nil {
+			return 0, err
+		}
+	}
+	return n, tx.Commit()
+}
+
 // ------------------------------------------------------------------ 系统付费用量
 
 // SystemUsage 是某用户一段时间内**由系统上游承接**的用量。

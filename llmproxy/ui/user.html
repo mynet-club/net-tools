@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>llmproxy · 我的上游</title>
+<title>llmproxy · 用户控制台</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='7'%20fill='%234f46e5'/%3E%3Cpath%20d='M9%2016h12M17%2011l5%205-5%205'%20fill='none'%20stroke='%23fff'%20stroke-width='3'%20stroke-linecap='round'%20stroke-linejoin='round'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="app.css">
 </head>
@@ -28,6 +28,7 @@
     <button type="submit" id="login-btn" class="primary">登录</button>
     <p class="err" id="login-err" hidden></p>
     <p class="hint" id="login-hint"></p>
+    <p class="hint">管理员入口在 <a href="/admin/">/admin/</a>（用 admin_token 登录）。</p>
   </form>
 </main>
 
@@ -66,9 +67,10 @@
     <!-- 可用模型（消费模式，只读） -->
     <section class="card" id="models-card" hidden>
       <h2>可用模型</h2>
-      <p class="sub">这是管理员给你的白名单。没在列表里的模型会被直接拒绝（403），请求不会打到上游。</p>
+      <p class="sub" id="models-note">加载中…</p>
       <div id="models" class="chips"></div>
-      <p class="muted" id="models-empty" hidden>还没有可用模型 —— 需要用哪些模型请联系管理员。</p>
+      <p class="muted" id="models-pass" hidden></p>
+      <p class="muted" id="models-empty" hidden>系统池里还没有声明任何模型 —— 请联系管理员。</p>
     </section>
 
     <!-- 我的上游 -->
@@ -235,6 +237,7 @@
   </main>
 </div>
 
-<script src="app.js"></script>
+<script src="common.js"></script>
+<script src="user.js"></script>
 </body>
 </html>

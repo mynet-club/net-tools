@@ -47,6 +47,9 @@ type Server struct {
 
 	// 消费模式的当月计数与限流（内存，见 limits.go）
 	meters *meterSet
+
+	// 配置写回后等热加载的时长；测试里置 0 可跳过等待
+	configApplyWait time.Duration
 }
 
 func New(cfgStore *config.Store, db *store.Store, r *router.Router, lg *logx.Logger) *Server {
@@ -59,6 +62,7 @@ func New(cfgStore *config.Store, db *store.Store, r *router.Router, lg *logx.Log
 		startedAt:  time.Now(),
 	}
 	s.uiHandler = s.newUIHandler()
+	s.configApplyWait = 4 * time.Second
 	s.meters = newMeterSet(db, func() *config.PricingConfig {
 		if c := cfgStore.Current(); c != nil {
 			return &c.Pricing
@@ -75,8 +79,10 @@ func (s *Server) Transports() *dialer.TransportCache { return s.transports }
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
-	mux.HandleFunc("/ui", s.handleUI)
-	mux.HandleFunc("/ui/", s.handleUI)
+	mux.HandleFunc("/ui", s.handleUserUI)
+	mux.HandleFunc("/ui/", s.handleUserUI)
+	mux.HandleFunc("/admin", s.handleAdminUI)
+	mux.HandleFunc("/admin/", s.handleAdminUI)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/_providers", s.handleProviders)
 	mux.HandleFunc("/v1/", s.handleV1)
@@ -309,14 +315,16 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		OwnedBy string `json:"owned_by"`
 	}
 	data := []modelCard{}
-	// 消费用户能调哪些模型完全由白名单决定：直接列它，别让他从系统池里猜
+	// 消费用户能调哪些模型：没配映射就是继承系统池声明的全部（方案 A），配了就是他那份收窄列表。
+	// 直接列有效清单，别让用户从系统池里猜。
 	if e := s.usersSnapshot().byName[auth.Scope]; e != nil && e.Consumption {
-		for _, m := range e.Models {
-			if seen[m.Model] {
+		names, _, _ := s.effectiveModels(e)
+		for _, m := range names {
+			if seen[m] {
 				continue
 			}
-			seen[m.Model] = true
-			data = append(data, modelCard{ID: m.Model, Object: "model", OwnedBy: "llmproxy"})
+			seen[m] = true
+			data = append(data, modelCard{ID: m, Object: "model", OwnedBy: "llmproxy"})
 		}
 	}
 	list, _ := s.providersFor(auth.Scope, "")

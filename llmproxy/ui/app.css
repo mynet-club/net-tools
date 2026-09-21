@@ -199,3 +199,56 @@ code.k { font-family: var(--mono); font-size: 12px; color: #4b5563; }
 .tag.ok { background: #e6f4ea; color: var(--ok); }
 .mt { margin-top: 10px; }
 #m-manual { flex: 1; min-width: 240px; }
+
+/* ── 管理员视图 ───────────────────────────────────────────────────── */
+.badge.admin { background: #ece9fd; color: var(--accent); font-weight: 500; }
+.sub-h { margin: 20px 0 4px; font-size: 13px; font-weight: 600; }
+
+/* 下拉与输入框保持同一副样子 */
+select {
+  width: 100%; padding: 8px 10px; border: 1px solid var(--border);
+  border-radius: 7px; background: #fff; color: var(--ink); font: inherit;
+}
+select:focus { outline: 2px solid #c7c3f7; outline-offset: 1px; }
+
+/* 加模型映射那一行：几个输入 + 一个按钮 */
+.mm-add { align-items: center; }
+.mm-add input { flex: 1; min-width: 150px; }
+.mm-add select { width: 190px; flex: none; }
+
+/* ── config.yaml 的 providers 编辑器 ──────────────────────────────── */
+.prow { border: 1px solid var(--border); border-radius: 9px; padding: 14px; margin-top: 12px; background: #fcfcfd; }
+.prow-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.prow-head .pname { max-width: 220px; font-family: var(--mono); font-size: 12px; font-weight: 500; }
+.prow-grid { display: grid; grid-template-columns: 2fr 1.4fr 0.6fr 1.2fr 0.8fr; gap: 12px; }
+.prow-grid > div > label { font-size: 12px; }
+.prow-models { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); display: flex; gap: 18px; flex-wrap: wrap; align-items: center; }
+.mmap { width: 100%; margin-top: 8px; }
+.mmap-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.mmap-row input { flex: 1; min-width: 140px; }
+.banner.err-banner { background: #fdecea; border-color: #f0b3ac; color: #8a2f26; white-space: pre-wrap; }
+#cfg-result { white-space: pre-wrap; }
+
+@media (max-width: 900px) {
+  .prow-grid { grid-template-columns: 1fr 1fr; }
+}
+
+/* ── 选模型弹窗 ───────────────────────────────────────────────────── */
+.modal {
+  position: fixed; inset: 0; background: rgba(22, 24, 29, .45);
+  display: flex; align-items: center; justify-content: center; padding: 24px; z-index: 50;
+}
+.modal-box {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 18px; width: 100%; max-width: 720px; max-height: 84vh; overflow: auto;
+}
+.modal-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.modal-head strong { font-size: 14px; }
+/* 弹窗里的候选列表点一下就是「勾选」，所以整行可点 */
+#pick-list .cand { cursor: pointer; }
+#pick-list { max-height: 320px; }
+
+/* 映射行里的测试结果 */
+.testres { font-size: 12px; color: var(--muted); }
+.testres.ok { color: var(--ok); }
+.testres.bad { color: var(--danger); }

@@ -1,74 +1,5 @@
 'use strict';
 
-/* llmproxy 用户控制台（无框架、无外部资源，随二进制一起分发）
-   安全取向：
-   - token 只放 sessionStorage，不进 URL、不进日志、不落 localStorage
-   - 所有来自接口的字符串一律走 textContent 渲染，不用 innerHTML ——
-     上游名、地址、模型名、错误信息都是用户可控的，拼 HTML 就是 XSS */
-
-const $ = (id) => document.getElementById(id);
-const state = { base: '', token: '', me: null, days: 7, editing: null };
-
-/* ── 小工具 ───────────────────────────────────────────────────────── */
-
-function h(tag, props, ...kids) {
-  const n = document.createElement(tag);
-  for (const [k, v] of Object.entries(props || {})) {
-    if (v == null || v === false) continue;
-    if (k === 'class') n.className = v;
-    else if (k === 'text') n.textContent = v;
-    else if (k.startsWith('on')) n.addEventListener(k.slice(2).toLowerCase(), v);
-    else n.setAttribute(k, v);
-  }
-  for (const kid of kids.flat()) {
-    if (kid == null || kid === false) continue;
-    n.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
-  }
-  return n;
-}
-
-const num = (v) => (v == null ? '—' : Number(v).toLocaleString('zh-CN'));
-// 金额：小额给 4 位小数，否则 0.00002 会被四舍五入成 0.00，看着像没花钱
-const money = (v, cur) => {
-  const n = Number(v || 0);
-  return (n >= 1 ? n.toFixed(2) : n.toFixed(4)) + (cur ? ' ' + cur : '');
-};
-const ms = (v) => (v == null || v === 0 ? '—' : Math.round(v) + 'ms');
-
-function defaultBase() {
-  if (location.protocol === 'http:' || location.protocol === 'https:') return location.origin;
-  return 'http://127.0.0.1:8787';
-}
-
-function showErr(node, msg) {
-  node.textContent = msg || '';
-  node.hidden = !msg;
-}
-
-/* ── 接口 ─────────────────────────────────────────────────────────── */
-
-async function api(path, opts = {}) {
-  const headers = { Authorization: 'Bearer ' + state.token, ...(opts.headers || {}) };
-  if (opts.body) headers['Content-Type'] = 'application/json';
-  let res;
-  try {
-    res = await fetch(state.base + path, { ...opts, headers });
-  } catch (e) {
-    throw new Error('连不上网关 ' + state.base + '：' + e.message +
-      '（若页面是从文件打开的，浏览器会拦跨源请求；建议直接访问网关自带的 /ui/）');
-  }
-  const text = await res.text();
-  let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch { data = null; }
-  if (!res.ok) {
-    const m = (data && data.error && (data.error.message || data.error.type)) || res.status + ' ' + res.statusText;
-    const err = new Error(m);
-    err.status = res.status;
-    throw err;
-  }
-  return { data, res };
-}
-
 /* ── 登录 ─────────────────────────────────────────────────────────── */
 
 function renderLogin(msg) {
@@ -82,27 +13,29 @@ function renderLogin(msg) {
   $('login-token').focus();
 }
 
+// 用户台只有「用户」这一个身份，不做任何身份猜测：管理员入口在 /admin/，是另一个页面。
 async function login(base, token) {
   state.base = base.replace(/\/+$/, '');
   state.token = token;
   try {
     const { data } = await api('/v1/_me');
     state.me = data;
-    sessionStorage.setItem('llmproxy.base', state.base);
-    sessionStorage.setItem('llmproxy.token', state.token);
+    sessionSave();
     renderApp();
     await Promise.all([loadProviders(), loadModelOverview(), loadUsage()]);
   } catch (e) {
     state.token = '';
     if (e.status === 401) renderLogin('token 无效。');
-    else if (e.status === 403) renderLogin('这个 token 没有用户身份（可能是网关的静态 key），不能使用自助接口。');
-    else if (e.status === 501) renderLogin('网关没启用多用户模式（服务端缺少主密钥）。');
-    else renderLogin(e.message);
+    else if (e.status === 403) {
+      renderLogin('这个 token 没有用户身份。注意：config.yaml 里的 api_keys 是给 ' +
+        '/v1/chat/completions 用的静态 key，登录不了这里；请用 llmproxy user add 建的 token。');
+    } else if (e.status === 501) renderLogin('网关没启用多用户模式（服务端缺少主密钥）。');
+    else renderLogin(e.status ? e.message : '连不上网关：' + e.message);
   }
 }
 
 function logout() {
-  sessionStorage.removeItem('llmproxy.token');
+  sessionClear();
   state.token = '';
   state.me = null;
   renderLogin('');
@@ -184,6 +117,18 @@ function renderMode(me) {
   const box = $('models');
   box.replaceChildren(...ms.map((m) => h('span', { class: 'chip', text: m })));
   $('models-empty').hidden = ms.length > 0;
+
+  // 说清这些模型从哪来：继承系统池，还是管理员给你单独收窄了 —— 决定你该不该找人
+  $('models-note').textContent = me.models_source === 'own'
+    ? '管理员为你指定了模型范围。范围外的模型会被直接拒绝（403），请求不会打到上游；需要放开请联系管理员。'
+    : '这些是网关主人开放的模型，直接就能用（不用自己配）。需要只给你开一部分、或换个名字，让管理员指定即可。';
+  const pass = $('models-pass');
+  if (me.models_passthrough) {
+    pass.textContent = '注意：上游里有一家接受任意模型名（直通），所以实际可用的不止上面这些。';
+    pass.hidden = false;
+  } else {
+    pass.hidden = true;
+  }
 
   // 「试一下」的默认模型必须是白名单里的，否则用户一点就吃 403
   const t = $('t-model');
@@ -635,10 +580,14 @@ $('days').addEventListener('click', (e) => {
   loadUsage().catch((err) => alert(err.message));
 });
 
-/* 启动：有会话就直接进，否则显示登录 */
+
+/* 启动：用户台只认用户 token */
 (function boot() {
-  const base = sessionStorage.getItem('llmproxy.base') || defaultBase();
-  const token = sessionStorage.getItem('llmproxy.token');
-  if (token) login(base, token);
-  else renderLogin('');
+  state.storageKey = 'llmproxy.user';
+  const s = sessionLoad();
+  if (s.token) {
+    login(s.base, s.token).catch((e) => renderLogin('启动失败：' + e.message));
+  } else {
+    renderLogin('');
+  }
 })();

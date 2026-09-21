@@ -114,9 +114,12 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 	providers, isSystem := s.providersFor(scope, probe.Model)
 	rec.SystemPaid = isSystem
 	if len(providers) == 0 {
-		if allowed, consumption := s.modelAllowed(scope, probe.Model); consumption && !allowed {
+		// 归因要分清：是「管理员把你能用的收窄了」，还是「系统池里根本没有这个模型」。
+		// 前者 403 并告诉用户找谁；后者是池子的问题，不是用户的权限问题。
+		if consumption, narrowed, listed := s.consumptionVerdict(scope, probe.Model); consumption && narrowed && !listed {
 			s.fail(w, rec, http.StatusForbidden, "model_not_allowed",
-				fmt.Sprintf("模型 %q 不在你的可用列表里；要用哪些模型请联系管理员加映射", probe.Model), 0, started)
+				fmt.Sprintf("模型 %q 不在你的可用列表里（管理员给你指定了模型范围）；"+
+					"要用这个模型请联系管理员放开", probe.Model), 0, started)
 			return
 		}
 		msg := "没有可用的上游供应商"

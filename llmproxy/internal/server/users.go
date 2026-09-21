@@ -8,7 +8,6 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -202,7 +201,8 @@ func (s *Server) userProviderToConfig(up store.UserProvider) (config.Provider, e
 //
 // 三种作用域：
 //   - 静态 key（scope 为空）：系统池。这是网关主人自己在用。
-//   - consumption 用户：系统池，但被 user_models 收窄 —— 它既是白名单也是映射表。
+//   - consumption 用户：系统池。**没配模型映射时继承系统池声明的全部模型**（开箱可用）；
+//     配了映射则被收窄成那些 —— 那时它既是白名单也是别名表。
 //   - byo 用户：只能用自己配的上游。**一个都没配时不再回退系统池**：
 //     否则等于用户白嫖网关主人的上游。要消费就走 consumption 模式，那样才有计量与配额。
 func (s *Server) providersFor(scope, model string) (list []config.Provider, isSystem bool) {
@@ -214,9 +214,65 @@ func (s *Server) providersFor(scope, model string) (list []config.Provider, isSy
 		return nil, false
 	}
 	if e.Consumption {
+		if len(e.Models) == 0 {
+			// 方案 A：没配映射就继承系统池声明的全部模型，不必逐用户配
+			return s.globalProviders(), true
+		}
 		return s.scopedSystemProviders(e, model), true
 	}
 	return e.Providers, false
+}
+
+// effectiveModels 返回一个消费用户实际能调的逻辑模型名，以及这份清单的来源。
+//
+//	source = "own"      用户自己被收窄的列表（配了映射）
+//	source = "inherit"  继承系统池声明的名字（没配映射）
+//
+// passthrough=true 表示系统池里至少有家接受任意模型名，这时列举不全，只能说明。
+func (s *Server) effectiveModels(e *userEntry) (names []string, source string, passthrough bool) {
+	if e == nil {
+		return nil, "", false
+	}
+	if len(e.Models) > 0 {
+		return modelNames(e.Models), "own", false
+	}
+	seen := map[string]bool{}
+	for _, p := range s.globalProviders() {
+		if !p.Enabled {
+			continue
+		}
+		if p.Models.Passthrough {
+			passthrough = true
+		}
+		for down := range p.Models.Map {
+			if down == "*" || seen[down] {
+				continue
+			}
+			seen[down] = true
+			names = append(names, down)
+		}
+	}
+	sort.Strings(names)
+	return names, "inherit", passthrough
+}
+
+// consumptionVerdict 给「选不出候选」这件事归因，好让报错说清是权限问题还是池子问题。
+//
+//	consumption  是不是消费用户
+//	narrowed     他是不是配了自己的收窄列表
+//	listed       那个模型在不在他的收窄列表里
+func (s *Server) consumptionVerdict(scope, model string) (consumption, narrowed, listed bool) {
+	e := s.usersSnapshot().byName[scope]
+	if e == nil || !e.Consumption {
+		return false, false, false
+	}
+	narrowed = len(e.Models) > 0
+	for _, m := range e.Models {
+		if m.Model == model {
+			return true, true, true
+		}
+	}
+	return true, narrowed, false
 }
 
 // scopedSystemProviders 把系统池按用户的模型映射收窄。
@@ -266,20 +322,6 @@ func (s *Server) scopedSystemProviders(e *userEntry, model string) []config.Prov
 func (s *Server) hasNoProviders(scope string) bool {
 	e := s.usersSnapshot().byName[scope]
 	return e != nil && !e.Consumption && len(e.Providers) == 0 && len(e.Broken) == 0
-}
-
-// modelAllowed 报告消费用户的模型白名单里有没有这个模型（第二个返回值表示是不是消费用户）。
-func (s *Server) modelAllowed(scope, model string) (allowed bool, consumption bool) {
-	e := s.usersSnapshot().byName[scope]
-	if e == nil || !e.Consumption {
-		return false, false
-	}
-	for _, m := range e.Models {
-		if m.Model == model {
-			return true, true
-		}
-	}
-	return false, true
 }
 
 // unusableNote 在用户配的上游全部不可用时给一句能定位问题的报错。
@@ -493,7 +535,13 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, auth authResul
 				q["left_cost"] = left
 			}
 			out["quota"] = q
-			out["models"] = modelNames(e.Models)
+			names, source, passthrough := s.effectiveModels(e)
+			out["models"] = names
+			out["models_source"] = source
+			if passthrough {
+				// 列举不全时要说清楚，免得用户以为只有这几个
+				out["models_passthrough"] = true
+			}
 		}
 		if len(e.Broken) > 0 {
 			out["broken_providers"] = e.Broken
@@ -798,16 +846,17 @@ func (s *Server) handleMeUsage(w http.ResponseWriter, r *http.Request, scope str
 		writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error", "只支持 GET")
 		return
 	}
-	days := 30
-	if v := r.URL.Query().Get("days"); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 || n > 3650 {
-			writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
-				"days 需要在 1~3650 之间")
-			return
-		}
-		days = n
+	days, err := parseDays(r.URL.Query().Get("days"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
 	}
+	s.writeUsageReport(w, scope, days)
+}
+
+// writeUsageReport 出一个用户的用量报表。用户自助（/v1/_me/usage）与管理员
+// （/v1/_admin/users/{name}/usage）共用同一份实现 —— 两处各写一遍迟早会漂移。
+func (s *Server) writeUsageReport(w http.ResponseWriter, scope string, days int) {
 	since := time.Now().AddDate(0, 0, -days)
 	rows, err := s.db.UsageByUser(since, scope)
 	if err != nil {
@@ -906,141 +955,33 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/_admin"), "/")
-	if rest != "users" && !strings.HasPrefix(rest, "users/") {
-		writeJSONError(w, http.StatusNotFound, "invalid_request_error",
-			"可用路径：/v1/_admin/users[/{name}[/token|enable|disable|providers]]")
-		return
-	}
-	tail := strings.Trim(strings.TrimPrefix(rest, "users"), "/")
-
-	// 集合：GET 列表 / POST 建用户
-	if tail == "" {
-		switch r.Method {
-		case http.MethodGet, http.MethodHead:
-			s.adminListUsers(w)
-		case http.MethodPost:
-			s.adminCreateUser(w, r)
-		default:
-			writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error",
-				fmt.Sprintf("不支持的方法 %s", r.Method))
-		}
-		return
-	}
-
-	parts := strings.Split(tail, "/")
-	name := parts[0]
-	if !validName(name) {
-		writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
-			"用户名只能包含字母、数字、点、下划线、连字符，长度 1~64")
-		return
-	}
-	action := ""
-	if len(parts) > 1 {
-		action = parts[1]
-	}
-	if len(parts) > 2 {
-		writeJSONError(w, http.StatusNotFound, "invalid_request_error", "路径过深")
-		return
-	}
-
-	switch action {
-	case "":
-		switch r.Method {
-		case http.MethodGet, http.MethodHead:
-			s.adminShowUser(w, name)
-		case http.MethodDelete:
-			if err := s.db.DeleteUser(name); err != nil {
-				writeJSONError(w, http.StatusNotFound, "not_found", err.Error())
+	switch {
+	case rest == "users" || strings.HasPrefix(rest, "users/"):
+		s.adminUsersRoute(w, r, strings.Trim(strings.TrimPrefix(rest, "users"), "/"))
+	case rest == "config" || strings.HasPrefix(rest, "config/"):
+		s.handleAdminConfig(w, r, strings.Trim(strings.TrimPrefix(rest, "config"), "/"))
+	case rest == "providers":
+		s.adminListSystemProviders(w, r)
+	case strings.HasPrefix(rest, "providers/"):
+		tail := strings.Trim(strings.TrimPrefix(rest, "providers"), "/")
+		parts := strings.Split(tail, "/")
+		if len(parts) == 2 {
+			switch parts[1] {
+			case "discover":
+				s.discoverSystemModels(w, r, parts[0])
+				return
+			case "test":
+				s.adminTestProvider(w, r, parts[0])
 				return
 			}
-			s.router.ForgetScope(name)
-			_ = s.SyncUsers()
-			s.log.Warnf("管理员删除了用户 %s", name)
-			writeJSON(w, http.StatusOK, map[string]any{"deleted": name})
-		default:
-			writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error",
-				fmt.Sprintf("不支持的方法 %s", r.Method))
 		}
-	case "token":
-		if r.Method != http.MethodPost {
-			writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error", "只支持 POST")
-			return
-		}
-		token, err := store.NewToken()
-		if err != nil {
-			writeJSONError(w, http.StatusInternalServerError, "internal", err.Error())
-			return
-		}
-		if err := s.db.SetUserToken(name, store.TokenHash(token)); err != nil {
-			writeJSONError(w, http.StatusNotFound, "not_found", err.Error())
-			return
-		}
-		_ = s.SyncUsers()
-		s.log.Warnf("管理员轮换了用户 %s 的 token（旧 token 已失效）", name)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"name":  name,
-			"token": token,
-			"note":  "明文只在这里返回一次，请立刻交给用户",
-		})
-	case "enable", "disable":
-		if r.Method != http.MethodPost {
-			writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error", "只支持 POST")
-			return
-		}
-		if err := s.db.SetUserEnabled(name, action == "enable"); err != nil {
-			writeJSONError(w, http.StatusNotFound, "not_found", err.Error())
-			return
-		}
-		_ = s.SyncUsers()
-		s.log.Warnf("管理员%s了用户 %s", map[bool]string{true: "启用", false: "停用"}[action == "enable"], name)
-		writeJSON(w, http.StatusOK, map[string]any{"name": name, "enabled": action == "enable"})
-	case "providers":
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error", "只支持 GET")
-			return
-		}
-		e := s.usersSnapshot().byName[name]
-		if e == nil {
-			writeJSONError(w, http.StatusNotFound, "not_found", "用户不存在")
-			return
-		}
-		list := make([]map[string]any, 0, len(e.Providers))
-		for _, p := range e.Providers {
-			list = append(list, maskProvider(p))
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"name": name, "providers": list, "broken": e.Broken,
-		})
+		writeJSONError(w, http.StatusNotFound, "invalid_request_error",
+			"可用路径：/v1/_admin/providers[/{name}/discover|/test]")
 	default:
 		writeJSONError(w, http.StatusNotFound, "invalid_request_error",
-			fmt.Sprintf("未知操作 %q", action))
+			"可用路径：/v1/_admin/users[/{name}[/token|enable|disable|providers|models|usage]]、"+
+				"/v1/_admin/providers[/{name}/discover]、/v1/_admin/config[/providers|/validate]")
 	}
-}
-
-func (s *Server) adminListUsers(w http.ResponseWriter) {
-	reg := s.usersSnapshot()
-	type item struct {
-		Name        string   `json:"name"`
-		Enabled     bool     `json:"enabled"`
-		Providers   []string `json:"providers"`
-		BrokenCount int      `json:"broken_providers,omitempty"`
-		TotalTokens int64    `json:"total_tokens"`
-		TotalReqs   int64    `json:"total_requests"`
-	}
-	out := []item{}
-	for _, e := range reg.byName {
-		tot, err := s.db.TotalByUser(time.Time{}, e.Name)
-		if err != nil {
-			s.log.Warnf("统计用户 %s 用量失败: %v", e.Name, err)
-		}
-		out = append(out, item{
-			Name: e.Name, Enabled: e.Enabled,
-			Providers: providerNames(e.Providers), BrokenCount: len(e.Broken),
-			TotalTokens: tot.TotalTokens, TotalReqs: tot.Requests,
-		})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	writeJSON(w, http.StatusOK, map[string]any{"users": out})
 }
 
 func (s *Server) adminCreateUser(w http.ResponseWriter, r *http.Request) {
@@ -1073,26 +1014,5 @@ func (s *Server) adminCreateUser(w http.ResponseWriter, r *http.Request) {
 		"token": token,
 		"note":  "明文只在这里返回一次，请立刻交给用户",
 		"usage": "用户拿这个 token 调 /v1/chat/completions，并用 PUT /v1/_me/providers/{name} 配自己的上游",
-	})
-}
-
-func (s *Server) adminShowUser(w http.ResponseWriter, name string) {
-	reg := s.usersSnapshot()
-	e := reg.byName[name]
-	if e == nil {
-		writeJSONError(w, http.StatusNotFound, "not_found", fmt.Sprintf("用户 %q 不存在", name))
-		return
-	}
-	tot, err := s.db.TotalByUser(time.Time{}, name)
-	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "internal", err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"name":      e.Name,
-		"enabled":   e.Enabled,
-		"providers": providerNames(e.Providers),
-		"broken":    e.Broken,
-		"usage":     tot,
 	})
 }

@@ -20,10 +20,12 @@ import (
 const ToolName = "llmproxy"
 
 // Version 是发行版本号。刻意用 var 而不是 const：交叉编译脚本与 CI 用
-// -ldflags "-X .../internal/config.Version=v1.2.3" 把 git tag 注进来，
-// 这样二进制里报的版本永远等于发布时的 tag，不用手工改这里。
-// 直接 go build 时会保持下面这个默认值。
-var Version = "v0.1.0"
+// -ldflags "-X .../internal/config.Version=v1.2.3" 把 git tag 注进来。
+//
+// 下面这个默认值只对「直接 go build」的裸构建可见，它表达的是「这不是发行版」，
+// 不是一个版本号 —— 所以刻意不写成某个真实版本，免得本地构建报出一个
+// 永远追不上 tag 的过期版本号。发行版号只有一个来源：git tag。
+var Version = "v0.0.0-dev"
 
 var loopbackHosts = map[string]bool{
 	"127.0.0.1":        true,

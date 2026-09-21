@@ -334,3 +334,170 @@ func TestBYOWithoutProvidersDoesNotFallBackToSystem(t *testing.T) {
 		t.Fatalf("报错要提示可以改走消费模式: %s", raw)
 	}
 }
+
+// 方案 A：消费用户没配模型映射时，继承系统池声明的全部模型（开箱可用）。
+func TestConsumptionInheritsSystemPoolWhenNoMapping(t *testing.T) {
+	stub := newUsageStub(t, 0)
+	h := newConsumptionHarness(t, stub, testPricing) // 系统池 sys-a 是 models: ["*"] 直通
+	token := h.addUser(t, "carol")
+	// 只切成消费模式，不配任何映射
+	if err := h.db.SetUserMode("carol", store.ModeConsumption); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.srv.SyncUsers(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 任意模型名都该能用（继承 = 不拦）
+	resp, raw := h.post(t, "/v1/chat/completions", token, map[string]any{
+		"model": "whatever-name", "messages": []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("继承模式下应当开箱可用，实际 %d: %s", resp.StatusCode, raw)
+	}
+	if stub.hitCount() != 1 {
+		t.Fatalf("应当打到系统上游，实际命中 %d", stub.hitCount())
+	}
+
+	// /v1/_me 要说清来源是继承
+	_, body := h.get(t, "/v1/_me", token)
+	var me map[string]any
+	if err := json.Unmarshal(body, &me); err != nil {
+		t.Fatal(err)
+	}
+	if me["models_source"] != "inherit" {
+		t.Errorf("models_source 应为 inherit，实际 %v", me["models_source"])
+	}
+	if me["models_passthrough"] != true {
+		t.Errorf("系统池有直通供应商时应当标出来，实际 %v", me["models_passthrough"])
+	}
+}
+
+// 系统池声明了具体模型名（非直通）时：继承列出这些名字；
+// 打一个池子里没有的模型 —— 那是池子的问题，不该报 403（不能让人以为是自己没权限）。
+func TestConsumptionInheritListAndPoolMissAttribution(t *testing.T) {
+	stub := newUsageStub(t, 0)
+	yamlSrc := strings.Replace(consumptionYAML(stub.srv.URL, testPricing), "models: [\"*\"]",
+		"models: {m-one: m-one, m-two: m-two}", 1)
+	h := newMUHarnessWith(t, yamlSrc)
+	token := h.addUser(t, "carol")
+	if err := h.db.SetUserMode("carol", store.ModeConsumption); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.srv.SyncUsers(); err != nil {
+		t.Fatal(err)
+	}
+
+	// /v1/models 应当列出池子声明的两个名字
+	_, body := h.get(t, "/v1/models", token)
+	if !strings.Contains(string(body), "m-one") || !strings.Contains(string(body), "m-two") {
+		t.Errorf("/v1/models 应当列出继承来的模型名: %s", body)
+	}
+
+	// 池子里没有的模型 → 502（上游无候选），且报错里带上可用模型
+	resp, raw := h.post(t, "/v1/chat/completions", token, map[string]any{
+		"model": "not-in-pool", "messages": []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatalf("池子里没有 ≠ 用户没权限，不该 403: %s", raw)
+	}
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("应当 502，实际 %d: %s", resp.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), "m-one") {
+		t.Errorf("报错里应当列出可用模型: %s", raw)
+	}
+}
+
+// 有映射 = 收窄：范围外的模型 403，并且话术要指向管理员。
+func TestConsumptionNarrowedStillForbidden(t *testing.T) {
+	stub := newUsageStub(t, 0)
+	h := newConsumptionHarness(t, stub, testPricing)
+	token := h.addUser(t, "carol")
+	setConsumption(t, h, "carol", "fast", "sys-model")
+
+	resp, raw := h.post(t, "/v1/chat/completions", token, map[string]any{
+		"model": "outside", "messages": []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("被收窄的模型应当 403，实际 %d: %s", resp.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), "管理员") {
+		t.Errorf("403 的话术要指向管理员: %s", raw)
+	}
+	_, body := h.get(t, "/v1/_me", token)
+	if !strings.Contains(string(body), `"models_source":"own"`) {
+		t.Errorf("配了映射时来源应为 own: %s", body)
+	}
+}
+
+// 清空映射 = 放开回继承（管理端的「改为继承系统池」）。
+func TestClearMappingsReturnsToInherit(t *testing.T) {
+	stub := newUsageStub(t, 0)
+	h := newConsumptionHarness(t, stub, testPricing)
+	token := h.addUser(t, "carol")
+	setConsumption(t, h, "carol", "fast", "sys-model")
+
+	// 收窄状态下，范围外的模型被拒
+	body := map[string]any{"model": "outside", "messages": []map[string]any{{"role": "user", "content": "hi"}}}
+	if resp, _ := h.post(t, "/v1/chat/completions", token, body); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("前置条件不成立：应当先被拒，实际 %d", resp.StatusCode)
+	}
+
+	// 清空全部映射
+	resp, raw := h.del(t, "/v1/_admin/users/carol/models", adminToken)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("清空映射失败 %d: %s", resp.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), `"models_source":"inherit"`) {
+		t.Errorf("清空后应回到继承: %s", raw)
+	}
+	if ms, _ := h.db.ListUserModels("carol"); len(ms) != 0 {
+		t.Errorf("库里应当没有映射了: %+v", ms)
+	}
+
+	// 现在同样的请求应当放行
+	if resp, raw := h.post(t, "/v1/chat/completions", token, body); resp.StatusCode != http.StatusOK {
+		t.Fatalf("清空后应当可用，实际 %d: %s", resp.StatusCode, raw)
+	}
+}
+
+// 管理端列表要能看出「继承」还是「收窄」。
+func TestAdminSummaryShowsModelSource(t *testing.T) {
+	stub := newUsageStub(t, 0)
+	h := newConsumptionHarness(t, stub, testPricing)
+	h.addUser(t, "inherit-user")
+	h.addUser(t, "narrow-user")
+	for _, n := range []string{"inherit-user", "narrow-user"} {
+		if err := h.db.SetUserMode(n, store.ModeConsumption); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.db.UpsertUserModel(store.UserModel{UserName: "narrow-user", Model: "fast", Upstream: "sys-model", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.srv.SyncUsers(); err != nil {
+		t.Fatal(err)
+	}
+
+	code, body := adminGet(t, h, "/v1/_admin/users")
+	if code != 200 {
+		t.Fatalf("列表应 200，实际 %d", code)
+	}
+	var out struct {
+		Users []struct {
+			Name         string `json:"name"`
+			ModelsSource string `json:"models_source"`
+		} `json:"users"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, u := range out.Users {
+		got[u.Name] = u.ModelsSource
+	}
+	if got["inherit-user"] != "inherit" || got["narrow-user"] != "own" {
+		t.Errorf("来源标注不对: %+v", got)
+	}
+}
