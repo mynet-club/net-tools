@@ -282,6 +282,20 @@ func (p *Provider) UpstreamModel(model string) (string, bool) {
 	return "", false
 }
 
+// Declares 报告该供应商是否**点名**承接了这个模型（`models` 里有这一条），
+// 而不是靠 `["*"]` / catch-all 通配兜底。
+//
+// 选路用它区分「明确指定」和「兜底」：一家写 `models: ["*"]` 的供应商声明「任何模型名我都接」，
+// 于是它也会成为那些**别人点名声明过**的模型名的候选。两者若平权，一次请求走对还是走错
+// 就全看随机 —— 表现为同一个模型名时而正常、时而 400（兜底那家其实不认这个名字）。
+func (p *Provider) Declares(model string) bool {
+	if model == "" || model == "*" {
+		return false
+	}
+	_, ok := p.Models.Map[model]
+	return ok
+}
+
 // ------------------------------------------------------------------ 路径
 
 func GetRuntimeDir() string {

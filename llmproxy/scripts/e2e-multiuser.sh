@@ -485,5 +485,37 @@ echo "$tp" | grep -q '"ok":true' && pass "未保存的供应商：内联凭证�
 echo "$tp" | grep -q '"upstream_model":"m-one"' && pass "自动挑的是上游列表里真实的模型名" || fail "挑错模型：$tp"
 
 echo
+echo "=== 20. 点名声明优先于直通兜底（同一个模型名不再随机走错上游）==="
+# 池子里放一家「全部直通」+ 一家点名声明 {only-here: only-here}。
+# 两家都接得住 only-here（直通那家声明「任何名字都接」），权重也都是 1。
+# 修之前是按权重随机 → 约一半请求会落到直通那家；修之后必须 100% 走点名的那家。
+# 这不是纸上推演：线上就是这么翻的车（deepseek 直通 + neolink 点名 gpt-5-sol，
+# 同一个模型名十次里七次被送去 deepseek，那边根本不认这个名字）。
+curl -s -X PUT "$GW/v1/_admin/config/providers" -H "Authorization: Bearer $ADMIN" \
+  -H 'Content-Type: application/json' \
+  -d "{\"providers\":[
+    {\"name\":\"global-up\",\"enabled\":true,\"base_url\":\"http://127.0.0.1:$GPORT/v1\",\"api_key\":\"\",\"weight\":1,\"proxy\":\"direct\",\"timeout_ms\":10000,\"models\":[\"*\"]},
+    {\"name\":\"declared-up\",\"enabled\":true,\"base_url\":\"http://127.0.0.1:$IPORT/v1\",\"api_key\":\"sk-declared\",\"weight\":1,\"proxy\":\"direct\",\"timeout_ms\":10000,\"models\":{\"only-here\":\"only-here\"}}
+  ]}" >/dev/null
+sleep 2.5
+chk "热加载生效（运行时 2 家供应商）" "$(curl -s "$GW/healthz" | sed 's/.*"providers":\([0-9]*\).*/\1/')" "2"
+hit=0
+for _ in $(seq 1 20); do
+  prov=$(curl -s -D - -o /dev/null -X POST "$GW/v1/chat/completions" \
+    -H "Authorization: Bearer sk-single-user" -H 'Content-Type: application/json' \
+    -d '{"model":"only-here","messages":[{"role":"user","content":"hi"}]}' \
+    | tr -d '\r' | sed -n 's/^[Xx]-[Ll]lmproxy-[Pp]rovider: *//p')
+  [ "$prov" = "declared-up" ] && hit=$((hit + 1))
+done
+chk "20 次请求全部落到点名声明的供应商" "$hit" "20"
+
+# 反过来：没被任何人点名的模型名，仍旧由直通那家接住（兜底没坏）
+prov=$(curl -s -D - -o /dev/null -X POST "$GW/v1/chat/completions" \
+  -H "Authorization: Bearer sk-single-user" -H 'Content-Type: application/json' \
+  -d '{"model":"随便一个没人声明的名字","messages":[{"role":"user","content":"hi"}]}' \
+  | tr -d '\r' | sed -n 's/^[Xx]-[Ll]lmproxy-[Pp]rovider: *//p')
+chk "没人点名时仍由直通兜底" "$prov" "global-up"
+
+echo
 echo "================ 结果：通过 $PASS 项，失败 $FAIL 项 ================"
 [ "$FAIL" -eq 0 ] || exit 1

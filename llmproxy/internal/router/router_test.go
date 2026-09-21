@@ -425,3 +425,118 @@ func TestApplyConfigKeepsUserScopes(t *testing.T) {
 		t.Errorf("热重载不应影响用户作用域，实际 %d", got)
 	}
 }
+
+// 点名声明过这个模型的供应商，优先于靠 ["*"] 兜底的供应商。
+//
+// 现实里的样子：一家 deepseek 写 models: ["*"]（声明「任何模型名我都接」），
+// 另一家 neolink 点名声明 {gpt-5-sol: gp-5.6-so}。两家权重都是 1 时，
+// 如果平权随机，一半请求会被送去 deepseek —— 而它根本不认 gpt-5-sol，
+// 于是同一个模型名时而正常、时而 400。
+func TestPickDeclaredBeatsPassthrough(t *testing.T) {
+	r := New(config.RoutingConfig{}, []config.Provider{
+		mapped("neolink", 1, map[string]string{"gpt-5-sol": "gp-5.6-so"}),
+		passthrough("deepseek", 1), // 权重相同，故意不靠权重压制
+	})
+	for i := 0; i < 500; i++ {
+		c, err := r.Pick("gpt-5-sol", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.Provider.Name != "neolink" {
+			t.Fatalf("第 %d 次选到了兜底供应商 %q（应当只走点名声明的那家）", i, c.Provider.Name)
+		}
+		if c.UpstreamModel != "gp-5.6-so" {
+			t.Fatalf("上游名 = %q", c.UpstreamModel)
+		}
+	}
+}
+
+// catch-all（models 里有 "*"）与直通同类：也算兜底，让位给点名声明的。
+func TestPickDeclaredBeatsCatchAll(t *testing.T) {
+	r := New(config.RoutingConfig{}, []config.Provider{
+		mapped("pinned", 1, map[string]string{"fast": "m-one"}),
+		mkProvider("catchall", 1, config.ModelSpec{Map: map[string]string{"*": "*"}, CatchAll: true}),
+	})
+	for i := 0; i < 300; i++ {
+		c, err := r.Pick("fast", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.Provider.Name != "pinned" {
+			t.Fatalf("第 %d 次选到了 catch-all 供应商 %q", i, c.Provider.Name)
+		}
+	}
+	// 没被点名的模型名，仍旧由 catch-all 接住
+	c, err := r.Pick("随便一个名字", nil)
+	if err != nil {
+		t.Fatalf("catch-all 应当接住未声明的模型名: %v", err)
+	}
+	if c.Provider.Name != "catchall" {
+		t.Errorf("应当是 catchall，实际 %q", c.Provider.Name)
+	}
+}
+
+// 兜底本身不能失效：池子里只有直通型时，照样用它。
+func TestPickFallsBackToPassthroughWhenNobodyDeclares(t *testing.T) {
+	r := New(config.RoutingConfig{}, []config.Provider{
+		passthrough("any-a", 1),
+		passthrough("any-b", 1),
+	})
+	seen := map[string]int{}
+	for i := 0; i < 200; i++ {
+		c, err := r.Pick("随便", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seen[c.Provider.Name]++
+	}
+	if len(seen) != 2 {
+		t.Errorf("两家直通应当都在分担，实际 %v", seen)
+	}
+}
+
+// 点名声明的那家进了冷却，也不该把请求让给兜底的 ——
+// 「指名道姓要走这家」比「随便找一家能接的」更强，宁可让上层看到熔断，也别悄悄换个上游。
+func TestPickDeclaredStaysPreferredEvenWhenUnhealthy(t *testing.T) {
+	r := New(config.RoutingConfig{FailureThreshold: 1, CooldownSeconds: 60}, []config.Provider{
+		mapped("declared", 1, map[string]string{"m": "m"}),
+		passthrough("fallback", 1),
+	})
+	r.ReportFailure("declared", fmt.Errorf("boom")) // 打进冷却
+	c, err := r.Pick("m", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Provider.Name != "declared" {
+		t.Errorf("冷却中也不该换上游，实际选了 %q", c.Provider.Name)
+	}
+}
+
+// 重试时把点名的那家排除掉（它刚失败），这时才轮到兜底的顶上。
+func TestPickDeclaredExcludedThenFallsBack(t *testing.T) {
+	r := New(config.RoutingConfig{}, []config.Provider{
+		mapped("declared", 1, map[string]string{"m": "m"}),
+		passthrough("fallback", 1),
+	})
+	c, err := r.Pick("m", map[string]bool{"declared": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Provider.Name != "fallback" {
+		t.Errorf("点名那家被排除后应当由兜底顶上，实际 %q", c.Provider.Name)
+	}
+}
+
+// 点名的那家被停用，就退回到兜底。
+func TestPickDeclaredDisabledFallsBack(t *testing.T) {
+	d := mapped("declared", 1, map[string]string{"m": "m"})
+	d.Enabled = false
+	r := New(config.RoutingConfig{}, []config.Provider{d, passthrough("fallback", 1)})
+	c, err := r.Pick("m", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Provider.Name != "fallback" {
+		t.Errorf("应当由兜底接，实际 %q", c.Provider.Name)
+	}
+}

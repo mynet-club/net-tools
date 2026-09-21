@@ -168,7 +168,9 @@ func (r *Router) PickFrom(scope string, candidates []config.Provider, model stri
 		c Candidate
 		w float64
 	}
-	var healthy, all []weighted
+	// 分成「点名声明了这个模型」和「靠通配兜底」两堆。
+	// 详见下面挑池子时那段说明。
+	var explHealthy, explAll, fbHealthy, fbAll []weighted
 	for _, p := range candidates {
 		if !p.Enabled {
 			continue
@@ -185,7 +187,12 @@ func (r *Router) PickFrom(scope string, candidates []config.Provider, model stri
 			w = 1
 		}
 		item := weighted{c: Candidate{Provider: p, UpstreamModel: up}, w: w}
-		all = append(all, item)
+		declares := p.Declares(model)
+		if declares {
+			explAll = append(explAll, item)
+		} else {
+			fbAll = append(fbAll, item)
+		}
 
 		// 只读查状态：Pick 不应为没跑过的供应商创建状态
 		var unhealthyUntil time.Time
@@ -195,13 +202,31 @@ func (r *Router) PickFrom(scope string, candidates []config.Provider, model stri
 			}
 		}
 		if !now.Before(unhealthyUntil) {
-			healthy = append(healthy, item)
+			if declares {
+				explHealthy = append(explHealthy, item)
+			} else {
+				fbHealthy = append(fbHealthy, item)
+			}
 		}
 	}
 
-	pool := healthy
+	// 点名声明优先于通配兜底。
+	//
+	// 一家写 models: ["*"] 的供应商声明「任何模型名我都接」，于是它也会成为那些
+	// **别人点名声明过**的模型名的候选。两者若平权（各自按权重随机），一次请求走对
+	// 还是走错就全看运气 —— 表现就是同一个模型名时而正常、时而 400。
+	// 所以只要有人点名声明了这个模型，就只在它们里面选；一个点名的都没有，才轮到兜底的。
+	//
+	// 「先健康、兜不住了再拿不健康的顶上」这个既有次序不变，只是各自在自己那一堆里排。
+	pool := explHealthy
 	if len(pool) == 0 {
-		pool = all
+		pool = explAll
+	}
+	if len(pool) == 0 {
+		pool = fbHealthy
+	}
+	if len(pool) == 0 {
+		pool = fbAll
 	}
 	if len(pool) == 0 {
 		return nil, fmt.Errorf("没有供应商能承接模型 %q（可能已被排除或未配置）", model)
