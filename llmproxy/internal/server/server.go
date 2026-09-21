@@ -48,11 +48,20 @@ type Server struct {
 	// 消费模式的当月计数与限流（内存，见 limits.go）
 	meters *meterSet
 
+	// 会话粘性：把同一个 (用户, 会话, 模型) 钉在同一个后端，保住上游的前缀缓存。
+	// 见 affinity.go 与 forwarder.go 里的接线。
+	affinity *affinityStore
+
 	// 配置写回后等热加载的时长；测试里置 0 可跳过等待
 	configApplyWait time.Duration
 }
 
 func New(cfgStore *config.Store, db *store.Store, r *router.Router, lg *logx.Logger) *Server {
+	// 会话粘性的保留时长跟配置走：没配用默认 24h，显式 0 = 关闭（请求照旧随机选）
+	affTTL := defaultAffinityTTL
+	if c := cfgStore.Current(); c != nil {
+		affTTL = time.Duration(c.Server.AffinityTTL()) * time.Millisecond
+	}
 	s := &Server{
 		cfgStore:   cfgStore,
 		db:         db,
@@ -60,6 +69,7 @@ func New(cfgStore *config.Store, db *store.Store, r *router.Router, lg *logx.Log
 		log:        lg,
 		transports: dialer.NewTransportCache(),
 		startedAt:  time.Now(),
+		affinity:   newAffinityStore(affTTL, defaultAffinityMax),
 	}
 	s.uiHandler = s.newUIHandler()
 	s.configApplyWait = 4 * time.Second

@@ -196,8 +196,20 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 	)
 	attempts := 0
 
+	// 会话粘性：下游（MiMoCode 等）会在 x-session-affinity 里带会话 id，没有这个头
+	// 就没有粘性，照旧按权重随机。粘性的键是 (用户, 会话, 模型) —— 上游的前缀缓存
+	// 本来就按模型分区，一个会话还会调多个模型。配置里 affinity_ttl_ms=0 时整体关闭，
+	// 这时连观测头都不写，免得留一条永远是 new 的字段来混淆排障。
+	affinityOn := s.affinity.Enabled()
+	affinitySession := ""
+	prefer := ""
+	if affinityOn {
+		affinitySession = r.Header.Get("X-Session-Affinity")
+		prefer = s.affinity.Get(scope, affinitySession, probe.Model) // 头为空时返回 ""
+	}
+
 	for i := 0; i < maxAttempts; i++ {
-		cand, err := s.router.PickFrom(scope, providers, probe.Model, exclude)
+		cand, err := s.router.PickFromPreferring(scope, providers, probe.Model, exclude, prefer)
 		if err != nil {
 			if lastErr == nil {
 				lastErr = fmt.Errorf("%w（当前可用模型：%s）", err, describeModels(providers))
@@ -205,6 +217,20 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 			break
 		}
 		attempts++
+
+		// 观测：告诉调用方这次是按粘性选的（sticky）还是漂移过来的（drift），
+		// 或者本来就没粘性记录（new）。排障与上线验证都要看这一列。
+		if affinityOn && affinitySession != "" {
+			outcome := "new"
+			if prefer != "" {
+				if cand.Provider.Name == prefer {
+					outcome = "sticky"
+				} else {
+					outcome = "drift"
+				}
+			}
+			w.Header().Set("X-Llmproxy-Affinity", outcome)
+		}
 
 		proxyURL, err := cand.Provider.Proxy.Resolve(cfg.ProxyIndex)
 		if err != nil {
@@ -322,11 +348,28 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 		rec.Attempts = attempts
 		rec.StatusCode = resp.StatusCode
 
+		// 记录/更新粘性。只有真正成功的响应才钉住这家；非重试类 4xx
+		// （比如这家在配置里声明了这个名字、上游其实不认）说明「这家用不了」——
+		// 忘掉粘性让下一个请求重新选。这条很要紧：4xx 不触发熔断，
+		// 不忘掉的话会话会被钉在一家只会报错的后端上死循环。
+		if affinitySession != "" {
+			if resp.StatusCode < 400 {
+				s.affinity.Set(scope, affinitySession, probe.Model, cand.Provider.Name)
+			} else {
+				s.affinity.Set(scope, affinitySession, probe.Model, "")
+			}
+		}
+
 		func() {
 			defer cancel()
 			s.relay(w, r, resp, &rec, started, wd)
 		}()
 		return
+	}
+
+	// 全部尝试失败：忘掉粘性，让下一个请求重新选 —— 别把会话钉在一家已经全挂的后端上
+	if affinitySession != "" {
+		s.affinity.Set(scope, affinitySession, probe.Model, "")
 	}
 
 	// 全部尝试失败

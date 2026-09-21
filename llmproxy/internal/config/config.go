@@ -121,6 +121,13 @@ type ServerConfig struct {
 	// 指针是为了区分「没配」（用默认 2 分钟）和「显式写 0」（关闭，退回总时限行为）——
 	// 用普通 int 的话这两者都是 0，没法表达「关掉它」。
 	StreamIdleTimeoutMs *int `yaml:"stream_idle_timeout_ms"`
+	// AffinityTTLMs 是会话粘性的保留时长：同一个 (用户, 会话, 模型) 在这段时间内
+	// 一直钉在同一家供应商上，避免权重随机把一段对话的前缀缓存打散到多家。
+	//
+	// 显式 0 = 关闭粘性（请求照旧按权重随机）。没配时用默认 24 小时 —— 会话可能
+	// 隔夜还在继续，而上游的前缀缓存通常也活那么久，过期太早等于每个回合边界都换家。
+	// 同样用指针区分「没配」与「关闭」。
+	AffinityTTLMs *int `yaml:"affinity_ttl_ms"`
 }
 
 // StreamIdleMs 给出流式空闲上限（毫秒）。没配 = 默认 2 分钟；显式 0 = 关闭。
@@ -129,6 +136,14 @@ func (c ServerConfig) StreamIdleMs() int {
 		return 120000
 	}
 	return *c.StreamIdleTimeoutMs
+}
+
+// AffinityTTL 给出会话粘性保留时长（毫秒）。没配 = 默认 24 小时；显式 0 = 关闭。
+func (c ServerConfig) AffinityTTL() int {
+	if c.AffinityTTLMs == nil {
+		return 24 * 3600 * 1000
+	}
+	return *c.AffinityTTLMs
 }
 
 // APIKey 既支持纯字符串，也支持 {key, label} 对象形式；label 只用于日志，不参与鉴权。
@@ -494,6 +509,10 @@ func (c *Config) normalize(opts LoadOptions) error {
 	}
 	if v := c.Server.StreamIdleTimeoutMs; v != nil && *v != 0 && (*v < 1000 || *v > 86400000) {
 		return fmt.Errorf("server.stream_idle_timeout_ms 需要是 0（关闭）或 1000~86400000 之间，当前是 %d", *v)
+	}
+	// 会话粘性：上限 30 天。更长没有意义 —— 上游自己的前缀缓存不会活那么久。
+	if v := c.Server.AffinityTTLMs; v != nil && *v != 0 && (*v < 1000 || *v > 2592000000) {
+		return fmt.Errorf("server.affinity_ttl_ms 需要是 0（关闭）或 1000~2592000000 之间，当前是 %d", *v)
 	}
 
 	seenKey := map[string]bool{}

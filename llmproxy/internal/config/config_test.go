@@ -401,3 +401,48 @@ func TestExampleConfigParses(t *testing.T) {
 		t.Error("示例配置应演示代理用法")
 	}
 }
+
+// 会话粘性保留时长：0 = 关闭，未配 = 默认 24 小时，非法值要报错。
+// 指针是为了区分「没配」和「显式关闭」——这两者语义完全不同。
+func TestAffinityTTLMsValidation(t *testing.T) {
+	src := func(v string) string {
+		body := "providers:\n  - name: a\n    base_url: https://x/v1\n    api_key: k\n    models: [\"*\"]\n"
+		if v != "" {
+			body = "server:\n  affinity_ttl_ms: " + v + "\n" + body
+		}
+		return body
+	}
+	// 未配：默认 24 小时
+	cfg, err := Parse([]byte(src("")))
+	if err != nil {
+		t.Fatalf("未配时不该报错: %v", err)
+	}
+	if got := cfg.Server.AffinityTTL(); got != 24*3600*1000 {
+		t.Errorf("未配时应当用默认 24 小时（毫秒），实际 %d", got)
+	}
+	// 显式 0 = 关闭，且不能被默认值吃掉
+	cfg, err = Parse([]byte(src("0")))
+	if err != nil {
+		t.Fatalf("显式 0（关闭）不该报错: %v", err)
+	}
+	if got := cfg.Server.AffinityTTL(); got != 0 {
+		t.Errorf("显式 0 应当保持为 0（关闭），实际 %d", got)
+	}
+	// 合法值
+	cfg, err = Parse([]byte(src("60000")))
+	if err != nil {
+		t.Fatalf("60000 不该报错: %v", err)
+	}
+	if got := cfg.Server.AffinityTTL(); got != 60000 {
+		t.Errorf("应当原样取 60000，实际 %d", got)
+	}
+	// 非法值：太小 / 太大
+	for _, bad := range []string{"500", "2592000001"} {
+		_, err := Parse([]byte(src(bad)))
+		if err == nil {
+			t.Errorf("affinity_ttl_ms=%s 应当报错", bad)
+		} else if !strings.Contains(err.Error(), "affinity_ttl_ms") {
+			t.Errorf("错误信息 %q 不含 affinity_ttl_ms", err.Error())
+		}
+	}
+}

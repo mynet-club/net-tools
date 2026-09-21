@@ -160,13 +160,32 @@ func (r *Router) Pick(model string, exclude map[string]bool) (*Candidate, error)
 //   - 优先在"健康"供应商中按权重随机
 //   - 若一个健康供应商都没有，则在全部候选中按权重随机（宁可重试也不要硬失败）
 func (r *Router) PickFrom(scope string, candidates []config.Provider, model string, exclude map[string]bool) (*Candidate, error) {
+	return r.PickFromPreferring(scope, candidates, model, exclude, "")
+}
+
+// PickFromPreferring 在 PickFrom 的基础上多一个「优先选这家」。
+//
+// 用途是会话粘性：把同一个会话钉在同一个后端，别让权重随机把一段对话的前缀缓存
+// 打散到多家 —— 缓存是按「上游账号 + 模型」分区的，换家等于从冷缓存重来。
+//
+// prefer 是**软**约束，三条语义都要记住：
+//
+//  1. 它只在最终候选池里生效。若某个模型名被别家点名声明过（于是「点名声明优先于
+//     通配兜底」把兜底那家挤出了候选池），即便 prefer 指着那家兜底的，也不会生效 ——
+//     否则粘性就成了绕过候选规则的旁路。代价是：某个模型的声明方集合变化时，
+//     会话可能迁移一次（罕见，且只会发生一次）。
+//  2. 那家正在冷却时**不生效**，直接按原规则漂移到别家（「后端不能用就换家」）。
+//     漂移之后上层会更新粘性，于是不会改回来——避免两家来回横跳把两边的缓存都弄冷。
+//  3. prefer 为空、或它不在候选里（停用/不承接这个模型/被 exclude），等同于没提。
+func (r *Router) PickFromPreferring(scope string, candidates []config.Provider, model string, exclude map[string]bool, prefer string) (*Candidate, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	now := r.now()
 	type weighted struct {
-		c Candidate
-		w float64
+		c       Candidate
+		w       float64
+		healthy bool
 	}
 	// 分成「点名声明了这个模型」和「靠通配兜底」两堆。
 	// 详见下面挑池子时那段说明。
@@ -188,11 +207,6 @@ func (r *Router) PickFrom(scope string, candidates []config.Provider, model stri
 		}
 		item := weighted{c: Candidate{Provider: p, UpstreamModel: up}, w: w}
 		declares := p.Declares(model)
-		if declares {
-			explAll = append(explAll, item)
-		} else {
-			fbAll = append(fbAll, item)
-		}
 
 		// 只读查状态：Pick 不应为没跑过的供应商创建状态
 		var unhealthyUntil time.Time
@@ -201,7 +215,16 @@ func (r *Router) PickFrom(scope string, candidates []config.Provider, model stri
 				unhealthyUntil = st.UnhealthyUntil
 			}
 		}
-		if !now.Before(unhealthyUntil) {
+		// healthy 的语义是「这家此刻能不能用」，与它被放进哪一堆无关 ——
+		// explAll/fbAll 里也装着健康成员，这个标志不能只在写入 *Healthy 时才置位。
+		item.healthy = !now.Before(unhealthyUntil)
+
+		if declares {
+			explAll = append(explAll, item)
+		} else {
+			fbAll = append(fbAll, item)
+		}
+		if item.healthy {
 			if declares {
 				explHealthy = append(explHealthy, item)
 			} else {
@@ -230,6 +253,18 @@ func (r *Router) PickFrom(scope string, candidates []config.Provider, model stri
 	}
 	if len(pool) == 0 {
 		return nil, fmt.Errorf("没有供应商能承接模型 %q（可能已被排除或未配置）", model)
+	}
+
+	// 会话粘性：优先项在池子里且健康，就用它（语义见 PickFromPreferring 的说明）。
+	// 放在池子定下来之后，是为了让「点名声明优先于兜底」仍然说了算 ——
+	// 粘性是"在这批合法候选里挑哪一家"，不是"绕过候选规则"。
+	if prefer != "" {
+		for _, item := range pool {
+			if item.c.Provider.Name == prefer && item.healthy {
+				c := item.c
+				return &c, nil
+			}
+		}
 	}
 
 	var total float64
