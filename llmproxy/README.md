@@ -661,14 +661,35 @@ providers:
 - **按时间只追加**：同一 (供应商, 模型) 插入新价时，此前有效的行自动收口成
   `[旧.valid_from, 新.valid_from)`，历史天然保留，随时可回溯。
 - **折扣不单独建模**：改价时插一条新行、`note` 里写明折扣来源即可（路由只关心有效价）。
+- **分时段计价**：价目行自带峰谷规则。DeepSeek 明码标价「空闲时段是高峰价的一半」，
+  所以单价是「供应商 × 模型 × 时段」的函数：
+
+  ```json
+  {"peak_hours": ["09:00-12:00", "14:00-18:00"], "off_peak_ratio": 0.5, "peak_tz": "+08:00"}
+  ```
+
+  填进去的单价是**高峰价**，落在空闲时段时乘 `off_peak_ratio`。三个字段都可空，
+  为空则**逐字段**沿用 `config.yaml` 的 `pricing` 段（只填时段、时区仍用全局的，
+  这种混着写是支持的）。
+
+  `peak_tz` 最好显式给：时段是按**供应商所在时区**解释的，而服务器多半跑在 UTC ——
+  把 DeepSeek 的 `09:00-12:00` 当本地时间用会错位 8 小时，正好把高峰判成空闲，账差一倍。
+  取值是**固定偏移**（`"+08:00"`、`"-05:30"`）而不是 `Asia/Shanghai` 这类名字：
+  固定偏移不依赖系统 tzdata，而 Alpine/musl 的精简镜像里常常没有 zoneinfo。
+
+  判哪一档用的是**请求开始时刻** —— 与上面「取哪条价目行」同一个时刻，
+  一个请求一个价，可审计。只认「周一~周五」，**不识别中国法定节假日**：
+  法定节假日会按高峰价算，属偏高估（不会低估）。
 
 ```bash
 # 录一条上游价（时间是 RFC3339，必须整点）：单价单位是「每百万 token」
 curl -X PUT http://127.0.0.1:8787/v1/_admin/prices/provider \
   -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
   -d '{"provider":"deepseek","upstream_model":"deepseek-flash",
-       "valid_from":"2026-09-21T09:00:00+08:00",
-       "in_hit":0.04,"in_miss":2.0,"in_write":2.5,"out":8.0,"note":"官网报价"}'
+       "valid_from":"2026-09-22T00:00:00+08:00",
+       "in_hit":0.04,"in_miss":2.0,"in_write":2.0,"out":8.0,
+       "peak_hours":["09:00-12:00","14:00-18:00"],"off_peak_ratio":0.5,"peak_tz":"+08:00",
+       "note":"官网高峰价，空闲×0.5"}'
 
 curl "http://127.0.0.1:8787/v1/_admin/prices/provider?provider=deepseek&upstream_model=deepseek-flash" \
   -H "Authorization: Bearer $ADMIN"     # 看历史（含被收口的旧行）
@@ -687,6 +708,7 @@ pricing:
   currency: CNY
   off_peak_ratio: 0.5                  # 空闲时段 = 高峰价 × 系数；不写就不分时段
   peak_hours: ["09:00-12:00", "14:00-18:00"]   # 高峰时段，仅周一~周五（不识别法定节假日）
+  peak_tz: "+08:00"                    # 时段按哪个时区判（固定偏移）；不写按 UTC —— 服务器在 UTC，务必显式给
   models:
     # 单价单位是「每百万 token」，和各家官网报价口径一致
     deepseek-flash:  {cache_hit: 0.04, cache_miss: 2.0, output: 8.0}

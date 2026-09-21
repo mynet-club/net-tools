@@ -22,9 +22,8 @@ type PricingConfig struct {
 	Currency     string                `yaml:"currency"`
 	OffPeakRatio float64               `yaml:"off_peak_ratio"`
 	PeakHours    []string              `yaml:"peak_hours"`
+	PeakTZ       string                `yaml:"peak_tz"`
 	Models       map[string]ModelPrice `yaml:"models"`
-
-	windows []timeWindow
 }
 
 // ModelPrice 是单个模型的单价（每百万 token）。
@@ -52,18 +51,13 @@ func (p *PricingConfig) normalize() error {
 		p.Currency = "CNY"
 	}
 	if p.OffPeakRatio < 0 || p.OffPeakRatio > 1 {
-		return fmt.Errorf("pricing.off_peak_ratio 需要在 0~1 之间（0 或 1 表示不分时段），当前是 %v", p.OffPeakRatio)
+		return fmt.Errorf("pricing.off_peak_ratio 需要在 0~1 之间（1 表示不分时段），当前是 %v", p.OffPeakRatio)
 	}
-	p.windows = nil
-	for _, spec := range p.PeakHours {
-		w, err := parseTimeWindow(spec)
-		if err != nil {
-			return fmt.Errorf("pricing.peak_hours 里的 %q 不是合法时段（形如 09:00-12:00）: %w", spec, err)
-		}
-		p.windows = append(p.windows, w)
+	if _, err := parseWindows(p.PeakHours); err != nil {
+		return fmt.Errorf("pricing 段: %w", err)
 	}
-	if len(p.windows) == 0 {
-		p.OffPeakRatio = 1 // 没配高峰时段就没有空闲概念
+	if _, err := ParseTZ(p.PeakTZ); err != nil {
+		return fmt.Errorf("pricing 段: %w", err)
 	}
 	for name, mp := range p.Models {
 		if mp.CacheHit < 0 || mp.CacheMiss < 0 || mp.Output < 0 {
@@ -124,25 +118,20 @@ func (p *PricingConfig) PriceFor(model string) (ModelPrice, bool) {
 	return ModelPrice{}, false
 }
 
-// ratioAt 返回该时刻的计价系数。
+// PeakRule 把全局配置表达成一条峰谷规则。
 //
-// 只按「周一~周五 + 时段」判断，不识别法定节假日 —— 那些天会按高峰价算，
-// 估算会略偏高。要更准就自己把单价填成实际均价。
+// 两处用到它：一是这里的估算路径；二是价目行自己没带峰谷规则时**沿用全局**
+// （provider_prices.peak_hours 为空就是这个意思）。
+func (p *PricingConfig) PeakRule() PeakRule {
+	if p == nil {
+		return PeakRule{}
+	}
+	return PeakRule{Hours: p.PeakHours, OffPeakRatio: p.OffPeakRatio, TZ: p.PeakTZ}
+}
+
+// ratioAt 返回该时刻的计价系数（见 PeakRule.RatioAt）。
 func (p *PricingConfig) ratioAt(t time.Time) float64 {
-	if p == nil || p.OffPeakRatio >= 1 || len(p.windows) == 0 {
-		return 1
-	}
-	wd := t.Weekday()
-	if wd == time.Saturday || wd == time.Sunday {
-		return p.OffPeakRatio
-	}
-	min := t.Hour()*60 + t.Minute()
-	for _, w := range p.windows {
-		if min >= w.startMin && min < w.endMin {
-			return 1
-		}
-	}
-	return p.OffPeakRatio
+	return p.PeakRule().RatioAt(t)
 }
 
 // Cost 估算一次请求的金额。priced=false 表示这个模型没配单价（金额按 0 计）。

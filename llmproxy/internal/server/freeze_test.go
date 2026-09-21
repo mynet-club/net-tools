@@ -124,23 +124,23 @@ func TestUpstreamCostBuckets(t *testing.T) {
 
 	// DeepSeek 风格：显式 hit/miss（写入算在未命中里），没有写入档
 	rec := &store.RequestRecord{PromptTokens: i(1000), CompletionTokens: i(100), CacheHitTokens: 800, CacheMissTokens: 200}
-	if got, want := upstreamCost(price, rec), (800*1.0+200*2.0+100*8.0)/1e6; math.Abs(got-want) > 1e-12 {
+	if got, want := upstreamCost(price, rec, 1), (800*1.0+200*2.0+100*8.0)/1e6; math.Abs(got-want) > 1e-12 {
 		t.Errorf("DeepSeek 风格：得到 %v，期望 %v", got, want)
 	}
 	// OpenAI 风格：命中 + 写入 + 未命中三档
 	rec = &store.RequestRecord{PromptTokens: i(1000), CompletionTokens: i(100), CacheHitTokens: 600, CacheWriteTokens: 300}
-	if got, want := upstreamCost(price, rec), (600*1.0+300*4.0+100*2.0+100*8.0)/1e6; math.Abs(got-want) > 1e-12 {
+	if got, want := upstreamCost(price, rec, 1), (600*1.0+300*4.0+100*2.0+100*8.0)/1e6; math.Abs(got-want) > 1e-12 {
 		t.Errorf("三档：得到 %v，期望 %v", got, want)
 	}
 	// hit+write 超过 prompt → 未命中夹成 0，不能把负数算进去
 	rec = &store.RequestRecord{PromptTokens: i(1000), CacheHitTokens: 800, CacheWriteTokens: 900}
-	if got, want := upstreamCost(price, rec), (800*1.0+900*4.0)/1e6; math.Abs(got-want) > 1e-12 {
+	if got, want := upstreamCost(price, rec, 1), (800*1.0+900*4.0)/1e6; math.Abs(got-want) > 1e-12 {
 		t.Errorf("超报夹取：得到 %v，期望 %v", got, want)
 	}
 	// 没有 token（失败请求）只算每请求费
 	rec = &store.RequestRecord{}
 	p2 := &store.ProviderPrice{PerRequestFee: 0.25}
-	if got := upstreamCost(p2, rec); math.Abs(got-0.25) > 1e-12 {
+	if got := upstreamCost(p2, rec, 1); math.Abs(got-0.25) > 1e-12 {
 		t.Errorf("无 token 时应当只算每请求费，实际 %v", got)
 	}
 }

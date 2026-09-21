@@ -54,6 +54,18 @@ type Server struct {
 
 	// 配置写回后等热加载的时长；测试里置 0 可跳过等待
 	configApplyWait time.Duration
+
+	// 规则 B 比价用的时钟。留空走 time.Now，测试可换成固定时刻 ——
+	// 「空闲时段谁便宜」这种判断依赖当前时间，不给测试一个把手就没法稳定断言。
+	nowFn func() time.Time
+}
+
+// now 返回当前时刻；测试可以通过 nowFn 固定它。
+func (s *Server) now() time.Time {
+	if s.nowFn != nil {
+		return s.nowFn()
+	}
+	return time.Now()
 }
 
 func New(cfgStore *config.Store, db *store.Store, r *router.Router, lg *logx.Logger) *Server {

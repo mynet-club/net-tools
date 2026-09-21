@@ -517,5 +517,48 @@ prov=$(curl -s -D - -o /dev/null -X POST "$GW/v1/chat/completions" \
 chk "没人点名时仍由直通兜底" "$prov" "global-up"
 
 echo
+echo "=== 21. 上游价目：录价之后请求的金额被冻结下来（峰谷字段走通）==="
+# 时段依赖真实时间，所以这里把 peak_hours 铺满全天、off_peak_ratio=1（系数恒为 1），
+# 断言因此与「跑测试时是几点」无关。「按哪个时区判、空闲打几折」由单测覆盖，
+# 这一节只验整条链路：录得进、读得回、请求的金额真的按它冻住。
+VA=$(python3 -c 'import time;print(time.strftime("%Y-%m-%dT%H:00:00", time.gmtime(time.time()-7200+8*3600))+"+08:00")')
+PROBE="e2e-price-probe"
+code=$(curl -s -o "$H/p21.json" -w '%{http_code}' -X PUT "$GW/v1/_admin/prices/provider" \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+  -d "{\"provider\":\"global-up\",\"upstream_model\":\"$PROBE\",\"valid_from\":\"$VA\",
+       \"in_hit\":1,\"in_miss\":2,\"out\":3,
+       \"peak_hours\":[\"00:00-24:00\"],\"off_peak_ratio\":1,\"peak_tz\":\"+08:00\",\"note\":\"e2e\"}")
+chk "录一条带峰谷的上游价目" "$code" "200"
+
+got=$(curl -s "$GW/v1/_admin/prices/provider?provider=global-up&upstream_model=$PROBE" \
+  -H "Authorization: Bearer $ADMIN" \
+  | python3 -c 'import json,sys;d=json.load(sys.stdin);p=d["prices"][0];print(p["peak_tz"],float(p["off_peak_ratio"]),len(p["peak_hours"]))')
+chk "峰谷字段原样读回" "$got" "+08:00 1.0 1"
+
+# 非法峰谷一律 400：IANA 时区名、越界偏移、坏时段写法、越界系数。
+# 每条用不同的 upstream_model，免得某条意外插入后把后面的"只追加"冲突混进来。
+i=0
+for bad in '"peak_tz":"Asia/Shanghai"' '"peak_tz":"+15:00"' '"peak_hours":["09:00"]' '"peak_hours":["09:00-12:00"],"off_peak_ratio":1.5'; do
+  i=$((i + 1))
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$GW/v1/_admin/prices/provider" \
+    -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+    -d "{\"provider\":\"e2e-bad\",\"upstream_model\":\"bad$i\",\"valid_from\":\"$VA\",$bad}")
+  chk "非法峰谷被拒（${bad}）" "$code" "400"
+done
+
+# 打一次请求：假上游固定报 prompt=1 / completion=1，全算未命中 →（1×2 + 1×3）/1e6
+prov=$(curl -s -D - -o /dev/null -X POST "$GW/v1/chat/completions" \
+  -H "Authorization: Bearer sk-single-user" -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$PROBE\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" \
+  | tr -d '\r' | sed -n 's/^[Xx]-[Ll]lmproxy-[Pp]rovider: *//p')
+chk "请求落到录了价目的那家" "$prov" "global-up"
+chk "上游成本已冻结且金额正确" \
+  "$(sqlite3 "$DB" "SELECT printf('%.6f', COALESCE(SUM(cost_upstream),0)) FROM requests WHERE upstream_model='$PROBE' AND price_upstream_id>0;")" \
+  "0.000005"
+chk "冻结行带上了币种" \
+  "$(sqlite3 "$DB" "SELECT currency FROM requests WHERE upstream_model='$PROBE' AND price_upstream_id>0 LIMIT 1;")" \
+  "CNY"
+
+echo
 echo "================ 结果：通过 $PASS 项，失败 $FAIL 项 ================"
 [ "$FAIL" -eq 0 ] || exit 1

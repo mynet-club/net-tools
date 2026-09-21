@@ -31,11 +31,15 @@ const ruleBQuotaCooldown = 5 * time.Minute
 //   - **跳过冷却中的候选**：这正是 402/429 记冷却的意义；也顺带避开熔断中的家。
 //   - **排序键是 in_miss + out**：把两档单价相加当标量，粗糙但透明 —— 输入输出都贵的家一定靠后。
 //     真正精确的做法是按实测 token 混合比加权，那需要历史数据，留待以后。
+//   - **乘上各家自己的峰谷系数**：单价是「供应商 × 模型 × 时段」的函数，两家的
+//     高峰时段（甚至时区）可以不同，同一时刻谁便宜会因此翻转。不乘就会在空闲时段
+//     把贵的家选出来 —— DeepSeek 的高峰价正好是空闲价的两倍，错一次就是双倍成本。
 func (s *Server) cheapestProvider(scope string, providers []config.Provider, model string) string {
 	if s.db == nil {
 		return ""
 	}
-	prices, err := s.db.ProviderPricesEffective(time.Now())
+	now := s.now()
+	prices, err := s.db.ProviderPricesEffective(now)
 	if err != nil {
 		s.log.Warnf("查当前在效价目失败，规则 B 本次跳过: %v", err)
 		return ""
@@ -65,7 +69,8 @@ func (s *Server) cheapestProvider(scope string, providers []config.Provider, mod
 		if !ok {
 			continue
 		}
-		cost := price.InMiss + price.Out
+		ratio := s.peakRuleAt(price.PeakHours, price.OffPeakRatio, price.PeakTZ).RatioAt(now)
+		cost := (price.InMiss + price.Out) * ratio
 		if best == "" || cost < bestCost {
 			best, bestCost = p.Name, cost
 		}

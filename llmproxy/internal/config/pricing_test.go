@@ -8,13 +8,18 @@ import (
 
 // 刻意不硬编码 2026-09-01 是周几：从任意基准日推到目标星期，
 // 这样测试与「今天」无关。
+//
+// 时刻用 +08:00 构造，与 samplePricing 里的 peak_tz 一致 —— 峰谷是按
+// **供应商时区**判的，与跑测试的机器在哪个时区无关。
 func weekdayAt(h, m int, wd time.Weekday) time.Time {
-	d := time.Date(2026, 9, 1, h, m, 0, 0, time.Local)
+	d := time.Date(2026, 9, 1, h, m, 0, 0, cst)
 	for d.Weekday() != wd {
 		d = d.AddDate(0, 0, 1)
 	}
 	return d
 }
+
+var cst = time.FixedZone("+08:00", 8*3600)
 
 func samplePricing(t *testing.T) *PricingConfig {
 	t.Helper()
@@ -22,6 +27,7 @@ func samplePricing(t *testing.T) *PricingConfig {
 		Currency:     "CNY",
 		OffPeakRatio: 0.5,
 		PeakHours:    []string{"09:00-12:00", "14:00-18:00"},
+		PeakTZ:       "+08:00",
 		Models: map[string]ModelPrice{
 			"deepseek-flash": {CacheHit: 0.04, CacheMiss: 2.0, Output: 8.0},
 			"*":              {CacheHit: 0, CacheMiss: 0, Output: 0},

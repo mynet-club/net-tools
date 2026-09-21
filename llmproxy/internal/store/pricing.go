@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/mynet-club/net-tools/llmproxy/internal/config"
 )
 
 // 计价与成本模型（设计见 docs/pricing-design.md）的存储层。
@@ -37,6 +39,7 @@ CREATE TABLE IF NOT EXISTS provider_prices (
   per_request_fee    REAL    NOT NULL DEFAULT 0,
   peak_hours         TEXT    NOT NULL DEFAULT '',
   off_peak_ratio     REAL,
+  peak_tz            TEXT    NOT NULL DEFAULT '',
   valid_from         INTEGER NOT NULL,
   valid_to           INTEGER NOT NULL DEFAULT 0,
   note               TEXT    NOT NULL DEFAULT '',
@@ -55,6 +58,9 @@ CREATE TABLE IF NOT EXISTS user_prices (
   out                REAL    NOT NULL DEFAULT 0,
   reasoning_out      REAL    NOT NULL DEFAULT 0,
   per_request_fee    REAL    NOT NULL DEFAULT 0,
+  peak_hours         TEXT    NOT NULL DEFAULT '',
+  off_peak_ratio     REAL,
+  peak_tz            TEXT    NOT NULL DEFAULT '',
   valid_from         INTEGER NOT NULL,
   valid_to           INTEGER NOT NULL DEFAULT 0,
   note               TEXT    NOT NULL DEFAULT '',
@@ -76,12 +82,15 @@ type ProviderPrice struct {
 	Out           float64
 	ReasoningOut  float64 // 0 = 与 Out 同价
 	PerRequestFee float64
-	PeakHours     []string // nil = 沿用全局
-	OffPeakRatio  *float64 // nil = 沿用全局
-	ValidFrom     time.Time
-	ValidTo       time.Time // 零值 = 一直有效
-	Note          string
-	CreatedAt     time.Time
+	// 峰谷规则：价目行自带，空则**沿用全局**（config.yaml 的 pricing 段）。
+	// 按供应商所在时区判（TZ 形如 "+08:00"），不是服务器时区。
+	PeakHours    []string // nil = 沿用全局
+	OffPeakRatio *float64 // nil = 沿用全局
+	PeakTZ       string   // "" = 沿用全局
+	ValidFrom    time.Time
+	ValidTo      time.Time // 零值 = 一直有效
+	Note         string
+	CreatedAt    time.Time
 }
 
 // UserPrice 是一条**分发**价目行（我们向用户收多少）。
@@ -97,6 +106,9 @@ type UserPrice struct {
 	Out           float64
 	ReasoningOut  float64
 	PerRequestFee float64
+	PeakHours     []string // 同上，空 = 沿用全局
+	OffPeakRatio  *float64
+	PeakTZ        string
 	ValidFrom     time.Time
 	ValidTo       time.Time
 	Note          string
@@ -121,6 +133,16 @@ func validateRate(name string, v float64) error {
 		return fmt.Errorf("%s 不能为负，当前是 %v", name, v)
 	}
 	return nil
+}
+
+// validatePeak 校验价目行自带的峰谷规则。
+// 空值（= 沿用全局）不做校验 —— 那是 config.yaml 里 pricing 段的事。
+func validatePeak(hours []string, ratio *float64, tz string) error {
+	r := config.PeakRule{Hours: hours, TZ: tz}
+	if ratio != nil {
+		r.OffPeakRatio = *ratio
+	}
+	return r.Validate()
 }
 
 func (p *ProviderPrice) validate() error {
@@ -159,7 +181,7 @@ func (p *ProviderPrice) validate() error {
 			return err
 		}
 	}
-	return nil
+	return validatePeak(p.PeakHours, p.OffPeakRatio, p.PeakTZ)
 }
 
 func (p *UserPrice) validate() error {
@@ -203,7 +225,7 @@ func (p *UserPrice) validate() error {
 			return err
 		}
 	}
-	return nil
+	return validatePeak(p.PeakHours, p.OffPeakRatio, p.PeakTZ)
 }
 
 func tsOf(t time.Time) int64 {
@@ -258,11 +280,11 @@ func (s *Store) InsertProviderPrice(p *ProviderPrice) error {
 	}
 	res, err := tx.Exec(`INSERT INTO provider_prices
 		(provider, upstream_model, currency, in_miss, in_hit, in_write, out, reasoning_out,
-		 per_request_fee, peak_hours, off_peak_ratio, valid_from, valid_to, note, created_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 per_request_fee, peak_hours, off_peak_ratio, peak_tz, valid_from, valid_to, note, created_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		p.Provider, p.UpstreamModel, p.Currency, p.InMiss, p.InHit, p.InWrite, p.Out, p.ReasoningOut,
-		p.PerRequestFee, strings.Join(p.PeakHours, ","), p.OffPeakRatio, p.ValidFrom.UnixMilli(),
-		tsOf(p.ValidTo), p.Note, p.CreatedAt.UnixMilli())
+		p.PerRequestFee, strings.Join(p.PeakHours, ","), p.OffPeakRatio, p.PeakTZ,
+		p.ValidFrom.UnixMilli(), tsOf(p.ValidTo), p.Note, p.CreatedAt.UnixMilli())
 	if err != nil {
 		return err
 	}
@@ -308,10 +330,11 @@ func (s *Store) InsertUserPrice(p *UserPrice) error {
 	}
 	res, err := tx.Exec(`INSERT INTO user_prices
 		(scope, model, currency, in_miss, in_hit, in_write, out, reasoning_out,
-		 per_request_fee, valid_from, valid_to, note, created_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 per_request_fee, peak_hours, off_peak_ratio, peak_tz, valid_from, valid_to, note, created_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		p.Scope, p.Model, p.Currency, p.InMiss, p.InHit, p.InWrite, p.Out, p.ReasoningOut,
-		p.PerRequestFee, p.ValidFrom.UnixMilli(), tsOf(p.ValidTo), p.Note, p.CreatedAt.UnixMilli())
+		p.PerRequestFee, strings.Join(p.PeakHours, ","), p.OffPeakRatio, p.PeakTZ,
+		p.ValidFrom.UnixMilli(), tsOf(p.ValidTo), p.Note, p.CreatedAt.UnixMilli())
 	if err != nil {
 		return err
 	}
@@ -322,8 +345,16 @@ func (s *Store) InsertUserPrice(p *UserPrice) error {
 }
 
 const providerPriceCols = `id, provider, upstream_model, currency, in_miss, in_hit, in_write,
-	out, reasoning_out, per_request_fee, peak_hours, off_peak_ratio, valid_from, valid_to, note, created_at`
+	out, reasoning_out, per_request_fee, peak_hours, off_peak_ratio, peak_tz,
+	valid_from, valid_to, note, created_at`
 
+const userPriceCols = `id, scope, model, currency, in_miss, in_hit, in_write,
+	out, reasoning_out, per_request_fee, peak_hours, off_peak_ratio, peak_tz,
+	valid_from, valid_to, note, created_at`
+
+// scanProviderPrice / scanUserPrice 是两张表各自**唯一**的读取路径。
+// 列与 Scan 必须一一对应，抽出来是为了让「加了列忘了改 Scan」这类错
+// 只可能发生在一个地方（曾经因为 SELECT 与 Scan 不同步而静默查不出数据）。
 func scanProviderPrice(row interface{ Scan(...any) error }) (*ProviderPrice, error) {
 	var (
 		p         ProviderPrice
@@ -334,7 +365,34 @@ func scanProviderPrice(row interface{ Scan(...any) error }) (*ProviderPrice, err
 		createdAt int64
 	)
 	if err := row.Scan(&p.ID, &p.Provider, &p.UpstreamModel, &p.Currency, &p.InMiss, &p.InHit,
-		&p.InWrite, &p.Out, &p.ReasoningOut, &p.PerRequestFee, &peak, &offPeak,
+		&p.InWrite, &p.Out, &p.ReasoningOut, &p.PerRequestFee, &peak, &offPeak, &p.PeakTZ,
+		&validFrom, &validTo, &p.Note, &createdAt); err != nil {
+		return nil, err
+	}
+	if peak != "" {
+		p.PeakHours = strings.Split(peak, ",")
+	}
+	if offPeak.Valid {
+		v := offPeak.Float64
+		p.OffPeakRatio = &v
+	}
+	p.ValidFrom = timeOf(validFrom)
+	p.ValidTo = timeOf(validTo)
+	p.CreatedAt = timeOf(createdAt)
+	return &p, nil
+}
+
+func scanUserPrice(row interface{ Scan(...any) error }) (*UserPrice, error) {
+	var (
+		p         UserPrice
+		peak      string
+		offPeak   sql.NullFloat64
+		validFrom int64
+		validTo   int64
+		createdAt int64
+	)
+	if err := row.Scan(&p.ID, &p.Scope, &p.Model, &p.Currency, &p.InMiss, &p.InHit, &p.InWrite,
+		&p.Out, &p.ReasoningOut, &p.PerRequestFee, &peak, &offPeak, &p.PeakTZ,
 		&validFrom, &validTo, &p.Note, &createdAt); err != nil {
 		return nil, err
 	}
@@ -403,28 +461,17 @@ func (s *Store) UserPriceAt(userName, model string, t time.Time) (*UserPrice, er
 		scopes = []string{ScopeUser(userName), ScopeDefault} // 最具体的那条生效
 	}
 	for _, scope := range scopes {
-		row := s.db.QueryRow(`SELECT id, scope, model, currency, in_miss, in_hit, in_write,
-			out, reasoning_out, per_request_fee, valid_from, valid_to, note, created_at
-			FROM user_prices WHERE scope=? AND model=? AND valid_from<=? AND (valid_to=0 OR valid_to>?)
+		row := s.db.QueryRow(`SELECT `+userPriceCols+` FROM user_prices
+			WHERE scope=? AND model=? AND valid_from<=? AND (valid_to=0 OR valid_to>?)
 			ORDER BY valid_from DESC LIMIT 1`, scope, model, ts, ts)
-		var (
-			p         UserPrice
-			validFrom int64
-			validTo   int64
-			createdAt int64
-		)
-		err := row.Scan(&p.ID, &p.Scope, &p.Model, &p.Currency, &p.InMiss, &p.InHit, &p.InWrite,
-			&p.Out, &p.ReasoningOut, &p.PerRequestFee, &validFrom, &validTo, &p.Note, &createdAt)
+		p, err := scanUserPrice(row)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
 		if err != nil {
 			return nil, err
 		}
-		p.ValidFrom = timeOf(validFrom)
-		p.ValidTo = timeOf(validTo)
-		p.CreatedAt = timeOf(createdAt)
-		return &p, nil
+		return p, nil
 	}
 	return nil, nil
 }
@@ -451,29 +498,19 @@ func (s *Store) ListProviderPrices(provider, upstreamModel string) ([]ProviderPr
 
 // ListUserPrices 列出某个 (scope, model) 的全部分发价目行（含历史），按 valid_from 升序。
 func (s *Store) ListUserPrices(scope, model string) ([]UserPrice, error) {
-	rows, err := s.db.Query(`SELECT id, scope, model, currency, in_miss, in_hit, in_write,
-		out, reasoning_out, per_request_fee, valid_from, valid_to, note, created_at
-		FROM user_prices WHERE scope=? AND model=? ORDER BY valid_from ASC`, scope, model)
+	rows, err := s.db.Query(`SELECT `+userPriceCols+` FROM user_prices
+		WHERE scope=? AND model=? ORDER BY valid_from ASC`, scope, model)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
 	out := []UserPrice{}
 	for rows.Next() {
-		var (
-			p         UserPrice
-			validFrom int64
-			validTo   int64
-			createdAt int64
-		)
-		if err := rows.Scan(&p.ID, &p.Scope, &p.Model, &p.Currency, &p.InMiss, &p.InHit, &p.InWrite,
-			&p.Out, &p.ReasoningOut, &p.PerRequestFee, &validFrom, &validTo, &p.Note, &createdAt); err != nil {
+		p, err := scanUserPrice(rows)
+		if err != nil {
 			return nil, err
 		}
-		p.ValidFrom = timeOf(validFrom)
-		p.ValidTo = timeOf(validTo)
-		p.CreatedAt = timeOf(createdAt)
-		out = append(out, p)
+		out = append(out, *p)
 	}
 	return out, rows.Err()
 }
@@ -481,6 +518,20 @@ func (s *Store) ListUserPrices(scope, model string) ([]UserPrice, error) {
 // migratePricingColumns 给**已有**的库补上计价冻结相关列。
 // 新库由 schema 里的 DDL 一次建全，这里只管老库升级（生产上的库已经有 requests/usage_daily 数据）。
 func migratePricingColumns(db *sql.DB) error {
+	// 峰谷时区是后加的：老库的价目表已经有 peak_hours / off_peak_ratio
+	//（user_prices 连这两个都没有），这里一次补齐。
+	if err := addColumnsIfMissing(db, "provider_prices", map[string]string{
+		"peak_tz": "TEXT NOT NULL DEFAULT ''",
+	}); err != nil {
+		return err
+	}
+	if err := addColumnsIfMissing(db, "user_prices", map[string]string{
+		"peak_hours":     "TEXT NOT NULL DEFAULT ''",
+		"off_peak_ratio": "REAL",
+		"peak_tz":        "TEXT NOT NULL DEFAULT ''",
+	}); err != nil {
+		return err
+	}
 	if err := addColumnsIfMissing(db, "requests", map[string]string{
 		"cache_write_tokens":  "INTEGER",
 		"price_upstream_id":   "INTEGER NOT NULL DEFAULT 0",

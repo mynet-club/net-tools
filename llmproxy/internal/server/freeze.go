@@ -13,6 +13,7 @@ import (
 // 为什么用开始时刻：上游只在响应结束时给一份 usage 快照，**没有 token 时间线**；
 // 要按生成时刻切进不同价格区间，只能按请求时长摊分 —— 那是估计，不是计量。
 // 一个请求一个价，与「价格整点生效」的价目表一一对应，可审计。
+// 峰谷同理：用的是开始时刻那个时段的系数，不是结束时刻的。
 //
 // 只冻结**系统付费**（走系统池）的请求：BYO 用户用自己的上游，网关不掏钱，
 // 真实成本该是 0，而且上游价目表里也没有他家的行。这类请求保持「未冻结」，
@@ -34,15 +35,46 @@ func (s *Server) freezeUpstreamCost(rec *store.RequestRecord, started time.Time)
 	if price == nil {
 		return // 没配价目 → 保持未冻结，报表归入估算段
 	}
-	amount := upstreamCost(price, rec)
+	ratio := s.peakRuleAt(price.PeakHours, price.OffPeakRatio, price.PeakTZ).RatioAt(started)
+	amount := upstreamCost(price, rec, ratio)
 	rec.PriceUpstreamID = price.ID
 	rec.CostUpstream = &amount
 	rec.Currency = price.Currency
 }
 
+// globalPeakRule 是全局（config.yaml 的 pricing 段）的峰谷规则，作为价目行的回落。
+func (s *Server) globalPeakRule() config.PeakRule {
+	if s.cfgStore == nil {
+		return config.PeakRule{}
+	}
+	if c := s.cfgStore.Current(); c != nil {
+		return c.Pricing.PeakRule()
+	}
+	return config.PeakRule{}
+}
+
+// peakRuleAt 组装这次请求该用的峰谷规则：价目行自带的部分优先，**逐字段**沿用全局。
+//
+// 逐字段而不是整条覆盖：价目行可能只填了 peak_hours 而没填 peak_tz，
+// 那意思是"时段我定，时区用全局的"，不该因为 ratio 为空就把时段一起丢掉。
+func (s *Server) peakRuleAt(hours []string, ratio *float64, tz string) config.PeakRule {
+	r := s.globalPeakRule()
+	if len(hours) > 0 {
+		r.Hours = hours
+	}
+	if ratio != nil {
+		r.OffPeakRatio = *ratio
+	}
+	if tz != "" {
+		r.TZ = tz
+	}
+	return r
+}
+
 // upstreamCost 按上游价目的三档算一次请求的成本（单价单位是「每百万 token」）。
-func upstreamCost(p *store.ProviderPrice, rec *store.RequestRecord) float64 {
-	return costFromRates(p.InHit, p.InMiss, p.InWrite, p.Out, p.PerRequestFee, rec)
+// ratio 是该时刻的峰谷系数（高峰 1，空闲按配置打折）。
+func upstreamCost(p *store.ProviderPrice, rec *store.RequestRecord, ratio float64) float64 {
+	return costFromRates(p.InHit, p.InMiss, p.InWrite, p.Out, p.PerRequestFee, rec, ratio)
 }
 
 // costFromRates 是上游价与分发价共用的三档算法：两层价格的费率形状完全一致，
@@ -52,9 +84,12 @@ func upstreamCost(p *store.ProviderPrice, rec *store.RequestRecord) float64 {
 //   - DeepSeek 类：显式报 hit/miss（写入被算在未命中里），以它为准；
 //   - neolink 类：报 cached_tokens（命中）与 cache_write_tokens（写入），未命中要减出来。
 //
+// 峰谷系数只乘 token 部分，**不乘 per_request_fee**：每请求固定费是接入费，
+// 与用量无关，供应商也不给它做峰谷浮动。
+//
 // reasoning_out（推理输出单独计价）暂时不生效：我们还没解析上游的 reasoning_tokens，
 // 拿不到那个数就不该假装算得准 —— 输出一律按 out 档计。
-func costFromRates(inHit, inMiss, inWrite, out, perReq float64, rec *store.RequestRecord) float64 {
+func costFromRates(inHit, inMiss, inWrite, out, perReq float64, rec *store.RequestRecord, ratio float64) float64 {
 	prompt := tokOr0(rec.PromptTokens)
 	completion := tokOr0(rec.CompletionTokens)
 
@@ -76,7 +111,7 @@ func costFromRates(inHit, inMiss, inWrite, out, perReq float64, rec *store.Reque
 	}
 
 	sum := float64(hit)*inHit + float64(write)*inWrite + float64(miss)*inMiss + float64(completion)*out
-	return sum/1e6 + perReq
+	return sum/1e6*ratio + perReq
 }
 
 // freezeDownstreamCharge 按**分发价**（user_prices）冻结"向这个用户收多少钱"。
@@ -100,7 +135,8 @@ func (s *Server) freezeDownstreamCharge(rec *store.RequestRecord, started time.T
 	if price == nil {
 		return // 没配分发价 → 保持未冻结，计费侧按估算兜底
 	}
-	amount := costFromRates(price.InHit, price.InMiss, price.InWrite, price.Out, price.PerRequestFee, rec)
+	ratio := s.peakRuleAt(price.PeakHours, price.OffPeakRatio, price.PeakTZ).RatioAt(started)
+	amount := costFromRates(price.InHit, price.InMiss, price.InWrite, price.Out, price.PerRequestFee, rec, ratio)
 	rec.PriceDownstreamID = price.ID
 	rec.Charge = &amount
 	if rec.Currency == "" {

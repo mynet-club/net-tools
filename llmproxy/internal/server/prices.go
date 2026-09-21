@@ -34,24 +34,28 @@ type providerPriceIn struct {
 	PerRequestFee float64  `json:"per_request_fee"`
 	PeakHours     []string `json:"peak_hours"`
 	OffPeakRatio  *float64 `json:"off_peak_ratio"`
+	PeakTZ        string   `json:"peak_tz"`
 	ValidFrom     string   `json:"valid_from"`
 	ValidTo       string   `json:"valid_to"`
 	Note          string   `json:"note"`
 }
 
 type userPriceIn struct {
-	Scope         string  `json:"scope"`
-	Model         string  `json:"model"`
-	Currency      string  `json:"currency"`
-	InMiss        float64 `json:"in_miss"`
-	InHit         float64 `json:"in_hit"`
-	InWrite       float64 `json:"in_write"`
-	Out           float64 `json:"out"`
-	ReasoningOut  float64 `json:"reasoning_out"`
-	PerRequestFee float64 `json:"per_request_fee"`
-	ValidFrom     string  `json:"valid_from"`
-	ValidTo       string  `json:"valid_to"`
-	Note          string  `json:"note"`
+	Scope         string   `json:"scope"`
+	Model         string   `json:"model"`
+	Currency      string   `json:"currency"`
+	InMiss        float64  `json:"in_miss"`
+	InHit         float64  `json:"in_hit"`
+	InWrite       float64  `json:"in_write"`
+	Out           float64  `json:"out"`
+	ReasoningOut  float64  `json:"reasoning_out"`
+	PerRequestFee float64  `json:"per_request_fee"`
+	PeakHours     []string `json:"peak_hours"`
+	OffPeakRatio  *float64 `json:"off_peak_ratio"`
+	PeakTZ        string   `json:"peak_tz"`
+	ValidFrom     string   `json:"valid_from"`
+	ValidTo       string   `json:"valid_to"`
+	Note          string   `json:"note"`
 }
 
 // parsePriceTime 解析 RFC3339 时间；空串 = 零值（一直有效 / 由校验决定）。
@@ -81,6 +85,9 @@ func providerPriceJSON(p store.ProviderPrice) map[string]any {
 	if p.OffPeakRatio != nil {
 		out["off_peak_ratio"] = *p.OffPeakRatio
 	}
+	if p.PeakTZ != "" {
+		out["peak_tz"] = p.PeakTZ
+	}
 	out["valid_from"] = p.ValidFrom
 	if !p.ValidTo.IsZero() {
 		out["valid_to"] = p.ValidTo
@@ -94,6 +101,15 @@ func userPriceJSON(p store.UserPrice) map[string]any {
 		"in_miss": p.InMiss, "in_hit": p.InHit, "in_write": p.InWrite,
 		"out": p.Out, "reasoning_out": p.ReasoningOut, "per_request_fee": p.PerRequestFee,
 		"note": p.Note, "created_at": p.CreatedAt, "valid_from": p.ValidFrom,
+	}
+	if len(p.PeakHours) > 0 {
+		out["peak_hours"] = p.PeakHours
+	}
+	if p.OffPeakRatio != nil {
+		out["off_peak_ratio"] = *p.OffPeakRatio
+	}
+	if p.PeakTZ != "" {
+		out["peak_tz"] = p.PeakTZ
 	}
 	if !p.ValidTo.IsZero() {
 		out["valid_to"] = p.ValidTo
@@ -157,7 +173,7 @@ func (s *Server) adminPutProviderPrice(w http.ResponseWriter, r *http.Request) {
 		Provider: in.Provider, UpstreamModel: in.UpstreamModel, Currency: in.Currency,
 		InMiss: in.InMiss, InHit: in.InHit, InWrite: in.InWrite, Out: in.Out,
 		ReasoningOut: in.ReasoningOut, PerRequestFee: in.PerRequestFee,
-		PeakHours: in.PeakHours, OffPeakRatio: in.OffPeakRatio,
+		PeakHours: in.PeakHours, OffPeakRatio: in.OffPeakRatio, PeakTZ: in.PeakTZ,
 		ValidFrom: validFrom, ValidTo: validTo, Note: in.Note,
 	}
 	if err := s.db.InsertProviderPrice(p); err != nil {
@@ -190,6 +206,7 @@ func (s *Server) adminPutUserPrice(w http.ResponseWriter, r *http.Request) {
 		Scope: in.Scope, Model: in.Model, Currency: in.Currency,
 		InMiss: in.InMiss, InHit: in.InHit, InWrite: in.InWrite, Out: in.Out,
 		ReasoningOut: in.ReasoningOut, PerRequestFee: in.PerRequestFee,
+		PeakHours: in.PeakHours, OffPeakRatio: in.OffPeakRatio, PeakTZ: in.PeakTZ,
 		ValidFrom: validFrom, ValidTo: validTo, Note: in.Note,
 	}
 	if err := s.db.InsertUserPrice(p); err != nil {
