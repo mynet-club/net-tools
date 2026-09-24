@@ -52,6 +52,14 @@ type Server struct {
 	// 见 affinity.go 与 forwarder.go 里的接线。
 	affinity *affinityStore
 
+	// persistFailures 是「请求已成功返回给客户端、但记账落库失败」的累计次数。
+	//
+	// 这个数必须是**可观测**的：落库失败时请求已经发出去了，账却永久丢失 ——
+	// README 承诺的「客户端成功数 / 上游收到数 / 数据库落库数三者一致」会静默破裂，
+	// 而只写一行 ERROR 日志的话，没人盯着日志就永远发现不了。
+	// 所以暴露到 /healthz，让监控能直接盯这一个数。
+	persistFailures atomic.Int64
+
 	// 配置写回后等热加载的时长；测试里置 0 可跳过等待
 	configApplyWait time.Duration
 
@@ -321,8 +329,14 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		"uptime_s":  int(time.Since(s.startedAt).Seconds()),
 		"revision":  s.cfgStore.Revision(),
 		"providers": len(cfg.Normalized),
+		// 非 0 表示有请求已经成功返回给客户端、但记账没落库 —— 账在丢，要查磁盘/锁。
+		// 刻意不影响 status：转发本身是好的，把它标成不健康会让监控误判成服务不可用。
+		"persist_failures": s.persistFailures.Load(),
 	})
 }
+
+// PersistFailures 返回记账落库失败的累计次数（观测/测试用）。
+func (s *Server) PersistFailures() int64 { return s.persistFailures.Load() }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {

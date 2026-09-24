@@ -190,3 +190,54 @@ func TestFreezeSkippedForNonSystemPaid(t *testing.T) {
 		t.Error("系统付费的请求应当被冻结")
 	}
 }
+
+// 上游**同时**回报两种缓存形状时不能重复计费。
+//
+// cacheSplit 的 DeepSeek 分支与 OpenAI 分支对 cache_write_tokens 并不互斥 ——
+// 聚合商转发时把两家字段混在一个 usage 里是可能的。而 DeepSeek 的显式 miss 按口径
+// **已经包含**写入，于是 write 会被算两遍：prompt=1000 / hit=400 / miss=600 / write=300
+// 时三档之和是 1300，超出 prompt 300。
+//
+// 夹取 miss 而不是丢弃 write：既然上游专门回报了 cache_write_tokens，说明它确实按
+// 写入档单独计费（Anthropic 系约 1.25× 溢价），丢掉 write 是低估。夹取后
+// hit+write+miss 恰好等于 prompt，不变式成立。
+func TestUpstreamCostClampsWhenBucketsExceedPrompt(t *testing.T) {
+	price := &store.ProviderPrice{InHit: 1, InMiss: 2, InWrite: 4, Out: 8}
+	i := func(v int64) *int64 { return &v }
+
+	// 两种形状并存：显式 hit/miss + cache_write_tokens
+	rec := &store.RequestRecord{
+		PromptTokens:   i(1000),
+		CacheHitTokens: 400, CacheMissTokens: 600, CacheWriteTokens: 300,
+	}
+	// 夹取后 miss = 1000 - 400 - 300 = 300
+	want := (400*1.0 + 300*4.0 + 300*2.0) / 1e6      // 0.0022
+	unclamped := (400*1.0 + 300*4.0 + 600*2.0) / 1e6 // 0.0028（超报 300 token）
+	if got := upstreamCost(price, rec, 1); math.Abs(got-want) > 1e-12 {
+		t.Errorf("三档之和超过 prompt 时应当夹取 miss：得到 %v，期望 %v（不夹取会是 %v，多收 %.0f%%）",
+			got, want, unclamped, (unclamped/want-1)*100)
+	}
+
+	// hit+write 本身就超过 prompt → miss 夹到 0，不能出现负数
+	rec = &store.RequestRecord{PromptTokens: i(1000), CacheHitTokens: 800, CacheWriteTokens: 900}
+	want = (800*1.0 + 900*4.0) / 1e6
+	if got := upstreamCost(price, rec, 1); math.Abs(got-want) > 1e-12 {
+		t.Errorf("hit+write 超报时 miss 应夹到 0：得到 %v，期望 %v", got, want)
+	}
+
+	// 正常情况（miss 由 prompt 减出来，三档之和恰好等于 prompt）不受夹取影响
+	rec = &store.RequestRecord{
+		PromptTokens: i(1000), CompletionTokens: i(100),
+		CacheHitTokens: 600, CacheWriteTokens: 300,
+	}
+	want = (600*1.0 + 300*4.0 + 100*2.0 + 100*8.0) / 1e6
+	if got := upstreamCost(price, rec, 1); math.Abs(got-want) > 1e-12 {
+		t.Errorf("正常三档不该被夹取影响：得到 %v，期望 %v", got, want)
+	}
+
+	// prompt 为 0（失败请求）时不夹取，只算每请求费
+	rec = &store.RequestRecord{}
+	if got := upstreamCost(&store.ProviderPrice{PerRequestFee: 0.25}, rec, 1); math.Abs(got-0.25) > 1e-12 {
+		t.Errorf("无 token 时应当只算每请求费，实际 %v", got)
+	}
+}

@@ -913,3 +913,47 @@ providers:
 		t.Errorf("直通型供应商不应贡献模型名, got %d 个", len(parsed.Data))
 	}
 }
+
+// 记账落库失败必须**可观测**。
+//
+// 落库失败时请求已经成功返回给客户端了，这笔账却永久丢失 —— README 承诺的
+// 「客户端成功数 / 上游收到数 / 数据库落库数三者一致」会静默破裂。只写一行 ERROR
+// 日志的话，没人盯着日志就永远发现不了，所以计数要暴露到 /healthz 让监控能直接盯。
+func TestPersistFailureIsObservable(t *testing.T) {
+	up := startMockUpstream(t, &mockUpstream{name: "vendorA", apiKey: "sk-vendorA"})
+	h := newHarness(t, cfgYAML(map[string]string{"vendorA": up.baseURL}, []string{"sk-local"}))
+
+	if got := h.srv.PersistFailures(); got != 0 {
+		t.Fatalf("初始计数应当是 0，实际 %d", got)
+	}
+	_, body := h.get(t, "/healthz", "")
+	if !bytes.Contains(body, []byte(`"persist_failures":0`)) {
+		t.Errorf("healthz 应当暴露 persist_failures 字段: %s", body)
+	}
+
+	// 关掉库制造落库失败
+	if err := h.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, body := h.post(t, "/v1/chat/completions", "sk-local", map[string]any{
+		"model":    "gpt-4o",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	})
+	// 转发本身不该受影响：记账是响应之后的事，账丢了也不能把客户端的请求弄失败
+	if resp.StatusCode != 200 {
+		t.Errorf("记账失败不该影响转发，实际 %d: %s", resp.StatusCode, body)
+	}
+	if got := h.srv.PersistFailures(); got != 1 {
+		t.Errorf("落库失败应当被计数，实际 %d", got)
+	}
+
+	_, body = h.get(t, "/healthz", "")
+	if !bytes.Contains(body, []byte(`"persist_failures":1`)) {
+		t.Errorf("healthz 应当反映计数: %s", body)
+	}
+	// 但 status 仍然是 ok：转发是好的，标成不健康会让监控误判成服务不可用
+	if !bytes.Contains(body, []byte(`"status":"ok"`)) {
+		t.Errorf("记账失败不该把 status 标成不健康: %s", body)
+	}
+}

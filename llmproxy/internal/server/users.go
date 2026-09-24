@@ -111,10 +111,25 @@ func (s *Server) SyncUsersIfChanged() {
 }
 
 func (s *Server) buildRegistry() (*userRegistry, error) {
+	// Revision 必须在读数据**之前**取。
+	//
+	// 下面四次查询不在一个事务里，而 CLI 是另一个进程、随时可能提交一次写。
+	// 如果 rev 留到最后读，就可能出现「数据是 rev=5 的快照、rev 却记成 6」——
+	// 之后 SyncUsersIfChanged 比对 cur.rev == rev 成立、直接 return，
+	// 于是新建的用户会一直 401，直到有别的东西再改一次配置才被动重建。
+	// 那正是 main.go 里「改完立刻能用」想避免的症状，而 SIGHUP 快路径自己就有这个竞态。
+	//
+	// 反过来先读 rev 就是安全方向：并发写只会让 reg.rev **偏小**，
+	// 下一轮 2 秒轮询必然发现不一致并重建。宁可多重建一次，不要漏一次。
+	rev, err := s.db.Revision()
+	if err != nil {
+		return nil, err
+	}
 	reg := &userRegistry{
 		byToken:  map[string]*userEntry{},
 		byName:   map[string]*userEntry{},
 		loadedAt: time.Now(),
+		rev:      rev,
 	}
 	users, err := s.db.ListUsers()
 	if err != nil {
@@ -155,9 +170,6 @@ func (s *Server) buildRegistry() (*userRegistry, error) {
 		}
 		reg.byToken[u.TokenHash] = e
 		reg.byName[u.Name] = e
-	}
-	if rev, err := s.db.Revision(); err == nil {
-		reg.rev = rev
 	}
 	return reg, nil
 }

@@ -649,7 +649,10 @@ func (s *Server) persist(rec *store.RequestRecord) {
 		return
 	}
 	if err := s.db.InsertRequest(*rec); err != nil {
-		s.log.Errorf("写入请求日志失败: %v", err)
+		// 请求已经成功返回给客户端了，这笔账却永久丢了 —— 计数器 + 日志双管齐下，
+		// 因为只写日志的话没人盯着就永远发现不了（详见 Server.persistFailures 的注释）。
+		n := s.persistFailures.Add(1)
+		s.log.Errorf("写入请求日志失败（累计 %d 次，账在丢，请查磁盘空间与库锁）: %v", n, err)
 	}
 }
 

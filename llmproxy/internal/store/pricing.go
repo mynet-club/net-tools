@@ -420,6 +420,22 @@ func scanUserPrice(row interface{ Scan(...any) error }) (*UserPrice, error) {
 // ProviderPriceAt 查某个时刻对该 (供应商, 上游模型) 生效的上游价目行；没有则返回 nil。
 // 生效区间是半开区间 [valid_from, valid_to)。价目行本身整点生效，所以用时刻本身判断
 // 与「先整点截断再查」等价。
+//
+// ORDER BY 带 `id DESC` 做确定性 tie-break：正常情况下同一 (供应商, 模型) 不该有两条
+// valid_from 相同的行（插入时的「只追加」校验会拒），但表上**没有 UNIQUE 约束**，
+// 直接 SQL 插入仍可能造出并列。没有 tie-break 时 LIMIT 1 取哪条由 SQLite 决定，
+// 同一份库两次查可能给出不同金额 —— 那是不可复现的账。
+//
+// 实测下来 SQLite 目前**碰巧**给出与 `id DESC` 相同的结果（索引会隐式附加 rowid，
+// 等值 valid_from 的条目按 rowid 升序排列，DESC 扫描自然先遇到最大 id）。
+// 但那是实现细节、不是契约，所以这里显式写出来。也正因为碰巧一致，
+// 这一条**没有**回归测试能区分「有 tie-break」与「没有」—— 写过的版本在去掉
+// tie-break 后照样通过，那种测试只会制造假信心，已删除。
+//
+// 跨进程竞态造不出并列：DSN 里带了 _txlock=immediate，事务一开始就拿写锁，
+// 第二个事务必须等第一个提交，于是它的 SELECT MAX(valid_from) 能看到前者的行、
+// 被「只追加」校验拒掉。这也是没有给两张价目表加 UNIQUE 约束的理由 ——
+// 为一个 API 已不可达的状态在有真实数据的生产库上做迁移，不划算。
 func (s *Store) ProviderPriceAt(provider, upstreamModel string, t time.Time) (*ProviderPrice, error) {
 	if strings.TrimSpace(provider) == "" || strings.TrimSpace(upstreamModel) == "" {
 		return nil, errors.New("provider 与 upstream_model 不能为空")
@@ -427,7 +443,7 @@ func (s *Store) ProviderPriceAt(provider, upstreamModel string, t time.Time) (*P
 	ts := t.UnixMilli()
 	row := s.db.QueryRow(`SELECT `+providerPriceCols+` FROM provider_prices
 		WHERE provider=? AND upstream_model=? AND valid_from<=? AND (valid_to=0 OR valid_to>?)
-		ORDER BY valid_from DESC LIMIT 1`, provider, upstreamModel, ts, ts)
+		ORDER BY valid_from DESC, id DESC LIMIT 1`, provider, upstreamModel, ts, ts)
 	p, err := scanProviderPrice(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -471,7 +487,7 @@ func (s *Store) UserPriceAt(userName, model string, t time.Time) (*UserPrice, er
 	for _, scope := range scopes {
 		row := s.db.QueryRow(`SELECT `+userPriceCols+` FROM user_prices
 			WHERE scope=? AND model=? AND valid_from<=? AND (valid_to=0 OR valid_to>?)
-			ORDER BY valid_from DESC LIMIT 1`, scope, model, ts, ts)
+			ORDER BY valid_from DESC, id DESC LIMIT 1`, scope, model, ts, ts)
 		p, err := scanUserPrice(row)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue

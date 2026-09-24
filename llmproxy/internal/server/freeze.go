@@ -110,6 +110,26 @@ func costFromRates(inHit, inMiss, inWrite, out, perReq float64, rec *store.Reque
 		}
 	}
 
+	// 强制住上面注释里写的那个不变式：prompt = 命中 + 写入 + 未命中。
+	//
+	// 上游可能**同时**回报两种形状 —— DeepSeek 的显式 hit/miss（其中 miss 按口径
+	// 已经包含写入）与 OpenAI 的 prompt_tokens_details.cache_write_tokens。
+	// cacheSplit 的两个分支对 write 并不互斥，于是 write 会被算两遍：
+	// 实测 prompt=1000 / hit=400 / miss=600（显式）/ write=300 时，
+	// 计费 token 变成 1300（超报 300），按 1/2/4 的单价多收 75%。
+	//
+	// 夹取 miss 而不是丢弃 write：write 是单独一档、单价通常比未命中还贵
+	// （Anthropic 系约 1.25×），丢掉它是低估；而 miss 本来就是「剩下的那部分」，
+	// 由 prompt 减出来才是它的定义。prompt 为 0 时不夹（失败请求没有 token，
+	// 只算 per_request_fee，夹了反而会把 hit/write 的既有语义搅乱）。
+	if prompt > 0 && hit+write+miss > prompt {
+		if m := prompt - hit - write; m > 0 {
+			miss = m
+		} else {
+			miss = 0
+		}
+	}
+
 	// in_write 可空 = 与 in_miss 同价（docs/pricing-design.md §6.1、store.ProviderPrice.InWrite
 	// 的注释、以及建表语句的 DEFAULT 0 都是这么承诺的）。这个回落必须在这里兑现：
 	// 接口省略 in_write 时 Go 的零值就是 0，直接乘会让「写入缓存」这一档 token 完全不计费 ——
