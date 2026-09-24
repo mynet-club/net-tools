@@ -338,6 +338,22 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 				// 看门狗掐的：上下文是被 Cancel 而不是超时，不认一下会误报成「客户端断开」
 				err = fmt.Errorf("供应商 %s 连续 %s 没有返回数据（空闲超时）",
 					cand.Provider.Name, wd.Idle())
+			} else if r.Context().Err() != nil {
+				// 客户端已经断开。这不是供应商的错，也**不该再换一家重试** ——
+				// 重试只会白打一次上游、再给第二家记一笔莫须有的失败。
+				//
+				// 这条很要紧：failure_threshold 默认是 3，几个爱掐连接的客户端就能把
+				// 一家健康上游打进冷却。看门狗取消的是派生出的 ctx、不是 r.Context()，
+				// 所以这个判断只会命中「真的是客户端走了」。
+				//
+				// 499 沿用 nginx 对「客户端主动断开」的记法；客户端已经走了，
+				// 这个状态码只进库和日志，不会真的发出去。
+				s.log.Infof("客户端在上游响应前断开 ip=%s model=%s provider=%s",
+					auth.ClientIP, probe.Model, cand.Provider.Name)
+				rec.Provider = cand.Provider.Name
+				rec.UpstreamModel = cand.UpstreamModel
+				s.fail(w, rec, 499, "client_gone", "客户端在上游返回前断开", attempts, started)
+				return
 			} else if errMsg := err.Error(); strings.Contains(errMsg, "context deadline exceeded") || strings.Contains(errMsg, "Client.Timeout") {
 				err = fmt.Errorf("供应商 %s 请求超时（%s）", cand.Provider.Name, timeout)
 			}
