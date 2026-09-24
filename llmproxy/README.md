@@ -504,7 +504,14 @@ token 只存这个标签页的会话里，关掉标签就失效，不进 URL、C
 | 试一下 | 用你的 token 从网关发一条请求，直接看到是**哪个上游接走的**、耗时多少 |
 
 **管理台 `/admin/`** 是三块：系统上游（编辑 `providers` 段）、用户（建号 / 配额 / 模型范围）、
-全局用量与计价设置。
+最近用量（只读）。
+
+> ⚠️ **价目行没有界面**，只能用 API：`PUT /v1/_admin/prices/provider` 与
+> `PUT /v1/_admin/prices/user`（见下面「价目从哪来」一节的 curl 示例）。
+> 管理台只能**看**用量与金额，不能改单价。同样地，`server` / `routing` / `log` /
+> `database` 段在管理台里是只读展示（`GET /v1/_admin/config` 会回 host、port、
+> api_key 数量、admin_token 是否已设、routing 与 warnings），**写回的只有 `providers` 段**。
+> 改那些要编辑 config.yaml —— 但 2 秒内自动热加载，不用重启。
 
 ### 用户台：模型怎么配（同步 + 勾选，不写 JSON）
 
