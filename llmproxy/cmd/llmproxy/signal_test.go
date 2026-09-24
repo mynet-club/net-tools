@@ -26,7 +26,7 @@ func TestHealthURL(t *testing.T) {
 		want string
 	}{
 		{"普通 IPv4", cfgWith("127.0.0.1", 8787), "http://127.0.0.1:8787/healthz"},
-		{"局域网地址", cfgWith("192.168.0.4", 8787), "http://192.168.0.4:8787/healthz"},
+		{"局域网地址", cfgWith("192.168.1.50", 8787), "http://192.168.1.50:8787/healthz"},
 		{"IPv6 要加方括号", cfgWith("::1", 8787), "http://[::1]:8787/healthz"},
 		{"通配 0.0.0.0 换成回环", cfgWith("0.0.0.0", 8787), "http://127.0.0.1:8787/healthz"},
 		{"通配 :: 换成回环", cfgWith("::", 8787), "http://127.0.0.1:8787/healthz"},
