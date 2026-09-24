@@ -796,9 +796,16 @@ llmproxy test [-model M] [-stream]
 llmproxy user add|list|show|rm|enable|disable|token
 llmproxy user mode|quota|limits|models|add-model|rm-model
 llmproxy user add-provider|rm-provider|providers|usage
+llmproxy admin token|rotate  管理凭证的取值与轮换（写回 config.yaml）
+llmproxy config get|set      读写常用标量配置（备份 → 校验 → 原子改名）
+llmproxy price list|set      价目录入与历史回溯（整点生效、只追加）
 llmproxy service install|uninstall
 llmproxy version
 ```
+
+`status` 不只报版本与健康：还有**本月用量与配额余量**、**价目覆盖**（哪些模型还没录价）、
+**各供应商的熔断状态**。`admin` / `config` / `price` 三组把「改配置不必打开含密钥的
+`config.yaml`」和「录价不必手写 curl」收成一条命令，写回安全链与管理台同一条。
 
 CLI 的写操作会**主动通知**运行中的服务重载，所以立刻就能用。发信号前会先确认
 健康端点真的在应答 —— PID 文件可能是陈旧的（服务被 SIGKILL 或崩溃时不会清它），

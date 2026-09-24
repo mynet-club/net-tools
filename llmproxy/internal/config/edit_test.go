@@ -395,3 +395,161 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// SetConfigScalar 只动指定段下的一行标量，其余字节逐字节不变。
+//
+// 动的是生产配置文件，所以「注释、空行、缩进、别的键一个都不能被顺手改掉」
+// 是硬要求 —— 与 EditProviders 同一条底线。
+func TestSetConfigScalarOnlyTouchesOneLine(t *testing.T) {
+	src := `# 段前注释，必须保留
+server:
+  host: 127.0.0.1        # 监听地址
+  port: 8787
+  api_keys:
+    - sk-x
+  admin_token: sk-old
+  block_local_upstream: true
+
+routing: {retry: 2}
+providers:
+  - name: p
+    enabled: true
+    base_url: https://api.example.com/v1
+    api_key: k
+    models: ["*"]
+log:
+  level: info
+`
+	out, err := SetConfigScalar([]byte(src), "server", "admin_token", "sk-new-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(out)
+
+	// 新值生效
+	if !strings.Contains(got, "admin_token: sk-new-token") {
+		t.Errorf("新值没写进去:\n%s", got)
+	}
+	if strings.Contains(got, "sk-old") {
+		t.Errorf("旧值仍在:\n%s", got)
+	}
+	// 其余内容一个字节都不能变
+	for _, must := range []string{
+		"# 段前注释，必须保留",
+		"  host: 127.0.0.1        # 监听地址",
+		"  port: 8787",
+		"  api_keys:",
+		"    - sk-x",
+		"  block_local_upstream: true",
+		"",
+		"routing: {retry: 2}",
+		"providers:",
+		"  - name: p",
+		"    base_url: https://api.example.com/v1",
+		"    api_key: k",
+		"    models: [\"*\"]",
+		"log:",
+		"  level: info",
+	} {
+		if must != "" && !strings.Contains(got, must) {
+			t.Errorf("不该被动的内容丢了: %q\n%s", must, got)
+		}
+	}
+	// 替换后的配置必须仍然可加载，且新值生效
+	cfg, err := Parse([]byte(got))
+	if err != nil {
+		t.Fatalf("写回后的配置解析失败: %v\n%s", err, got)
+	}
+	if cfg.Server.AdminToken != "sk-new-token" {
+		t.Errorf("新值未生效: %q", cfg.Server.AdminToken)
+	}
+}
+
+// 行末注释要保住；行数与除目标行外的每一行都要完全一致。
+func TestSetConfigScalarKeepsLineComment(t *testing.T) {
+	src := "server:\n  port: 8787          # 监听端口\n  host: 127.0.0.1\n"
+	out, err := SetConfigScalar([]byte(src), "server", "port", "9000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "port: 9000          # 监听端口") {
+		t.Errorf("行末注释没保住:\n%s", out)
+	}
+	before := strings.Split(src, "\n")
+	after := strings.Split(string(out), "\n")
+	if len(before) != len(after) {
+		t.Fatalf("行数变了: %d → %d\n%s", len(before), len(after), out)
+	}
+	for i := range before {
+		if i == 1 {
+			continue // 目标行
+		}
+		if before[i] != after[i] {
+			t.Errorf("第 %d 行不该变: %q → %q", i+1, before[i], after[i])
+		}
+	}
+}
+
+func TestSetConfigScalarErrors(t *testing.T) {
+	src := "server:\n  port: 8787\n  ports: 1\n"
+	cases := []struct {
+		name, section, key string
+	}{
+		{"段不存在", "nonexistent", "port"},
+		{"键不存在", "server", "admin_token"},
+		{"前缀匹配但不是同一个键（ports ≠ port）", "server", "port_"},
+		{"section 为空", "", "port"},
+		{"key 为空", "server", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if out, err := SetConfigScalar([]byte(src), c.section, c.key, "1"); err == nil {
+				t.Errorf("应当报错，却输出了 %q", out)
+			}
+		})
+	}
+}
+
+// SetOrInsertConfigScalar：键存在就替换（与 SetConfigScalar 一致），不存在就插入一行。
+//
+// 需要插入是因为 `config.example.yaml` 里 `admin_token` 是被注释掉的，
+// 新建的配置很可能压根没这个键。只报「键不存在」等于把「不想手改文件」又推回给用户。
+func TestSetOrInsertConfigScalar(t *testing.T) {
+	// 1) 键不存在 → 插在段标题下一行，其余逐字节不变
+	src := "# 顶注\nserver:\n  host: 127.0.0.1   # 保留注释\n  port: 8787\n\nlog:\n  level: info\n"
+	out, err := SetOrInsertConfigScalar([]byte(src), "server", "admin_token", "sk-new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "# 顶注\nserver:\n  admin_token: sk-new\n  host: 127.0.0.1   # 保留注释\n  port: 8787\n\nlog:\n  level: info\n"
+	if string(out) != want {
+		t.Errorf("插入结果不对:\ngot:\n%s\nwant:\n%s", out, want)
+	}
+
+	// 2) 键已存在 → 行为与 SetConfigScalar 一致（替换，不重复插入）
+	out2, err := SetOrInsertConfigScalar(out, "server", "admin_token", "sk-second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(out2), "admin_token:") != 1 {
+		t.Errorf("不该出现第二个 admin_token:\n%s", out2)
+	}
+	if !strings.Contains(string(out2), "admin_token: sk-second") {
+		t.Errorf("替换没生效:\n%s", out2)
+	}
+
+	// 3) 段里一个键都没有 → 用两个空格的默认缩进
+	empty := "server:\n\nlog:\n  level: info\n"
+	out3, err := SetOrInsertConfigScalar([]byte(empty), "server", "admin_token", "sk-3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out3), "  admin_token: sk-3") {
+		t.Errorf("空段里没插入对:\n%s", out3)
+	}
+
+	// 4) 段不存在 → 仍然报错（不给它无中生有一个段）
+	if _, err := SetOrInsertConfigScalar([]byte(src), "nope", "k", "v"); err == nil {
+		t.Error("段不存在时应当报错")
+	}
+}

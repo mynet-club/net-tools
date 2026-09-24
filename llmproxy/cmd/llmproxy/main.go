@@ -53,6 +53,13 @@ const usageText = `llmproxy %s — 自用 LLM 转发网关
   stats [-days N] [-recent N]   查看消耗统计
   logs [-n N] [-f]    查看日志
   test [-model M] [-stream]     通过本机网关发一条测试请求
+  admin token         打印管理凭证（管理台 /admin/ 用）
+  admin rotate        轮换管理凭证并写回 config.yaml
+  config get          列出可设置项的当前值
+  config set <段.键> <值>  改一项（备份 → 校验 → 原子改名，2 秒内热加载）
+  price list           列出当前生效的价目 / 指定键的全部历史
+  price set provider <供应商> <上游模型> [选项]   录一条上游价
+  price set user <scope> <模型> [选项]            录一条分发价
   service install     安装系统服务（macOS launchd / Linux systemd）
   service uninstall   卸载系统服务
   version             显示版本
@@ -102,6 +109,12 @@ func main() {
 		err = cmdTest(paths, args)
 	case "user", "users":
 		err = cmdUser(paths, args)
+	case "admin":
+		err = cmdAdmin(paths, args)
+	case "config":
+		err = cmdConfig(paths, args)
+	case "price", "prices":
+		err = cmdPrice(paths, args)
 	case "service":
 		if len(args) < 1 {
 			err = fmt.Errorf("用法: llmproxy service install|uninstall")
@@ -564,37 +577,245 @@ func cmdStop(paths config.Paths) error {
 	return nil
 }
 
+// fmtDur 把时长写成人看的形态（3h12m / 47s），不用读一个 180000 的数字。
+func fmtDur(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%.0fs", d.Seconds())
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm%02ds", int(d.Minutes()), int(d.Seconds())%60)
+	}
+	if d < 24*time.Hour {
+		return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+	}
+	return fmt.Sprintf("%dd%02dh", int(d.Hours())/24, int(d.Hours())%24)
+}
+
+// cmdStatus 回答「这台网关现在到底是什么状态」。
+//
+// 以前它只报版本 / 供应商数 / 健康，而运维真正想知道的是四件事：跑着的是哪个版本、
+// 各家供应商健不健康、这个月花了多少还剩多少配额、价目配齐了没有。这四件数据后端全都有
+// （/healthz、/v1/_providers、usage_user_daily、user_prices），只是没拼在一起。
 func cmdStatus(paths config.Paths) error {
 	pid, running := readPID(paths.PIDFile)
 	cfg, err := config.LoadFileLenient(paths.ConfigFile)
 	if err != nil {
-		fmt.Printf("配置: 加载失败 — %v\n", err)
+		fmt.Printf("配置   加载失败 — %v\n", err)
 	} else {
-		fmt.Printf("配置: %s（供应商 %d 个，已启用 %d 个）\n",
-			paths.ConfigFile, len(cfg.Providers), countEnabled(cfg.Normalized))
+		fmt.Printf("配置   %s\n", paths.ConfigFile)
+		fmt.Printf("       供应商 %d 个，已启用 %d 个\n", len(cfg.Providers), countEnabled(cfg.Normalized))
+		if cfg.Server.HasAdminToken() {
+			fmt.Printf("       管理接口已开启（admin_token 已设）；用 `llmproxy admin token` 取值\n")
+		} else {
+			fmt.Printf("       管理接口未启用（server.admin_token 为空）\n")
+		}
+		if cfg.Server.BlockLocalUpstream {
+			fmt.Printf("       出网校验：严格（用户自配上游不许指向回环/私网）\n")
+		}
 	}
 	if !running {
-		fmt.Println("服务: 未运行")
+		fmt.Println("服务   未运行")
 		return nil
 	}
-	fmt.Printf("服务: 运行中 pid=%d\n", pid)
 
-	// 探活本机健康端点
+	// 健康端点：版本、已运行多久、记账有没有丢
+	uptime, version, persistFail := "未知", "未知", int64(-1)
 	if cfg != nil {
 		url := healthURL(cfg)
 		client := &http.Client{Timeout: 2 * time.Second}
 		resp, err := client.Get(url)
 		if err != nil {
-			fmt.Printf("健康检查: 失败 — %v\n", err)
-			fmt.Printf("  （pid %d 在、但 %s 连不上：可能已卡死，也可能这个 pid 已被别的进程复用。\n"+
-				"   先 ps -p %d -o args= 确认它是谁，再决定要不要 kill）\n", pid, url, pid)
+			fmt.Printf("服务   pid %d 在，但 %s 连不上 —— 可能已卡死，也可能这个 pid 已被别的进程复用。\n",
+				pid, url)
+			fmt.Printf("       先 ps -p %d -o args= 确认它是谁，再决定要不要 kill。\n", pid)
 			return nil
 		}
 		defer resp.Body.Close()
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		fmt.Printf("健康检查: %s %s\n", resp.Status, strings.TrimSpace(string(body)))
+		var h struct {
+			Version       string `json:"version"`
+			UptimeS       int    `json:"uptime_s"`
+			PersistFail   *int64 `json:"persist_failures"`
+			ProviderCount int    `json:"providers"`
+			Revision      int64  `json:"revision"`
+			Status        string `json:"status"`
+		}
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if err := json.Unmarshal(raw, &h); err == nil {
+			version = h.Version
+			uptime = fmtDur(time.Duration(h.UptimeS) * time.Second)
+			if h.PersistFail != nil {
+				persistFail = *h.PersistFail
+			}
+		}
+	}
+	fmt.Printf("服务   pid=%d  %s  已运行 %s", pid, version, uptime)
+	if persistFail >= 0 {
+		if persistFail > 0 {
+			fmt.Printf("  ⚠ 记账失败 %d 次", persistFail)
+		} else {
+			fmt.Printf("  记账失败 0 次")
+		}
+	}
+	fmt.Println()
+
+	// 各供应商运行期状态（走实时接口，含刚发生的熔断）
+	if cfg != nil {
+		if live, err := fetchLiveProviders(cfg); err == nil && len(live) > 0 {
+			fmt.Println("供应商")
+			for _, p := range live {
+				state := "健康"
+				if !p.Enabled {
+					state = "停用"
+				} else if !p.Healthy {
+					state = "冷却中"
+				}
+				models := "any(*)"
+				if len(p.Models) > 0 {
+					models = fmt.Sprintf("%d 个映射", len(p.Models))
+				}
+				fmt.Printf("  %-22s %-4s %s  权重 %g  代理 %s  模型 %-10s 请求 %d  失败 %d  连续失败 %d\n",
+					p.Name, map[bool]string{true: "启用", false: "停用"}[p.Enabled], state,
+					p.Weight, p.Proxy, models, p.TotalRequests, p.TotalFailures, p.ConsecutiveFailures)
+				if !p.Healthy && p.Enabled && p.UnhealthyUntil != "" {
+					fmt.Printf("  %-22s   冷却至 %s\n", "", p.UnhealthyUntil)
+				}
+			}
+		}
+	}
+
+	// 本月用量与配额 + 价目覆盖
+	if cfg != nil {
+		db, err := openReadOnly(cfg.Database.Path)
+		if err != nil {
+			fmt.Printf("（读不到数据库：%v）\n", err)
+			return nil
+		}
+		defer db.Close()
+		now := time.Now()
+		printUsageAndQuota(db, now, &cfg.Pricing)
+		printPriceCoverage(db, now)
 	}
 	return nil
+}
+
+// printUsageAndQuota 打印每个用户当月的已用与配额。
+func printUsageAndQuota(db *store.Store, now time.Time, pricing *config.PricingConfig) {
+	users, err := db.ListUsers()
+	if err != nil || len(users) == 0 {
+		return
+	}
+	fmt.Println("本月用量（只算走系统上游的）")
+	for _, u := range users {
+		var tokens int64
+		var cost float64
+		if rows, err := db.SystemUsageRowsSince(u.Name, store.MonthStart(now)); err == nil {
+			for _, r := range rows {
+				tokens += r.PromptTokens + r.CompletionTokens
+				cost += rowChargeOf(r, pricing, now)
+			}
+		}
+		mode := "byo 自带上游"
+		if u.IsConsumption() {
+			mode = "consumption 消费系统上游"
+		}
+		fmt.Printf("  %-12s %-26s token %s  金额 ¥%s\n",
+			u.Name, mode, humanCount(tokens), humanMoney(cost))
+		qt := "token 不限"
+		if u.QuotaMonthTokens > 0 {
+			qt = fmt.Sprintf("token 上限 %s（剩 %s）", humanCount(u.QuotaMonthTokens),
+				humanCount(u.QuotaMonthTokens-tokens))
+		}
+		qc := "金额 不限"
+		if u.QuotaMonthCost > 0 {
+			qc = fmt.Sprintf("金额上限 ¥%s（剩 ¥%s）", humanMoney(u.QuotaMonthCost),
+				humanMoney(u.QuotaMonthCost-cost))
+		}
+		fmt.Printf("             配额: %s  %s\n", qt, qc)
+	}
+}
+
+// printPriceCoverage 打印当前生效的价目，以及「用量里出现过、但没有价目」的模型。
+func printPriceCoverage(db *store.Store, now time.Time) {
+	ps, err := db.ProviderPricesEffective(now)
+	if err != nil {
+		return
+	}
+	us, _ := db.UserPricesEffective(now)
+	fmt.Println("价目（当前生效）")
+	if len(ps) == 0 {
+		fmt.Printf("  上游价   无 —— 成本报表只能是估算段\n")
+	} else {
+		var keys []string
+		for _, p := range ps {
+			keys = append(keys, p.Provider+"/"+p.UpstreamModel)
+		}
+		fmt.Printf("  上游价   %d 条: %s\n", len(ps), strings.Join(keys, "、"))
+	}
+	if len(us) == 0 {
+		fmt.Printf("  分发价   无 —— 金额配额会走估算兜底\n")
+	} else {
+		var keys []string
+		for _, u := range us {
+			keys = append(keys, u.Scope+"/"+u.Model)
+		}
+		fmt.Printf("  分发价   %d 条: %s\n", len(us), strings.Join(keys, "、"))
+	}
+	fmt.Println("  （要录入/改价：llmproxy price set --help）")
+}
+
+// humanCount 把 token 数写成带千分位的形态，307425279 比 307425279 好读。
+func humanCount(n int64) string {
+	if n < 0 {
+		return "0"
+	}
+	s := strconv.FormatInt(n, 10)
+	var b strings.Builder
+	for i, c := range s {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			b.WriteByte(',')
+		}
+		b.WriteRune(c)
+	}
+	return b.String()
+}
+
+// humanMoney 金额保留 4 位有效小数（¥0.0017 这种小额也有意义）。
+func humanMoney(v float64) string {
+	if v == 0 {
+		return "0"
+	}
+	if v < 0.01 {
+		return fmt.Sprintf("%.6f", v)
+	}
+	return fmt.Sprintf("%.2f", v)
+}
+
+// rowChargeOf 是 internal/server.rowCharge 的简化副本。
+//
+// 那个函数在 internal 包里、cmd 引不到，而 CLI 显示的金额必须与服务端口径一致
+// （冻结优先、未冻结按 legacy 表估算兜底）。这里把同一套算法复述一遍，
+// 避免出现「CLI 报一个数、API 报另一个数」。
+// TODO: 想真正消除重复，应当把 rowCharge 下沉到 internal/store 或 internal/config，
+// 让服务端与 CLI 共用一份。这是一次小重构，等下一轮再做。
+func rowChargeOf(r store.UsageRow, p *config.PricingConfig, now time.Time) float64 {
+	if r.OK > 0 && r.FrozenCharges >= r.OK {
+		return r.Charge
+	}
+	hit, miss := r.CacheHitTokens, r.CacheMissTokens
+	if hit+miss == 0 && r.PromptTokens > 0 {
+		miss = r.PromptTokens
+	}
+	est := 0.0
+	if p != nil && p.Enabled() {
+		if v, ok := p.Cost(r.UpstreamModel, hit, miss, r.CompletionTokens, now); ok {
+			est = v
+		}
+	}
+	if r.FrozenCharges == 0 || r.OK == 0 {
+		return est
+	}
+	unfrozen := float64(r.OK-r.FrozenCharges) / float64(r.OK)
+	return r.Charge + est*unfrozen
 }
 
 func countEnabled(ps []config.Provider) int {

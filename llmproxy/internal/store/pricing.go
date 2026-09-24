@@ -524,6 +524,28 @@ func (s *Store) HasEffectiveUserPrices(userName string, t time.Time) (bool, erro
 	return true, nil
 }
 
+// UserPricesEffective 返回在 t 时刻生效的全部分发价目行（跨 scope，含 default 与各 user:）。
+// 供 `llmproxy status` / `llmproxy price list` 展示价目覆盖情况用。
+func (s *Store) UserPricesEffective(t time.Time) ([]UserPrice, error) {
+	ts := t.UnixMilli()
+	rows, err := s.db.Query(`SELECT `+userPriceCols+` FROM user_prices
+		WHERE valid_from<=? AND (valid_to=0 OR valid_to>?)
+		ORDER BY scope, model`, ts, ts)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := []UserPrice{}
+	for rows.Next() {
+		p, err := scanUserPrice(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *p)
+	}
+	return out, rows.Err()
+}
+
 // ListProviderPrices 列出某个 (供应商, 上游模型) 的全部价目行（含历史），按 valid_from 升序。
 // 界面与排障用：要看「这个模型什么时候涨过价」时直接读它。
 func (s *Store) ListProviderPrices(provider, upstreamModel string) ([]ProviderPrice, error) {

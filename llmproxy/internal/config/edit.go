@@ -2,8 +2,13 @@ package config
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -310,4 +315,176 @@ func RawProviders(src []byte) ([]ProviderRaw, error) {
 		return nil, fmt.Errorf("解析 providers 失败: %w", err)
 	}
 	return doc.Providers, nil
+}
+
+// sectionTitleLine 找到顶层段标题所在的行号（0-based）。
+//
+// 先用 AST 确认这个段真的存在（比文本搜索可靠：注释里、字符串里的 "server:" 都骗不到它），
+// 再用行扫描找 `section:` 这一行。之所以不能直接用 yaml.Node.Line：段里一个键都没有时
+// yaml.v3 给出的值节点 Line 是 0，反推不到标题行。
+func sectionTitleLine(lines []string, section string, doc *yaml.Node) (int, error) {
+	if _, val := findTopLevelKey(doc, section); val == nil {
+		return -1, fmt.Errorf("配置里没有 %s 段", section)
+	}
+	for i, ln := range lines {
+		if strings.TrimRight(ln, "\r\n") == section+":" {
+			return i, nil
+		}
+	}
+	return -1, fmt.Errorf("定位 %s 段失败", section)
+}
+
+// SetConfigScalar 把 config.yaml 里某个顶层段下的**标量键**的值替换成新的，
+// 其余内容（注释、空行、缩进、别的键）逐字节不变。
+//
+// 只支持「已经存在的标量键」：想新增键请用别的方式。这条限制是刻意的 ——
+// 动的是生产配置文件，要能保证「只动我要动的那一行」，否则一次保存就能把
+// 注释、缩进风格和别的键一起改掉。行末的 `# 注释` 会保留下来。
+//
+// 调用方负责「校验不过不落盘」：先写临时文件、用加载器校验、再原子改名（见
+// configedit.go 的做法）。这里只负责生成字节。
+func SetConfigScalar(src []byte, section, key, value string) ([]byte, error) {
+	section = strings.TrimSpace(section)
+	key = strings.TrimSpace(key)
+	if section == "" || key == "" {
+		return nil, errors.New("section 与 key 不能为空")
+	}
+	// 用 AST 找到段的起始行（yaml.Node.Line 是 1-based）
+	var doc yaml.Node
+	if err := yaml.Unmarshal(src, &doc); err != nil {
+		return nil, fmt.Errorf("解析现有配置失败: %w", err)
+	}
+	lines := strings.Split(string(src), "\n")
+	titleLine, err := sectionTitleLine(lines, section, &doc)
+	if err != nil {
+		return nil, err
+	}
+	end := sectionEnd(lines, titleLine, 0)
+
+	// 在段内找 `  key:`
+	prefix := key + ":"
+	for i := titleLine + 1; i < end; i++ {
+		raw := strings.TrimRight(lines[i], "\r\n")
+		trimmed := strings.TrimLeft(raw, " ")
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if !strings.HasPrefix(trimmed, prefix) {
+			continue
+		}
+		// 必须是 `key:` 后跟空格或行尾，避免把 keyx: 误认成 key:
+		rest := trimmed[len(prefix):]
+		if rest != "" && !strings.HasPrefix(rest, " ") && !strings.HasPrefix(rest, "\t") {
+			continue
+		}
+		indent := raw[:len(raw)-len(trimmed)]
+		// 保留行末注释与它前面的**对齐空白**（`port: 8787          # 监听端口`）——
+		// 「只动值」的意思是连那段空白都不动。注释只在值是裸标量时能这么切分：
+		// 这里只处理标量键（token / 数字 / 布尔 / 主机名），它们的值里不会带 ` #`。
+		comment, gap := "", ""
+		valuePart := rest
+		if idx := strings.Index(rest, " #"); idx >= 0 {
+			comment = rest[idx:]
+			valuePart = strings.TrimRight(rest[:idx], " \t")
+			gap = rest[len(valuePart):idx]
+		}
+		lines[i] = indent + prefix + " " + value + gap + comment
+		out := strings.Join(lines, "\n")
+		return []byte(out), nil
+	}
+	return nil, fmt.Errorf("%s 段里没有 %s 这个键（只支持替换已存在的键）", section, key)
+}
+
+// SetOrInsertConfigScalar 与 SetConfigScalar 一样，区别是**键不存在时插入一行**。
+//
+// 什么时候需要插入：`config.example.yaml` 里 `admin_token` 是被注释掉的，
+// 所以新建的配置里很可能压根没有这个键。如果这时只报「键不存在，请自己加」，
+// 就等于把「不想改配置文件」这个初衷又推回给用户了。
+//
+// 插入位置是段标题的下一行（`server:` 之后）。插入的那行是本函数唯一新增的字节，
+// 其余内容与 SetConfigScalar 一样逐字节不变。
+func SetOrInsertConfigScalar(src []byte, section, key, value string) ([]byte, error) {
+	out, err := SetConfigScalar(src, section, key, value)
+	if err == nil {
+		return out, nil
+	}
+	if !strings.Contains(err.Error(), "只支持替换已存在的键") {
+		return nil, err
+	}
+
+	// 键不存在：定位段标题行，插在它下面
+	var doc yaml.Node
+	if err := yaml.Unmarshal(src, &doc); err != nil {
+		return nil, err
+	}
+	lines := strings.Split(string(src), "\n")
+	titleLine, err := sectionTitleLine(lines, section, &doc)
+	if err != nil {
+		return nil, err
+	}
+	// 用段内已有键的缩进，段里一个键都没有就用两个空格
+	indent := "  "
+	if end := sectionEnd(lines, titleLine, 0); titleLine+1 < end {
+		for i := titleLine + 1; i < end; i++ {
+			raw := strings.TrimRight(lines[i], "\r\n")
+			if trimmed := strings.TrimLeft(raw, " "); trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+				indent = raw[:len(raw)-len(trimmed)]
+				break
+			}
+		}
+	}
+	insertAt := titleLine + 1
+	newLines := append([]string{}, lines[:insertAt]...)
+	newLines = append(newLines, indent+key+": "+value)
+	newLines = append(newLines, lines[insertAt:]...)
+	return []byte(strings.Join(newLines, "\n")), nil
+}
+
+// WriteFileSafely 把新的配置字节落盘，走与管理台写回 providers 段同一条安全底线：
+//
+//  1. 先把原文件备份成 `config.yaml.bak-<时间戳>`（0600，只留最近 5 份）；
+//  2. 写进临时文件 `config.yaml.new`（0600）；
+//  3. 用加载器校验——**校验不过就删掉临时文件、原文件一字不动**；
+//  4. 通过才 `os.Rename` 原子覆盖。
+//
+// 这四步缺一不可：动的是生产配置文件，一次手滑不能把网关搞挂。
+// 这个函数放在 config 包是为了让 server（管理台写回）与 cmd（CLI 改配置）共用一份；
+// 目前 server 的 configedit.go 仍保留自己的实现，等下一轮再迁过来。
+func WriteFileSafely(path string, newSrc []byte) error {
+	orig, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	// 1) 备份。名字必须带**微秒**：只精确到秒的话，同一秒内连着保存两次会互相覆盖、
+	// 少一代备份（审阅里的 L4，实测过：测试里连着 rotate 两次就只剩 1 份备份）。
+	backup := fmt.Sprintf("%s.bak-%s", path, time.Now().Format("20060102-150405.000000"))
+	if err := os.WriteFile(backup, orig, 0o600); err != nil {
+		return fmt.Errorf("写备份失败: %w", err)
+	}
+	// 只留最近 5 份
+	if baks, err := filepath.Glob(path + ".bak-*"); err == nil {
+		sort.Strings(baks)
+		if over := len(baks) - 5; over > 0 {
+			for _, old := range baks[:over] {
+				_ = os.Remove(old)
+			}
+		}
+	}
+
+	// 2) 临时文件
+	tmp := path + ".new"
+	if err := os.WriteFile(tmp, newSrc, 0o600); err != nil {
+		return err
+	}
+	// 3) 校验：用与线上同一条加载通道（含 ${ENV} 展开与全部校验）
+	if _, err := LoadFileLenient(tmp); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("新配置校验不通过，原文件未改动: %w", err)
+	}
+	// 4) 原子覆盖
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }

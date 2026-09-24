@@ -361,11 +361,15 @@ log:
 
 ```bash
 # 1) 给管理接口设一个凭证（不设则 /v1/_admin 整体关闭）
-#    在 config.yaml 的 server 段加：admin_token: ${LLMPROXY_ADMIN_TOKEN}
+./llmproxy admin rotate          # 生成新 token 并写回 config.yaml（备份 → 校验 → 原子改名）
+./llmproxy admin token           # 之后随时取值，粘进浏览器登录
 
 # 2) 直接启动：首次启动会自动生成 0600 的 master.key，用来加密用户的上游密钥
 ./llmproxy start
 ```
+
+`admin rotate` 是**写在文件里的字面值**。想走环境变量引用也行，自己在 `config.yaml` 的
+`server` 段加 `admin_token: ${LLMPROXY_ADMIN_TOKEN}`，并保证启动时那个变量已 export。
 
 主密钥是运行时目录下的 `master.key`（32 字节随机）。**它丢了，库里已有的上游密钥就解不开**，
 只能让用户重填 —— 这是这套设计唯一的硬代价。别把它弄丢，也别和数据库放在一起。
@@ -410,6 +414,9 @@ log:
 | GET | `/v1/_me/usage?days=N` | 按日 / 按模型的消耗 |
 
 ### 管理接口（用 `server.admin_token` 鉴权）
+
+凭证用 `llmproxy admin token` 取、`llmproxy admin rotate` 轮换（见下面 CLI 一节）。
+没配 `admin_token` 时整个 `/v1/_admin` 与 `/admin/` 一律 403。
 
 | 方法 | 路径 | 用途 |
 |------|------|------|
@@ -728,7 +735,13 @@ providers:
   法定节假日会按高峰价算，属偏高估（不会低估）。
 
 ```bash
-# 录一条上游价（时间是 RFC3339，必须整点）：单价单位是「每百万 token」
+# 录一条上游价 —— 推荐用 CLI（备份/校验/收口历史都在里面）：
+llmproxy price set provider deepseek deepseek-flash \
+  -in-hit 0.04 -in-miss 2.0 -out 8.0 \
+  -peak-hours "09:00-12:00,14:00-18:00" -off-peak-ratio 0.5 -peak-tz "+08:00" \
+  -valid-from 2026-09-22T00:00:00+08:00 -note "官网高峰价，空闲×0.5"
+
+# 等价的 curl（管理台没有价目编辑界面时用；现在有 CLI 了，一般不必手写）
 curl -X PUT http://127.0.0.1:8787/v1/_admin/prices/provider \
   -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
   -d '{"provider":"deepseek","upstream_model":"deepseek-flash",
@@ -737,8 +750,9 @@ curl -X PUT http://127.0.0.1:8787/v1/_admin/prices/provider \
        "peak_hours":["09:00-12:00","14:00-18:00"],"off_peak_ratio":0.5,"peak_tz":"+08:00",
        "note":"官网高峰价，空闲×0.5"}'
 
-curl "http://127.0.0.1:8787/v1/_admin/prices/provider?provider=deepseek&upstream_model=deepseek-flash" \
-  -H "Authorization: Bearer $ADMIN"     # 看历史（含被收口的旧行）
+llmproxy price list -provider deepseek -upstream-model deepseek-flash   # 看历史
+# 或 curl "http://127.0.0.1:8787/v1/_admin/prices/provider?provider=deepseek&upstream_model=deepseek-flash" \
+#      -H "Authorization: Bearer $ADMIN"
 curl http://127.0.0.1:8787/v1/_admin/prices/effective -H "Authorization: Bearer $ADMIN"   # 当前在效的全部价目
 ```
 
@@ -792,7 +806,7 @@ llmproxy init                初始化运行时目录并生成配置
 llmproxy start               前台启动
 llmproxy stop                停止
 llmproxy restart             重启
-llmproxy status              运行状态 + 健康检查
+llmproxy status              运行状态 + 配额用量 + 价目覆盖 + 各供应商健康
 llmproxy reload              热加载配置（SIGHUP）
 llmproxy providers           各供应商配置与运行期状态（含熔断）
 llmproxy stats [-days N] [-recent N]   消耗统计
@@ -803,10 +817,66 @@ llmproxy user providers|usage <名字>   该用户的上游 / 消耗
 llmproxy user mode|quota|limits <名字> 消费模式的模式 / 配额 / 限流
 llmproxy user models|add-model <名字>  消费模式的模型白名单（也是模型映射）
 llmproxy user add-provider <用户> <上游名>   代用户配上游
+llmproxy admin token         打印管理凭证（管理台 /admin/ 用）
+llmproxy admin rotate        轮换管理凭证并写回 config.yaml
+llmproxy config get [段.键]  看可设置项的当前值
+llmproxy config set <段.键> <值>       改一项（备份 → 校验 → 原子改名，2 秒内热加载）
+llmproxy price list          当前生效的价目 / 指定键的全部历史
+llmproxy price set provider <供应商> <上游模型> [选项]   录一条上游价
+llmproxy price set user <scope> <模型> [选项]            录一条分发价
 llmproxy service install     安装为 launchd / systemd 服务
 llmproxy service uninstall   卸载系统服务
 llmproxy version
 ```
+
+### `admin` / `config`：不动配置文件也能改配置
+
+日常运维最烦的就是「为改一个数字去打开含上游密钥的 `config.yaml`」。这三组命令
+把常用的读写收成一条命令，安全链与管理台写回 `providers` 段**同一条**（备份 →
+临时文件 → 加载器校验 → 原子改名；校验不过则原文件一字不动）：
+
+```bash
+llmproxy admin token                      # 取管理凭证（等同于 root，别贴进聊天记录）
+llmproxy admin rotate                     # 换一个新的，旧的立即失效
+
+llmproxy config get                       # 列出全部可设置项的当前值
+llmproxy config get server.port           # 只看一项
+llmproxy config set log.level debug       # 改一项，2 秒内热加载
+llmproxy config set database.retain_days 0   # 0 = 永久保留请求明细
+```
+
+`config set` **刻意只放开标量**，而且只放「已经存在的键」。`server.admin_token` 走
+`admin rotate`（那是密钥），`server.api_keys` 与 `providers` 不走这条通道（前者是列表，
+后者是管理台唯一的写入面）。`server.host` / `server.port` 改完要重启，其余项热加载生效。
+
+### `price`：价目录入不必再写 curl
+
+价目规则（整点生效、只追加、历史可回溯）见上一节；这里只是把录入从 `curl` 收成命令行：
+
+```bash
+# 录一条上游价（单价单位：每百万 token，CNY）
+llmproxy price set provider deepseek deepseek-flash \
+  -in-miss 0.04 -out 2 \
+  -peak-hours "09:00-12:00,14:00-18:00" -off-peak-ratio 0.5 -peak-tz "+08:00" \
+  -note "官网高峰价，空闲×0.5"
+
+# 录一条分发价（scope = default 或 user:<名>）
+llmproxy price set user default deepseek-flash -in-miss 0.052 -out 2.6
+
+llmproxy price list                                    # 当前生效的全部
+llmproxy price list -provider deepseek -upstream-model deepseek-flash   # 这条键的全部历史
+llmproxy price list -scope default -model deepseek-flash
+```
+
+几个容易踩的点：
+
+- **`-valid-from` 缺省是下一个整点**，不是现在 —— 价格只在整点生效，取「下一个」
+  也避开「只追加」对同刻插入的拒绝。要立即生效就显式给一个整点时刻（RFC3339）。
+- **`-in-write` 不传 = 与 `-in-miss` 同价**；传 0 也是这个意思。
+  **`-off-peak-ratio` 不传 = 沿用全局**；显式传 0 会被拒（0 意味着空闲免费，
+  而全局规则把 `<=0` 当未设置，两边都讨不着好 —— 想沿用全局就别传）。
+- **币种必须与基准币一致**（`pricing.currency`，缺省 CNY）。目前不做汇率换算。
+- 改价就是**再录一条更晚的**：旧行自动收口，历史不被改写。
 
 `stats` 输出示例：
 
