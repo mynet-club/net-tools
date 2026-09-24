@@ -141,7 +141,7 @@ func configEqual(a, b *Config) bool {
 	if a.Routing != b.Routing {
 		return false
 	}
-	if a.Database != b.Database {
+	if !databaseEqual(a.Database, b.Database) {
 		return false
 	}
 	if len(a.Proxies) != len(b.Proxies) {
@@ -163,9 +163,35 @@ func configEqual(a, b *Config) bool {
 	return true
 }
 
+// databaseEqual 逐字段比较，**不能**直接写 a != b。
+//
+// DatabaseConfig 里的 RetainDays 是 *int（用来区分「没配」与「显式 0 = 永久」），
+// 而结构体含指针字段时 `!=` 比的是**指针身份**：两次 Parse 各自分配一个 int，
+// 于是哪怕配置一字未改，a.Database != b.Database 也恒为真。后果是每次保存配置
+// 都被判成「变了」→ 重载回调白跑一遍 → srv.Transports().Reset() 把上游连接池
+// 全部丢掉（管理台的「就近保存」会让这件事频繁发生）。
+func databaseEqual(a, b DatabaseConfig) bool {
+	return a.Path == b.Path && a.EffectiveRetainDays() == b.EffectiveRetainDays()
+}
+
+// serverEqual 比较会影响运行时行为的 server 字段。
+//
+// 指针型的可选字段（StreamIdleTimeoutMs / AffinityTTLMs）一律**通过访问器比值**，
+// 理由与 databaseEqual 相同：直接比指针会因为「两次 Parse 各分配一个 int」而恒不等。
+// 用访问器还顺带得到正确的语义 —— 「没配」与「显式写成默认值」行为完全一致，
+// 就该判为相等，不该触发一次无谓的重载。
 func serverEqual(a, b ServerConfig) bool {
 	if a.Host != b.Host || a.Port != b.Port ||
 		a.MaxBodyMB != b.MaxBodyMB || a.RequestTimeoutMs != b.RequestTimeoutMs {
+		return false
+	}
+	// affinity_ttl_ms 必须参与比较：它被缓存在 affinityStore 里、不是每请求实时读，
+	// 漏比的话改了这个值 configEqual 会返回 true → 重载回调直接 return →
+	// 连「配置已热加载」的日志都不打，而粘性行为一点没变。
+	if a.StreamIdleMs() != b.StreamIdleMs() || a.AffinityTTL() != b.AffinityTTL() {
+		return false
+	}
+	if a.AdminToken != b.AdminToken || a.BlockLocalUpstream != b.BlockLocalUpstream {
 		return false
 	}
 	if len(a.APIKeys) != len(b.APIKeys) {

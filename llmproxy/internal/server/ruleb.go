@@ -54,6 +54,7 @@ func (s *Server) cheapestProvider(scope string, providers []config.Provider, mod
 	}
 
 	best, bestCost := "", 0.0
+	base := s.baseCurrency()
 	for _, p := range providers {
 		if !p.Enabled {
 			continue
@@ -67,6 +68,13 @@ func (s *Server) cheapestProvider(scope string, providers []config.Provider, mod
 		}
 		price, ok := byKey[key{p.Name, up}]
 		if !ok {
+			continue
+		}
+		// 币种与基准币不符的不参与比价：排序键是 (in_miss + out) 的**数值**，
+		// 混币种会比出完全错误的结果。写入口已经拒了异币种，这里是防御 ——
+		// 库里可能有早于那道校验的行，或者被直接 SQL 插进来的。
+		// 跳过而不是当成 0 价：当成 0 会让它永远胜出，那比不选它还糟。
+		if !sameCurrency(price.Currency, base) {
 			continue
 		}
 		ratio := s.peakRuleAt(price.PeakHours, price.OffPeakRatio, price.PeakTZ).RatioAt(now)

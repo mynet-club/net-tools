@@ -308,6 +308,22 @@ func cmdStart(paths config.Paths) error {
 		}
 	}
 
+	// 三处重载路径（2 秒轮询回调、首个 SIGHUP、后续 SIGHUP）要做的事完全一样，
+	// 所以抽成一个闭包 —— 之前正是因为抄了三份，affinity_ttl_ms 在三份里全漏了：
+	// 它被缓存在 affinityStore 里、不像 stream_idle_timeout_ms 那样每请求实时读，
+	// 于是运维改了这个值、SIGHUP 也发了、日志还说重载了，粘性行为却一点没变。
+	applyCfg := func(newCfg *config.Config) {
+		r.ApplyConfig(newCfg.Routing, newCfg.Normalized)
+		srv.Transports().Reset() // 代理设置可能变了，丢弃旧连接池
+		srv.SetAffinityTTL(time.Duration(newCfg.Server.AffinityTTL()) * time.Millisecond)
+		lg.SetLevel(logx.ParseLevel(newCfg.Log.Level))
+	}
+
+	// 监听地址在启动时就绑定了、之后不会重绑，所以「需要重启才生效」的比较基准
+	// 永远是**启动时**的值。用不可变的局部量而不是一个会被重载回调改写的共享 cfg ——
+	// 后者既语义不对（该比的是进程实际在听的地址），又是跨 goroutine 的数据竞争。
+	startHost, startPort := cfg.Server.Host, cfg.Server.Port
+
 	// 配置热重载
 	storeCfg.Watch(2*time.Second, func(ok, changed bool, newCfg *config.Config, err error) {
 		if !ok {
@@ -321,15 +337,11 @@ func cmdStart(paths config.Paths) error {
 		for _, w := range newCfg.Warnings {
 			lg.Warnf("配置警告: %s", w)
 		}
-		r.ApplyConfig(newCfg.Routing, newCfg.Normalized)
-		srv.Transports().Reset() // 代理设置可能变了，丢弃旧连接池
-		// 监听地址变化需要重启才生效
-		if newCfg.Server.Host != cfg.Server.Host || newCfg.Server.Port != cfg.Server.Port {
+		applyCfg(newCfg)
+		if newCfg.Server.Host != startHost || newCfg.Server.Port != startPort {
 			lg.Warnf("server.host/port 变更（%s:%d → %s:%d）需要重启才生效",
-				cfg.Server.Host, cfg.Server.Port, newCfg.Server.Host, newCfg.Server.Port)
+				startHost, startPort, newCfg.Server.Host, newCfg.Server.Port)
 		}
-		cfg = newCfg
-		lg.SetLevel(logx.ParseLevel(newCfg.Log.Level))
 	})
 	defer storeCfg.Stop()
 
@@ -355,7 +367,13 @@ func cmdStart(paths config.Paths) error {
 				if err := srv.PersistProviderStatus(); err != nil {
 					lg.Warnf("保存供应商状态失败: %v", err)
 				}
-				if n, err := db.Prune(cfg.Database.EffectiveRetainDays()); err == nil && n > 0 {
+				// 走 storeCfg.Current()（atomic.Value）而不是闭包捕获的 cfg：
+				// 这个 goroutine 与重载回调并发，读一个会被别处改写的局部变量是数据竞争。
+				retainDays := 90
+				if cur := storeCfg.Current(); cur != nil {
+					retainDays = cur.Database.EffectiveRetainDays()
+				}
+				if n, err := db.Prune(retainDays); err == nil && n > 0 {
 					lg.Debugf("清理 %d 条过期请求日志", n)
 				}
 			}
@@ -381,9 +399,7 @@ func cmdStart(paths config.Paths) error {
 			if err != nil {
 				lg.Errorf("SIGHUP 配置重载失败，继续使用旧配置: %v", err)
 			} else if changed {
-				r.ApplyConfig(newCfg.Routing, newCfg.Normalized)
-				srv.Transports().Reset()
-				cfg = newCfg
+				applyCfg(newCfg)
 				lg.Infof("SIGHUP 配置已重载（供应商 %d 个）", len(newCfg.Normalized))
 			} else {
 				lg.Infof("SIGHUP：配置无变化")
@@ -399,9 +415,7 @@ func cmdStart(paths config.Paths) error {
 					if err != nil {
 						lg.Errorf("SIGHUP 配置重载失败: %v", err)
 					} else if changed {
-						r.ApplyConfig(newCfg.Routing, newCfg.Normalized)
-						srv.Transports().Reset()
-						cfg = newCfg
+						applyCfg(newCfg)
 						lg.Infof("SIGHUP 配置已重载")
 					}
 					srv.SyncUsersIfChanged()
@@ -466,12 +480,73 @@ func readPID(path string) (int, bool) {
 	return pid, true
 }
 
+// healthURL 拼出健康端点地址。host 是通配（0.0.0.0 / :: / 空）时换成回环 ——
+// 探测要的是一个能连的具体地址，而通配地址在 macOS 上连不通。
+func healthURL(cfg *config.Config) string {
+	host := "127.0.0.1"
+	if cfg != nil {
+		switch cfg.Server.Host {
+		case "", "0.0.0.0", "::", "[::]", "*":
+		default:
+			host = cfg.Server.Host
+		}
+	}
+	port := "8787"
+	if cfg != nil && cfg.Server.Port != 0 {
+		port = strconv.Itoa(cfg.Server.Port)
+	}
+	return "http://" + net.JoinHostPort(host, port) + "/healthz"
+}
+
+// serviceResponding 探测是否真的有一个 llmproxy 在应答。
+//
+// 这是给「要不要往这个 pid 发信号」把关的。readPID 只用 kill(pid, 0) 探活，
+// 它证明的是「有这么个进程」，**不是**「这个进程是 llmproxy」：服务被 SIGKILL
+// 或崩溃时不会清 PID 文件，那个 pid 之后可能被系统分配给完全无关的进程 ——
+// 于是 `llmproxy stop` 会给它发 SIGTERM、CLI 写操作后的通知会给它发 SIGHUP，
+// 而这两个信号的默认动作都是终止。
+//
+// 用健康端点而不是 /proc/<pid>/comm：后者在 macOS 上不存在，健康端点两个平台一样。
+// 判据也不是「证明这个 pid 是 llmproxy」，而是「确实有一个 llmproxy 在服务」——
+// 如果没有，那 PID 文件就是陈旧的，谁都不该发信号。
+func serviceResponding(cfg *config.Config) bool {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(healthURL(cfg))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	return resp.StatusCode == http.StatusOK
+}
+
+// cfgForSignal 读一份配置出来，只为了知道该探哪个地址。
+// 读不出来就返回 nil —— 那时 serviceResponding 会退回默认地址，
+// 探不通就不发信号（宁可不发，也不要打错进程）。
+func cfgForSignal(paths config.Paths) *config.Config {
+	cfg, err := config.LoadFileLenient(paths.ConfigFile)
+	if err != nil {
+		return nil
+	}
+	return cfg
+}
+
 func cmdStop(paths config.Paths) error {
 	pid, running := readPID(paths.PIDFile)
 	if !running {
 		_ = os.Remove(paths.PIDFile)
 		fmt.Println("服务未在运行")
 		return nil
+	}
+	cfg := cfgForSignal(paths)
+	if !serviceResponding(cfg) {
+		// 进程在、但服务不应答：可能是 llmproxy 卡死了，也可能是这个 pid 已经被
+		// 别的进程复用。SIGTERM 会杀掉后者，所以不动手 —— 也不删 PID 文件
+		// （万一那真是个卡死的 llmproxy，删了就再也找不回它了）。
+		return fmt.Errorf("pid %d 存在，但 %s 没有应答，已跳过发信号\n"+
+			"这个 pid 可能已被别的进程复用（服务被 SIGKILL 或崩溃时不会清 PID 文件）。\n"+
+			"先确认它到底是谁：ps -p %d -o args=   ；确认是 llmproxy 再手动 kill %d",
+			pid, healthURL(cfg), pid, pid)
 	}
 	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
 		return fmt.Errorf("发送 SIGTERM 给 pid %d 失败: %w", pid, err)
@@ -506,11 +581,13 @@ func cmdStatus(paths config.Paths) error {
 
 	// 探活本机健康端点
 	if cfg != nil {
-		url := fmt.Sprintf("http://%s/healthz", net.JoinHostPort(cfg.Server.Host, fmt.Sprint(cfg.Server.Port)))
+		url := healthURL(cfg)
 		client := &http.Client{Timeout: 2 * time.Second}
 		resp, err := client.Get(url)
 		if err != nil {
 			fmt.Printf("健康检查: 失败 — %v\n", err)
+			fmt.Printf("  （pid %d 在、但 %s 连不上：可能已卡死，也可能这个 pid 已被别的进程复用。\n"+
+				"   先 ps -p %d -o args= 确认它是谁，再决定要不要 kill）\n", pid, url, pid)
 			return nil
 		}
 		defer resp.Body.Close()
@@ -534,6 +611,12 @@ func cmdReload(paths config.Paths) error {
 	pid, running := readPID(paths.PIDFile)
 	if !running {
 		return fmt.Errorf("服务未在运行，无需重载")
+	}
+	cfg := cfgForSignal(paths)
+	if !serviceResponding(cfg) {
+		// 同 cmdStop：进程在但服务不应答，这个 pid 可能已经是别人的了
+		return fmt.Errorf("pid %d 存在，但 %s 没有应答，已跳过发 SIGHUP"+
+			"（这个 pid 可能已被别的进程复用）", pid, healthURL(cfg))
 	}
 	if err := syscall.Kill(pid, syscall.SIGHUP); err != nil {
 		return fmt.Errorf("发送 SIGHUP 给 pid %d 失败: %w", pid, err)

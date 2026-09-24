@@ -1,7 +1,9 @@
 package server
 
 import (
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -259,5 +261,122 @@ func TestAffinityConcurrent(t *testing.T) {
 	}
 	if got := s.Get(sc, "ses", mo); got != "alpha" {
 		t.Errorf("并发之后应当仍是 alpha，实际 %q", got)
+	}
+}
+
+// checkConsistent 校验 map 与链表没有失去同步 —— 这是 O(1) LRU 最容易写错的地方
+// （忘了从其中一边摘、摘错了 key、或者 MoveToFront 漏了）。
+func (s *affinityStore) checkConsistent(t *testing.T) {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.entries) != s.lru.Len() {
+		t.Fatalf("map 与链表失去同步: map=%d list=%d", len(s.entries), s.lru.Len())
+	}
+	seen := make(map[affinityKey]bool, len(s.entries))
+	for el := s.lru.Front(); el != nil; el = el.Next() {
+		e, ok := el.Value.(*affinityEntry)
+		if !ok {
+			t.Fatal("链表节点的值类型不对")
+		}
+		if seen[e.key] {
+			t.Fatalf("链表里出现重复键 %+v", e.key)
+		}
+		seen[e.key] = true
+		if got, ok := s.entries[e.key]; !ok || got != el {
+			t.Fatalf("链表节点 %+v 在 map 里对不上同一个 element", e.key)
+		}
+	}
+	for k, el := range s.entries {
+		if e := el.Value.(*affinityEntry); e.key != k {
+			t.Fatalf("map 键 %+v 与节点里存的键 %+v 不一致", k, e.key)
+		}
+	}
+}
+
+// 表满之后每次 Set 都要淘汰一条 —— 这条路径必须保持 O(1) 且结构不失同步。
+//
+// 旧实现（一个 map，每次全表扫找最旧）在这里有 3500 倍的悬崖：8192 条上限下
+// 0.12µs/次 → 423.6µs/次，而且全程持全局锁、加并发也没用（64 协程只拿到 4673 ops/s）。
+// 触发门槛低到约 340 个新会话/小时，而压测工具从不发 x-session-affinity 头，
+// 所以这条悬崖在压测里完全看不见。
+//
+// 上面那个 TestAffinityConcurrent 用了 8 个协程却只有 2 个不同的键，表永远填不满 ——
+// 淘汰分支一次都没执行过，给了「并发安全」的假信心。这条测试专门把它填满。
+func TestAffinityEvictionAtCapacityStaysConsistent(t *testing.T) {
+	const max = 64
+	s, advance := newTestAffinity(time.Hour, max)
+
+	for i := 0; i < max; i++ {
+		s.Set(sc, fmt.Sprintf("s%d", i), mo, "alpha")
+		advance(time.Second) // 拉开 lastUsed，让 LRU 顺序确定
+	}
+	if n := s.Len(); n != max {
+		t.Fatalf("填满后应当是 %d 条，实际 %d", max, n)
+	}
+	s.checkConsistent(t)
+
+	// 再插一倍，每一次都触发淘汰
+	for i := max; i < 2*max; i++ {
+		s.Set(sc, fmt.Sprintf("s%d", i), mo, "alpha")
+		advance(time.Second)
+		s.checkConsistent(t)
+		if n := s.Len(); n != max {
+			t.Fatalf("插入 s%d 后应当被钉在 %d 条，实际 %d", i, max, n)
+		}
+	}
+
+	// 淘汰的必须真正是最久没用的那一半
+	for i := 0; i < max; i++ {
+		if got := s.Get(sc, fmt.Sprintf("s%d", i), mo); got != "" {
+			t.Errorf("最久没用的 s%d 应当被淘汰，实际还留着 %q", i, got)
+		}
+	}
+	for i := max; i < 2*max; i++ {
+		if got := s.Get(sc, fmt.Sprintf("s%d", i), mo); got != "alpha" {
+			t.Errorf("最近的 s%d 应当还在，实际 %q", i, got)
+		}
+	}
+	s.checkConsistent(t)
+}
+
+// 并发 + 表满：淘汰路径在锁竞争下也不能让 map 与链表失同步。
+// 键各不相同，所以每次 Set 都在真的淘汰（-race 会抓住任何无保护的读写）。
+func TestAffinityConcurrentAtCapacity(t *testing.T) {
+	s, _ := newTestAffinity(time.Hour, 128)
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				key := fmt.Sprintf("ses-%d-%d", g, j)
+				s.Set(sc, key, mo, "alpha")
+				_ = s.Get(sc, key, mo)
+				s.Set(sc, key, mo, "") // 忘掉一半，制造删除路径
+				_ = s.Len()
+			}
+		}(g)
+	}
+	wg.Wait()
+	if n := s.Len(); n > 128 {
+		t.Errorf("并发之后不该超过容量上限，实际 %d", n)
+	}
+	s.checkConsistent(t)
+}
+
+// 表满之后的 Set 开销。旧实现在这里约 423µs/op（8192 条上限），
+// O(1) LRU 应当在微秒量级 —— 这个数决定「还能再挂多少路并发」。
+func BenchmarkAffinitySetAtCapacity(b *testing.B) {
+	s := newAffinityStore(time.Hour, defaultAffinityMax)
+	for i := 0; i < defaultAffinityMax; i++ {
+		s.Set(sc, fmt.Sprintf("s%d", i), mo, "alpha")
+	}
+	if n := s.Len(); n != defaultAffinityMax {
+		b.Fatalf("前提不成立：表没填满（%d）", n)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s.Set(sc, fmt.Sprintf("new%d", i), mo, "alpha")
 	}
 }

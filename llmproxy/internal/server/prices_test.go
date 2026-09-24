@@ -183,3 +183,56 @@ func TestAdminUserPriceAPI(t *testing.T) {
 		t.Errorf("URL 编码后的 scope 应能查询，实际 %d: %s", resp.StatusCode, raw)
 	}
 }
+
+// 币种护栏：录价时与基准币不符要被拒，留空则填成基准币。
+//
+// 两张价目表都带 currency 列，但聚合、比价、报表都不看它 —— 换算还没实现。
+// 在实现之前必须把混币种挡在门外，否则规则 B 会比出完全错误的结果
+// （见 TestRuleBSkipsForeignCurrency），而报表的币种标签也会撒谎。
+func TestPriceCurrencyGuard(t *testing.T) {
+	h := priceHarness(t)
+	base := hourFloor(time.Now().Add(-2 * time.Hour))
+
+	// 1) 异币种被拒（上游价）
+	body := providerPriceBody("neolink", "gp-5.6-so", base.Format(time.RFC3339), 9.0)
+	body["currency"] = "USD"
+	resp, raw := h.put(t, "/v1/_admin/prices/provider", adminToken, body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("异币种应当被拒（400），实际 %d: %s", resp.StatusCode, raw)
+	} else if !strings.Contains(string(raw), "基准币") {
+		t.Errorf("错误信息该说清是币种与基准币不一致，实际：%s", raw)
+	}
+
+	// 2) 分发价一侧同样被拒
+	resp, raw = h.put(t, "/v1/_admin/prices/user", adminToken, map[string]any{
+		"scope": "default", "model": "sys-model",
+		"valid_from": base.Format(time.RFC3339),
+		"in_miss":    2.0, "out": 8.0, "currency": "USD",
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("分发价的异币种也应当被拒，实际 %d: %s", resp.StatusCode, raw)
+	}
+
+	// 3) 留空 → 填成基准币（testPricing 里是 CNY）。
+	//    必须在这一层填，不能留给 store 去填它硬编码的 "CNY" ——
+	//    那样在基准币不是 CNY 时会存进一个与基准币不符的值，再被比价护栏悄悄排除掉。
+	body = providerPriceBody("neolink", "gp-5.6-so", base.Format(time.RFC3339), 9.0)
+	resp, raw = h.put(t, "/v1/_admin/prices/provider", adminToken, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("留空币种不该被拒，实际 %d: %s", resp.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), `"currency":"CNY"`) {
+		t.Errorf("留空时应当填成基准币 CNY，实际：%s", raw)
+	}
+
+	// 4) 大小写不同但是同一个币种 → 接受，并归一成基准币的写法
+	//    （不归一的话后续 sameCurrency 之外的直接字符串比较会对不上）
+	body = providerPriceBody("neolink", "gp-5.6-so", base.Add(time.Hour).Format(time.RFC3339), 9.0)
+	body["currency"] = "cny"
+	resp, raw = h.put(t, "/v1/_admin/prices/provider", adminToken, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("cny 与 CNY 是同一个币种，不该被拒，实际 %d: %s", resp.StatusCode, raw)
+	} else if !strings.Contains(string(raw), `"currency":"CNY"`) {
+		t.Errorf("应当归一成基准币的写法 CNY，实际：%s", raw)
+	}
+}

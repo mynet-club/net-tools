@@ -183,3 +183,92 @@ func TestRuleBFallsBackWithoutPrices(t *testing.T) {
 		t.Errorf("没价目时应当仍按权重分担，实际只用到 %v", seen)
 	}
 }
+
+// 规则 B 跳过币种与基准币不符的候选。
+//
+// 排序键是 (in_miss + out) 的**数值**，混币种会比出完全错误的结果：
+// 下面 alpha 报 USD 1+1（数值 2）、beta 报 CNY 9+90（数值 99），数值上 alpha
+// 便宜得多，但 USD 2 约合 ¥14 而 CNY 99 就是 ¥99 —— 谁便宜取决于汇率，
+// 而汇率根本没参与计算。选错供应商能差好几倍。
+//
+// 关键是「跳过」而不是「当成 0 价」：当成 0 会让异币种那家永远胜出，那比不参与还糟。
+// 写入口（prices.go 的 normalizePriceCurrency）已经拒了异币种，这里防的是
+// 早于那道校验就存在的行、或被直接 SQL 插进来的行。
+func TestRuleBSkipsForeignCurrency(t *testing.T) {
+	alpha := newUsageStub(t, 0)
+	beta := newUsageStub(t, 0)
+	h := newMUHarnessWith(t, twoProviderYAML(
+		"alpha", alpha.srv.URL, "{m: m}",
+		"beta", beta.srv.URL, "{m: m}",
+		testPricing))
+	token := h.addUser(t, "carol")
+	setConsumption(t, h, "carol", "m", "")
+
+	from := hourFloor(time.Now().Add(-2 * time.Hour))
+	if err := h.db.InsertProviderPrice(&store.ProviderPrice{
+		Provider: "alpha", UpstreamModel: "m", ValidFrom: from,
+		InMiss: 1, Out: 1, Currency: "USD", // 基准币是 CNY（见 testPricing）
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.db.InsertProviderPrice(&store.ProviderPrice{
+		Provider: "beta", UpstreamModel: "m", ValidFrom: from,
+		InMiss: 9, Out: 90, Currency: "CNY",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 6; i++ {
+		resp, raw := h.post(t, "/v1/chat/completions", token, map[string]any{
+			"model": "m", "messages": []map[string]string{{"role": "user", "content": "hi"}},
+		})
+		if resp.StatusCode != 200 {
+			t.Fatalf("第 %d 次应 200，实际 %d: %s", i, resp.StatusCode, raw)
+		}
+		if got := resp.Header.Get("X-LLMProxy-Provider"); got != "beta" {
+			t.Fatalf("第 %d 次应当走币种一致的 beta（alpha 的 USD 价目不该参与比价），实际 %q", i, got)
+		}
+	}
+	if n := alpha.hitCount(); n != 0 {
+		t.Errorf("异币种的 alpha 不该被选中，实际被打到 %d 次", n)
+	}
+}
+
+// 全家都是异币种时，规则 B 应当**退场**（返回空、回落到按权重随机），
+// 而不是硬挑一家 —— 这与「全都没价目就退场」是同一条原则：
+// 不知道价不等于便宜，猜一个出来只会把流量固定到错误的一家上。
+func TestRuleBAllForeignCurrencyFallsBackToWeight(t *testing.T) {
+	alpha := newUsageStub(t, 0)
+	beta := newUsageStub(t, 0)
+	h := newMUHarnessWith(t, twoProviderYAML(
+		"alpha", alpha.srv.URL, "{m: m}",
+		"beta", beta.srv.URL, "{m: m}",
+		testPricing))
+	token := h.addUser(t, "carol")
+	setConsumption(t, h, "carol", "m", "")
+
+	from := hourFloor(time.Now().Add(-2 * time.Hour))
+	for _, p := range []string{"alpha", "beta"} {
+		if err := h.db.InsertProviderPrice(&store.ProviderPrice{
+			Provider: p, UpstreamModel: "m", ValidFrom: from,
+			InMiss: 1, Out: 1, Currency: "USD",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	seen := map[string]int{}
+	for i := 0; i < 20; i++ {
+		resp, raw := h.post(t, "/v1/chat/completions", token, map[string]any{
+			"model": "m", "messages": []map[string]string{{"role": "user", "content": "hi"}},
+		})
+		if resp.StatusCode != 200 {
+			t.Fatalf("第 %d 次应 200，实际 %d: %s", i, resp.StatusCode, raw)
+		}
+		seen[resp.Header.Get("X-LLMProxy-Provider")]++
+	}
+	// 退化成权重随机（两家权重相同），所以两家都该被打到
+	if len(seen) != 2 {
+		t.Errorf("全部异币种时应当回落到权重随机、两家都走到，实际分布 %+v", seen)
+	}
+}

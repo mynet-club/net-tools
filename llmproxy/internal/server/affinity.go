@@ -1,6 +1,7 @@
 package server
 
 import (
+	"container/list"
 	"sync"
 	"time"
 )
@@ -20,6 +21,7 @@ type affinityKey struct {
 }
 
 type affinityEntry struct {
+	key      affinityKey // 淘汰时要靠它从 map 里摘掉自己
 	provider string
 	lastUsed time.Time
 }
@@ -33,7 +35,16 @@ type affinityEntry struct {
 // 两条约束：
 //   - 会过期：超过 ttl 没动静的条目当作「没粘过」。清理是**懒**的 ——
 //     在 Get 命中那条 key、或某次 Set 把容量推过 max 时才删；内存始终被 max 钉死。
-//   - 有容量上限：超了先清已过期的，还不够就丢最久没用过的（近似 LRU）。
+//   - 有容量上限：超了先清已过期的，还不够就丢最久没用过的（真 LRU）。
+//
+// 数据结构是 map + 双向链表（container/list）：map 做 O(1) 查找，链表维护
+// 「最近使用」的顺序，队首最新、队尾最旧。淘汰因此是 O(1)。
+//
+// 之所以不用「一个 map 每次全表扫找最旧」：表满之后那样每次 Set 都要扫两遍
+// （一遍清过期、一遍找最旧），8192 条上限下实测 0.12µs/次 → 423.6µs/次，
+// **3500 倍**的悬崖，而且全程持全局锁、加并发也没用（64 协程只拿到 4673 ops/s）。
+// 触发门槛低到约 340 个新会话/小时，而压测工具从不发 x-session-affinity 头，
+// 所以这条悬崖在压测里完全看不见 —— 只会觉得「上游最近有点卡」。
 //
 // 刻意不持久化：重启后粘性全丢，代价只是每个活跃会话迁移一次（一轮缓存）；
 // 换来的好处是每次请求都不用落盘 —— 为一个"省一次换家"的优化去写库，不值。
@@ -41,7 +52,8 @@ type affinityEntry struct {
 // ttl <= 0 表示整体关闭：Get 一律返回空、Set 不记（读作"没有粘性"）。
 type affinityStore struct {
 	mu      sync.Mutex
-	entries map[affinityKey]affinityEntry
+	entries map[affinityKey]*list.Element // 值指向 lru 里的节点
+	lru     *list.List                    // 队首 = 最近用过，队尾 = 最久没用
 	ttl     time.Duration
 	max     int
 	now     func() time.Time
@@ -72,7 +84,8 @@ func newAffinityStore(ttl time.Duration, max int) *affinityStore {
 		max = defaultAffinityMax
 	}
 	return &affinityStore{
-		entries: make(map[affinityKey]affinityEntry),
+		entries: make(map[affinityKey]*list.Element),
+		lru:     list.New(),
 		ttl:     ttl,
 		max:     max,
 		now:     time.Now,
@@ -80,7 +93,7 @@ func newAffinityStore(ttl time.Duration, max int) *affinityStore {
 }
 
 // Get 返回该会话该模型上次用的供应商；没粘过、已过期、或功能关闭时返回空串。
-// 命中会刷新「最近使用」，让淘汰更接近真 LRU。
+// 命中会刷新「最近使用」并移到队首，让淘汰是真 LRU。
 func (s *affinityStore) Get(scope, session, model string) string {
 	if !affinityPartOK(session) || !affinityPartOK(model) || s == nil || s.ttl <= 0 {
 		return ""
@@ -88,16 +101,17 @@ func (s *affinityStore) Get(scope, session, model string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	k := affinityKey{scope: scope, session: session, model: model}
-	e, ok := s.entries[k]
+	el, ok := s.entries[k]
 	if !ok {
 		return ""
 	}
+	e := el.Value.(*affinityEntry)
 	if s.expired(e) {
-		delete(s.entries, k)
+		s.removeLocked(el)
 		return ""
 	}
 	e.lastUsed = s.now()
-	s.entries[k] = e
+	s.lru.MoveToFront(el)
 	return e.provider
 }
 
@@ -110,11 +124,22 @@ func (s *affinityStore) Set(scope, session, model, provider string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	k := affinityKey{scope: scope, session: session, model: model}
-	if provider == "" {
-		delete(s.entries, k)
+	if el, ok := s.entries[k]; ok {
+		if provider == "" {
+			s.removeLocked(el)
+			return
+		}
+		e := el.Value.(*affinityEntry)
+		e.provider = provider
+		e.lastUsed = s.now()
+		s.lru.MoveToFront(el)
 		return
 	}
-	s.entries[k] = affinityEntry{provider: provider, lastUsed: s.now()}
+	if provider == "" {
+		return // 本来就没记，"忘掉"等于什么都不做
+	}
+	el := s.lru.PushFront(&affinityEntry{key: k, provider: provider, lastUsed: s.now()})
+	s.entries[k] = el
 	s.evictLocked()
 }
 
@@ -135,44 +160,80 @@ func (s *affinityStore) Enabled() bool {
 	return s != nil && s.ttl > 0
 }
 
+// TTL 返回当前的保留时长（观测/测试用）。
+func (s *affinityStore) TTL() time.Duration {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ttl
+}
+
+// SetTTL 热重载时更新保留时长。
+//
+// ttl 是**缓存**在这个结构里的（不像 stream_idle_timeout_ms 那样每请求实时读配置），
+// 所以配置改了必须主动调它，否则运维把 affinity_ttl_ms 改成 0 想临时关掉粘性排障，
+// SIGHUP 也发了、日志也说重载了，行为却一点没变。
+//
+// 缩短 ttl 时不主动清扫：过期判定是每次 Get 时按当前 ttl 现算的，
+// 旧条目会立刻被当成过期忽略掉，内存仍由 max 钉死。
+func (s *affinityStore) SetTTL(ttl time.Duration) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ttl = ttl
+}
+
 // affinityPartOK 判断粘性键里的一项是否可用：非空且不超过长度上限。
 // 超长或为空都当作「没有粘性」。
 func affinityPartOK(v string) bool {
 	return v != "" && len(v) <= maxAffinityPartLen
 }
 
-func (s *affinityStore) expired(e affinityEntry) bool {
+func (s *affinityStore) expired(e *affinityEntry) bool {
 	return s.now().Sub(e.lastUsed) >= s.ttl
 }
 
-// evictLocked 把表压回上限以内。先清已过期的（它们本来就该走了），
-// 再不够就丢最久没用过的。调用方须持锁。
+// removeLocked 同时从 map 与链表里摘掉一个条目。调用方须持锁。
+func (s *affinityStore) removeLocked(el *list.Element) {
+	if e, ok := el.Value.(*affinityEntry); ok {
+		delete(s.entries, e.key)
+	}
+	s.lru.Remove(el)
+}
+
+// evictLocked 把表压回上限以内：先清已过期的，再不够就按 LRU 从队尾丢。
+// 调用方须持锁。
 //
-// 注意这是懒清理：只在 Set 时进来，且低于上限直接返回。所以「过期且再没被访问」
-// 的条目可能在表里留很久 —— 内存仍被 max 钉死，不是泄漏。
+// 两步都是 O(1) 每条，因为链表按 lastUsed 降序排列（每次改动 lastUsed 都伴随
+// MoveToFront），于是「已过期」必然是**队尾的一段连续前缀** —— 从队尾往前清
+// 就等于清掉全部过期条目，不需要旧实现那样全表扫一遍。
+//
+// 注意这是懒清理：只在 Set 把容量推过 max 时进来。所以「过期且再没被访问」的
+// 条目在没超容量时可能留一阵子 —— 内存仍被 max 钉死，不是泄漏，
+// 而且 Get 命中它时会按当前 ttl 现算、立刻判过期。
 func (s *affinityStore) evictLocked() {
 	if len(s.entries) <= s.max {
 		return
 	}
-	for k, e := range s.entries {
-		if s.expired(e) {
-			delete(s.entries, k)
+	for {
+		el := s.lru.Back()
+		if el == nil {
+			return
 		}
+		if !s.expired(el.Value.(*affinityEntry)) {
+			break // 队尾都没过期，前面的更不可能
+		}
+		s.removeLocked(el)
 	}
 	for len(s.entries) > s.max {
-		var (
-			oldestKey affinityKey
-			oldest    time.Time
-			found     bool
-		)
-		for k, e := range s.entries {
-			if !found || e.lastUsed.Before(oldest) {
-				oldestKey, oldest, found = k, e.lastUsed, true
-			}
+		el := s.lru.Back()
+		if el == nil {
+			return
 		}
-		if !found {
-			return // 表是空的，没什么可淘汰（理论上到不了这里）
-		}
-		delete(s.entries, oldestKey)
+		s.removeLocked(el)
 	}
 }

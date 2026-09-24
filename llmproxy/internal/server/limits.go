@@ -15,12 +15,15 @@ import (
 // （SetMaxOpenConns(1)），每请求查一次库会把网关的吞吐直接压到那条连接上。
 // 所以：
 //   - 计数在内存累加，只在「当月首次用到某个用户」时从库里装载一次；
+//   - 那次装载的 DB 读**在锁外**做（见 ensureMonthLoaded）—— 否则持锁抢唯一那条
+//     连接期间，所有用户的限流与配额判断全堵在后面，跨月瞬间就是一次集体停顿；
 //   - 落库照旧走 usage_user_daily，内存计数只为快速判断。
 //
 // 两个刻意的取舍，都写在这里以免以后当成 bug：
 //  1. 配额是**软限制**：判断发生在请求之前，并发请求最多可能超出「同时在飞」的那几条。
-//  2. 重启后金额按当时的单价从库里重算一遍；如果中途改过价，计数会与新单价对齐，
-//     而不是保留历史价。要精确到分就不是估算，那是支付系统的活。
+//  2. 重启后金额从库里重建，口径是**冻结优先**（rowCharge）：已冻结的请求用它当时
+//     写死的金额，只有还没录价目的那部分才按 legacy 单价表估算兜底。所以改价不会
+//     重写历史 —— 这与「读取时用当前价现算」的旧行为不同。
 type meterSet struct {
 	mu    sync.Mutex
 	users map[string]*userMeter
@@ -57,10 +60,12 @@ func (m *meterSet) Acquire(user string, rpm, maxConcurrent int) (func(), error) 
 	if user == "" || (rpm <= 0 && maxConcurrent <= 0) {
 		return func() {}, nil
 	}
+	m.ensureMonthLoaded(user) // 可能读库，必须在持锁之前做
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	um := m.meterForLocked(user, rpm)
+	um := m.meterForLocked(user)
 	if rpm > 0 {
 		if um.bucket == nil || um.bucket.capacity != bucketCapacity(rpm) {
 			um.bucket = newTokenBucket(rpm, m.now())
@@ -81,11 +86,15 @@ func (m *meterSet) Acquire(user string, rpm, maxConcurrent int) (func(), error) 
 	um.inflight++
 
 	var once sync.Once
+	// 闭包捕获 **um 指针**而不是 user 字符串：释放时要减的必须是当初自增的那个桶。
+	// 按 user 重新查的话，如果中途桶被换掉了（跨月、或删用户触发 Forget），
+	// 这次释放就会去减**另一个**桶的 inflight —— 新桶凭空少一个计数，
+	// 并发上限被悄悄放松，而且看不出来。
 	return func() {
 		once.Do(func() {
 			m.mu.Lock()
-			if cur := m.users[user]; cur != nil && cur.inflight > 0 {
-				cur.inflight--
+			if um.inflight > 0 {
+				um.inflight--
 			}
 			m.mu.Unlock()
 		})
@@ -97,10 +106,12 @@ func (m *meterSet) CheckQuota(user string, quotaTokens int64, quotaCost float64)
 	if user == "" || (quotaTokens <= 0 && quotaCost <= 0) {
 		return 0, 0, false, ""
 	}
+	m.ensureMonthLoaded(user) // 可能读库，必须在持锁之前做
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	um := m.meterForLocked(user, 0)
+	um := m.meterForLocked(user)
 	if quotaTokens > 0 && um.tokens >= quotaTokens {
 		return um.tokens, um.cost, true, fmt.Sprintf(
 			"本月 token 配额已用完（已用 %d / %d），下个自然月自动恢复", um.tokens, quotaTokens)
@@ -128,10 +139,12 @@ func (m *meterSet) Add(user, upstreamModel string, prompt, cacheHit, cacheMiss, 
 	if cacheHit+cacheMiss == 0 && prompt > 0 {
 		cacheMiss = prompt
 	}
+	m.ensureMonthLoaded(user) // 可能读库，必须在持锁之前做
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	um := m.meterForLocked(user, 0)
+	um := m.meterForLocked(user)
 	um.tokens += prompt + output
 	if frozen != nil {
 		um.cost += *frozen
@@ -149,9 +162,10 @@ func (m *meterSet) Snapshot(user string) (tokens int64, cost float64) {
 	if user == "" {
 		return 0, 0
 	}
+	m.ensureMonthLoaded(user) // 可能读库，必须在持锁之前做
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	um := m.meterForLocked(user, 0)
+	um := m.meterForLocked(user)
 	return um.tokens, um.cost
 }
 
@@ -162,27 +176,75 @@ func (m *meterSet) Forget(user string) {
 	delete(m.users, user)
 }
 
-// meterForLocked 取当月计数桶；跨月或首次使用时装载。调用方必须持有 m.mu。
-func (m *meterSet) meterForLocked(user string, rpm int) *userMeter {
+// meterForLocked 取当月计数桶。调用方必须持有 m.mu。
+//
+// 正常情况下桶已经由 ensureMonthLoaded 在**锁外**装载好了，这里只是取出来。
+// 只有「ensureMonthLoaded 之后正好跨了月」这个极窄的窗口才会走到下面那条读库分支 ——
+// 那时宁可在持锁状态下读一次，也不要建个空桶：空桶会被后续请求当成「本月已装载」
+// 而再也不刷新，整月的配额都会少算。
+func (m *meterSet) meterForLocked(user string) *userMeter {
 	now := m.now()
 	month := now.Format("2006-01")
 	if um := m.users[user]; um != nil && um.month == month {
 		return um
 	}
-
-	um := &userMeter{month: month}
-	if m.db != nil {
-		// 逐条按各自的上游模型定价：不同模型单价不同，先汇总再定价会算错
-		if rows, err := m.db.SystemUsageRowsSince(user, store.MonthStart(now)); err == nil {
-			p := m.price()
-			for _, r := range rows {
-				um.tokens += r.PromptTokens + r.CompletionTokens
-				um.cost += rowCharge(r, p, now)
-			}
-		}
-	}
+	tokens, cost := m.loadMonth(user, now)
+	um := &userMeter{month: month, tokens: tokens, cost: cost}
 	m.users[user] = um
 	return um
+}
+
+// loadMonth 从库里读出某用户当月的已用量。**不持锁** —— 见 ensureMonthLoaded。
+func (m *meterSet) loadMonth(user string, now time.Time) (tokens int64, cost float64) {
+	if m.db == nil {
+		return 0, 0
+	}
+	rows, err := m.db.SystemUsageRowsSince(user, store.MonthStart(now))
+	if err != nil {
+		return 0, 0
+	}
+	// 逐条按各自的上游模型定价：不同模型单价不同，先汇总再定价会算错
+	p := m.price()
+	for _, r := range rows {
+		tokens += r.PromptTokens + r.CompletionTokens
+		cost += rowCharge(r, p, now)
+	}
+	return tokens, cost
+}
+
+// ensureMonthLoaded 确保 user 的当月计数桶已在内存里，必要时从库里装载。
+//
+// 装载分三步：持锁查一下 → 没有就**放锁**读库 → 重新持锁并复查。
+//
+// 为什么不能在持锁时读库：这条查询要抢唯一那条 SQLite 连接（store 是
+// SetMaxOpenConns(1)），而抢连接期间 m.mu 一直被握着，于是**所有用户**的
+// Acquire / CheckQuota / Add / Snapshot 全堵在后面。触发时机是「某用户当月首次
+// 请求」和「跨月后的第一批请求」—— 后者会让所有活跃用户在跨月瞬间同时命中，
+// 磁盘一慢就是整条请求路径的集体停顿。
+//
+// 复查是必须的：放锁期间别的协程可能已经把同一个用户的桶装载好、甚至累加过新请求了，
+// 这时要用它那份，不能拿自己读到的旧值覆盖掉。
+func (m *meterSet) ensureMonthLoaded(user string) {
+	if user == "" {
+		return
+	}
+	m.mu.Lock()
+	now := m.now()
+	month := now.Format("2006-01")
+	if um := m.users[user]; um != nil && um.month == month {
+		m.mu.Unlock()
+		return
+	}
+	m.mu.Unlock()
+
+	tokens, cost := m.loadMonth(user, now)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if um := m.users[user]; um != nil && um.month == month {
+		return // 别人已经装载好了，用它那份
+	}
+	m.users[user] = &userMeter{month: month, tokens: tokens, cost: cost}
 }
 
 // ------------------------------------------------------------------ 令牌桶

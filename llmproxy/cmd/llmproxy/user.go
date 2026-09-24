@@ -142,9 +142,20 @@ func userMutating(sub string) bool {
 //
 // 借的是 SIGHUP 这条现成通道：服务收到后会重载配置并同步用户表。
 // 服务没在跑、或没权限发信号，都静默跳过 —— 还有那个 2 秒的轮询兜底。
+//
+// 发信号前先确认服务真的在应答：PID 文件可能是陈旧的（服务被 SIGKILL 或崩溃时
+// 不会清它），而那个 pid 之后可能被系统分配给完全无关的进程 —— SIGHUP 的默认动作
+// 是终止。这条路径纯粹是个加速，探不通就什么都不做，代价只是多等 2 秒。
 func notifyRunningService(paths config.Paths) {
 	pid, running := readPID(paths.PIDFile)
 	if !running {
+		return
+	}
+	cfg, err := config.LoadFileLenient(paths.ConfigFile)
+	if err != nil {
+		return // 连配置都读不出来，没法确认该探哪个地址，宁可不发
+	}
+	if !serviceResponding(cfg) {
 		return
 	}
 	_ = syscall.Kill(pid, syscall.SIGHUP)

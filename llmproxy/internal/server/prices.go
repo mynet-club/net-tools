@@ -154,9 +154,58 @@ func (s *Server) adminPricesRoute(w http.ResponseWriter, r *http.Request, tail s
 	}
 }
 
+// baseCurrency 是当前配置的基准币（pricing.currency；未配时 normalize 会填成 CNY）。
+func (s *Server) baseCurrency() string {
+	if c := s.cfgStore.Current(); c != nil && c.Pricing.Currency != "" {
+		return c.Pricing.Currency
+	}
+	return "CNY"
+}
+
+// normalizePriceCurrency 校验并归一价目行的币种，返回应当落库的值。
+//
+// 两张价目表都带 currency 列，但聚合、比价、报表**都不看它** —— 设计文档 §3 写了
+// 「多供应商后可能混币种；聚合前换算到基准币」，而换算还没实现。在实现之前必须先把
+// 混币种挡在门外，否则全是静默算错：
+//
+//   - 规则 B 会**比错价**：一家报 USD `in_miss=2.5 / out=10`、另一家报 CNY `2 / 8`，
+//     数值上后者(10)胜出，而前者约合 ¥18 / ¥72 其实更便宜 —— 选错供应商，成本差 3~7 倍。
+//   - `requests.currency` 只有一列却装两层金额：上游价 USD、分发价 CNY 时，
+//     charge（CNY 数值）会被存在 currency='USD' 的行里。
+//   - 用量报表一律贴全局 currency 标签，录了 USD 的行也会被标成 CNY。
+//
+// 留空 = 跟随基准币。这里就把空值填成基准币、并把大小写统一，而不是留给 store 层去填
+// 它自己硬编码的 "CNY" —— 那样在基准币不是 CNY 时会存进一个与基准币不符的值，
+// 再被下面的比价护栏悄悄排除掉。
+//
+// 这是把「静默算错」换成「响亮报错」，不是支持多币种 —— 真要混币种得先做换算。
+func (s *Server) normalizePriceCurrency(got string) (string, error) {
+	base := s.baseCurrency()
+	got = strings.TrimSpace(got)
+	if got == "" || strings.EqualFold(got, base) {
+		return base, nil
+	}
+	return "", fmt.Errorf("currency %q 与基准币 %q 不一致，已拒绝：目前不做汇率换算，"+
+		"混币种会让规则 B 比错价（可能选出贵几倍的供应商）、报表的币种标签也会撒谎。"+
+		"请先按 %s 换算好再录，或把 pricing.currency 改成 %s",
+		got, base, base, got)
+}
+
+// sameCurrency 报告价目行的币种能否与基准币放在一起比较/聚合。
+// 供选路侧做防御性判断（库里可能有早于写入校验的行，或被直接 SQL 插进来的）。
+func sameCurrency(priceCurrency, base string) bool {
+	priceCurrency = strings.TrimSpace(priceCurrency)
+	return priceCurrency == "" || strings.EqualFold(priceCurrency, strings.TrimSpace(base))
+}
+
 func (s *Server) adminPutProviderPrice(w http.ResponseWriter, r *http.Request) {
 	var in providerPriceIn
 	if err := readJSONBody(w, r, &in); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	currency, err := s.normalizePriceCurrency(in.Currency)
+	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
@@ -171,7 +220,7 @@ func (s *Server) adminPutProviderPrice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := &store.ProviderPrice{
-		Provider: in.Provider, UpstreamModel: in.UpstreamModel, Currency: in.Currency,
+		Provider: in.Provider, UpstreamModel: in.UpstreamModel, Currency: currency,
 		InMiss: in.InMiss, InHit: in.InHit, InWrite: in.InWrite, Out: in.Out,
 		ReasoningOut: in.ReasoningOut, PerRequestFee: in.PerRequestFee,
 		PeakHours: in.PeakHours, OffPeakRatio: in.OffPeakRatio, PeakTZ: in.PeakTZ,
@@ -193,6 +242,11 @@ func (s *Server) adminPutUserPrice(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
+	currency, err := s.normalizePriceCurrency(in.Currency)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
 	validFrom, err := parsePriceTime(in.ValidFrom)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "valid_from: "+err.Error())
@@ -204,7 +258,7 @@ func (s *Server) adminPutUserPrice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := &store.UserPrice{
-		Scope: in.Scope, Model: in.Model, Currency: in.Currency,
+		Scope: in.Scope, Model: in.Model, Currency: currency,
 		InMiss: in.InMiss, InHit: in.InHit, InWrite: in.InWrite, Out: in.Out,
 		ReasoningOut: in.ReasoningOut, PerRequestFee: in.PerRequestFee,
 		PeakHours: in.PeakHours, OffPeakRatio: in.OffPeakRatio, PeakTZ: in.PeakTZ,

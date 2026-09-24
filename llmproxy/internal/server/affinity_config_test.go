@@ -81,3 +81,49 @@ func TestAffinityTTLFromConfig(t *testing.T) {
 		t.Errorf("应当是 60s，实际 %s", h.srv.affinity.ttl)
 	}
 }
+
+// 热重载必须能改掉粘性 TTL。
+//
+// ttl 是**缓存**在 affinityStore 里的（不像 stream_idle_timeout_ms 那样每请求实时读
+// 配置），所以光把新配置存进 cfgStore 不会生效，必须由重载路径主动调 SetAffinityTTL。
+// 曾经三处重载路径（2 秒轮询、首个 SIGHUP、后续 SIGHUP）都漏了这一步，于是运维把
+// affinity_ttl_ms 改成 0 想临时关掉粘性排障，SIGHUP 也发了、行为却一点没变 ——
+// 而且因为 serverEqual 也没比较这个字段，连「配置已热加载」那行日志都不会打。
+func TestAffinityTTLHotReload(t *testing.T) {
+	h := affinityHarness(t, "")
+	aff := h.srv.affinity
+	if !aff.Enabled() {
+		t.Fatal("前提不成立：默认应当启用粘性")
+	}
+
+	// 关掉：Get/Set 都应当变成空操作
+	h.srv.SetAffinityTTL(0)
+	if aff.Enabled() {
+		t.Error("SetAffinityTTL(0) 之后粘性应当关闭")
+	}
+	aff.Set("alice", "ses", "m", "alpha")
+	if got := aff.Get("alice", "ses", "m"); got != "" {
+		t.Errorf("关闭后不该记粘性，实际拿到 %q", got)
+	}
+
+	// 再打开
+	h.srv.SetAffinityTTL(time.Hour)
+	if !aff.Enabled() {
+		t.Error("SetAffinityTTL(1h) 之后粘性应当重新启用")
+	}
+	if aff.TTL() != time.Hour {
+		t.Errorf("TTL = %s, want 1h", aff.TTL())
+	}
+	aff.Set("alice", "ses", "m", "alpha")
+	if got := aff.Get("alice", "ses", "m"); got != "alpha" {
+		t.Errorf("重新启用后应当能记粘性，实际 %q", got)
+	}
+
+	// 缩短 TTL 后旧条目应当**立刻**被当成过期：判定是每次 Get 时按当前 ttl 现算的，
+	// 所以 SetTTL 不需要主动清扫（内存也仍由 max 钉死）。
+	h.srv.SetAffinityTTL(time.Nanosecond)
+	time.Sleep(2 * time.Millisecond)
+	if got := aff.Get("alice", "ses", "m"); got != "" {
+		t.Errorf("TTL 缩到 1ns 后旧条目应当立即过期，实际拿到 %q", got)
+	}
+}

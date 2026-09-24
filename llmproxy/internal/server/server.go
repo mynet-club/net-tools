@@ -97,6 +97,12 @@ func New(cfgStore *config.Store, db *store.Store, r *router.Router, lg *logx.Log
 func (s *Server) Router() *router.Router             { return s.router }
 func (s *Server) Transports() *dialer.TransportCache { return s.transports }
 
+// SetAffinityTTL 热重载时更新会话粘性的保留时长。
+//
+// 必须显式调：affinity_ttl_ms 被缓存在 affinityStore 里，不像 stream_idle_timeout_ms
+// 那样每请求实时读配置，所以光把新配置存进 cfgStore 是不会生效的。
+func (s *Server) SetAffinityTTL(d time.Duration) { s.affinity.SetTTL(d) }
+
 // Handler 返回 HTTP 路由表（测试与 Start 共用）。
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
