@@ -2,6 +2,7 @@ package server
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -143,5 +144,55 @@ log: {level: error}
 	})
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("云元数据地址应当 400，实际 %d: %s", resp.StatusCode, raw)
+	}
+}
+
+// /v1/_providers 对消费模式用户关闭。
+//
+// 这个接口会回 base_url、内联代理 URL（常带 user:pass）与 last_error ——
+// 而 last_error 存的是上游错误响应体的前 300 字节。消费用户没有自己的上游，
+// 调用它只会看到**系统池**，于是这三样全泄漏出去；而用户台压根不调这个接口
+// （它用的是 /v1/_me 的 broken_providers），所以拒掉不损失任何功能。
+//
+// BYO 用户与静态 key 必须照旧放行：前者看的是自己那些上游的状态
+// （「我配的上游为什么在冷却」是正当需求，见 TestCircuitBreakerIsolatedByUser），
+// 后者是运营者自己（`llmproxy providers` 走的就是静态 key）。
+func TestProvidersEndpointClosedToConsumptionUsers(t *testing.T) {
+	h := newMUHarness(t)
+
+	// 消费模式用户 → 403
+	carol := h.addUser(t, "carol")
+	setConsumption(t, h, "carol", "sys-model", "")
+	resp, raw := h.get(t, "/v1/_providers", carol)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("消费用户应当 403，实际 %d: %s", resp.StatusCode, raw)
+	}
+	// 而且响应体里不该带出系统池的任何细节
+	for _, leak := range []string{"base_url", "last_error", "sys-a"} {
+		if strings.Contains(string(raw), leak) {
+			t.Errorf("403 响应里不该出现 %q: %s", leak, raw)
+		}
+	}
+
+	// 静态 key（运营者 / CLI）→ 照常 200
+	if resp, raw := h.get(t, "/v1/_providers", "sk-static"); resp.StatusCode != http.StatusOK {
+		t.Errorf("静态 key 应当 200，实际 %d: %s", resp.StatusCode, raw)
+	}
+
+	// BYO 用户 → 照常 200，且只看到自己的上游
+	dave := h.addUser(t, "dave")
+	h.addProvider(t, "dave", "dave-up", "https://api.example.com/v1", "sk-d", `["*"]`)
+	if err := h.srv.SyncUsers(); err != nil {
+		t.Fatal(err)
+	}
+	resp, raw = h.get(t, "/v1/_providers", dave)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("BYO 用户应当 200，实际 %d: %s", resp.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), "dave-up") {
+		t.Errorf("BYO 用户应当看到自己的上游: %s", raw)
+	}
+	if strings.Contains(string(raw), "sys-a") {
+		t.Errorf("BYO 用户不该看到系统池: %s", raw)
 	}
 }

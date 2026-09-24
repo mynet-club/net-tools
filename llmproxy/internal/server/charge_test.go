@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"math"
+	"net/http"
 	"testing"
 	"time"
 
@@ -205,5 +206,49 @@ func TestFreezeDownstreamSkippedForNonSystemPaid(t *testing.T) {
 	}
 	if want := (float64(prompt)*2 + float64(completion)*8) / 1e6; math.Abs(*rec.Charge-want) > 1e-12 {
 		t.Errorf("分发金额应当是 %v，实际 %v", want, *rec.Charge)
+	}
+}
+
+// priced 要反映「金额口径到底可不可用」，而不只是「legacy 兜底表配没配」。
+//
+// config.yaml 的 pricing 段早已退居为「没有价目行时的估算兜底」，真正的价目在库里。
+// 只看 pricing.Enabled() 的话：录了 DB 价目、金额也确实在按请求冻结，接口却仍然回
+// priced:false —— 生产上就撞见过这个自相矛盾（frozen_charges=1 而 priced=false）。
+func TestUsageReportPricedReflectsDBPrices(t *testing.T) {
+	stub := newUsageStub(t, 0)
+	h := newConsumptionHarness(t, stub, "") // 刻意不给 legacy pricing 段
+	token := h.addUser(t, "carol")
+	setConsumption(t, h, "carol", "sys-model", "")
+
+	readPriced := func() bool {
+		t.Helper()
+		resp, raw := h.get(t, "/v1/_me/usage?days=1", token)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("用量接口应 200，实际 %d: %s", resp.StatusCode, raw)
+		}
+		var out struct {
+			Cost struct {
+				Priced bool `json:"priced"`
+			} `json:"cost"`
+		}
+		if err := json.Unmarshal(raw, &out); err != nil {
+			t.Fatalf("解析用量响应: %v (%s)", err, raw)
+		}
+		return out.Cost.Priced
+	}
+
+	if readPriced() {
+		t.Error("既没有 legacy 表、也没有 DB 价目行时，priced 应当是 false")
+	}
+
+	from := hourFloor(time.Now().Add(-time.Hour))
+	if err := h.db.InsertUserPrice(&store.UserPrice{
+		Scope: store.ScopeDefault, Model: "sys-model", ValidFrom: from,
+		InMiss: 2, Out: 8, Currency: "CNY",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !readPriced() {
+		t.Error("录了 DB 分发价目之后 priced 应当翻成 true（legacy 兜底表仍然是空的）")
 	}
 }

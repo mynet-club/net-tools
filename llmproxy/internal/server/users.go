@@ -942,13 +942,25 @@ func (s *Server) writeUsageReport(w http.ResponseWriter, scope string, days int)
 			monthCost += rowCharge(r, &pricing, now)
 		}
 	}
+
+	// priced 要回答的是「金额口径到底可不可用」，而不只是「legacy 兜底表配没配」。
+	// config.yaml 的 pricing 段早已退居为「没有价目行时的估算兜底」，真正的价目在库里 ——
+	// 只看 pricing.Enabled() 的话，录了 DB 价目、金额也确实在按请求冻结，这里却仍然回
+	// false，字面自相矛盾（生产上就撞见过：frozen_charges=1 而 priced=false）。
+	priced := pricing.Enabled()
+	if !priced && s.db != nil {
+		if ok, err := s.db.HasEffectiveUserPrices(scope, now); err == nil {
+			priced = ok
+		}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"days":   days,
 		"totals": tot,
 		"rows":   out,
 		"cost": map[string]any{
 			"currency":     pricing.Currency,
-			"priced":       pricing.Enabled(),
+			"priced":       priced,
 			"month_system": monthCost,
 			"counted_upto": now.Format("2006-01-02"),
 			"note":         "只统计走系统上游的消耗；金额冻结优先（按请求开始时刻的价目行算好写死），未冻结的部分按 config.yaml 的 pricing 表估算兜底",

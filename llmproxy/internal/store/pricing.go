@@ -484,6 +484,30 @@ func (s *Store) UserPriceAt(userName, model string, t time.Time) (*UserPrice, er
 	return nil, nil
 }
 
+// HasEffectiveUserPrices 报告当前是否有生效的分发价目行（该用户的覆盖，或 default）。
+//
+// 用来回答「这个部署到底有没有在计价」。不能只看 config.yaml 的 legacy pricing 表 ——
+// 那张表已经退居为「没有价目行时的估算兜底」，真正的价目在库里。只报 legacy 表的话，
+// 明明录了价目、金额也确实在按请求冻结，接口却仍然回 priced:false，字面自相矛盾。
+func (s *Store) HasEffectiveUserPrices(userName string, t time.Time) (bool, error) {
+	ts := t.UnixMilli()
+	scopes := []string{ScopeDefault}
+	if strings.TrimSpace(userName) != "" {
+		scopes = append(scopes, ScopeUser(userName))
+	}
+	var found int
+	err := s.db.QueryRow(`SELECT 1 FROM user_prices
+		WHERE scope IN (?,?) AND valid_from<=? AND (valid_to=0 OR valid_to>?) LIMIT 1`,
+		scopes[0], scopes[len(scopes)-1], ts, ts).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // ListProviderPrices 列出某个 (供应商, 上游模型) 的全部价目行（含历史），按 valid_from 升序。
 // 界面与排障用：要看「这个模型什么时候涨过价」时直接读它。
 func (s *Store) ListProviderPrices(provider, upstreamModel string) ([]ProviderPrice, error) {

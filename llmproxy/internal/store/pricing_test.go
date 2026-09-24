@@ -334,3 +334,69 @@ func openTestStoreAt(t *testing.T, path string) *Store {
 	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
+
+// HasEffectiveUserPrices 要能区分「真的没有价目」与「有但此刻不生效」。
+//
+// 它支撑的是用量接口里的 priced 字段：只看 config.yaml 的 legacy 兜底表会自相矛盾 ——
+// 录了 DB 价目、金额也确实在按请求冻结，接口却回 priced:false（生产上撞见过）。
+func TestHasEffectiveUserPrices(t *testing.T) {
+	now := time.Now().UTC()
+	hour := now.Truncate(time.Hour)
+
+	// 一条都没有
+	s := openTestStore(t)
+	if ok, err := s.HasEffectiveUserPrices("alice", now); err != nil || ok {
+		t.Errorf("空表应当 false，实际 ok=%v err=%v", ok, err)
+	}
+
+	// default 行生效
+	if err := s.InsertUserPrice(&UserPrice{
+		Scope: ScopeDefault, Model: "m", ValidFrom: hour, InMiss: 2, Out: 8,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.HasEffectiveUserPrices("alice", now); err != nil || !ok {
+		t.Errorf("有 default 行时应当 true，实际 ok=%v err=%v", ok, err)
+	}
+	if ok, _ := s.HasEffectiveUserPrices("", now); !ok {
+		t.Error("用户名为空（静态 key）也应当看到 default 行")
+	}
+
+	// 只有别人的覆盖行时，对 alice 不算「有价目」
+	s2 := openTestStore(t)
+	if err := s2.InsertUserPrice(&UserPrice{
+		Scope: ScopeUser("bob"), Model: "m", ValidFrom: hour, InMiss: 2, Out: 8,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := s2.HasEffectiveUserPrices("alice", now); ok {
+		t.Error("只有 bob 的覆盖行时，alice 不该算「有价目」")
+	}
+	if ok, _ := s2.HasEffectiveUserPrices("bob", now); !ok {
+		t.Error("bob 自己应当算「有价目」")
+	}
+
+	// valid_from 在未来的行不算「当前生效」
+	s3 := openTestStore(t)
+	if err := s3.InsertUserPrice(&UserPrice{
+		Scope: ScopeDefault, Model: "m", ValidFrom: hour.Add(2 * time.Hour), InMiss: 2, Out: 8,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := s3.HasEffectiveUserPrices("alice", now); ok {
+		t.Error("valid_from 在未来的行不该算「当前生效」")
+	}
+
+	// 已收口（valid_to 在过去）的行不算
+	s4 := openTestStore(t)
+	if err := s4.InsertUserPrice(&UserPrice{
+		Scope: ScopeDefault, Model: "m",
+		ValidFrom: hour.Add(-2 * time.Hour), ValidTo: hour.Add(-time.Hour),
+		InMiss: 2, Out: 8,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := s4.HasEffectiveUserPrices("alice", now); ok {
+		t.Error("已过期的行不该算「当前生效」")
+	}
+}

@@ -398,11 +398,22 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg := s.cfgStore.Current()
-	// 消费用户的可用上游是按模型映射逐次收窄的，状态页展示「系统池」更有意义
-	providers, _ := s.providersFor(auth.Scope, "")
+	// 消费模式用户一律 403：他们没有自己的上游，这个接口对他们只会展示**系统池** ——
+	// 而系统池视图里含 base_url、内联代理 URL（常带 user:pass）与 last_error
+	// （上游错误响应体的前 300 字节）。用户台压根不调这个接口（它用的是 /v1/_me 的
+	// broken_providers），所以拒掉不损失任何功能，却一次堵住两条泄漏。
+	//
+	// BYO 用户照旧放行：他们看到的是**自己**那些上游的状态（下面按 auth.Scope 收窄过），
+	// base_url 与错误正文本来就是他们自己的东西 ——「我配的上游为什么在冷却」是正当需求，
+	// 而且有测试钉住（TestCircuitBreakerIsolatedByUser）。静态 key 是运营者自己，也照旧。
 	if e := s.usersSnapshot().byName[auth.Scope]; e != nil && e.Consumption {
-		providers = s.globalProviders()
+		writeJSONError(w, http.StatusForbidden, "invalid_request_error",
+			"消费模式用户没有自己的上游，这里不展示系统池；用量请看 /v1/_me/usage")
+		return
 	}
+	// 走到这里只剩静态 key（全局作用域）与 BYO 用户（自己的上游），
+	// 两者都按 auth.Scope 收窄即可 —— 消费模式已经在上面被拒了。
+	providers, _ := s.providersFor(auth.Scope, "")
 	snap := s.router.SnapshotFor(auth.Scope)
 
 	type liveProvider struct {
