@@ -142,6 +142,14 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"你好"}]}'
 ```
 
+想确认它活着、以及现在能用哪些模型，直接打 base URL 就行（`GET /v1` 与 `/v1/models`
+返回完全一致，匿名仍然 401）：
+
+```bash
+curl http://127.0.0.1:8787/v1 -H "Authorization: Bearer sk-local-change-me"
+# {"object":"list","data":[{"id":"deepseek-chat","object":"model","owned_by":"llmproxy"}]}
+```
+
 响应头里会告诉你**是哪家上游接走的**、以及粘性决策：
 
 ```

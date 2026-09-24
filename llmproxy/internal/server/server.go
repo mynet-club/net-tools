@@ -121,6 +121,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/admin/", s.handleAdminUI)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/_providers", s.handleProviders)
+	// /v1 要显式注册：只注册 /v1/ 的话 ServeMux 会把 GET /v1 用 301 重定向到 /v1/，
+	// 而不少客户端在重定向时会丢掉 Authorization 头，于是探活变成 401。
+	mux.HandleFunc("/v1", s.handleV1)
 	mux.HandleFunc("/v1/", s.handleV1)
 	mux.HandleFunc("/", s.handleNotFound)
 	return s.withAccessLog(mux)
@@ -508,9 +511,19 @@ func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleV1(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
-	// /v1/models 已在 mux 上单独注册，这里兜底其余路径
+	// GET /v1 与 /v1/ 回模型列表。
+	//
+	// 严格说 OpenAI 的规范里只有 /v1/models，没有 GET /v1 —— 但把 base_url 直接粘进
+	// 浏览器或拿它探活是很常见的动作，回一句 404 提示不如回「现在能用哪些模型」。
+	// 直接复用 handleModels，所以鉴权、以及「每个用户只看到自己那份」的收窄
+	// 与 /v1/models 完全一致，不扩大任何暴露面（匿名仍然是 401）。
 	if path == "/v1" || path == "/v1/" {
-		writeJSONError(w, http.StatusNotFound, "invalid_request_error", "请使用 /v1/chat/completions 或 /v1/models")
+		if r.Method == http.MethodGet || r.Method == http.MethodHead {
+			s.handleModels(w, r)
+			return
+		}
+		writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error",
+			fmt.Sprintf("不支持 %s /v1。可用端点：POST /v1/chat/completions、GET /v1/models", r.Method))
 		return
 	}
 

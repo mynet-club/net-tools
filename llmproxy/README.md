@@ -11,7 +11,11 @@
 ## 特性
 
 - **下游 OpenAI 兼容**：`POST /v1/chat/completions`、`POST /v1/completions`、`POST /v1/embeddings`、
-  `GET /v1/models`。POST 侧是**白名单**，其余路径一律 404（理由见「安全约定」）
+  `GET /v1/models`。POST 侧是**白名单**，其余路径一律 404（理由见「安全约定」）。
+  `GET /v1` 与 `GET /v1/` 也回模型列表（严格说规范里只有 `/v1/models`，但把 base_url
+  粘进浏览器探活很常见）——鉴权与按用户收窄和 `/v1/models` 完全一致，匿名仍然 401；
+  `/v1` 在 mux 上**显式注册**，不走 ServeMux 的 307 重定向，因为不少客户端重定向时会
+  丢掉 `Authorization` 头
 - **上游全部是 OpenAI 兼容端点**：`base_url` + `api_key` + 模型名映射
 - **权重路由**：同一模型可配多个供应商，按 `weight` 随机分摊
 - **可用性**：连续失败达到阈值后临时摘除，冷却后自动恢复；失败请求自动换下一个供应商重试

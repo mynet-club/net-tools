@@ -957,3 +957,90 @@ func TestPersistFailureIsObservable(t *testing.T) {
 		t.Errorf("记账失败不该把 status 标成不健康: %s", body)
 	}
 }
+
+// GET /v1 与 /v1/ 应当回模型列表，与 /v1/models 逐字节一致。
+//
+// 严格说 OpenAI 规范里只有 /v1/models、没有 GET /v1 —— 但把 base_url 直接粘进浏览器
+// 或拿它探活是很常见的动作，回一句 404 提示不如回「现在能用哪些模型」。
+// 关键是**不扩大暴露面**：匿名仍然 401，每个用户仍然只看到自己那份（复用 handleModels）。
+func TestRootV1ReturnsModelsList(t *testing.T) {
+	alpha := newUsageStub(t, 0)
+	beta := newUsageStub(t, 0)
+	h := newMUHarnessWith(t, twoProviderYAML(
+		"alpha", alpha.srv.URL, "{m-one: m-one}",
+		"beta", beta.srv.URL, "{m-two: m-two}",
+		testPricing))
+
+	_, want := h.get(t, "/v1/models", "sk-static")
+	if !bytes.Contains(want, []byte(`"m-one"`)) || !bytes.Contains(want, []byte(`"m-two"`)) {
+		t.Fatalf("前提不成立：模型列表不完整 %s", want)
+	}
+
+	for _, p := range []string{"/v1", "/v1/"} {
+		resp, got := h.get(t, p, "sk-static")
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("GET %s 应当 200，实际 %d: %s", p, resp.StatusCode, got)
+			continue
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("GET %s 应当与 /v1/models 逐字节一致\n  %s        = %s\n  /v1/models = %s", p, p, got, want)
+		}
+		if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
+			t.Errorf("GET %s 的 Content-Type = %q", p, ct)
+		}
+	}
+
+	// 不扩大暴露面：匿名与无效 key 仍然 401
+	for _, p := range []string{"/v1", "/v1/"} {
+		if resp, _ := h.get(t, p, ""); resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("匿名 GET %s 应当 401，实际 %d", p, resp.StatusCode)
+		}
+		if resp, _ := h.get(t, p, "sk-wrong"); resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("无效 key GET %s 应当 401，实际 %d", p, resp.StatusCode)
+		}
+	}
+}
+
+// GET /v1 不该被 ServeMux 301 重定向到 /v1/ —— 不少客户端在重定向时会丢掉
+// Authorization 头，于是探活变成 401。所以 /v1 必须在 mux 上显式注册。
+func TestRootV1NoRedirect(t *testing.T) {
+	alpha := newUsageStub(t, 0)
+	beta := newUsageStub(t, 0)
+	h := newMUHarnessWith(t, twoProviderYAML(
+		"alpha", alpha.srv.URL, "{m: m}", "beta", beta.srv.URL, "{m: m}", testPricing))
+
+	req, _ := http.NewRequest(http.MethodGet, h.gateway.URL+"/v1", nil)
+	req.Header.Set("Authorization", "Bearer sk-static")
+	// 用一个不跟随重定向的 client，才能看出有没有 301
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusMovedPermanently || resp.StatusCode == http.StatusTemporaryRedirect {
+		t.Errorf("GET /v1 不该被重定向（%d → %s），客户端可能丢掉 Authorization 头",
+			resp.StatusCode, resp.Header.Get("Location"))
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET /v1 应当直接 200，实际 %d", resp.StatusCode)
+	}
+}
+
+// POST /v1 既不该被当成转发路径（不在白名单里），也不该回模型列表。
+func TestRootV1RejectsNonGET(t *testing.T) {
+	alpha := newUsageStub(t, 0)
+	beta := newUsageStub(t, 0)
+	h := newMUHarnessWith(t, twoProviderYAML(
+		"alpha", alpha.srv.URL, "{m: m}", "beta", beta.srv.URL, "{m: m}", testPricing))
+
+	resp, raw := h.post(t, "/v1", "sk-static", map[string]any{"model": "m"})
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("POST /v1 应当 405，实际 %d: %s", resp.StatusCode, raw)
+	}
+	if n := alpha.hitCount() + beta.hitCount(); n != 0 {
+		t.Errorf("POST /v1 不该打到上游，实际 %d 次", n)
+	}
+}
