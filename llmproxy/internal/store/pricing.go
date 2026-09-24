@@ -137,7 +137,15 @@ func validateRate(name string, v float64) error {
 
 // validatePeak 校验价目行自带的峰谷规则。
 // 空值（= 沿用全局）不做校验 —— 那是 config.yaml 里 pricing 段的事。
+//
+// 但「显式填 0」要拒：0 意味着空闲时段免费，而 config.PeakRule.RatioAt 会把 <= 0
+// 当成「未设置」按不打折处理，所以填 0 既拿不到免费、又几乎肯定是笔误
+// （多半是想沿用全局却写了个 0）。这里分得清 nil 与 0，就在这一层说清楚。
 func validatePeak(hours []string, ratio *float64, tz string) error {
+	if len(hours) > 0 && ratio != nil && *ratio <= 0 {
+		return fmt.Errorf("off_peak_ratio 需要是 0~1 之间的正数（1 表示不分时段），当前是 %v；"+
+			"想沿用全局的系数就不要传这个字段", *ratio)
+	}
 	r := config.PeakRule{Hours: hours, TZ: tz}
 	if ratio != nil {
 		r.OffPeakRatio = *ratio

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -709,10 +708,17 @@ func (s *Server) upsertMyProvider(w http.ResponseWriter, r *http.Request, userNa
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "base_url 必填")
 		return
 	}
-	u, err := url.Parse(baseURL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
-		writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
-			"base_url 必须是 http/https 开头的合法 URL")
+	u, err := config.ParseBaseURL(baseURL)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "base_url "+err.Error())
+		return
+	}
+	// 用户可控的 base_url 等于「让网关以它自己的网络位置发请求、再把响应逐字节读回来」
+	// 的能力，所以要做出网校验。link-local（含云元数据）一律拒绝；回环与私网段只在
+	// block_local_upstream 打开时拒绝，免得打断「上游是本机 ollama」这类正当用法。
+	// 界线与局限见 config.CheckUpstreamEgress。
+	if err := config.CheckUpstreamEgress(u, cfg != nil && cfg.Server.BlockLocalUpstream); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 	baseURL = strings.TrimRight(baseURL, "/")
@@ -945,7 +951,7 @@ func (s *Server) writeUsageReport(w http.ResponseWriter, scope string, days int)
 			"priced":       pricing.Enabled(),
 			"month_system": monthCost,
 			"counted_upto": now.Format("2006-01-02"),
-			"note":         "只统计走系统上游的消耗；金额按当前单价估算，非历史价",
+			"note":         "只统计走系统上游的消耗；金额冻结优先（按请求开始时刻的价目行算好写死），未冻结的部分按 config.yaml 的 pricing 表估算兜底",
 		},
 	})
 }

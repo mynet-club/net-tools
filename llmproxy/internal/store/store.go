@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -118,12 +119,10 @@ type Store struct {
 	db *sql.DB
 }
 
+// schema 只放 DDL。连接级参数（busy_timeout / journal_mode / synchronous / _txlock）
+// 一律在 dsn() 里给 —— 它们必须对**每一条**连接生效，而 db.Exec(schema) 只作用于
+// 当时那一条。详见 dsn 的注释。
 const schema = `
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
--- CLI 与运行中的服务会同时开库（用户管理命令走 CLI），给它一点重试窗口
-PRAGMA busy_timeout=5000;
-
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT    PRIMARY KEY,
   value INTEGER NOT NULL
@@ -198,6 +197,35 @@ CREATE TABLE IF NOT EXISTS usage_daily (
 );
 `
 
+// dsn 把库路径与连接级参数拼成 modernc.org/sqlite 的 file: URI。
+//
+// 这些参数必须走 DSN，不能只靠 schema 开头那几行 PRAGMA：journal_mode=WAL 写进库文件头、
+// 是持久的，但 busy_timeout 与 synchronous 是**每连接**属性 —— 靠一次性 db.Exec(schema)
+// 设置，只在「池里恰好只有一条永不回收的连接」时成立。驱动一旦因 I/O 错误丢弃并重开连接
+// （driver.ErrBadConn），新连接就静默降级成 busy_timeout=0 + synchronous=FULL：
+// 前者让任何跨进程锁竞争立刻失败而不等 5 秒，后者让每次 commit 都 fsync，而且都没有日志。
+//
+// _txlock=immediate 解决另一件事：SQLite 的 busy_timeout **不覆盖**「deferred 事务内
+// 读锁升级成写锁」—— 那种冲突立刻返回 SQLITE_BUSY（这是 SQLite 刻意的防死锁设计）。
+// 价目收口与用户上游 upsert 都是「先 SELECT 再 UPDATE」，CLI 与服务端并发时会随机报
+// database is locked。让事务一开头就拿写锁，就落回 busy_timeout 的等待路径。
+// 本包 14 处事务全是写事务，所以没有只读事务会被这个设置拖累。
+//
+// 用 file: URI 而不是「裸路径 + ?query」：裸路径形式下驱动按第一个 '?' 切分 DSN，
+// 路径里真带 '?' 就会切错；URI 形式交给 SQLite 解析，路径部分由 url.URL 百分号转义
+// （空格、'?'、'#' 三种路径都有测试覆盖）。
+func dsn(path string) string {
+	u := url.URL{
+		Scheme: "file",
+		Path:   path,
+		RawQuery: "_pragma=busy_timeout(5000)" +
+			"&_pragma=journal_mode(WAL)" +
+			"&_pragma=synchronous(NORMAL)" +
+			"&_txlock=immediate",
+	}
+	return u.String()
+}
+
 // Open 打开（必要时创建）SQLite 数据库。文件权限强制 0600。
 func Open(path string) (*Store, error) {
 	if path == "" {
@@ -206,7 +234,7 @@ func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("创建数据库目录失败: %w", err)
 	}
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", dsn(path))
 	if err != nil {
 		return nil, fmt.Errorf("打开 SQLite 失败: %w", err)
 	}
@@ -524,36 +552,24 @@ ON CONFLICT(scope, name) DO UPDATE SET
 	return tx.Commit()
 }
 
-// scopeKey 把 (作用域, 供应商) 拼成 map 的键。
-// 全局作用域直接用供应商名，这样单用户时代的调用方和已有测试不受影响。
-func scopeKey(scope, name string) string {
-	if scope == "" {
-		return name
-	}
-	return scope + "/" + name
-}
-
-// SplitScopeKey 是 scopeKey 的逆运算，供需要还原作用域的调用方使用。
-func SplitScopeKey(k string) (scope, name string) {
-	if i := strings.IndexByte(k, '/'); i >= 0 {
-		return k[:i], k[i+1:]
-	}
-	return "", k
-}
-
 // LoadProviderStatus 读取全部供应商状态（含各用户自己的上游），重启后恢复熔断。
-func (s *Store) LoadProviderStatus() (map[string]ProviderStatus, error) {
+//
+// 返回**切片**而不是 map：ProviderStatus 自带 Scope 与 Name，而把两者拼成复合键会丢信息 ——
+// 键 "alice/my-up" 既可能是「用户 alice 的上游 my-up」，也可能是一个名字里真带斜杠的
+// 全局供应商，恢复时无法还原（SplitScopeKey 只能猜）。ORDER BY 则让恢复结果不依赖
+// SQL 的返回顺序：同一份库两次读出来必须一样。
+func (s *Store) LoadProviderStatus() ([]ProviderStatus, error) {
 	rows, err := s.db.Query(`
 SELECT COALESCE(scope,''), name, enabled, consecutive_failures, unhealthy_until,
        COALESCE(last_error,''), COALESCE(last_success_at,0), COALESCE(last_failure_at,0),
        total_requests, total_failures
-FROM provider_stats`)
+FROM provider_stats ORDER BY scope, name`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	out := make(map[string]ProviderStatus)
+	out := []ProviderStatus{}
 	for rows.Next() {
 		var st ProviderStatus
 		var enabled, unhealthyUntil, lastOK, lastFail int64
@@ -572,7 +588,7 @@ FROM provider_stats`)
 		if lastFail != 0 {
 			st.LastFailureAt = time.UnixMilli(lastFail)
 		}
-		out[scopeKey(st.Scope, st.Name)] = st
+		out = append(out, st)
 	}
 	return out, rows.Err()
 }
@@ -621,10 +637,20 @@ func (s *Store) Stats(since time.Time, recentLimit int) (*Stats, error) {
 
 	where := ""
 	args := []any{}
+	// usage_daily 是按**天**聚合的（day 是 TEXT），粒度与 requests.ts 的毫秒不同，
+	// 所以要另起一个 where。曾经这两个查询完全没有 WHERE —— 于是 `stats --days 1`
+	// 会打印「总计: 请求 1」，紧接着的按供应商表却是全量历史，同屏自相矛盾。
+	dayWhere := ""
+	dayArgs := []any{}
 	if !since.IsZero() {
 		where = " WHERE ts >= ?"
 		args = append(args, since.UnixMilli())
+		dayWhere = " WHERE day >= ?"
+		dayArgs = append(dayArgs, since.Format("2006-01-02"))
 	}
+	// 注意残留的边界误差（数据模型决定，无法消除）：总计按毫秒精确过滤，
+	// 而两张聚合表只能按整天过滤，所以 since 当天里早于 since 时刻的那部分
+	// 会出现在聚合表里、却不在总计里。要更细就得让 usage_daily 按小时聚合。
 	err := s.db.QueryRow(`
 SELECT COUNT(*),
        COALESCE(SUM(CASE WHEN ok=1 THEN 1 ELSE 0 END),0),
@@ -637,15 +663,15 @@ FROM requests`+where, args...).Scan(
 	}
 
 	rows, err := s.db.Query(`
-SELECT day, provider, model,
+SELECT '-', provider, model,
        SUM(requests), SUM(ok), SUM(failed),
        SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
        CASE WHEN SUM(requests)>0 THEN CAST(SUM(latency_sum_ms) AS REAL)/SUM(requests) ELSE 0 END,
        COALESCE(SUM(cost_upstream),0), COALESCE(SUM(frozen_requests),0)
-FROM usage_daily
+FROM usage_daily`+dayWhere+`
 GROUP BY provider, model
 ORDER BY SUM(requests) DESC, provider, model
-LIMIT 200`)
+LIMIT 200`, dayArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -671,10 +697,10 @@ SELECT day, '-', '-',
        SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
        CASE WHEN SUM(requests)>0 THEN CAST(SUM(latency_sum_ms) AS REAL)/SUM(requests) ELSE 0 END,
        COALESCE(SUM(cost_upstream),0), COALESCE(SUM(frozen_requests),0)
-FROM usage_daily
+FROM usage_daily`+dayWhere+`
 GROUP BY day
 ORDER BY day DESC
-LIMIT 90`)
+LIMIT 90`, dayArgs...)
 	if err != nil {
 		return nil, err
 	}

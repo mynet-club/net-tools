@@ -321,6 +321,23 @@ func (s *Store) userUpdate(setClause string, setArgs []any, name string) error {
 }
 
 // DeleteUser 删除用户及其全部上游配置。
+//
+// 级联删的是「**新建同名用户时不该被继承**」的那些行：
+//
+//   - `user_models`：消费模式的模型白名单与「下游名 → 上游模型」映射。不删的话，
+//     删掉 alice 再建一个 alice，新账号会**静默继承前任被授权的模型范围** ——
+//     管理员以为发出去的是个干净账号，实际它已经能调前任那些模型了。
+//   - `provider_stats`：按 (用户, 上游) 分桶的熔断状态。不删的话新账号继承前任的
+//     连续失败计数；若前任是在冷却中被删的，新账号一上来就是「熔断中」。
+//     内存那一份由 admin.go 的 router.ForgetScope 清，但库里的行还在，
+//     重启后会被重新加载回来。
+//
+// 刻意**保留**的两类：
+//
+//   - `usage_user_daily`：这是账单。钱已经花掉了，删掉等于销毁计量记录。
+//   - `user_prices`：历史价目行。请求行上的冻结金额（charge）已经写死、不依赖它，
+//     但 `price_downstream_id` 要指着它才能回溯「当时用的是哪一档价」。
+//     代价是新建同名用户会继承前任的分发价 —— 改价请显式插一条新行。
 func (s *Store) DeleteUser(name string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -329,6 +346,12 @@ func (s *Store) DeleteUser(name string) error {
 	defer func() { _ = tx.Rollback() }()
 
 	if _, err := tx.Exec(`DELETE FROM user_providers WHERE user_name = ?`, name); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM user_models WHERE user_name = ?`, name); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM provider_stats WHERE scope = ?`, name); err != nil {
 		return err
 	}
 	res, err := tx.Exec(`DELETE FROM users WHERE name = ?`, name)

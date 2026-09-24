@@ -110,6 +110,15 @@ func costFromRates(inHit, inMiss, inWrite, out, perReq float64, rec *store.Reque
 		}
 	}
 
+	// in_write 可空 = 与 in_miss 同价（docs/pricing-design.md §6.1、store.ProviderPrice.InWrite
+	// 的注释、以及建表语句的 DEFAULT 0 都是这么承诺的）。这个回落必须在这里兑现：
+	// 接口省略 in_write 时 Go 的零值就是 0，直接乘会让「写入缓存」这一档 token 完全不计费 ——
+	// 而它的单价通常比未命中还贵（Anthropic 系约 1.25×），漏掉是实打实低估成本。
+	// 上游成本与分发计费共用这个函数，所以两层一起修好。
+	if inWrite <= 0 {
+		inWrite = inMiss
+	}
+
 	sum := float64(hit)*inHit + float64(write)*inWrite + float64(miss)*inMiss + float64(completion)*out
 	return sum/1e6*ratio + perReq
 }
@@ -160,7 +169,15 @@ func tokOr0(p *int64) int64 {
 // 注意这与 stats 的「估算段/冻结段分开列」不矛盾：那是**报表口径**要求两段分开展示，
 // 这里是**配额/账单口径**要求必须连续可用。
 func rowCharge(r store.UsageRow, p *config.PricingConfig, now time.Time) float64 {
-	if r.Requests > 0 && r.FrozenCharges >= r.Requests {
+	// 摊分的分母用 OK（成功请求数）而不是 Requests：**失败请求永远不会被冻结**
+	// （freezeDownstreamCharge 在 !rec.OK 时直接 return），却照样给 Requests +1。
+	// 拿 Requests 当分母的话，只要这一行有过任何一次失败，FrozenCharges < Requests
+	// 就永久成立，于是永远走摊分路径 —— 失败请求贡献 0 token 却贡献 +1 分母，
+	// est 会被按失败率重复摊一遍到已经冻结的金额上。实测 9 成功 + 1 失败：
+	// 正确是 18.0，算出来 19.8，多收正好 10%（= 失败率），30% 失败率就多收 30%。
+	// 连带后果是**进程重启会凭空抬高用户的当月已用金额**：实时路径 meterSet.Add
+	// 是逐请求的（失败请求加 0），重载路径 meterForLocked 走这里，两边口径对不上。
+	if r.OK > 0 && r.FrozenCharges >= r.OK {
 		return r.Charge
 	}
 	hit, miss := r.CacheHitTokens, r.CacheMissTokens
@@ -173,9 +190,13 @@ func rowCharge(r store.UsageRow, p *config.PricingConfig, now time.Time) float64
 			est = c
 		}
 	}
-	if r.FrozenCharges == 0 || r.Requests == 0 {
+	if r.FrozenCharges == 0 || r.OK == 0 {
 		return est
 	}
-	unfrozen := float64(r.Requests-r.FrozenCharges) / float64(r.Requests)
+	// 残留的不精确（明确接受）：成功但上游没回报 usage 的请求同样不会被冻结，
+	// 却仍被算进这个分母，于是摊出来的比例略偏大。要彻底精确得在 usage_user_daily
+	// 里单记一列「可冻结请求数」（ok AND prompt_tokens IS NOT NULL），那是一次 schema
+	// 迁移；而这一档误差远小于原先「按失败率线性多收」的量级。
+	unfrozen := float64(r.OK-r.FrozenCharges) / float64(r.OK)
 	return r.Charge + est*unfrozen
 }

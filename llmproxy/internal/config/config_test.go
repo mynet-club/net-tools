@@ -107,8 +107,70 @@ providers:
 	if cfg.Normalized[0].Weight != 1 || cfg.Normalized[0].TimeoutMs != 120000 {
 		t.Errorf("默认 provider = %+v", cfg.Normalized[0])
 	}
-	if cfg.Database.RetainDays != 90 {
-		t.Errorf("默认 retain_days = %d", cfg.Database.RetainDays)
+	if cfg.Database.EffectiveRetainDays() != 90 {
+		t.Errorf("默认 retain_days = %d", cfg.Database.EffectiveRetainDays())
+	}
+}
+
+// retain_days 的三档语义必须分得清：没配 = 90 天、显式 0 = 永久、负数 = 拒绝。
+//
+// 「显式 0 = 永久」是 README 与 config.example.yaml 都写明的承诺，而 requests 表正是
+// 计价冻结账本的唯一载体 —— 悄悄把 0 当成「没配」而规范化成 90，等于让照着文档配的人
+// 在第 90 天丢掉账本，剩下的聚合表只有金额合计、没有价目行 id，无法复核。
+func TestRetainDaysDistinguishesUnsetFromZero(t *testing.T) {
+	parse := func(src string) (*Config, error) {
+		return Parse([]byte(`
+server: {host: 127.0.0.1, port: 8787, api_keys: [sk-x]}
+providers:
+  - {name: p, enabled: true, base_url: "https://api.example.com/v1", api_key: k, models: ["*"]}
+database: {path: "", ` + src + `}
+`))
+	}
+
+	// 显式配 90 → 就是 90
+	cfg, err := parse("retain_days: 90")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Database.EffectiveRetainDays(); got != 90 {
+		t.Errorf("retain_days: 90 应当是 90，实际 %d", got)
+	}
+
+	// 显式 0 → 永久（EffectiveRetainDays 返回 0，Prune 会直接 no-op）
+	cfg, err = parse("retain_days: 0")
+	if err != nil {
+		t.Fatalf("retain_days: 0 不该被拒: %v", err)
+	}
+	if cfg.Database.RetainDays == nil {
+		t.Fatal("显式 0 应当被解析成一个非 nil 的指针（否则与「没配」无法区分）")
+	}
+	if got := cfg.Database.EffectiveRetainDays(); got != 0 {
+		t.Errorf("retain_days: 0 应当是 0（永久保留），实际 %d", got)
+	}
+
+	// 负数 → 拒绝，且错误信息要说清 0 才是「永久」
+	if _, err := parse("retain_days: -1"); err == nil {
+		t.Error("retain_days: -1 应当被拒")
+	} else if !strings.Contains(err.Error(), "永久") {
+		t.Errorf("错误信息该提示 0 表示永久保留，实际：%v", err)
+	}
+}
+
+// 「没配」与「显式 0」必须走不同的路径：前者默认 90 天，后者永久保留。
+func TestRetainDaysUnsetDefaultsTo90(t *testing.T) {
+	cfg, err := Parse([]byte(`
+server: {host: 127.0.0.1, port: 8787, api_keys: [sk-x]}
+providers:
+  - {name: p, enabled: true, base_url: "https://api.example.com/v1", api_key: k, models: ["*"]}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Database.RetainDays != nil {
+		t.Errorf("没配 retain_days 时指针应当是 nil，实际 %v", *cfg.Database.RetainDays)
+	}
+	if got := cfg.Database.EffectiveRetainDays(); got != 90 {
+		t.Errorf("没配时应当默认 90 天，实际 %d", got)
 	}
 }
 

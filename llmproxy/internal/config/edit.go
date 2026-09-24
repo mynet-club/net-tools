@@ -120,21 +120,39 @@ func renderProviders(ps []ProviderRaw) ([]byte, error) {
 		if strings.TrimSpace(p.Name) == "" {
 			return nil, fmt.Errorf("供应商名不能为空")
 		}
-		fmt.Fprintf(&b, "  - name: %s\n", yamlScalar(p.Name))
+		// 每个可能来自界面的字符串都走 yamlScalar：它负责引号/转义，
+		// 并在值含控制字符时**报错**而不是静默写出一个会被 YAML 折叠或越段的标量。
+		name, err := yamlScalar(p.Name)
+		if err != nil {
+			return nil, fmt.Errorf("供应商名 %w", err)
+		}
+		fmt.Fprintf(&b, "  - name: %s\n", name)
 		if p.Enabled.Set {
 			fmt.Fprintf(&b, "    enabled: %v\n", p.Enabled.Value)
 		}
 		if p.BaseURL != "" {
-			fmt.Fprintf(&b, "    base_url: %s\n", yamlScalar(p.BaseURL))
+			v, err := yamlScalar(p.BaseURL)
+			if err != nil {
+				return nil, fmt.Errorf("供应商 %s 的 base_url %w", p.Name, err)
+			}
+			fmt.Fprintf(&b, "    base_url: %s\n", v)
 		}
 		if p.APIKey != "" {
-			fmt.Fprintf(&b, "    api_key: %s\n", yamlScalar(p.APIKey))
+			v, err := yamlScalar(p.APIKey)
+			if err != nil {
+				return nil, fmt.Errorf("供应商 %s 的 api_key %w", p.Name, err)
+			}
+			fmt.Fprintf(&b, "    api_key: %s\n", v)
 		}
 		if p.Weight != 0 {
 			fmt.Fprintf(&b, "    weight: %v\n", p.Weight)
 		}
 		if p.Proxy != "" {
-			fmt.Fprintf(&b, "    proxy: %s\n", yamlScalar(p.Proxy))
+			v, err := yamlScalar(p.Proxy)
+			if err != nil {
+				return nil, fmt.Errorf("供应商 %s 的 proxy %w", p.Name, err)
+			}
+			fmt.Fprintf(&b, "    proxy: %s\n", v)
 		}
 		if p.TimeoutMs != 0 {
 			fmt.Fprintf(&b, "    timeout_ms: %d\n", p.TimeoutMs)
@@ -189,22 +207,65 @@ func renderModels(n *yaml.Node) (string, error) {
 	return b.String(), nil
 }
 
-// yamlScalar 决定一个字符串要不要加引号。
-// 只在确实会被 YAML 误解析时才加 —— URL 和 ${ENV} 都能裸写，加了反而难读。
-func yamlScalar(s string) string {
-	if s == "" {
-		return `""`
+// yamlScalar 把一个字符串渲染成**单行** YAML 标量。
+//
+// 引号与转义一律交给 yaml.v3，不再手写判断规则。手写那版只看 `\n`，漏掉了
+// lone CR（U+000D）、U+2028、U+0085 —— 而 YAML 把这三个都当换行，于是一个带 CR 的
+// 供应商名能逃出 providers 段、在 config.yaml 里注入一个全新的顶层段
+// （实测过可落盘的 PoC：注入一个 pricing 段把所有单价变成 0，配额于永不触发）。
+// 交给 yaml.v3 之后它会把 CR 编成双引号转义 `"a\rb"`，注入就不成立了。
+//
+// 顺带修掉旧实现的另一个坑：`123` / `true` / `null` / `1.5` 这类值旧代码会裸写，
+// 而 YAML 会把它们解析成整数/布尔/null 而不是字符串；yaml.v3 会自动加引号。
+//
+// 含控制字符的值**直接拒绝**，而不是想办法渲染，两个理由：
+//
+//   - yaml.v3 对含换行的值会输出多行块标量（`|-`），而 renderProviders 是按
+//     「一个字段一行」拼的，多行标量塞进去缩进就对不上了；
+//   - 更根本的是，供应商名 / base_url / api_key / proxy 里出现换行或控制字符
+//     本身就一定是错误输入（多半是从表格软件或 Windows 环境粘来的）。
+//     旧实现会把裸换行放进双引号标量里 —— 而 YAML 双引号标量的裸换行是「折叠」语义，
+//     于是 api_key 被静默改成 `sk-line1 line2`：校验通过、落盘成功、界面毫无提示，
+//     之后那家供应商每个请求都 401。响亮地拒绝远好于静默改坏。
+func yamlScalar(s string) (string, error) {
+	if i := strings.IndexFunc(s, unsafeYAMLRune); i >= 0 {
+		return "", fmt.Errorf("值里含控制字符或行分隔符（%q 处），不能写进配置文件；"+
+			"多半是从表格或别处粘来的，请去掉换行再试", s[i:])
 	}
-	needs := strings.ContainsAny(s, "\n") ||
-		strings.Contains(s, ": ") || strings.Contains(s, " #") ||
-		strings.HasPrefix(s, " ") || strings.HasSuffix(s, " ") ||
-		strings.ContainsAny(s[:1], "-?:,[]{}#&*!|>'\"%@`")
-	if !needs {
-		return s
+	n := yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: s}
+	out, err := yaml.Marshal(&n)
+	if err != nil {
+		return "", fmt.Errorf("编码 YAML 标量失败: %w", err)
 	}
-	escaped := strings.ReplaceAll(s, `\`, `\\`)
-	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
-	return `"` + escaped + `"`
+	text := strings.TrimRight(string(out), "\n")
+	if strings.ContainsAny(text, "\r\n") {
+		return "", fmt.Errorf("%q 无法写成单行 YAML 标量", s)
+	}
+	// 往返校验：解回来必须逐字节相同。这一道不依赖我枚举全所有危险字符 ——
+	// 任何「写下去再读回来就变了」的值都会在这里被挡住。
+	var back string
+	if err := yaml.Unmarshal(out, &back); err != nil {
+		return "", fmt.Errorf("%q 写成的 YAML 解不回来: %w", s, err)
+	}
+	if back != s {
+		return "", fmt.Errorf("%q 无法被安全地写成 YAML（往返不一致，读回来是 %q）", s, back)
+	}
+	return text, nil
+}
+
+// unsafeYAMLRune 报告 r 是否是「不能出现在单行 YAML 标量里」的字符：
+// C0 控制字符（含 \t \n \r）、DEL、C1 控制字符（含 U+0085 NEL），
+// 以及 YAML 当作行分隔符的 U+2028 / U+2029。
+func unsafeYAMLRune(r rune) bool {
+	switch {
+	case r < 0x20 || r == 0x7f:
+		return true
+	case r >= 0x80 && r <= 0x9f:
+		return true
+	case r == 0x2028 || r == 0x2029:
+		return true
+	}
+	return false
 }
 
 // ModelsNode 把接口传来的值编成 models 节点。

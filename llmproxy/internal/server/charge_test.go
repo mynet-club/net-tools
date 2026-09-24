@@ -105,7 +105,7 @@ func TestRowChargeFrozenFirstAndMixed(t *testing.T) {
 	}
 	now := time.Now()
 	base := store.UsageRow{
-		UpstreamModel: "u-model", Requests: 10,
+		UpstreamModel: "u-model", Requests: 10, OK: 10,
 		PromptTokens: 1000, CacheHitTokens: 800, CacheMissTokens: 200, CompletionTokens: 100,
 	}
 	// 1) 全部冻结 → 直接用冻结值
@@ -131,6 +131,52 @@ func TestRowChargeFrozenFirstAndMixed(t *testing.T) {
 	r.Charge, r.FrozenCharges = 3.0, 4
 	if got, want := rowCharge(r, nil, now), 3.0; math.Abs(got-want) > 1e-12 {
 		t.Errorf("没有 legacy 表时应当只拿冻结值 %v，实际 %v", want, got)
+	}
+}
+
+// 摊分的分母必须是**成功数**，不是总请求数。
+//
+// 失败请求永远不会被冻结（freezeDownstreamCharge 在 !rec.OK 时直接 return），
+// 却照样给 Requests +1。拿 Requests 当分母的话，只要这一行有过任何一次失败，
+// FrozenCharges < Requests 就永久成立、于是永远走摊分路径 —— 而失败请求贡献 0 token
+// 却贡献 +1 分母，est 被按失败率重复摊一遍到已经冻结的金额上。
+// 这里让 legacy 单价与冻结口径一致，差额就一眼可见：**多收的比例正好等于失败率**。
+// 连带后果是进程重启会凭空抬高用户的当月已用金额（实时路径逐请求累加、失败请求加 0，
+// 重载路径走这里），配额于是提前触顶。
+func TestRowChargeDenominatorExcludesFailedRequests(t *testing.T) {
+	p := &config.PricingConfig{
+		Currency: "CNY",
+		Models:   map[string]config.ModelPrice{"u-model": {CacheMiss: 2}},
+	}
+	now := time.Now()
+
+	// 9 条成功、每条 1e6 未命中输入 → 每条 ¥2、合计冻结 18.0；再加 1 条失败（0 token）
+	row := store.UsageRow{
+		UpstreamModel: "u-model",
+		Requests:      10, OK: 9, Failed: 1,
+		PromptTokens: 9_000_000, CacheMissTokens: 9_000_000,
+		Charge: 18.0, FrozenCharges: 9,
+	}
+	if got := rowCharge(row, p, now); math.Abs(got-18.0) > 1e-12 {
+		t.Errorf("9 成功（全冻结）+ 1 失败应当正好是冻结值 18.0，实际 %v —— "+
+			"多出来的部分就是按失败率（10%%）多收的钱", got)
+	}
+
+	// 失败率 30%：差额同样线性放大，确认不是恰好抵消
+	row.Requests, row.OK, row.Failed = 10, 7, 3
+	row.PromptTokens, row.CacheMissTokens = 7_000_000, 7_000_000
+	row.Charge, row.FrozenCharges = 14.0, 7
+	if got := rowCharge(row, p, now); math.Abs(got-14.0) > 1e-12 {
+		t.Errorf("7 成功（全冻结）+ 3 失败应当正好是 14.0，实际 %v", got)
+	}
+
+	// 混合行仍然要摊：5 条成功里只冻结了 2 条 → 冻结值 + 3/5 的估算
+	row.Requests, row.OK, row.Failed = 6, 5, 1
+	row.PromptTokens, row.CacheMissTokens = 5_000_000, 5_000_000
+	row.Charge, row.FrozenCharges = 4.0, 2
+	est := 5_000_000 * 2.0 / 1e6 // = 10.0
+	if got, want := rowCharge(row, p, now), 4.0+est*0.6; math.Abs(got-want) > 1e-12 {
+		t.Errorf("混合行应当是 %v（冻结 4 + 估算 10 的 3/5），实际 %v", want, got)
 	}
 }
 

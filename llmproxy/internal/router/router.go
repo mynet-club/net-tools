@@ -389,17 +389,13 @@ func (r *Router) SnapshotAll() []ScopedState {
 	return out
 }
 
-// RestoreState 从持久化恢复全局作用域的运行期状态（重启后继续熔断）。
-func (r *Router) RestoreState(states map[string]State) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for name, st := range states {
-		*r.stateLocked("", name) = st
-	}
-}
-
-// RestoreScoped 从持久化恢复全部作用域的状态。
+// RestoreScoped 从持久化恢复全部作用域的状态（重启后继续熔断）。
 // 已存在的作用域按名字覆盖，新作用域按需创建。
+//
+// 这是**唯一**的恢复入口：状态是按 (作用域, 供应商) 分桶的，全局池是 ""、
+// 每个用户自己的上游是用户名。曾经还有一个只写全局作用域的 RestoreState，
+// 生产代码调了它，于是用户级熔断重启即丢、还在库里长出名叫 "alice/my-up"
+// 的幽灵条目 —— 那个 API 已经删掉，让编译器杜绝重犯。
 func (r *Router) RestoreScoped(list []ScopedState) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

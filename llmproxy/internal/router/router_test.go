@@ -225,17 +225,41 @@ func TestApplyConfigPreservesState(t *testing.T) {
 	}
 }
 
-func TestRestoreState(t *testing.T) {
+// 恢复必须带上作用域，而且冷却时间要一起恢复。
+//
+// 曾经生产代码调的是一个只写全局作用域的 RestoreState，于是用户级熔断重启即丢，
+// 还在 provider_stats 里长出名叫 "alice/my-up" 的幽灵条目。那个 API 已经删掉，
+// 这条测试钉住最后那半个不变式：用户级状态必须落在自己的桶里，不许泄漏到全局。
+func TestRestoreScopedRecoversCooldown(t *testing.T) {
 	r := New(config.RoutingConfig{FailureThreshold: 3, CooldownSeconds: 60}, []config.Provider{
 		passthrough("a", 1),
 	})
 	future := time.Now().Add(30 * time.Second)
-	r.RestoreState(map[string]State{
-		"a": {ConsecutiveFailures: 3, UnhealthyUntil: future, TotalRequests: 10, TotalFailures: 3},
+	r.RestoreScoped([]ScopedState{
+		{Scope: "", Name: "a", State: State{
+			ConsecutiveFailures: 3, UnhealthyUntil: future, TotalRequests: 10, TotalFailures: 3}},
+		{Scope: "alice", Name: "my-up", State: State{
+			ConsecutiveFailures: 7, UnhealthyUntil: future, TotalRequests: 50, TotalFailures: 7}},
 	})
+
 	snap := r.Snapshot()
 	if snap["a"].ConsecutiveFailures != 3 || snap["a"].TotalRequests != 10 {
-		t.Errorf("状态未恢复: %+v", snap["a"])
+		t.Errorf("全局状态未恢复: %+v", snap["a"])
+	}
+	if !snap["a"].UnhealthyUntil.Equal(future) {
+		t.Errorf("全局冷却时间未恢复: %v, want %v", snap["a"].UnhealthyUntil, future)
+	}
+
+	alice := r.SnapshotFor("alice")
+	if alice["my-up"].ConsecutiveFailures != 7 || alice["my-up"].TotalRequests != 50 {
+		t.Errorf("alice 的状态未恢复到自己的作用域: %+v", alice)
+	}
+	if !alice["my-up"].UnhealthyUntil.Equal(future) {
+		t.Errorf("alice 的冷却时间未恢复: %v, want %v", alice["my-up"].UnhealthyUntil, future)
+	}
+	// 关键回归守卫：折叠成复合键塞进全局作用域，就是曾经那个 bug 的形状
+	if _, leaked := snap["alice/my-up"]; leaked {
+		t.Error("用户级状态泄漏进了全局作用域（键被折叠成 \"alice/my-up\"）")
 	}
 }
 

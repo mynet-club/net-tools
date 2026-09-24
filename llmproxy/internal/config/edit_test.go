@@ -250,42 +250,133 @@ func TestEditProvidersRejectsEmptyAndBadInput(t *testing.T) {
 }
 
 // 标量引号：URL 与 ${ENV} 不该被加引号（保持可读），怪名字才加。
+//
+// 引号与转义现在一律交给 yaml.v3，所以这里只钉住两件事：
+// 常见值保持裸写（否则 config.yaml 会变得难读），以及**该加引号的一定加**。
 func TestYAMLScalarQuoting(t *testing.T) {
-	cases := map[string]bool{ // 值 → 是否应当被引号包住
-		"https://api.deepseek.com/v1": true, // 含 ": " 才算需要引号，这里不含 → 不加
-		"${DEEPSEEK_API_KEY}":         true,
-		"sk-not-a-real-key":           true,
-		"direct":                      true,
-		"http://192.168.0.3:7890":     true,
-		"有中文":                         true,
-		"- 破折号开头":                     false,
-		"带: 冒号空格":                     false,
-		"结尾有空格 ":                      false,
-	}
-	for val, wantPlain := range cases {
-		got := yamlScalar(val)
-		plain := got == val
-		if plain != wantPlain {
-			t.Errorf("yamlScalar(%q) = %q；期望%s引号", val, got, map[bool]string{true: "不加", false: "加"}[wantPlain])
+	// 这些必须裸写：它们是 config.yaml 里最常见的值，加引号纯属噪音
+	for _, val := range []string{
+		"https://api.deepseek.com/v1",
+		"${DEEPSEEK_API_KEY}",
+		"${DEEPSEEK_API_KEY:-default}",
+		"sk-not-a-real-key",
+		"direct",
+		"http://192.168.0.3:7890",
+		"socks5://user:password@127.0.0.1:1081",
+		"有中文",
+		"openai-main",
+	} {
+		got, err := yamlScalar(val)
+		if err != nil {
+			t.Errorf("yamlScalar(%q) 不该报错: %v", val, err)
+			continue
+		}
+		if got != val {
+			t.Errorf("yamlScalar(%q) = %q；这个常见值应当裸写、不加引号", val, got)
 		}
 	}
+
+	// 这些必须被引号包住，否则 YAML 会把它们解析成别的东西
+	for _, val := range []string{
+		"",        // 空
+		"- 破折号开头", // 序列指示符
+		"带: 冒号空格", // 映射指示符
+		"结尾有空格 ",  // 尾随空格会被吃掉
+		"*",       // 别名指示符
+		"有 # 井号",  // 注释
+		"123",     // 会被解析成整数
+		"true",    // 会被解析成布尔
+		"null",    // 会被解析成 null
+		"1.5",     // 会被解析成浮点
+	} {
+		got, err := yamlScalar(val)
+		if err != nil {
+			t.Errorf("yamlScalar(%q) 不该报错: %v", val, err)
+			continue
+		}
+		if got == val && val != "" {
+			t.Errorf("yamlScalar(%q) 裸写了，YAML 会把它解析成别的类型", val)
+		}
+	}
+	// 注：`quote"inside` 与 `back\slash` 在 YAML 里是合法的**裸**标量
+	// （引号在中间不是指示符、反斜杠在裸标量里是字面量），所以不要求加引号 ——
+	// 它们的正确性由下面的往返测试保证。
 }
 
-// 把标量交给 YAML 解析器验证：加了引号的必须还是同一个字符串。
+// 把标量交给 YAML 解析器验证：不管加没加引号，解回来都必须是同一个字符串。
 func TestYAMLScalarRoundTrip(t *testing.T) {
 	for _, val := range []string{
 		"https://api.deepseek.com/v1", "${DEEPSEEK_API_KEY}", "sk-abc123",
 		"http://192.168.0.3:7890", "带: 冒号", "- 开头", "结尾空格 ", "有 # 井号",
+		"123", "true", "null", "1.5", "*", `quote"inside`, "back\\slash", "",
 	} {
-		src := "k: " + yamlScalar(val) + "\n"
+		got, err := yamlScalar(val)
+		if err != nil {
+			t.Errorf("yamlScalar(%q): %v", val, err)
+			continue
+		}
+		src := "k: " + got + "\n"
 		var m map[string]string
 		if err := yaml.Unmarshal([]byte(src), &m); err != nil {
-			t.Errorf("值 %q 渲染成 %q 后解析失败: %v", val, yamlScalar(val), err)
+			t.Errorf("值 %q 渲染成 %q 后解析失败: %v", val, got, err)
 			continue
 		}
 		if m["k"] != val {
-			t.Errorf("往返不一致: %q → %q → %q", val, yamlScalar(val), m["k"])
+			t.Errorf("往返不一致: %q → %q → %q", val, got, m["k"])
 		}
+	}
+}
+
+// 含换行或控制字符的值必须被**响亮拒绝**，不能被渲染出去。
+//
+// 两个真实危害：
+//
+//   - lone CR（U+000D）、U+2028、U+0085 在 YAML 里都是换行，而旧的手写规则只看 `\n`。
+//     于是一个带 CR 的供应商名能逃出 providers 段、在 config.yaml 里注入一个全新的
+//     顶层段（实测过可落盘的 PoC：注入 pricing 段把所有单价变成 0，配额于是永不触发）。
+//   - 裸换行放进双引号标量后，YAML 的「折叠」语义会把它变成空格 ——
+//     api_key 被静默改成 `sk-line1 line2`，校验通过、落盘成功、界面毫无提示，
+//     之后那家供应商每个请求都 401。
+func TestYAMLScalarRejectsControlCharacters(t *testing.T) {
+	for _, val := range []string{
+		"line1\nline2",
+		"carriage\rreturn",
+		"cr\r\nlf",
+		"tab\there",
+		"nul\x00byte",
+		"u0085\u0085sep",
+		"u2028\u2028sep",
+		"u2029\u2029sep",
+		"vertical\vtab",
+		// 审阅里那个可落盘 PoC 的形状：用 CR 当换行、冒号后紧跟 CR 以避开 ": " 判断
+		"openai-main\r    base_url:\r      https://evil/v1\rpricing:\r  currency:\r    |",
+	} {
+		if got, err := yamlScalar(val); err == nil {
+			t.Errorf("%q 应当被拒绝，却渲染成了 %q", val, got)
+		}
+	}
+}
+
+// 端到端：带 CR 的供应商名不能逃出 providers 段。
+//
+// 这是上面那条单元测试的实际后果 —— 旧实现下这个载荷能通过校验并落盘，
+// 在 config.yaml 里多出一个顶层 pricing 段。
+func TestEditProvidersRejectsSegmentEscape(t *testing.T) {
+	payload := "openai-main\r    base_url:\r      https://api.openai.com/v1\r" +
+		"    api_key:\r      ${OPENAI_API_KEY}\r    models:\r      - \"*\"\r" +
+		"pricing:\r  models:\r    \"*\":\r      cache_miss:\r        0\r  currency:\r    |"
+
+	_, err := renderProviders([]ProviderRaw{{
+		Name:    payload,
+		BaseURL: "https://api.openai.com/v1",
+		APIKey:  "${OPENAI_API_KEY}",
+		Weight:  1,
+	}})
+	if err == nil {
+		t.Fatal("带 CR 的供应商名应当被拒绝（它能逃出 providers 段注入新的顶层段）")
+	}
+	if !strings.Contains(err.Error(), "控制字符") {
+		t.Errorf("错误信息该说清是控制字符的问题，实际：%v", err)
 	}
 }
 

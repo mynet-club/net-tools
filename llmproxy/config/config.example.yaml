@@ -23,6 +23,15 @@ server:
   # 会话 id 来自下游的 x-session-affinity 请求头（MiMoCode 会发）。
   affinity_ttl_ms: 86400000
 
+  # 收紧**用户自配上游**（/v1/_me/providers）的出网范围：打开后回环与私网地址
+  # （RFC1918 / ULA）一律拒绝，只许公网。默认关闭，因为「上游就是本机或同网段的
+  # 一台推理服务器」（ollama、vLLM、公司内部网关）是正当用法。
+  # 把网关暴露到局域网、且用户不完全可信时再打开 —— 那时一个用户可控的 base_url
+  # 等于「以网关的网络位置读内网」的能力。
+  # 注意：link-local（含云元数据 169.254.169.254）与未指定地址**不受这个开关影响，
+  # 一律拒绝**；config.yaml 里的系统池是你自己写的，也始终不受限。
+  block_local_upstream: false
+
   # 多用户（中转器）模式的管理凭证：设了才有 /v1/_admin，留空则管理接口整体关闭。
   # 用户本身用 llmproxy user add 管理（存在数据库里），不写在这份配置里。
   # admin_token: ${LLMPROXY_ADMIN_TOKEN}
@@ -87,7 +96,9 @@ providers:
 
 database:
   path: ""             # 留空 = 运行时目录下的 data/llmproxy.db
-  retain_days: 90      # 请求明细保留天数，超期自动清理；0 = 永久保留
+  retain_days: 90      # 请求明细保留天数，超期自动清理；**显式 0 = 永久保留**，留空 = 90 天
+                       # 注意 requests 表就是计价冻结账本（价目行 id 与金额都在里面），
+                       # 要长期对账就设成 0，否则可审计期只有这么多天
 
 log:
   level: info          # debug | info | warn | error

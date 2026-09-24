@@ -6,14 +6,18 @@
 
 ## 特性
 
-- **下游 OpenAI 兼容**：`POST /v1/chat/completions`、`GET /v1/models`
+- **下游 OpenAI 兼容**：`POST /v1/chat/completions`、`POST /v1/completions`、`POST /v1/embeddings`、
+  `GET /v1/models`。POST 侧是**白名单**，其余路径一律 404（理由见「安全约定」）
 - **上游全部是 OpenAI 兼容端点**：`base_url` + `api_key` + 模型名映射
 - **权重路由**：同一模型可配多个供应商，按 `weight` 随机分摊
 - **可用性**：连续失败达到阈值后临时摘除，冷却后自动恢复；失败请求自动换下一个供应商重试
 - **YAML 配置热加载**：保存后自动生效（2 秒轮询），也可 `llmproxy reload` / `kill -HUP`；校验失败时保留旧配置继续服务
 - **按供应商配置代理**：`direct` / `http(s)://` / `socks5(h)://`，也可在 `proxies` 里起名字复用
 - **SQLite 记账**：请求明细 + 供应商状态 + 按日消耗汇总；**不记录任何请求/响应内容**
-- **流式 SSE 透传**：自动注入 `stream_options.include_usage`，从末尾 chunk 提取 token 数
+- **流式 SSE 透传**：**强制打开** `stream_options.include_usage`（客户端自带的其他子字段保留），
+  从末尾 chunk 提取 token 数。计量是网关自己的需求，不该由下游客户端决定 ——
+  否则客户端发一个 `{"include_usage":false}` 就能让这条请求记 0、配额一分不扣，
+  而上游照样向我们收钱
 - **多用户中转器（可选）**：每个用户带自己的 token 和**自己的上游**（自带 `base_url` / `api_key`），
   网关只负责鉴权、转发、按用户记账；上游密钥 AES-256-GCM 加密落库，熔断按用户隔离
 - **两种用户模式**：`byo`（用户自带上游，网关不掏钱）与 `consumption`（用户消费系统上游，
@@ -31,7 +35,10 @@
 | 下游凭证常数时间比较 | 先 SHA-256 摘要再比，不通过响应时间泄漏长度 |
 | 日志只存凭证哈希前缀 | `SHA-256(key)[:6]`，数据库与日志里都没有明文密钥 |
 | 不转发下游 Authorization | 上游收到的永远是**该供应商自己的** `api_key` |
-| 不记录请求/响应内容 | 只落模型名、延迟、token 数、状态码、错误类型 |
+| 不记录请求/响应正文 | 只落模型名、延迟、token 数、状态码、错误类型。**例外**：上游报错时响应体前 300 字节会进日志与 `provider_stats.last_error`，并随 `/v1/_providers` 下发（排障要用）—— 见下面「已知例外」 |
+| 下游 POST 只放行推理端点 | `chat/completions`、`completions`、`embeddings` 三条；其余一律 404。否则任何持有效 token 的用户都能让网关带着**你的上游密钥**去 POST 上游主机的任意路径（`/v1/files`、`/v1/fine_tuning/jobs`…），而且完全不进计量 |
+| `base_url` 不许带 query / 锚点 | 转发时上游 URL 是 `base_url + 下游路径` 直接拼的，一个 `?` 就能把路径吃进 query，从而绕过上面那条白名单 |
+| 用户自配上游做出网校验 | link-local（含云元数据 `169.254.169.254`）与未指定地址**一律拒绝**；回环与私网段由 `server.block_local_upstream` 控制（默认放行，见配置一节）。系统池是你自己写的，不受限 |
 | 配置/数据库文件 0600 | 权限过宽会在启动时警告 |
 | 代理完全由配置决定 | 直连时显式忽略 `HTTP_PROXY`/`HTTPS_PROXY` 环境变量 |
 | 被代理的请求走 CONNECT 隧道 | 代理不允许 CONNECT 时会明确报错，而不是静默直连 |
@@ -41,6 +48,20 @@
 | 消费额度只算系统掏钱的部分 | 用户用自己的上游时不计入配额；白名单外的模型直接 403 |
 | 单价按上游模型名计 | 用户把下游名映射到哪个上游模型，就按哪个模型的价格算，不会串价 |
 | 主密钥不可用则拒绝启动 | 库里已有用户却读不到 `master.key` 时直接不启动，而不是让这些用户莫名其妙全部 401 |
+| 控制台写回 config.yaml 拒绝控制字符 | 供应商名 / base_url / api_key / proxy 里出现换行或控制字符时**报错**而不是写下去 —— YAML 把 lone CR、U+2028、U+0085 也当换行，一个带 CR 的值能逃出 `providers` 段注入新的顶层段；而双引号标量里的裸换行会被「折叠」成空格，把 api_key 静默改坏 |
+
+### 已知例外
+
+**上游错误响应体会被留下来。** 上游返回可重试的错误状态码时，响应体前 300 字节会写进日志、
+存进 `provider_stats.last_error`，并通过 `GET /v1/_providers` 下发给下游（管理台与用户台都用它排障）。
+很多上游的错误体里会回显请求片段，所以这一条与上面「不记录请求/响应正文」是冲突的 ——
+它是刻意的取舍（不知道上游为什么 4xx 就没法排障），但**要知道它存在**：
+消费模式用户能从 `/v1/_providers` 读到系统供应商返回的错误正文。
+要收紧就把 `last_error` 改成只存归一化的错误类别、原文只进日志。
+
+**出网校验挡不住 DNS rebinding。** 主机名是在校验时解析的，校验通过后域名被改指到
+`169.254.169.254`，拨号时就会打过去。要彻底堵住得在 `net.Dialer.Control` 里对**解析后的 IP**
+再判一次。当前挡住的是「直接写 IP」和「解析结果就是内网」这两种绝大多数情况。
 
 ## 构建
 
@@ -139,6 +160,7 @@ server:
     - sk-local-change-me              # 纯字符串
     - key: sk-another                 # 或带标签（标签只进日志，方便区分客户端）
       label: laptop
+  block_local_upstream: false         # 打开后用户自配的上游不许指向回环/私网（见「安全约定」）
 
 routing:
   retry: 2                 # 首次失败后再换多少个供应商
@@ -175,7 +197,8 @@ providers:
 
 database:
   path: ""                # 留空 = 运行时目录下 data/llmproxy.db
-  retain_days: 90         # 请求明细保留天数，0 = 永久
+  retain_days: 90         # 请求明细保留天数；**显式 0 = 永久**，留空 = 90 天
+                          # 这张表就是计价冻结账本，要长期对账就设成 0
 
 log:
   level: info             # debug | info | warn | error
@@ -800,7 +823,9 @@ llmproxy/
     logx/              日志（stdout + 轮转文件）
   config/
     config.example.yaml
-  ui/                网页控制台的源文件（index.html / app.css / app.js），编译时嵌入二进制
+  ui/                网页控制台的源文件，编译时 go:embed 进二进制
+                     admin.html / admin.js（管理台）、user.html / user.js（用户台）、
+                     common.js / app.css（两边共用）、embed.go（嵌入声明）
   scripts/           交叉编译脚本（build.sh）与端到端验证脚本（e2e-multiuser.sh）
   data/                运行时数据（.gitkeep）
   logs/                日志目录（.gitkeep）

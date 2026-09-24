@@ -25,7 +25,7 @@ import (
 // PeakRule 是一条峰谷规则：哪几段是高峰、空闲乘几、按哪个时区判。
 type PeakRule struct {
 	Hours        []string // 形如 "09:00-12:00"；空 = 不分时段
-	OffPeakRatio float64  // 空闲时段系数；>= 1 或没有 Hours = 不分时段
+	OffPeakRatio float64  // 空闲时段系数；>= 1、<= 0（视为未设置）或没有 Hours = 不分时段
 	TZ           string   // 固定偏移，形如 "+08:00"；空 = +00:00
 }
 
@@ -34,8 +34,15 @@ type PeakRule struct {
 // 只按「周一~周五 + 时段」判断，**不识别法定节假日** —— DeepSeek 的规则里
 // 节假日算空闲，这里会当高峰，偏高估（不会低估）。要更准就把单价填成均价，
 // 或等以后加节假日表。
+//
+// OffPeakRatio <= 0 一律当「没设置」处理，返回 1（不打折）而不是 0。
+// 0 意味着「空闲时段免费」，那必须是一个显式表达的决定，不能靠缺省值撞上：
+// 价目行只填了 peak_hours、ratio 逐字段回落全局、而全局又没配 pricing 段时，
+// 组装出来的 ratio 就是 0 —— 于是高峰之外的全部流量成本与计费一起归零，
+// 而且完全静默（不报错、FROZEN 列还显示已冻结，只是金额是 0）。
+// 宁可不打折，不要免费。
 func (r PeakRule) RatioAt(t time.Time) float64 {
-	if len(r.Hours) == 0 || r.OffPeakRatio >= 1 || r.OffPeakRatio < 0 {
+	if len(r.Hours) == 0 || r.OffPeakRatio >= 1 || r.OffPeakRatio <= 0 {
 		return 1
 	}
 	windows, err := parseWindows(r.Hours)
@@ -60,6 +67,11 @@ func (r PeakRule) RatioAt(t time.Time) float64 {
 }
 
 // Validate 校验规则本身是否合法（写库前调）。
+//
+// 0 在这里是合法的：价目行的 off_peak_ratio 可空、为空时逐字段回落全局，
+// 那条路径组装出来的就是 0，不能在这一层拒掉（RatioAt 会把它当「未设置」按不打折处理）。
+// 「调用方显式填了 0」是另一回事 —— 那几乎一定是笔误，由 store.validatePeak 拒，
+// 只有它分得清 nil（回落全局）与 0（显式免费）。
 func (r PeakRule) Validate() error {
 	if _, err := parseWindows(r.Hours); err != nil {
 		return err

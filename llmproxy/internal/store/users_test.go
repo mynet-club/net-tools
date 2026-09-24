@@ -222,17 +222,17 @@ func TestProviderStatusScopeIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st := got["shared"]; st.ConsecutiveFailures != 1 || st.Scope != "" {
+	if len(got) != 3 {
+		t.Fatalf("应有 3 条，实际 %d: %v", len(got), got)
+	}
+	if st, ok := statusOf(got, "", "shared"); !ok || st.ConsecutiveFailures != 1 {
 		t.Errorf("全局作用域取错了: %+v", st)
 	}
-	if st := got["alice/shared"]; st.ConsecutiveFailures != 9 {
+	if st, ok := statusOf(got, "alice", "shared"); !ok || st.ConsecutiveFailures != 9 {
 		t.Errorf("alice 作用域取错了: %+v", st)
 	}
-	if st := got["bob/shared"]; st.ConsecutiveFailures != 2 {
+	if st, ok := statusOf(got, "bob", "shared"); !ok || st.ConsecutiveFailures != 2 {
 		t.Errorf("bob 作用域取错了: %+v", st)
-	}
-	if len(got) != 3 {
-		t.Errorf("应有 3 条，实际 %d: %v", len(got), got)
 	}
 
 	// 同名不同作用域必须互不覆盖
@@ -242,13 +242,13 @@ func TestProviderStatusScopeIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, _ = s.LoadProviderStatus()
-	if got["shared"].TotalRequests != 10 {
+	if st, _ := statusOf(got, "", "shared"); st.TotalRequests != 10 {
 		t.Error("写 alice 的作用域污染了全局记录")
 	}
-	if got["bob/shared"].TotalRequests != 20 {
+	if st, _ := statusOf(got, "bob", "shared"); st.TotalRequests != 20 {
 		t.Error("写 alice 的作用域污染了 bob 的记录")
 	}
-	if got["alice/shared"].TotalRequests != 91 {
+	if st, _ := statusOf(got, "alice", "shared"); st.TotalRequests != 91 {
 		t.Error("alice 的记录没更新")
 	}
 }
@@ -297,12 +297,10 @@ CREATE TABLE provider_stats (
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, ok := got["legacy-prov"]
+	// statusOf 按 (作用域, 名字) 匹配，所以找到即证明老数据归入了全局作用域
+	st, ok := statusOf(got, "", "legacy-prov")
 	if !ok {
-		t.Fatalf("迁移后老数据丢了: %v", got)
-	}
-	if st.Scope != "" {
-		t.Errorf("老数据应归入全局作用域，实际 scope=%q", st.Scope)
+		t.Fatalf("迁移后老数据丢了（或没归入全局作用域）: %v", got)
 	}
 	if st.ConsecutiveFailures != 2 || st.TotalRequests != 7 || st.TotalFailures != 3 || st.LastError != "boom" {
 		t.Errorf("迁移后字段值不对: %+v", st)
@@ -315,7 +313,7 @@ CREATE TABLE provider_stats (
 		t.Fatalf("迁移后写入失败: %v", err)
 	}
 	got2, _ := s.LoadProviderStatus()
-	if _, ok := got2["alice/my-up"]; !ok {
+	if _, ok := statusOf(got2, "alice", "my-up"); !ok {
 		t.Errorf("迁移后作用域写入不可用: %v", got2)
 	}
 
@@ -329,6 +327,128 @@ CREATE TABLE provider_stats (
 	got3, _ := s2.LoadProviderStatus()
 	if len(got3) != len(got2) {
 		t.Errorf("二次迁移改变了数据: %v → %v", got2, got3)
+	}
+}
+
+// LoadProviderStatus 的顺序必须稳定：恢复结果不该依赖 SQL 的返回顺序。
+//
+// 曾经它返回一个按 "scope/name" 折叠的 map，于是 ("alice","my-up") 与
+// ("", "alice/my-up") 会撞成同一个键，谁覆盖谁取决于返回顺序 ——
+// 多次重启之间恢复出来的计数会不确定地跳变。现在返回切片并按 (scope, name) 排序。
+func TestLoadProviderStatusDeterministicOrder(t *testing.T) {
+	s := openTestStore(t)
+	if err := s.SaveProviderStatus([]ProviderStatus{
+		{Scope: "bob", Name: "z-up", Enabled: true, TotalRequests: 3},
+		{Scope: "", Name: "shared", Enabled: true, TotalRequests: 1},
+		{Scope: "alice", Name: "my-up", Enabled: true, TotalRequests: 2},
+		{Scope: "", Name: "aaa", Enabled: true, TotalRequests: 4},
+	}); err != nil {
+		t.Fatalf("SaveProviderStatus: %v", err)
+	}
+	want := [][2]string{{"", "aaa"}, {"", "shared"}, {"alice", "my-up"}, {"bob", "z-up"}}
+
+	// 读两次：顺序与内容都必须一致
+	for round := 1; round <= 2; round++ {
+		got, err := s.LoadProviderStatus()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("第 %d 次读：应有 %d 条，实际 %d: %v", round, len(want), len(got), got)
+		}
+		for i, w := range want {
+			if got[i].Scope != w[0] || got[i].Name != w[1] {
+				t.Errorf("第 %d 次读第 %d 条 = (%q,%q)，期望 (%q,%q)",
+					round, i, got[i].Scope, got[i].Name, w[0], w[1])
+			}
+		}
+	}
+}
+
+// 删用户必须级联清掉「新建同名用户时不该被继承」的行。
+//
+// user_models 是消费模式的模型白名单与「下游名 → 上游模型」映射 —— 不删的话，
+// 删掉 bob 再建一个 bob，新账号会**静默继承前任被授权的模型范围**：管理员以为
+// 发出去的是个干净账号，实际它已经能调前任那些模型了。provider_stats 同理，
+// 会让新账号继承前任的熔断计数（前任若在冷却中被删，新账号一上来就是「熔断中」）；
+// 内存那一份由 router.ForgetScope 清，但库里的行不删就会在重启后被重新加载回来。
+func TestDeleteUserCascadesModelsAndProviderStats(t *testing.T) {
+	s := openTestStore(t)
+	if err := s.CreateUser("bob", TokenHash("sk-b")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertUserModel(UserModel{
+		UserName: "bob", Model: "gpt", Upstream: "gpt-4o", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertUserProvider(UserProvider{
+		UserName: "bob", Name: "up", BaseURL: "https://api.example.com/v1", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// bob 自己上游的熔断状态（作用域 = 用户名）
+	if err := s.SaveProviderStatus([]ProviderStatus{
+		{Scope: "bob", Name: "up", Enabled: true, ConsecutiveFailures: 5, TotalRequests: 9},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 账单：钱已经花掉了，删用户不该销毁计量记录
+	if err := s.InsertRequest(RequestRecord{
+		Ts: time.Now(), RequestID: "r1", Model: "gpt", Provider: "up",
+		UserName: "bob", SystemPaid: true, OK: true, TotalTokens: i64(100),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.DeleteUser("bob"); err != nil {
+		t.Fatalf("DeleteUser: %v", err)
+	}
+
+	models, err := s.ListUserModels("bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 0 {
+		t.Errorf("user_models 应当被级联删除，实际残留 %d 条: %+v", len(models), models)
+	}
+	provs, err := s.ListUserProviders("bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(provs) != 0 {
+		t.Errorf("user_providers 应当被级联删除，实际残留 %d 条", len(provs))
+	}
+	stats, err := s.LoadProviderStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st, ok := statusOf(stats, "bob", "up"); ok {
+		t.Errorf("bob 作用域的熔断状态应当被级联删除，实际残留: %+v", st)
+	}
+	// 刻意保留：用量是账单，不是配置
+	usage, err := s.SystemUsageRowsSince("bob", time.Now().AddDate(0, 0, -1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(usage) == 0 {
+		t.Error("usage_user_daily 应当保留（那是账单，删用户不等于销毁计量记录）")
+	}
+
+	// 关键场景：删掉之后建一个**同名**用户，它必须是干净的
+	if err := s.CreateUser("bob", TokenHash("sk-b2")); err != nil {
+		t.Fatal(err)
+	}
+	models, err = s.ListUserModels("bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 0 {
+		t.Errorf("同名重建后不该继承前任的模型授权，实际拿到 %d 条: %+v", len(models), models)
+	}
+	stats, _ = s.LoadProviderStatus()
+	if st, ok := statusOf(stats, "bob", "up"); ok {
+		t.Errorf("同名重建后不该继承前任的熔断状态，实际拿到 %+v", st)
 	}
 }
 
@@ -370,22 +490,5 @@ func TestRevisionBumpsOnUserChanges(t *testing.T) {
 	}
 	if r4, _ := s.Revision(); r4 <= r3 {
 		t.Errorf("禁用用户后修订号应增长: %d → %d", r3, r4)
-	}
-}
-
-func TestScopeKeyHelpers(t *testing.T) {
-	if k := scopeKey("", "p"); k != "p" {
-		t.Errorf("全局键应等于名字，实际 %q", k)
-	}
-	if k := scopeKey("alice", "p"); k != "alice/p" {
-		t.Errorf("作用域键应为 alice/p，实际 %q", k)
-	}
-	scope, name := SplitScopeKey("alice/p")
-	if scope != "alice" || name != "p" {
-		t.Errorf("SplitScopeKey 还原错误: %q %q", scope, name)
-	}
-	scope, name = SplitScopeKey("p")
-	if scope != "" || name != "p" {
-		t.Errorf("无作用域时不应拆分: %q %q", scope, name)
 	}
 }

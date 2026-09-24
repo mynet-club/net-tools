@@ -143,6 +143,26 @@ func TestUpstreamCostBuckets(t *testing.T) {
 	if got := upstreamCost(p2, rec, 1); math.Abs(got-0.25) > 1e-12 {
 		t.Errorf("无 token 时应当只算每请求费，实际 %v", got)
 	}
+
+	// in_write 缺省（0）→ 回落到 in_miss 同价，而不是让写入档免费。
+	// 接口省略 in_write 时 Go 的零值就是 0，而 store.ProviderPrice.InWrite 的注释与
+	// docs/pricing-design.md §6.1 都承诺「可空 = 与 in_miss 同价」；写入档单价通常还比
+	// 未命中贵（Anthropic 系约 1.25×），漏掉它是实打实低估成本。
+	noWrite := &store.ProviderPrice{InHit: 1, InMiss: 2, Out: 8}
+	rec = &store.RequestRecord{PromptTokens: i(1000), CompletionTokens: i(100), CacheHitTokens: 600, CacheWriteTokens: 300}
+	if got, want := upstreamCost(noWrite, rec, 1), (600*1.0+300*2.0+100*2.0+100*8.0)/1e6; math.Abs(got-want) > 1e-12 {
+		t.Errorf("in_write 缺省应当按 in_miss 计：得到 %v，期望 %v", got, want)
+	}
+	// 纯写入档：1e6 个写入 token、in_miss=2 → 该档单独就值 ¥2（回落前是 ¥0）
+	rec = &store.RequestRecord{PromptTokens: i(1_000_000), CacheWriteTokens: 1_000_000}
+	if got, want := upstreamCost(&store.ProviderPrice{InMiss: 2}, rec, 1), 2.0; math.Abs(got-want) > 1e-12 {
+		t.Errorf("纯写入档应当是 %v，实际 %v（0 意味着这一档完全免费）", want, got)
+	}
+	// 显式配了 in_write 时仍然用它，别被回落逻辑覆盖掉
+	rec = &store.RequestRecord{PromptTokens: i(1_000_000), CacheWriteTokens: 1_000_000}
+	if got, want := upstreamCost(&store.ProviderPrice{InMiss: 2, InWrite: 5}, rec, 1), 5.0; math.Abs(got-want) > 1e-12 {
+		t.Errorf("显式 in_write=5 应当照用，得到 %v，期望 %v", got, want)
+	}
 }
 
 // 只冻结**系统付费**的请求：BYO 用户用自己的上游，网关不掏钱，不该记成我们的成本。

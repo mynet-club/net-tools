@@ -112,6 +112,23 @@ func TestPeakRuleDefaults(t *testing.T) {
 	if got := (PeakRule{Hours: []string{"09:00-12:00"}, OffPeakRatio: 0.5, TZ: "Asia/Shanghai"}).RatioAt(at); got != 1 {
 		t.Errorf("时区不合法时应当退回 1，实际 %v", got)
 	}
+
+	// 系数缺省（0）→ 当成「未设置」按不打折处理，而不是「空闲时段免费」。
+	//
+	// 这几条必须在**空闲时刻**断言：高峰时段本来就返回 1，测不出区别 ——
+	// 而这正是这个坑当初漏过去的原因（价目行只填 peak_hours、ratio 逐字段回落全局、
+	// 全局又没配 pricing 段时，组装出来的 ratio 就是 0，于是高峰之外的流量全部记 ¥0）。
+	offPeak := wednesdayAt(13, 0, cst)
+	if got := (PeakRule{Hours: []string{"09:00-12:00"}, OffPeakRatio: 0, TZ: "+08:00"}).RatioAt(offPeak); got != 1 {
+		t.Errorf("系数为 0（未设置）时空闲时段应当退回 1，实际 %v（0 意味着这笔流量免费）", got)
+	}
+	if got := (PeakRule{Hours: []string{"09:00-12:00"}, OffPeakRatio: -0.5, TZ: "+08:00"}).RatioAt(offPeak); got != 1 {
+		t.Errorf("系数为负时应当退回 1，实际 %v", got)
+	}
+	// 对照：同一时刻、系数确实配了 0.5 → 该打折就打折，别把正常路径一起改坏
+	if got := (PeakRule{Hours: []string{"09:00-12:00"}, OffPeakRatio: 0.5, TZ: "+08:00"}).RatioAt(offPeak); got != 0.5 {
+		t.Errorf("系数为 0.5 时空闲时段应当是 0.5，实际 %v", got)
+	}
 }
 
 func TestPeakRuleValidate(t *testing.T) {

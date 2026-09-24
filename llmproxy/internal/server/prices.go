@@ -20,8 +20,9 @@ import (
 //   - 分发价的 scope 只能是 "default" 或 "user:<用户名>"
 
 // providerPriceIn / userPriceIn 是接口的入参形状。
-// 时间用 RFC3339 字符串（例如 "2026-09-21T09:00:00+08:00"），带不带时区都行，
-// 但**必须是整点** —— 校验在 store 层。
+// 时间用 RFC3339 字符串（例如 "2026-09-21T09:00:00+08:00"），**必须带时区偏移**
+// （`Z` 也算）—— 解析走 time.Parse(time.RFC3339, …)，不带偏移会直接失败。
+// 时刻本身还**必须是整点**，校验在 store 层。
 type providerPriceIn struct {
 	Provider      string   `json:"provider"`
 	UpstreamModel string   `json:"upstream_model"`

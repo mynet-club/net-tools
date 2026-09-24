@@ -373,28 +373,37 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 		}
 
 		// ---- 成功路径：把响应交给客户端（body 读完之后才能 cancel）
-		s.router.ReportSuccessFor(scope, cand.Provider.Name)
 		rec.Provider = cand.Provider.Name
 		rec.UpstreamModel = cand.UpstreamModel
 		rec.Attempts = attempts
 		rec.StatusCode = resp.StatusCode
 
-		// 记录/更新粘性。只有真正成功的响应才钉住这家；非重试类 4xx
-		// （比如这家在配置里声明了这个名字、上游其实不认）说明「这家用不了」——
-		// 忘掉粘性让下一个请求重新选。这条很要紧：4xx 不触发熔断，
-		// 不忘掉的话会话会被钉在一家只会报错的后端上死循环。
+		outcome := func() relayOutcome {
+			defer cancel()
+			return s.relay(w, r, resp, &rec, started, wd)
+		}()
+
+		// 熔断要等 relay 的结果再记：一家「返回 200 响应头、然后卡死不吐字节」的供应商，
+		// 正是空闲看门狗专门为它设计的那种故障。在读到 body 之前就报成功的话，
+		// 它会被永久判为健康 —— 看门狗掐掉它、库里记成 upstream_idle，router 却毫不知情。
+		if outcome == relayOK {
+			s.router.ReportSuccessFor(scope, cand.Provider.Name)
+		} else if outcome == relayUpstreamFailed {
+			s.router.ReportFailureFor(scope, cand.Provider.Name,
+				fmt.Errorf("上游在响应中途失败：%s", rec.ErrorMsg))
+		}
+
+		// 记录/更新粘性，同样看 relay 的结果。只有真正跑完的响应才钉住这家；
+		// 非重试类 4xx（比如这家在配置里声明了这个名字、上游其实不认）与流中途失败
+		// 都说明「这家用不了」—— 忘掉粘性让下一个请求重新选。这条很要紧：
+		// 这两种情况都不足以立刻熔断，不忘掉的话会话会被钉在一家只会报错的后端上死循环。
 		if affinitySession != "" {
-			if resp.StatusCode < 400 {
+			if outcome == relayOK && resp.StatusCode < 400 {
 				s.affinity.Set(scope, affinitySession, probe.Model, cand.Provider.Name)
 			} else {
 				s.affinity.Set(scope, affinitySession, probe.Model, "")
 			}
 		}
-
-		func() {
-			defer cancel()
-			s.relay(w, r, resp, &rec, started, wd)
-		}()
 		return
 	}
 
@@ -417,11 +426,48 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 	s.fail(w, rec, lastStatus, "upstream_unavailable", msg, attempts, started)
 }
 
+// relayOutcome 是 relay 的结果，用来决定熔断计数与会话粘性怎么记。
+//
+// 为什么不在 relay 内部直接调 router：relay 手上只有 rec，而熔断是按
+// (作用域, 供应商) 分桶的，作用域来自鉴权结果、不等于 rec.UserName（静态 key
+// 两者都为空，但语义不同）。把决策留给调用方，省得在这里猜。
+type relayOutcome int
+
+const (
+	relayOK             relayOutcome = iota // 干净跑完
+	relayUpstreamFailed                     // 上游的问题（空闲超时）：该记一次失败
+	relayClientGone                         // 下游断开：不是供应商的错，成败都不记
+	relayAmbiguous                          // 归因不明：不记失败（见 relay 里的说明）
+)
+
+// maxUpstreamResponseBytes 是**非流式**上游响应体在内存里的缓冲上限。
+//
+// 下游的请求体有 http.MaxBytesReader 管着，上游的响应体却曾经完全没限 ——
+// 于是一个 BYO 用户把 base_url 指向一个返回超大（或无限慢）响应的非 SSE 端点，
+// 一次请求就能把网关的内存吃光。上限取得很宽松：正常的 LLM JSON 响应远小于它
+// （32 MB 的补全已经荒谬），撞上就说明对面不是个正常的上游。
+// 流式路径不受影响 —— 它边收边转发、不缓存全文。
+const maxUpstreamResponseBytes = 32 << 20
+
+// writeBadGateway 在**还没发过状态码**时把这次转发改判成 502。
+//
+// 上游的 Content-Type / Content-Length 必须先清掉，否则会与这个 JSON 错误体不符 ——
+// 客户端按上游声明的长度去读，读出来就是一坨残缺 JSON，比一个干净的 502 更难排障。
+func writeBadGateway(w http.ResponseWriter, msg string) {
+	w.Header().Del("Content-Type")
+	w.Header().Del("Content-Length")
+	writeJSONError(w, http.StatusBadGateway, "upstream_error", msg)
+}
+
 // relay 把上游响应原样写给下游；同时提取 usage / TTFT 元数据。
-func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Response, rec *store.RequestRecord, started time.Time, wd *idleWatchdog) {
+func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Response, rec *store.RequestRecord, started time.Time, wd *idleWatchdog) relayOutcome {
 	defer resp.Body.Close()
 
-	// 复制响应头（跳过 hop-by-hop）
+	// 复制响应头（跳过 hop-by-hop）。
+	//
+	// WriteHeader 刻意**不在这里**调用：非流式要先把 body 读完才知道该发什么状态码。
+	// 先发 200 再发现读失败的话，客户端只能收到一个 200 + 截断 body，
+	// 分不清「模型返回了空补全」和「代理挂了」。
 	for k, vs := range resp.Header {
 		if isHopByHop(k) {
 			continue
@@ -432,7 +478,6 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 	}
 	w.Header().Set("X-LLMProxy-Provider", rec.Provider)
 	w.Header().Set("X-LLMProxy-Request-Id", rec.RequestID)
-	w.WriteHeader(resp.StatusCode)
 
 	contentType := resp.Header.Get("Content-Type")
 	isSSE := strings.Contains(contentType, "text/event-stream")
@@ -445,7 +490,9 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 
 	var written int64
 	var copyErr error
+	outcome := relayOK
 	if isSSE {
+		w.WriteHeader(resp.StatusCode)
 		// 流式：边转发边扫 usage，不缓存全文。
 		// body 外面包一层，读到字节就喂一次看门狗 —— 于是「上游慢但活着」不会被误杀，
 		// 「上游卡住不动」会在空闲上限处失败。
@@ -453,13 +500,39 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 		if wd != nil {
 			body = &activityReader{r: resp.Body, touch: wd.Touch}
 		}
-		written, copyErr = io.Copy(io.MultiWriter(dest, scanner), body)
+		// scanner 必须排在 dest 前面：MultiWriter 在任一 writer 出错时就停止、
+		// 不再写后面的，而 usage chunk 恰恰在流的末尾。反过来的话，客户端在
+		// 收到 usage 之前断开（网络抖动，或者故意掐这个时机）就会拿到完整答案
+		// 而记账为 0 —— 上游那边 token 已经生成、钱已经付了。
+		// scanner.Write 恒返回 (len(p), nil)，放前面绝不会截断给客户端的数据。
+		written, copyErr = io.Copy(io.MultiWriter(scanner, dest), body)
 	} else {
+		// 非流式：先读完、再发状态码，并且**有上限**（见 maxUpstreamResponseBytes）。
+		// LimitReader 读满 n 字节且不报错就代表「可能还有更多」，据此判截断。
 		var buf bytes.Buffer
-		written, copyErr = io.Copy(&buf, resp.Body)
-		if copyErr == nil {
+		written, copyErr = io.Copy(&buf, io.LimitReader(resp.Body, maxUpstreamResponseBytes))
+		switch {
+		case copyErr != nil:
+			// 读上游就失败了：还没发过任何状态码，可以干净地改判 502
+			rec.ErrorType = "upstream_body"
+			rec.ErrorMsg = fmt.Sprintf("读上游响应失败：%v", copyErr)
+			outcome = relayUpstreamFailed
+			writeBadGateway(w, rec.ErrorMsg)
+		case buf.Len() >= maxUpstreamResponseBytes:
+			rec.ErrorType = "upstream_body"
+			rec.ErrorMsg = fmt.Sprintf("上游响应超过 %d MB 上限，已拒绝缓冲", maxUpstreamResponseBytes>>20)
+			// copyErr 必须置上：rec.OK 是 `StatusCode < 400 && copyErr == nil` 算出来的，
+			// 而这时上游的状态码是 200 —— 不置就会把一次拒收记成成功请求。
+			copyErr = errors.New(rec.ErrorMsg)
+			outcome = relayUpstreamFailed
+			writeBadGateway(w, rec.ErrorMsg)
+		default:
 			scanner.consumeJSON(buf.Bytes())
-			_, _ = w.Write(buf.Bytes())
+			w.WriteHeader(resp.StatusCode)
+			if _, werr := w.Write(buf.Bytes()); werr != nil {
+				// 头已经发出去了，改判不了；只记下来。写不进去多半是下游断开。
+				copyErr = werr
+			}
 		}
 	}
 	_ = written
@@ -473,22 +546,37 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 	rec.CacheMissTokens = scanner.usage.cacheMiss
 	rec.CacheWriteTokens = scanner.usage.cacheWrite
 	rec.OK = resp.StatusCode < 400 && copyErr == nil
-	if copyErr != nil {
-		if wd.Fired() {
+
+	if copyErr != nil && rec.ErrorType == "" {
+		switch {
+		case wd.Fired():
 			// 读操作被 Cancel 掉时报的是 context canceled，和「下游断开」长得一样；
 			// 看门狗标记过就说明是空闲超时，归因要写清楚。
 			rec.ErrorType = "upstream_idle"
 			rec.ErrorMsg = fmt.Sprintf("上游 %s 连续 %s 没有返回数据（空闲超时）", rec.Provider, wd.Idle())
-		} else {
+			outcome = relayUpstreamFailed
+		case r.Context().Err() != nil:
+			// 下游主动断开：不是供应商的错。既不该记它失败（否则一个爱掐连接的客户端
+			// 就能把一家好上游打进冷却），也不该记成功。
+			rec.ErrorType = "client_gone"
+			rec.ErrorMsg = "客户端在响应结束前断开"
+			outcome = relayClientGone
+		default:
+			// 归因不明：可能是读上游出错，也可能是写下游出错（MultiWriter 把两边
+			// 的错误合成了一个）。分不清就不赖供应商 —— 宁可漏记一次失败，
+			// 也不要因为下游的破网络把好上游打进冷却。
 			rec.ErrorType = "relay_error"
 			rec.ErrorMsg = copyErr.Error()
+			outcome = relayAmbiguous
 		}
 	}
+
 	// 计价冻结：按**请求开始时刻**生效的价目行把成本/收费算好写死（见 freeze.go）。
 	// 上游成本（我们付供应商多少）与分发金额（我们向用户收多少）分别冻结、各自带价目行 id。
 	s.freezeUpstreamCost(rec, started)
 	s.freezeDownstreamCharge(rec, started)
 	s.persist(rec)
+	return outcome
 }
 
 // describeModels 汇总这组候选里可用声明的模型名，用于「模型不可用」时的报错提示。
@@ -558,7 +646,7 @@ func int64Or0(p *int64) int64 {
 
 // ------------------------------------------------------------------ 工具
 
-// rewriteModelBody 只替换 model 字段，必要时注入 stream_options.include_usage，
+// rewriteModelBody 只替换 model 字段，流式时强制打开 stream_options.include_usage，
 // 其余字段原样保留（用 json.RawMessage 避免数值精度被破坏）。
 func rewriteModelBody(body []byte, upstreamModel string, stream bool) ([]byte, error) {
 	var m map[string]json.RawMessage
@@ -571,16 +659,34 @@ func rewriteModelBody(body []byte, upstreamModel string, stream bool) ([]byte, e
 	}
 	m["model"] = quoted
 	if stream {
-		if _, ok := m["stream_options"]; !ok {
-			// 注入 include_usage，这样流式响应末尾会带 token 统计
-			m["stream_options"] = json.RawMessage(`{"include_usage":true}`)
-		}
+		m["stream_options"] = withIncludeUsage(m["stream_options"])
 	}
 	out, err := json.Marshal(m)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+// withIncludeUsage 强制打开 stream_options.include_usage，同时保留客户端的其他子字段。
+//
+// 不能只在键缺失时才注入：客户端自带 stream_options（哪怕写的是 include_usage:false，
+// 或者只是某个我们认不出的方言字段）就会把注入整个跳过 —— 上游于是不回报 usage，
+// 这条请求的 token 与金额全部记 0、配额一分不扣，而上游照样向我们收钱。
+// 计量是网关自己的需求，不该由下游客户端决定，所以这里一律覆盖 include_usage。
+func withIncludeUsage(raw json.RawMessage) json.RawMessage {
+	only := json.RawMessage(`{"include_usage":true}`)
+	var opts map[string]json.RawMessage
+	// raw 缺失（nil）、是 null、不是对象、或解析不了时，整个换成我们要的形状
+	if err := json.Unmarshal(raw, &opts); err != nil || opts == nil {
+		return only
+	}
+	opts["include_usage"] = json.RawMessage(`true`)
+	out, err := json.Marshal(opts)
+	if err != nil {
+		return only
+	}
+	return out
 }
 
 // retryableStatus 判断上游状态码是否值得换一个供应商重试。

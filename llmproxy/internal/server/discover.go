@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -40,10 +39,9 @@ func (e *upstreamFetchError) Error() string { return e.msg }
 // 这里已经把「连不上 / 密钥被拒 / 没有这个接口 / 解析不出模型」四种情况分开了 ——
 // 它们的处理方式完全不同（前两种要排障，后两种是常态，该引导手动填写）。
 func (s *Server) fetchModelIDs(ctx context.Context, baseURL, apiKey, proxyURL string) ([]string, error) {
-	u, err := url.Parse(baseURL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+	if _, err := config.ParseBaseURL(baseURL); err != nil {
 		return nil, &upstreamFetchError{http.StatusBadRequest, "invalid_request_error",
-			"base_url 必须是 http/https 开头的合法 URL"}
+			"base_url " + err.Error()}
 	}
 	if apiKey == "" {
 		return nil, &upstreamFetchError{http.StatusBadRequest, "invalid_request_error",
@@ -148,6 +146,20 @@ func (s *Server) discoverUpstreamModels(w http.ResponseWriter, r *http.Request, 
 	if stored != nil {
 		if resolved, err := stored.Proxy.Resolve(s.cfgStore.Current().ProxyIndex); err == nil {
 			proxyURL = resolved
+		}
+	}
+
+	// 这是**用户侧**的探测接口：base_url 可以由请求内联提供，而网关会拿它发一次真实请求
+	// 并把错误原因回给调用方 —— 于是它同时是一个连通性/状态码 oracle，可以拿来扫内网。
+	// 所以这里要做出网校验（管理侧的 discoverSystemModels 不做：那是运营者本人的机器）。
+	if u, err := config.ParseBaseURL(baseURL); err == nil {
+		strict := false
+		if c := s.cfgStore.Current(); c != nil {
+			strict = c.Server.BlockLocalUpstream
+		}
+		if err := config.CheckUpstreamEgress(u, strict); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
 		}
 	}
 

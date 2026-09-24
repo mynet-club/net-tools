@@ -510,6 +510,11 @@ func (s *Server) handleV1(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodPost:
+		if !isAllowedPostPath(path) {
+			writeJSONError(w, http.StatusNotFound, "invalid_request_error",
+				fmt.Sprintf("不支持 POST %s。可用端点：%s", path, strings.Join(allowedPostPaths, "、")))
+			return
+		}
 		s.handleUpstreamPost(w, r, auth)
 	case http.MethodGet:
 		// 只放行 models，其余 GET 一律 404（避免误暴露）
@@ -519,4 +524,37 @@ func (s *Server) handleV1(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error",
 			fmt.Sprintf("不支持的方法 %s", r.Method))
 	}
+}
+
+// allowedPostPaths 是下游可以 POST 的端点白名单。
+//
+// 曾经 POST 侧完全敞开、把下游路径原样拼到上游 base_url 后面，于是任何持有效 token 的
+// 用户都能让网关带着**运营者的上游密钥**去 POST 上游主机上的任意路径
+// （/v1/files 上传、/v1/fine_tuning/jobs 开微调任务、/v1/assistants…），
+// 而且这些调用完全不进计量 —— 消费模式的模型级访问控制因此形同虚设。
+// GET 侧本来就写了「避免误暴露」，这里补齐。
+//
+// 收录判据是「响应形状与 chat/completions 同族、usage 能被 usageScanner 认出来」：
+// 放行的端点都能被正常计量；不放行的要么没有 usage、要么形状不同（如 OpenAI 的
+// /v1/responses 用 output 而不是 choices），转发了就是白送。要加新端点，
+// 先确认 usageScanner 认得它的 usage 形状。
+var allowedPostPaths = []string{
+	"/v1/chat/completions",
+	"/v1/completions",
+	"/v1/embeddings",
+}
+
+// isAllowedPostPath 报告这个路径是否在白名单里。
+//
+// 比的是 `r.URL.Path`（**已解码**），拼接上游 URL 时用的也是它 —— 两边同源，
+// 所以 `%2F` / `%3F` 这类编码定界符无法在「检查」与「拼接」之间制造差异：
+// `/v1/chat%2Fcompletions` 解码后就是 `/v1/chat/completions`，检查通过、
+// 拼出去的也正是这个路径，与合法请求完全等价。
+func isAllowedPostPath(path string) bool {
+	for _, p := range allowedPostPaths {
+		if path == p {
+			return true
+		}
+	}
+	return false
 }

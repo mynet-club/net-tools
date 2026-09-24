@@ -79,6 +79,30 @@ func TestPricePeakValidation(t *testing.T) {
 	}); err != nil {
 		t.Errorf("合法峰谷不该被拒: %v", err)
 	}
+
+	// 显式填 0 要拒：0 意味着「空闲时段免费」，而 config.PeakRule.RatioAt 会把 <= 0
+	// 当成「未设置」按不打折处理 —— 填 0 既拿不到免费、又几乎一定是笔误
+	// （想沿用全局却写了个 0）。这一层分得清 nil 与 0，所以由它来说清楚。
+	zero := 0.0
+	if err := s.InsertProviderPrice(&ProviderPrice{
+		Provider: "p", UpstreamModel: "zero-ratio", ValidFrom: t9(),
+		PeakHours: []string{"09:00-12:00"}, OffPeakRatio: &zero, PeakTZ: "+08:00",
+	}); err == nil {
+		t.Error("显式 off_peak_ratio=0 应当被拒（想沿用全局就不要传这个字段）")
+	}
+	if err := s.InsertUserPrice(&UserPrice{
+		Scope: ScopeDefault, Model: "zero-ratio", ValidFrom: t9(),
+		PeakHours: []string{"09:00-12:00"}, OffPeakRatio: &zero, PeakTZ: "+08:00",
+	}); err == nil {
+		t.Error("分发价一侧显式 off_peak_ratio=0 也应当被拒")
+	}
+	// 但「只填时段、ratio 留空回落全局」是 README 明确支持的写法，不能被上面那条误伤
+	if err := s.InsertProviderPrice(&ProviderPrice{
+		Provider: "p", UpstreamModel: "inherit-ratio", ValidFrom: t9(),
+		PeakHours: []string{"09:00-12:00"}, PeakTZ: "+08:00",
+	}); err != nil {
+		t.Errorf("只填时段、ratio 沿用全局不该被拒: %v", err)
+	}
 }
 
 // 老库的价目表已经有峰谷但没有 peak_tz 列（user_prices 连峰谷都没有）：

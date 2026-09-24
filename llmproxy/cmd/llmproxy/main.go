@@ -260,19 +260,27 @@ func cmdStart(paths config.Paths) error {
 
 	r := router.New(cfg.Routing, cfg.Normalized)
 	if persisted, err := db.LoadProviderStatus(); err == nil && len(persisted) > 0 {
-		states := make(map[string]router.State, len(persisted))
-		for name, st := range persisted {
-			states[name] = router.State{
-				ConsecutiveFailures: st.ConsecutiveFailures,
-				UnhealthyUntil:      st.UnhealthyUntil,
-				TotalRequests:       st.TotalRequests,
-				TotalFailures:       st.TotalFailures,
-				LastError:           st.LastError,
-				LastSuccessAt:       st.LastSuccessAt,
-				LastFailureAt:       st.LastFailureAt,
-			}
+		// 必须按作用域恢复：熔断状态是**分桶**的（全局池是 ""，每个用户自己的上游是用户名）。
+		// 只写全局作用域的话，用户级熔断会被当成一个名叫 "alice/my-up" 的全局供应商恢复 ——
+		// 既永远匹配不到真实供应商（重启即丢用户级熔断），又会被 30 秒后的
+		// PersistProviderStatus 写回库，在 provider_stats 里长出幽灵行。
+		scoped := make([]router.ScopedState, 0, len(persisted))
+		for _, st := range persisted {
+			scoped = append(scoped, router.ScopedState{
+				Scope: st.Scope,
+				Name:  st.Name,
+				State: router.State{
+					ConsecutiveFailures: st.ConsecutiveFailures,
+					UnhealthyUntil:      st.UnhealthyUntil,
+					TotalRequests:       st.TotalRequests,
+					TotalFailures:       st.TotalFailures,
+					LastError:           st.LastError,
+					LastSuccessAt:       st.LastSuccessAt,
+					LastFailureAt:       st.LastFailureAt,
+				},
+			})
 		}
-		r.RestoreState(states)
+		r.RestoreScoped(scoped)
 	}
 
 	logPath := filepath.Join(paths.LogDir, config.ToolName+".log")
@@ -347,7 +355,7 @@ func cmdStart(paths config.Paths) error {
 				if err := srv.PersistProviderStatus(); err != nil {
 					lg.Warnf("保存供应商状态失败: %v", err)
 				}
-				if n, err := db.Prune(cfg.Database.RetainDays); err == nil && n > 0 {
+				if n, err := db.Prune(cfg.Database.EffectiveRetainDays()); err == nil && n > 0 {
 					lg.Debugf("清理 %d 条过期请求日志", n)
 				}
 			}
@@ -554,7 +562,16 @@ func cmdProviders(paths config.Paths) error {
 	}
 	defer db.Close()
 
-	statuses, _ := db.LoadProviderStatus()
+	// 这张表列的是 config.yaml 里的系统池，所以只取全局作用域（scope == ""）的状态；
+	// 各用户自己上游的熔断按用户名分桶，不属于这里。
+	global := map[string]store.ProviderStatus{}
+	if loaded, err := db.LoadProviderStatus(); err == nil {
+		for _, st := range loaded {
+			if st.Scope == "" {
+				global[st.Name] = st
+			}
+		}
+	}
 
 	fmt.Printf("%-22s %-8s %-8s %-10s %-12s %s\n",
 		"NAME", "ENABLED", "WEIGHT", "PROXY", "MODELS", "STATUS（来自数据库，可能滞后）")
@@ -564,7 +581,7 @@ func cmdProviders(paths config.Paths) error {
 			models = fmt.Sprintf("%d", len(p.Models.Map))
 		}
 		st := "无历史状态"
-		if s, ok := statuses[p.Name]; ok {
+		if s, ok := global[p.Name]; ok {
 			healthy := s.UnhealthyUntil.IsZero() || time.Now().After(s.UnhealthyUntil)
 			state := "健康"
 			if !healthy {

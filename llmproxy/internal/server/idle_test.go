@@ -180,3 +180,75 @@ func TestStreamIdleDisabledFallsBackToTotalTimeout(t *testing.T) {
 		t.Errorf("看门狗已关闭，不该报成空闲超时（%s）", et)
 	}
 }
+
+// 「返回 200 响应头、然后卡死不吐字节」的供应商必须能进熔断。
+//
+// 这正是空闲看门狗专门为它设计的那种故障。曾经 ReportSuccessFor 在读到 body 之前就执行、
+// 而 relay 里没有任何 router 调用，于是这家会被**永久判为健康**：看门狗掐掉它、
+// 库里记成 upstream_idle，router 却毫不知情 —— 更糟的是粘性还会把整个会话钉死在它上面，
+// 每个后续请求都要耗满 stream_idle_timeout_ms 才失败。
+// 两个自愈机制（熔断 + 粘性漂移）于是组合成了一个持久故障放大器。
+func TestStalledUpstreamTripsCircuitBreaker(t *testing.T) {
+	stall := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-stall // 之后一动不动
+	}))
+	defer func() { close(stall); up.Close() }()
+
+	// 用静态 key（作用域为空），这样熔断状态落在全局桶里、断言起来不含糊。
+	// failure_threshold 调到 2：两次失败就该看出计数在动。
+	h := newHarness(t, fmt.Sprintf(`
+server:
+  host: 127.0.0.1
+  port: 0
+  api_keys: [sk-static]
+  request_timeout_ms: 600000
+  stream_idle_timeout_ms: 1000
+routing: {retry: 0, failure_threshold: 2, cooldown_seconds: 60}
+providers:
+  - name: staller
+    enabled: true
+    base_url: %s/v1
+    api_key: sk-sys
+    weight: 1
+    proxy: direct
+    timeout_ms: 600000
+    models: ["*"]
+database: {path: "", retain_days: 30}
+log: {level: error}
+`, up.URL))
+
+	body := map[string]any{
+		"model": "sys-model", "stream": true,
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	}
+	for i := 0; i < 2; i++ {
+		h.post(t, "/v1/chat/completions", "sk-static", body)
+	}
+
+	st := h.router.Snapshot()["staller"]
+	if st.ConsecutiveFailures < 2 {
+		t.Errorf("卡死的上游应当累计失败次数（阈值 2），实际 %+v —— "+
+			"流中途失败必须反馈给 router，否则这家永远被判为健康", st)
+	}
+	if !st.UnhealthyUntil.After(time.Now()) {
+		t.Errorf("达到阈值后应当进入冷却，实际 UnhealthyUntil=%v", st.UnhealthyUntil)
+	}
+
+	// 库里也要归因成空闲超时，而不是含混的 relay_error
+	stats, err := h.db.Stats(time.Time{}, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats.Recent) == 0 {
+		t.Fatal("没有落库的请求记录")
+	}
+	if et := stats.Recent[0].ErrorType; et != "upstream_idle" {
+		t.Errorf("错误类型应当是 upstream_idle，实际 %q（%s）", et, stats.Recent[0].ErrorMsg)
+	}
+}

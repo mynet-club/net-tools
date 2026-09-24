@@ -67,6 +67,66 @@ func TestFreezeUpstreamCostAppliesPeakRatio(t *testing.T) {
 	}
 }
 
+// 价目行只填 peak_hours、off_peak_ratio 留空回落全局，而全局又没配 pricing 的峰谷 ——
+// 这是**当前生产配置的真实形状**（config.yaml 里根本没有 pricing 段，testPricing 也没有）。
+// 组装出来的规则是「有时段 + 系数 0」，而 0 必须被当成「未设置」按不打折处理。
+//
+// 否则高峰之外的全部流量，上游成本与向用户收的钱会**一起归零**，而且完全静默：
+// 不报错、不告警、FROZEN 列还显示已冻结，只是金额是 0。配额也一分不扣。
+func TestFreezeUnsetPeakRatioIsNotFree(t *testing.T) {
+	h := newConsumptionHarness(t, newUsageStub(t, 0), testPricing)
+
+	peak := atWeekday(time.Wednesday, 10, 0)
+	off := atWeekday(time.Wednesday, 13, 0)
+	from := hourFloor(off.Add(-13 * time.Hour))
+	// 两层价目都只填时段、都不填系数
+	if err := h.db.InsertProviderPrice(&store.ProviderPrice{
+		Provider: "sys-a", UpstreamModel: "m", ValidFrom: from,
+		InHit: 2, InMiss: 2, Out: 2, Currency: "CNY",
+		PeakHours: []string{"09:00-12:00"}, PeakTZ: "+08:00",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.db.InsertUserPrice(&store.UserPrice{
+		Scope: store.ScopeDefault, Model: "m", ValidFrom: from,
+		InHit: 4, InMiss: 4, Out: 4, Currency: "CNY",
+		PeakHours: []string{"09:00-12:00"}, PeakTZ: "+08:00",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	prompt, completion := int64(stubPrompt), int64(stubOut)
+	newRec := func() *store.RequestRecord {
+		return &store.RequestRecord{
+			OK: true, Provider: "sys-a", UpstreamModel: "m", SystemPaid: true,
+			UserName: "carol", Model: "m",
+			PromptTokens: &prompt, CompletionTokens: &completion,
+			CacheHitTokens: stubHit, CacheMissTokens: stubMiss,
+		}
+	}
+	// 单价统一（上游 2/百万、分发 4/百万），输入 1000 + 输出 500
+	costFull := float64(stubPrompt+stubOut) * 2 / 1e6
+	chargeFull := float64(stubPrompt+stubOut) * 4 / 1e6
+
+	for _, at := range []time.Time{peak, off} {
+		rec := newRec()
+		h.srv.freezeUpstreamCost(rec, at)
+		h.srv.freezeDownstreamCharge(rec, at)
+		if rec.CostUpstream == nil || rec.Charge == nil {
+			t.Fatalf("%s 应当冻结出金额（cost=%v charge=%v）", at.Format(time.RFC3339), rec.CostUpstream, rec.Charge)
+		}
+		// 系数没处可回落时，高峰与空闲都按全价 —— 关键是空闲**不等于 0**
+		if math.Abs(*rec.CostUpstream-costFull) > 1e-12 {
+			t.Errorf("%s 上游成本应当是全价 %v，实际 %v（0 意味着这段流量免费）",
+				at.Format("15:04"), costFull, *rec.CostUpstream)
+		}
+		if math.Abs(*rec.Charge-chargeFull) > 1e-12 {
+			t.Errorf("%s 分发金额应当是全价 %v，实际 %v（0 意味着配额一分不扣）",
+				at.Format("15:04"), chargeFull, *rec.Charge)
+		}
+	}
+}
+
 // 分发价同样分时段：两层价格的费率形状一致，系数算法不该各写一份。
 func TestFreezeDownstreamChargeAppliesPeakRatio(t *testing.T) {
 	h := newConsumptionHarness(t, newUsageStub(t, 0), testPricing)

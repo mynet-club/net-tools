@@ -134,6 +134,18 @@ func contains(s, sub string) bool {
 	})()
 }
 
+// statusOf 在 LoadProviderStatus 的切片里按 (作用域, 名字) 找一条。
+// 作用域必须一起匹配：熔断状态是按 (用户, 上游) 分桶的，
+// 只按名字找会把「alice 的 up」和「全局的 up」混为一谈 —— 那正是曾经的 bug。
+func statusOf(list []ProviderStatus, scope, name string) (ProviderStatus, bool) {
+	for _, st := range list {
+		if st.Scope == scope && st.Name == name {
+			return st, true
+		}
+	}
+	return ProviderStatus{}, false
+}
+
 func TestProviderStatusPersistence(t *testing.T) {
 	s := openTestStore(t)
 	until := time.Now().Add(60 * time.Second).Truncate(time.Second)
@@ -153,7 +165,10 @@ func TestProviderStatusPersistence(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("got %d statuses", len(got))
 	}
-	p1 := got["p1"]
+	p1, ok := statusOf(got, "", "p1")
+	if !ok {
+		t.Fatalf("没有找到 p1 的状态: %+v", got)
+	}
 	if p1.ConsecutiveFailures != 3 || p1.TotalRequests != 10 || p1.TotalFailures != 3 {
 		t.Errorf("p1 状态未正确恢复: %+v", p1)
 	}
@@ -173,8 +188,8 @@ func TestProviderStatusPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, _ = s.LoadProviderStatus()
-	if got["p1"].ConsecutiveFailures != 0 || !got["p1"].UnhealthyUntil.IsZero() {
-		t.Errorf("覆盖更新失败: %+v", got["p1"])
+	if p1, _ = statusOf(got, "", "p1"); p1.ConsecutiveFailures != 0 || !p1.UnhealthyUntil.IsZero() {
+		t.Errorf("覆盖更新失败: %+v", p1)
 	}
 }
 
@@ -251,6 +266,24 @@ func TestStatsSince(t *testing.T) {
 	}
 	if st.TotalRequests != 1 || st.TotalTokens != 20 {
 		t.Errorf("since 过滤后 = req=%d tok=%d, want 1/20", st.TotalRequests, st.TotalTokens)
+	}
+
+	// 两张聚合表也必须跟着 since 走。曾经它们完全没有 WHERE —— 于是 `stats --days 1`
+	// 会打印「总计: 请求 1」，紧接着的按供应商表却是全量历史，同屏自相矛盾。
+	if len(st.ByProvider) != 1 {
+		t.Fatalf("ByProvider 应当只有 1 行，实际 %d: %+v", len(st.ByProvider), st.ByProvider)
+	}
+	if st.ByProvider[0].Requests != 1 || st.ByProvider[0].TotalTokens != 20 {
+		t.Errorf("ByProvider 没跟着 since 过滤: req=%d tok=%d, want 1/20",
+			st.ByProvider[0].Requests, st.ByProvider[0].TotalTokens)
+	}
+	if len(st.ByDay) != 1 {
+		t.Errorf("ByDay 应当只有 1 天，实际 %d: %+v", len(st.ByDay), st.ByDay)
+	}
+	// ByProvider 按 (provider, model) 分组、跨天聚合，所以 day 列本身没有意义 ——
+	// 必须是占位符，而不是 SQLite 从组内任取一行的裸列值（那会是个误导人的随机日期）。
+	if st.ByProvider[0].Day != "-" {
+		t.Errorf("ByProvider 的 day 应当是占位符 '-'，实际 %q", st.ByProvider[0].Day)
 	}
 }
 

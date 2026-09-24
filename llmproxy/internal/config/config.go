@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -128,6 +129,15 @@ type ServerConfig struct {
 	// 隔夜还在继续，而上游的前缀缓存通常也活那么久，过期太早等于每个回合边界都换家。
 	// 同样用指针区分「没配」与「关闭」。
 	AffinityTTLMs *int `yaml:"affinity_ttl_ms"`
+	// BlockLocalUpstream 收紧**用户自配上游**（/v1/_me/providers）的出网范围：
+	// 打开后回环与私网地址（RFC1918 / ULA）一律拒绝，只许公网。
+	//
+	// 默认关闭，因为「上游就是本机或同网段的一台推理服务器」（ollama、vLLM、
+	// 公司内部网关）是正当用法。把网关暴露到局域网、且用户不完全可信时再打开 ——
+	// 那时一个用户可控的 base_url 等于「以网关的网络位置读内网」的能力。
+	// 注意 link-local（含云元数据 169.254.169.254）**不受这个开关影响，一律拒绝**。
+	// 系统池（config.yaml 里的 providers）是运营者自己写的，始终不受此限制。
+	BlockLocalUpstream bool `yaml:"block_local_upstream"`
 }
 
 // StreamIdleMs 给出流式空闲上限（毫秒）。没配 = 默认 2 分钟；显式 0 = 关闭。
@@ -198,8 +208,24 @@ func (p *ProviderRaw) IsEnabled() bool {
 }
 
 type DatabaseConfig struct {
-	Path       string `yaml:"path"`
-	RetainDays int    `yaml:"retain_days"`
+	Path string `yaml:"path"`
+	// RetainDays 是请求明细的保留天数；**显式 0 = 永久保留**（不清理）。
+	//
+	// 指针是为了区分「没配」（用默认 90 天）和「显式写 0」（永久）—— 用普通 int 的话
+	// 这两者都是 0，没法表达「别删」，于是文档承诺的「0 = 永久」会被悄悄改成 90 天。
+	// 这件事的代价比看起来大：requests 表正是计价冻结账本的唯一载体
+	// （price_upstream_id / cost_upstream / price_downstream_id / charge / currency 都在里面），
+	// 按 90 天删掉等于给「记录历史计价、每笔都能回溯」加了一个硬期限，
+	// 剩下的聚合表只有金额合计、没有价目行 id，无法复核。
+	RetainDays *int `yaml:"retain_days"`
+}
+
+// EffectiveRetainDays 给出实际的保留天数：没配 = 90 天；显式 0 = 永久（Prune 直接 no-op）。
+func (d DatabaseConfig) EffectiveRetainDays() int {
+	if d.RetainDays == nil {
+		return 90
+	}
+	return *d.RetainDays
 }
 
 type LogConfig struct {
@@ -600,15 +626,8 @@ func (c *Config) normalize(opts LoadOptions) error {
 			p.APIKey = expandEnv(p.APIKey, &missing, where+".api_key")
 		}
 
-		if p.BaseURL == "" {
-			return fmt.Errorf("%s.base_url 必填", where)
-		}
-		u, err := url.Parse(p.BaseURL)
-		if err != nil {
-			return fmt.Errorf("%s.base_url %q 不是合法 URL: %w", where, p.BaseURL, err)
-		}
-		if u.Scheme != "http" && u.Scheme != "https" {
-			return fmt.Errorf("%s.base_url 只支持 http/https，当前是 %s", where, u.Scheme)
+		if _, err := ParseBaseURL(p.BaseURL); err != nil {
+			return fmt.Errorf("%s.base_url %s", where, err)
 		}
 		if enabled && p.APIKey == "" && !opts.Strict {
 			// 宽松模式：密钥留空/未展开只记警告，方便 status 等命令
@@ -698,11 +717,11 @@ func (c *Config) normalize(opts LoadOptions) error {
 	if err := c.Pricing.normalize(); err != nil {
 		return err
 	}
-	if c.Database.RetainDays == 0 {
-		c.Database.RetainDays = 90
-	}
-	if c.Database.RetainDays < 0 {
-		return fmt.Errorf("database.retain_days 不能为负数，当前是 %d", c.Database.RetainDays)
+	// retain_days 不做「0 → 90」的规范化：0 是文档承诺的「永久保留」，
+	// 悄悄改成 90 会让照着文档配的人在第 90 天丢掉请求明细（也就是计价冻结账本）。
+	// 「没配」的默认值由 DatabaseConfig.EffectiveRetainDays 给，与「显式 0」区分开。
+	if c.Database.RetainDays != nil && *c.Database.RetainDays < 0 {
+		return fmt.Errorf("database.retain_days 不能为负数，当前是 %d（0 表示永久保留）", *c.Database.RetainDays)
 	}
 
 	switch c.Log.Level {
@@ -823,4 +842,102 @@ func (s *ServerConfig) HasAdminToken() bool {
 // RequiresAuth 报告是否配置了下游凭证。
 func (s *ServerConfig) RequiresAuth() bool {
 	return len(s.APIKeys) > 0
+}
+
+// ParseBaseURL 校验一个上游根地址：必须是 http/https、有主机名、且**不带 query 与锚点**。
+//
+// 不带 `?` / `#` 是硬性要求，不是洁癖：转发时上游 URL 是 `base_url + 下游路径后缀`
+// 直接拼出来的，所以 base_url 里一个 `?` 就能把后缀吃进 query ——
+// `http://10.0.0.5:9200/_search?x=` 拼上 `/chat/completions` 之后，真正打出去的是
+// `/_search?x=/chat/completions`。下游的 POST 路径白名单管不住这个，
+// 因为那条路径是 base_url 自己带的。
+func ParseBaseURL(raw string) (*url.URL, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, errors.New("base_url 必填")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%q 不是合法 URL: %w", raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("只支持 http/https，当前是 %s", u.Scheme)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("%q 缺少主机名", raw)
+	}
+	if strings.ContainsAny(raw, "?#") {
+		return nil, fmt.Errorf("%q 不能带查询串或锚点（? / #）：转发时下游路径直接拼在后面，"+
+			"一个 ? 就会把路径吃进 query。固定参数请写进路径，或改用 extra_headers", raw)
+	}
+	return u, nil
+}
+
+// CheckUpstreamEgress 拒绝指向不该作为上游的地址。
+//
+// **只对用户提供的 base_url 调用**（`/v1/_me/providers`、用户侧的 discover）。
+// config.yaml 里的系统池是运营者自己手写的，那是他自己的机器和自己的选择，不在此列。
+//
+// 为什么需要它：网关会拿这个地址发请求、并把上游响应体逐字节回传给调用方，
+// 所以一个用户可控的 base_url 等于「以网关的网络位置读内网」的能力。
+//
+// 分两档，界线是刻意画的：
+//
+//   - **一律拒绝** link-local（169.254.0.0/16、fe80::/10）与未指定地址。云厂商的元数据
+//     服务（169.254.169.254）就在 link-local 里，而它永远不可能是一个合法的 LLM 上游 ——
+//     挡掉它不妨碍任何正当用法，所以这一档没有开关。
+//   - **strict 时**再拒绝回环与私网段（RFC1918 / ULA）。默认不拒：
+//     「上游就是本机或同网段的一台推理服务器」（ollama、vLLM、公司内部网关）是完全
+//     正当的用法。把网关暴露到局域网、且用户不完全可信时，再打开
+//     `server.block_local_upstream`；真要收紧到「只许公网」，网络层（防火墙 / 安全组）
+//     比在这里猜意图可靠。
+//
+// 局限（明确接受）：主机名是**在校验时**解析的，所以挡不住 DNS rebinding ——
+// 校验通过后域名被改指到 169.254.169.254，拨号时就会打过去。要彻底堵住得在
+// `net.Dialer.Control` 里对**解析后的 IP** 再判一次，那需要把这条策略一路传到
+// dialer 层；当前先把「直接写 IP」和「解析结果就是内网」这两种绝大多数情况挡住。
+func CheckUpstreamEgress(u *url.URL, strict bool) error {
+	host := u.Hostname()
+	if host == "" {
+		return errors.New("base_url 缺少主机名")
+	}
+	check := func(ip net.IP) error {
+		if v4 := ip.To4(); v4 != nil {
+			ip = v4 // IPv4-mapped IPv6（::ffff:169.254.169.254）要先还原，否则下面的判断会漏
+		}
+		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+			return fmt.Errorf("base_url 不能指向 %s：link-local（含云元数据 169.254.169.254）"+
+				"与未指定地址不允许作为上游", describeIP(ip))
+		}
+		if strict && (ip.IsLoopback() || ip.IsPrivate()) {
+			return fmt.Errorf("base_url 不能指向 %s：已开启 server.block_local_upstream，"+
+				"回环与私网地址都不允许作为上游", describeIP(ip))
+		}
+		return nil
+	}
+
+	if ip := net.ParseIP(host); ip != nil {
+		return check(ip)
+	}
+	// 域名：解析后逐个 IP 判。解析失败不在这里报错 —— 拨号时会再失败一次，
+	// 那里的错误信息更准确（而且在这里报错会把「DNS 暂时不可用」误判成「配置非法」）。
+	addrs, err := net.LookupIP(host)
+	if err != nil {
+		return nil
+	}
+	for _, ip := range addrs {
+		if err := check(ip); err != nil {
+			return fmt.Errorf("%s（主机名 %s 解析所得）", err.Error(), host)
+		}
+	}
+	return nil
+}
+
+// describeIP 给错误信息用一个稳定的 IP 文本（顺带把 IPv4-mapped 写成点分十进制，
+// 免得用户看到 ::ffff:169.254.169.254 这种形式反而认不出来）。
+func describeIP(ip net.IP) string {
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String()
+	}
+	return ip.String()
 }
