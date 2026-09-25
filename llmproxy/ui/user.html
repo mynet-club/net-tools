@@ -73,8 +73,8 @@
       <p class="muted" id="models-empty" hidden>系统池里还没有声明任何模型 —— 请联系管理员。</p>
     </section>
 
-    <!-- 我的上游 -->
-    <section class="card">
+    <!-- 我的上游（byo 模式主路径；消费模式下不参与选路） -->
+    <section class="card" id="my-providers-card">
       <div class="head">
         <h2>我的上游</h2>
         <button type="button" id="add-open" class="primary sm">新增上游</button>
@@ -194,12 +194,12 @@
         </div>
         <div class="tablewrap">
           <table id="mm-rows">
-            <thead><tr><th>上游</th><th>上游模型名</th><th></th></tr></thead>
+            <thead><tr><th>上游</th><th>这家的上游模型名</th></tr></thead>
             <tbody></tbody>
           </table>
         </div>
-        <p class="muted" id="mm-hint">每家上游选它真正认的模型名。留空 = 这家不承接。
-          直通上游选一个具体名字后会改成「指定模型」，不再接收任意模型名。</p>
+        <p class="muted" id="mm-hint">每家填它真正认的模型名，点输入框会出候选。留空 = 这家不承接。
+          直通上游填了具体名字后会改成「指定模型」。</p>
         <div class="row">
           <button type="submit" class="primary">保存映射</button>
           <button type="button" id="mm-cancel" class="ghost">取消</button>

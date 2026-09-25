@@ -85,11 +85,14 @@ function renderApp() {
   $('t-model').value = $('t-model').value || 'deepseek-chat';
 }
 
-// 消费模式：配额与可用模型；byo 模式：这两张卡收起来
+// 消费模式：配额 + 可用模型（系统池）；byo：自己的上游 + 模型目录。
+// 两套互不参与：消费模式下配的「我的上游」**不会**被选路用到，藏起来免得误配。
 function renderMode(me) {
   const consumption = me.mode === 'consumption';
   $('quota-card').hidden = !consumption;
   $('models-card').hidden = !consumption;
+  $('my-providers-card').hidden = consumption;
+  $('my-models-card').hidden = consumption;
   if (!consumption) return;
 
   const q = me.quota || {};
@@ -476,8 +479,7 @@ async function loadModelOverview() {
     ));
   }
 
-  const card = $('my-models-card');
-  card.hidden = false;
+  // 显示与否交给 renderMode（消费模式整卡藏起）；这里只填内容
   const tb = $('my-models').querySelector('tbody');
   tb.replaceChildren(...rows);
   const note = $('my-models-pass');
@@ -496,6 +498,7 @@ function openModelForm(down) {
   const list = state.providers || [];
   if (!list.length) {
     showErr($('mm-err'), '还没有上游。先在上面「我的上游」里加一个。');
+    $('mmform').hidden = false;
     return;
   }
   $('mmform').hidden = false;
@@ -505,45 +508,39 @@ function openModelForm(down) {
 
   const tb = $('mm-rows').querySelector('tbody');
   tb.replaceChildren();
-  for (const p of list) {
+  list.forEach((p, i) => {
     const m = p.models || {};
-    const current = down && !m.passthrough ? (m.map || {})[down] : '';
-    // 候选：session 里同步过的 + 当前值 + 这家已有的上游名
+    const current = down && !m.passthrough ? ((m.map || {})[down] || '') : '';
+    // 候选：session 同步过的 + 当前值 + 这家已有的上游名
     const cands = new Set();
     try {
       const raw = sessionStorage.getItem('llmproxy.cands.' + p.name);
       if (raw) for (const c of JSON.parse(raw)) cands.add(c);
     } catch { /* 没有就算了 */ }
     if (current) cands.add(current);
-    if (!m.passthrough) for (const up of Object.values(m.map || {})) if (up !== '*') cands.add(up);
+    if (!m.passthrough) {
+      for (const up of Object.values(m.map || {})) if (up !== '*') cands.add(up);
+    } else if (down) {
+      // 直通上游在映射一个具体名字时，最省事的是同名
+      cands.add(down);
+    }
 
-    const sel = h('select', { class: 'mono' });
-    sel.append(h('option', { value: '', text: m.passthrough ? '保持直通（不指定）' : '不使用这家' }));
-    for (const c of [...cands].sort()) {
-      sel.append(h('option', { value: c, text: c }));
-    }
-    if (current) sel.value = current;
-    else if (m.passthrough && down) {
-      // 直通上游在映射一个具体名字时，默认用同名
-      const opt = h('option', { value: down, text: down + '（同名）' });
-      sel.append(opt);
-    }
-    // 允许手动填一个不在列表里的名字
-    const custom = h('input', {
-      type: 'text', class: 'mono', placeholder: '或手动填上游模型名',
-      autocomplete: 'off', spellcheck: 'false', value: '',
+    const dl = h('datalist', { id: 'mm-cands-' + i });
+    for (const c of [...cands].sort()) dl.append(h('option', { value: c }));
+    const inp = h('input', {
+      type: 'text', class: 'mono mm-up', list: 'mm-cands-' + i,
+      placeholder: m.passthrough ? '留空 = 保持直通' : '留空 = 不使用这家',
+      autocomplete: 'off', spellcheck: 'false', value: current,
     });
-    if (current && !cands.has(current)) custom.value = current;
 
+    const tag = m.passthrough
+      ? h('span', { class: 'tag', text: '直通', title: '现在接受任意模型名' })
+      : null;
     tb.append(h('tr', null,
-      h('td', null, h('code', { class: 'k', text: p.name }),
-        m.passthrough ? h('span', { class: 'tag', text: '直通' }) : null),
-      h('td', null, sel, ' ', custom),
-      h('td', null, m.passthrough
-        ? h('span', { class: 'muted', text: '选了名字就改成指定模型' })
-        : null),
+      h('td', null, h('code', { class: 'k', text: p.name }), tag ? ' ' : '', tag),
+      h('td', null, inp, dl),
     ));
-  }
+  });
   $('mm-name').focus();
   $('mm-name').scrollIntoView({ block: 'center', behavior: 'smooth' });
 }
@@ -554,16 +551,14 @@ function closeModelForm() {
 }
 
 // 读表单：返回 [{provider, up}]，up 为空串表示这家不承接。
-function collectModelForm(down) {
+function collectModelForm() {
   const tb = $('mm-rows').querySelector('tbody');
   const out = [];
   for (const tr of tb.rows) {
     const provider = tr.cells[0].querySelector('code')?.textContent?.trim();
-    const sel = tr.cells[1].querySelector('select');
-    const custom = tr.cells[1].querySelector('input');
+    const inp = tr.cells[1].querySelector('input.mm-up');
     if (!provider) continue;
-    const up = (custom && custom.value.trim()) || (sel && sel.value.trim()) || '';
-    out.push({ provider, up });
+    out.push({ provider, up: (inp && inp.value.trim()) || '' });
   }
   return out;
 }
@@ -574,7 +569,7 @@ async function saveModelMap(ev) {
   ev.preventDefault();
   const down = $('mm-name').value.trim();
   if (!down) return showErr($('mm-err'), '下游模型名必填');
-  const assigns = collectModelForm(down);
+  const assigns = collectModelForm();
   const touched = assigns.filter((a) => a.up);
   if (!touched.length) return showErr($('mm-err'), '至少给一家上游选一个模型名');
 
