@@ -15,6 +15,10 @@
   --warn-bg: #fff8e6;
   --warn-bd: #f0d493;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  /* 内容宽度按 1920×1080 定：用量明细表 13 列的自然宽度约 1100px，
+     加上卡片内边距与页面内边距要 ~1180px 才不横向滚动。
+     1560 在 1920 上左右各留 180，既不空也不至于把说明文字拉成一条超长的行。 */
+  --content: 1560px;
 }
 
 * { box-sizing: border-box; }
@@ -97,7 +101,7 @@ td.dim { color: var(--muted); }
 /* ── 顶栏 ─────────────────────────────────────────────────────────── */
 .bar { background: var(--surface); border-bottom: 1px solid var(--border); }
 .bar-in {
-  max-width: 980px; margin: 0 auto; padding: 12px 20px;
+  max-width: var(--content); margin: 0 auto; padding: 12px 20px;
   display: flex; align-items: center; gap: 8px;
 }
 .bar-in strong { font-size: 14px; }
@@ -112,7 +116,7 @@ td.dim { color: var(--muted); }
    里面的宽表格（用量明细十几列、nowrap）会把整页顶宽，margin:0 auto 再把整页居中 ——
    表现就是「内容整体右偏、还要横向拖动」。minmax(0,…) 允许列缩到比内容窄，
    横向滚动交给 .tablewrap 自己处理。 */
-.wrap { max-width: 980px; margin: 0 auto; padding: 20px;
+.wrap { max-width: var(--content); margin: 0 auto; padding: 20px;
         display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
 .head { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
 .head h2 { flex: 1; }
