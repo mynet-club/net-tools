@@ -140,3 +140,28 @@ func TestHybridQuotaDoesNotBlockOwnUpstream(t *testing.T) {
 		t.Errorf("只有系统池承接且额度用完时应当 402，实际 %d", resp2.StatusCode)
 	}
 }
+
+// 自有上游是「全部直通」时**不该**抢走系统池里点名声明过的模型：
+// 直通上游根本没那个模型，抢过去只会 400。
+func TestHybridPassthroughOwnDoesNotStealDeclaredModel(t *testing.T) {
+	stub := newUsageStub(t, 0)
+	h := newMUHarnessWith(t, hybridYAML(stub.srv.URL))
+	// 自有上游是直通（`["*"]`），指向一个「没有 gpt-5-sol」的假上游
+	own := startMockUpstream(t, &mockUpstream{name: "my-deepseek", apiKey: "sk-mine", failStatus: 404, failTimes: -1})
+
+	token := h.addUser(t, "arthur")
+	// 系统池：点名声明 gpt-5-sol
+	setConsumption(t, h, "arthur", "gpt-5-sol", "sys-model")
+	h.addProvider(t, "arthur", "my-deepseek", own.baseURL+"/v1", "sk-mine", `["*"]`)
+
+	resp, raw := h.post(t, "/v1/chat/completions", token, chatBody("gpt-5-sol"))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("应当由系统池承接 gpt-5-sol，实际 %d: %s", resp.StatusCode, raw)
+	}
+	if got := resp.Header.Get("X-LLMProxy-Provider"); got != "sys-a" {
+		t.Errorf("点名声明的系统池应当优先于自有直通，实际走了 %q", got)
+	}
+	if own.Count() != 0 {
+		t.Errorf("自有直通不该被尝试（它没有这个模型），实际调用 %d 次", own.Count())
+	}
+}

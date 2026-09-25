@@ -240,29 +240,26 @@ func (r *Router) PickFromPreferring(scope string, candidates []config.Provider, 
 	}
 
 	// 顺序即优先级，从高到低：
-	//   自有·点名·健康 → 自有·点名 → 自有·兜底·健康 → 自有·兜底 →
-	//   系统·点名·健康 → 系统·点名 → 系统·兜底·健康 → 系统·兜底
+	//   自有·点名·健康 → 自有·点名 → 系统·点名·健康 → 系统·点名 →
+	//   自有·兜底·健康 → 自有·兜底 → 系统·兜底·健康 → 系统·兜底
 	//
-	// 两层的次序各自沿用两条既有规则：
+	// 三条规则叠起来，**从外到内**依次是：
 	//   1) 点名声明优先于通配兜底 —— 写 models: ["*"] 的那家声明「任何模型名都接」，
 	//      于是它也会成为**别人点名声明过**的模型名的候选。两者若平权，
 	//      一次请求走对还是走错就全看运气（表现是同一个模型名时而正常、时而 400）。
-	//   2) 先健康的、兜不住了再拿不健康的顶上。
-	// 最外层新增的是「自有优先于系统池」：用户自己配的上游先花他自己的钱，
-	// 整层都排除掉了才回落到网关付费的系统池。
+	//      这条必须排在最外层：某家用 `["*"]` 的自有上游不该抢走系统池里
+	//      **明确声明**了 gpt-5-sol 的那家 —— 直通上游根本没那个模型，抢过去只会 400。
+	//   2) 同一层里，自有上游优先于系统池：用户自己配的先花他自己的钱。
+	//   3) 层内先健康的，兜不住了再拿不健康的顶上。
 	var pool []weighted
-	for _, b := range []buckets{own, sys} {
-		pool = b.explHealthy
-		if len(pool) == 0 {
-			pool = b.explAll
-		}
-		if len(pool) == 0 {
-			pool = b.fbHealthy
-		}
-		if len(pool) == 0 {
-			pool = b.fbAll
-		}
-		if len(pool) > 0 {
+	for _, cand := range [][]weighted{
+		own.explHealthy, own.explAll,
+		sys.explHealthy, sys.explAll,
+		own.fbHealthy, own.fbAll,
+		sys.fbHealthy, sys.fbAll,
+	} {
+		if len(cand) > 0 {
+			pool = cand
 			break
 		}
 	}
