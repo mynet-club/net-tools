@@ -126,7 +126,42 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1", s.handleV1)
 	mux.HandleFunc("/v1/", s.handleV1)
 	mux.HandleFunc("/", s.handleNotFound)
-	return s.withAccessLog(mux)
+	return s.withAccessLog(s.withCORS(mux))
+}
+
+// withCORS 让浏览器里的客户端（桌面端设置页的「测试连接」、网页控制台以外的
+// 前端）能直接调本机网关。
+//
+// 没有这一层时的症状是 `fetch failed`：带 Authorization 的跨域请求浏览器会先发
+// OPTIONS 预检，而路由表只注册了 GET/POST，预检拿到 405 且响应里没有
+// Access-Control-Allow-*，于是浏览器把真正的请求掐掉 —— curl 不走预检，所以
+// 「curl 通、界面测试失败」。这正是 MiMo Desktop 设置里测自定义模型时报错的原因。
+//
+// 放开跨域不会让接口多暴露：没 key 一样 401，有 key 的人在浏览器里本来也能用 curl。
+// 鉴权仍走 Authorization 头，不走 Cookie，所以 Allow-Origin 可以是 `*`。
+func (s *Server) withCORS(next http.Handler) http.Handler {
+	const (
+		allowOrigin  = "*"
+		allowMethods = "GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS"
+		allowHeaders = "Authorization, Content-Type, Accept, X-Requested-With"
+		maxAge       = "86400"
+	)
+	apply := func(w http.ResponseWriter) {
+		h := w.Header()
+		h.Set("Access-Control-Allow-Origin", allowOrigin)
+		h.Set("Access-Control-Allow-Methods", allowMethods)
+		h.Set("Access-Control-Allow-Headers", allowHeaders)
+		h.Set("Access-Control-Max-Age", maxAge)
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apply(w)
+		// 预检到此为止：不进路由表，免得被各 handler 的「只支持 GET」打成 405
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // statusRecorder 记录状态码，供访问日志使用。
