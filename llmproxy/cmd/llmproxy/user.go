@@ -404,6 +404,12 @@ func userUsageCmd(paths config.Paths, rest []string) error {
 
 	fmt.Printf("用户 %s 最近 %d 天：请求 %d（成功 %d / 失败 %d），prompt %d / completion %d / 合计 %d tokens\n",
 		name, *days, tot.Requests, tot.OK, tot.Failed, tot.PromptTokens, tot.OutputTokens, tot.TotalTokens)
+	if hit, miss := tot.CacheHitTokens, tot.CacheMissTokens; hit+miss > 0 {
+		fmt.Printf("输入缓存：命中 %s / 未命中 %s，命中率 %.1f%%\n",
+			humanCount(hit), humanCount(miss), float64(hit)*100/float64(hit+miss))
+	} else {
+		fmt.Printf("输入缓存：上游没回报缓存拆分（不是命中率 0%%）\n")
+	}
 	if len(rows) == 0 {
 		fmt.Println("（没有记录）")
 		return nil

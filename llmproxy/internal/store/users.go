@@ -551,14 +551,18 @@ LIMIT 500`, args...)
 // 字段名与 JSON 键刻意不同：这套接口对外一律 snake_case，
 // 且输出 token 数在别处叫 completion_tokens，这里跟着叫，免得同一个人面对两套名字。
 type UserTotals struct {
-	Requests     int64  `json:"requests"`
-	OK           int64  `json:"ok"`
-	Failed       int64  `json:"failed"`
-	TotalTokens  int64  `json:"total_tokens"`
-	PromptTokens int64  `json:"prompt_tokens"`
-	OutputTokens int64  `json:"completion_tokens"`
-	FirstDay     string `json:"first_day"`
-	LastDay      string `json:"last_day"`
+	Requests     int64 `json:"requests"`
+	OK           int64 `json:"ok"`
+	Failed       int64 `json:"failed"`
+	TotalTokens  int64 `json:"total_tokens"`
+	PromptTokens int64 `json:"prompt_tokens"`
+	OutputTokens int64 `json:"completion_tokens"`
+	// 输入侧的缓存拆分。命中率 = CacheHit / (CacheHit + CacheMiss)，两者都为 0 表示
+	// 上游压根没回报（不是「命中率 0%」），界面上要区分这两种情况。
+	CacheHitTokens  int64  `json:"cache_hit_tokens"`
+	CacheMissTokens int64  `json:"cache_miss_tokens"`
+	FirstDay        string `json:"first_day"`
+	LastDay         string `json:"last_day"`
 }
 
 // TotalByUser 汇总某用户从 since 起的累计消耗。
@@ -574,10 +578,12 @@ func (s *Store) TotalByUser(since time.Time, userName string) (UserTotals, error
 	err := s.db.QueryRow(`
 SELECT COALESCE(SUM(requests),0), COALESCE(SUM(ok),0), COALESCE(SUM(failed),0),
        COALESCE(SUM(total_tokens),0), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
+       COALESCE(SUM(cache_hit_tokens),0), COALESCE(SUM(cache_miss_tokens),0),
        MIN(day), MAX(day)
 FROM usage_user_daily `+where, args...).Scan(
 		&out.Requests, &out.OK, &out.Failed, &out.TotalTokens,
-		&out.PromptTokens, &out.OutputTokens, &first, &last)
+		&out.PromptTokens, &out.OutputTokens,
+		&out.CacheHitTokens, &out.CacheMissTokens, &first, &last)
 	if err != nil {
 		return out, err
 	}

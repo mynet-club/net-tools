@@ -45,6 +45,14 @@ function showErr(node, msg) {
   node.hidden = !msg;
 }
 
+// stat 造一个统计格；title 可选，用来放那句「这个数怎么算的」。
+// 放共用的 common.js：用户台与管理台的用量区都用它。
+function stat(k, v, cls, title) {
+  return h('div', title ? { title } : null,
+    h('div', { class: 'k', text: k }),
+    h('div', { class: cls ? 'v ' + cls : 'v', text: v }));
+}
+
 /* ── 接口 ─────────────────────────────────────────────────────────── */
 
 async function api(path, opts = {}) {

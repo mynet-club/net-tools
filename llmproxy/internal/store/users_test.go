@@ -492,3 +492,31 @@ func TestRevisionBumpsOnUserChanges(t *testing.T) {
 		t.Errorf("禁用用户后修订号应增长: %d → %d", r3, r4)
 	}
 }
+
+// 累计里要带上输入缓存的命中/未命中：用量界面的「命中率」全靠这两个字段，
+// 漏了它用户只能看到 0% 或者一片空白，看不出缓存到底有没有生效。
+func TestTotalByUserCarriesCacheSplit(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Now()
+	pt, ct, tt := int64(1000), int64(50), int64(1050)
+
+	if err := s.InsertRequest(RequestRecord{
+		Ts: now, RequestID: "c1", UserName: "carol", ClientLabel: "carol",
+		Model: "m", Provider: "p", OK: true, StatusCode: 200,
+		PromptTokens: &pt, CompletionTokens: &ct, TotalTokens: &tt,
+		CacheHitTokens: 800, CacheMissTokens: 200,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tot, err := s.TotalByUser(MonthStart(now), "carol")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tot.CacheHitTokens != 800 || tot.CacheMissTokens != 200 {
+		t.Fatalf("缓存拆分没汇总上来: %+v", tot)
+	}
+	// 命中率 = 800 / (800+200)
+	if got := float64(tot.CacheHitTokens) * 100 / float64(tot.CacheHitTokens+tot.CacheMissTokens); got != 80 {
+		t.Errorf("命中率应为 80%%，实际 %v", got)
+	}
+}

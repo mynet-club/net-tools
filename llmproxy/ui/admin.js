@@ -848,6 +848,23 @@ async function deleteModel(name, model) {
 async function loadUserUsage(name) {
   const { data } = await adminApi('/v1/_admin/users/' + encodeURIComponent(name) + '/usage?days=7');
   const rows = (data && data.rows) || [];
+
+  // 汇总 + 输入缓存命中率。hit+miss 都为 0 = 上游没回报缓存拆分，
+  // 那是「不知道」而不是 0%（有的聚合商压根不给这个字段）。
+  const t = (data && data.totals) || {};
+  const hit = t.cache_hit_tokens || 0;
+  const miss = t.cache_miss_tokens || 0;
+  const rate = hit + miss > 0 ? ((hit * 100) / (hit + miss)).toFixed(1) + '%' : '—';
+  const rateTitle = hit + miss > 0
+    ? '输入命中 ' + num(hit) + ' / 输入合计 ' + num(hit + miss) + ' token'
+    : '上游没回报缓存拆分（不是命中率 0%）';
+  $('ud-totals').replaceChildren(
+    stat('请求', num(t.requests)),
+    stat('成功 / 失败', num(t.ok) + ' / ' + num(t.failed)),
+    stat('输入 / 输出 tok', num(t.prompt_tokens) + ' / ' + num(t.completion_tokens)),
+    stat('输入缓存命中率', rate, 'sm', rateTitle),
+  );
+
   const tb = $('ud-usage').querySelector('tbody');
   tb.replaceChildren(...rows.map((r) => h('tr', null,
     h('td', null, h('code', { class: 'k', text: r.day })),

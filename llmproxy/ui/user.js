@@ -43,12 +43,6 @@ function logout() {
 
 /* ── 概览 ─────────────────────────────────────────────────────────── */
 
-function stat(k, v, cls) {
-  return h('div', null,
-    h('div', { class: 'k', text: k }),
-    h('div', { class: cls ? 'v ' + cls : 'v', text: v }));
-}
-
 function renderApp() {
   $('login').hidden = true;
   $('app').hidden = false;
@@ -683,12 +677,24 @@ async function loadUsage() {
   const t = (data && data.totals) || {};
 
   const c = (data && data.cost) || {};
+  // 输入缓存命中率：命中 /（命中+未命中）。两边都为 0 表示**上游没回报**（有的聚合商
+  // 只给 cached_tokens 甚至什么都不给），那是「不知道」而不是「0%」—— 两者必须分清，
+  // 否则会让人以为缓存完全没生效，去查一个不存在的问题。
+  const hit = t.cache_hit_tokens || 0;
+  const miss = t.cache_miss_tokens || 0;
+  const rate = hit + miss > 0 ? ((hit * 100) / (hit + miss)).toFixed(1) + '%' : '—';
+  const rateTitle = hit + miss > 0
+    ? '输入命中 ' + num(hit) + ' / 输入合计 ' + num(hit + miss) + ' token'
+    : '上游没回报缓存拆分（不是命中率 0%）';
+
   $('utotals').replaceChildren(
     stat('请求', num(t.requests)),
     stat('成功 / 失败', num(t.ok) + ' / ' + num(t.failed)),
     stat('输入 / 输出 tok', num(t.prompt_tokens) + ' / ' + num(t.completion_tokens)),
+    stat('输入缓存命中率', rate, 'sm', rateTitle),
     c.priced
-      ? stat('本月系统消费', money(c.month_system, c.currency || 'CNY'), 'sm')
+      ? stat('本月系统消费', money(c.month_system, c.currency || 'CNY'), 'sm',
+        '只算走系统上游的那部分；自有上游是你自己和供应商结算')
       : stat('token 合计', num(t.total_tokens)),
   );
 
