@@ -91,6 +91,9 @@ button.link.danger { color: var(--danger); }
 .card.dim { opacity: 0.72; }
 .card.dim:hover { opacity: 1; }
 
+/* 表格里的「这个值不知道」——比如上游没回报缓存拆分时的命中率（是不知道，不是 0%） */
+td.dim { color: var(--muted); }
+
 /* ── 顶栏 ─────────────────────────────────────────────────────────── */
 .bar { background: var(--surface); border-bottom: 1px solid var(--border); }
 .bar-in {

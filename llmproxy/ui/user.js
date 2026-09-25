@@ -703,6 +703,10 @@ async function loadUsage() {
   $('uempty').hidden = rows.length > 0;
 
   for (const r of rows) {
+    // 每行的命中率 = 命中 /（命中+未命中）。都 0 就是上游没回报，显示 — 而不是 0%。
+    const hit = r.cache_hit_tokens || 0;
+    const miss = r.cache_miss_tokens || 0;
+    const rate = hit + miss > 0 ? ((hit * 100) / (hit + miss)).toFixed(1) + '%' : '—';
     tb.append(h('tr', null,
       h('td', null, h('code', { class: 'k', text: r.day })),
       h('td', null, h('code', { class: 'k', text: r.provider })),
@@ -712,6 +716,7 @@ async function loadUsage() {
       h('td', { class: 'num', text: num(r.failed) }),
       h('td', { class: 'num', text: num(r.prompt_tokens) }),
       h('td', { class: 'num', text: num(r.cache_hit_tokens) }),
+      h('td', { class: 'num' + (rate === '—' ? ' dim' : ''), text: rate }),
       h('td', { class: 'num', text: num(r.completion_tokens) }),
       h('td', { class: 'num', text: num(r.total_tokens) }),
       h('td', { class: 'num', text: ms(r.avg_latency_ms) }),

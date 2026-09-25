@@ -866,19 +866,25 @@ async function loadUserUsage(name) {
   );
 
   const tb = $('ud-usage').querySelector('tbody');
-  tb.replaceChildren(...rows.map((r) => h('tr', null,
-    h('td', null, h('code', { class: 'k', text: r.day })),
-    h('td', null, h('code', { class: 'k', text: r.provider })),
-    h('td', null, h('code', { class: 'k', text: r.model })),
-    h('td', { class: 'num', text: num(r.requests) }),
-    h('td', { class: 'num', text: num(r.ok) }),
-    h('td', { class: 'num', text: num(r.failed) }),
-    h('td', { class: 'num', text: num(r.prompt_tokens) }),
-    h('td', { class: 'num', text: num(r.cache_hit_tokens) }),
-    h('td', { class: 'num', text: num(r.completion_tokens) }),
-    h('td', { class: 'num', text: num(r.total_tokens) }),
-    h('td', { class: 'num', text: r.cost != null ? r.cost.toFixed(4) : '—' }),
-  )));
+  tb.replaceChildren(...rows.map((r) => {
+    const hit = r.cache_hit_tokens || 0;
+    const miss = r.cache_miss_tokens || 0;
+    const rate = hit + miss > 0 ? ((hit * 100) / (hit + miss)).toFixed(1) + '%' : '—';
+    return h('tr', null,
+      h('td', null, h('code', { class: 'k', text: r.day })),
+      h('td', null, h('code', { class: 'k', text: r.provider })),
+      h('td', null, h('code', { class: 'k', text: r.model })),
+      h('td', { class: 'num', text: num(r.requests) }),
+      h('td', { class: 'num', text: num(r.ok) }),
+      h('td', { class: 'num', text: num(r.failed) }),
+      h('td', { class: 'num', text: num(r.prompt_tokens) }),
+      h('td', { class: 'num', text: num(r.cache_hit_tokens) }),
+      h('td', { class: 'num' + (rate === '—' ? ' dim' : ''), text: rate }),
+      h('td', { class: 'num', text: num(r.completion_tokens) }),
+      h('td', { class: 'num', text: num(r.total_tokens) }),
+      h('td', { class: 'num', text: r.cost != null ? r.cost.toFixed(4) : '—' }),
+    );
+  }));
   $('ud-usage-empty').hidden = rows.length > 0;
 }
 
