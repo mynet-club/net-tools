@@ -7,7 +7,7 @@
      上游名、地址、模型名、错误信息都是用户可控的，拼 HTML 就是 XSS */
 
 const $ = (id) => document.getElementById(id);
-const state = { base: '', token: '', storageKey: '', me: null, days: 7, editing: null };
+const state = { base: '', token: '', storageKey: '', me: null, days: 7, editing: null, providers: [] };
 
 /* ── 小工具 ───────────────────────────────────────────────────────── */
 

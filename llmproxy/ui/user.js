@@ -161,6 +161,7 @@ function modelsChips(m) {
 async function loadProviders() {
   const { data } = await api('/v1/_me/providers');
   const list = (data && data.providers) || [];
+  state.providers = list;
   const tb = $('ptable').querySelector('tbody');
   tb.replaceChildren();
   $('pempty').hidden = list.length > 0;
@@ -424,13 +425,14 @@ function mmAddManual() {
 }
 
 /* ── 我的模型：按下游模型名，看它挂在哪些上游上 ─────────────────────── */
+//
+// 这一节同时是**模型目录**的入口：客户端要填的下游名写在这里，一家或多家上游
+// 各自认一个上游模型名。同名多家 = 粘性优先 + 失败自动切换（见路由）。
 
-async function loadModelOverview() {
-  const { data } = await api('/v1/_me/providers');
-  const list = (data && data.providers) || [];
+// 从各上游的 models 声明收出「下游名 → [{provider, up, passthrough?}]」。
+function collectModelMap(list) {
   const byModel = new Map();
   const passthrough = [];
-
   for (const p of list) {
     const m = p.models || {};
     if (m.passthrough) { passthrough.push(p.name); continue; }
@@ -440,34 +442,210 @@ async function loadModelOverview() {
       byModel.get(down).push({ provider: p.name, up });
     }
   }
+  return { byModel, passthrough };
+}
+
+async function loadModelOverview() {
+  const { data } = await api('/v1/_me/providers');
+  const list = (data && data.providers) || [];
+  state.providers = list;
+  const { byModel, passthrough } = collectModelMap(list);
 
   const rows = [];
   for (const [down, ups] of [...byModel.entries()].sort()) {
     rows.push(h('tr', null,
       h('td', null, h('code', { class: 'k', text: down })),
-      h('td', null, ...ups.map((u) => h('span', { class: 'chip', text: u.provider + ' → ' + u.up }))),
-      // 多路就是「同一模型挂多个上游」，也就是负载均衡 + 失败自动切换
-      h('td', null, ups.length > 1
-        ? h('span', { class: 'tag ok', text: '负载均衡 + 失败切换' })
-        : h('span', { class: 'muted', text: '单路' })),
+      h('td', null, ...ups.map((u) => h('span', {
+        class: 'chip',
+        title: u.provider + ' → ' + u.up,
+        text: u.provider + ' → ' + u.up,
+      }))),
+      // 多路就是「同一模型挂多个上游」：粘性 + 失败自动切换
+      h('td', null,
+        ups.length > 1 ? h('span', { class: 'tag ok', text: '粘性 + 失败切换' }) : h('span', { class: 'muted', text: '单路' }),
+        ' ',
+        h('button', {
+          type: 'button', class: 'link', text: '编辑',
+          onclick: () => openModelForm(down),
+        }),
+        ' ',
+        h('button', {
+          type: 'button', class: 'link danger', text: '移除',
+          onclick: () => removeModel(down),
+        })),
     ));
   }
 
   const card = $('my-models-card');
-  const has = rows.length > 0 || passthrough.length > 0;
-  card.hidden = !has;
-  if (!has) return;
-
+  card.hidden = false;
   const tb = $('my-models').querySelector('tbody');
   tb.replaceChildren(...rows);
   const note = $('my-models-pass');
   if (passthrough.length) {
-    note.textContent = '这些上游接受任意模型名（全部直通），不逐个列出：' + passthrough.join('、');
+    note.textContent = '这些上游目前是「全部直通」（接受任意模型名，不进上表）：' +
+      passthrough.join('、') + '。要让它参与同名切换，在「映射模型」里给它选一个具体模型名。';
     note.hidden = false;
   } else {
     note.hidden = true;
   }
   $('my-models-empty').hidden = rows.length > 0;
+}
+
+// 打开模型映射表单：down 为空 = 新建。
+function openModelForm(down) {
+  const list = state.providers || [];
+  if (!list.length) {
+    showErr($('mm-err'), '还没有上游。先在上面「我的上游」里加一个。');
+    return;
+  }
+  $('mmform').hidden = false;
+  $('mm-err').hidden = true;
+  $('mm-name').value = down || '';
+  $('mm-name').disabled = !!down;
+
+  const tb = $('mm-rows').querySelector('tbody');
+  tb.replaceChildren();
+  for (const p of list) {
+    const m = p.models || {};
+    const current = down && !m.passthrough ? (m.map || {})[down] : '';
+    // 候选：session 里同步过的 + 当前值 + 这家已有的上游名
+    const cands = new Set();
+    try {
+      const raw = sessionStorage.getItem('llmproxy.cands.' + p.name);
+      if (raw) for (const c of JSON.parse(raw)) cands.add(c);
+    } catch { /* 没有就算了 */ }
+    if (current) cands.add(current);
+    if (!m.passthrough) for (const up of Object.values(m.map || {})) if (up !== '*') cands.add(up);
+
+    const sel = h('select', { class: 'mono' });
+    sel.append(h('option', { value: '', text: m.passthrough ? '保持直通（不指定）' : '不使用这家' }));
+    for (const c of [...cands].sort()) {
+      sel.append(h('option', { value: c, text: c }));
+    }
+    if (current) sel.value = current;
+    else if (m.passthrough && down) {
+      // 直通上游在映射一个具体名字时，默认用同名
+      const opt = h('option', { value: down, text: down + '（同名）' });
+      sel.append(opt);
+    }
+    // 允许手动填一个不在列表里的名字
+    const custom = h('input', {
+      type: 'text', class: 'mono', placeholder: '或手动填上游模型名',
+      autocomplete: 'off', spellcheck: 'false', value: '',
+    });
+    if (current && !cands.has(current)) custom.value = current;
+
+    tb.append(h('tr', null,
+      h('td', null, h('code', { class: 'k', text: p.name }),
+        m.passthrough ? h('span', { class: 'tag', text: '直通' }) : null),
+      h('td', null, sel, ' ', custom),
+      h('td', null, m.passthrough
+        ? h('span', { class: 'muted', text: '选了名字就改成指定模型' })
+        : null),
+    ));
+  }
+  $('mm-name').focus();
+  $('mm-name').scrollIntoView({ block: 'center', behavior: 'smooth' });
+}
+
+function closeModelForm() {
+  $('mmform').hidden = true;
+  $('mm-err').hidden = true;
+}
+
+// 读表单：返回 [{provider, up}]，up 为空串表示这家不承接。
+function collectModelForm(down) {
+  const tb = $('mm-rows').querySelector('tbody');
+  const out = [];
+  for (const tr of tb.rows) {
+    const provider = tr.cells[0].querySelector('code')?.textContent?.trim();
+    const sel = tr.cells[1].querySelector('select');
+    const custom = tr.cells[1].querySelector('input');
+    if (!provider) continue;
+    const up = (custom && custom.value.trim()) || (sel && sel.value.trim()) || '';
+    out.push({ provider, up });
+  }
+  return out;
+}
+
+// 把「下游名 → 各上游的上游名」写回每家上游的 models 声明。
+// 只动这一个下游键，别家的映射、catch_all、其它字段一律原样。
+async function saveModelMap(ev) {
+  ev.preventDefault();
+  const down = $('mm-name').value.trim();
+  if (!down) return showErr($('mm-err'), '下游模型名必填');
+  const assigns = collectModelForm(down);
+  const touched = assigns.filter((a) => a.up);
+  if (!touched.length) return showErr($('mm-err'), '至少给一家上游选一个模型名');
+
+  const btn = $('mmform').querySelector('button[type=submit]');
+  btn.disabled = true;
+  showErr($('mm-err'), '');
+  try {
+    for (const a of assigns) {
+      const p = (state.providers || []).find((x) => x.name === a.provider);
+      if (!p) continue;
+      const m = p.models || {};
+      const oldMap = m.passthrough ? {} : { ...(m.map || {}) };
+      const newMap = { ...oldMap };
+      if (a.up) newMap[down] = a.up;
+      else delete newMap[down];
+
+      // 没动就不 PUT：省得无谓写库，也避免顺手改掉别的字段
+      const had = oldMap[down] || '';
+      const now = a.up || '';
+      if (had === now && !(m.passthrough && a.up)) continue;
+
+      // 完全没映射了：回退成直通，否则服务端会拒「models 为空」
+      let models;
+      if (!a.up && Object.keys(newMap).length === 0 && !m.catch_all) {
+        models = ['*'];
+      } else if (a.up && m.passthrough) {
+        // 从直通改成指定模型：保留 catch_all 会让人以为「还接任意名」，这里明确收窄
+        models = newMap;
+      } else {
+        if (m.catch_all) newMap['*'] = '*';
+        models = newMap;
+      }
+
+      await api('/v1/_me/providers/' + encodeURIComponent(a.provider), {
+        method: 'PUT',
+        body: JSON.stringify({ models }),
+      });
+    }
+    closeModelForm();
+    await Promise.all([loadProviders(), loadModelOverview(), refreshMe()]);
+  } catch (e) {
+    showErr($('mm-err'), e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// 从所有上游上摘掉这个下游名。
+async function removeModel(down) {
+  if (!confirm('从所有上游上移除模型 ' + down + '？之后用它发请求会失败。')) return;
+  try {
+    for (const p of state.providers || []) {
+      const m = p.models || {};
+      if (m.passthrough) continue;
+      const map = { ...(m.map || {}) };
+      if (!(down in map)) continue;
+      delete map[down];
+      let models;
+      if (Object.keys(map).length === 0 && !m.catch_all) models = ['*'];
+      else {
+        if (m.catch_all) map['*'] = '*';
+        models = map;
+      }
+      await api('/v1/_me/providers/' + encodeURIComponent(p.name), {
+        method: 'PUT', body: JSON.stringify({ models }),
+      });
+    }
+    await Promise.all([loadProviders(), loadModelOverview(), refreshMe()]);
+  } catch (e) {
+    alert('移除失败：' + e.message);
+  }
 }
 
 /* ── 用量 ─────────────────────────────────────────────────────────── */
@@ -561,6 +739,9 @@ $('logout').addEventListener('click', logout);
 $('add-open').addEventListener('click', () => openForm(null));
 $('add-cancel').addEventListener('click', closeForm);
 $('pform').addEventListener('submit', saveProvider);
+$('mm-open').addEventListener('click', () => openModelForm(''));
+$('mm-cancel').addEventListener('click', closeModelForm);
+$('mmform').addEventListener('submit', saveModelMap);
 $('t-send').addEventListener('click', trySend);
 $('m-sync').addEventListener('click', mmSync);
 $('m-manual-add').addEventListener('click', mmAddManual);

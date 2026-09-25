@@ -562,3 +562,65 @@ func (h *muHarness) mustToken(t *testing.T, name string) string {
 	}
 	return token
 }
+
+// 同一个用户把同一下游名映射到两家上游：第一家失败后自动落到第二家。
+// 这是「上游 A / B 都有 deepseek-flash，A 花完了不用自己切」的那条链路。
+func TestSameModelAcrossOwnUpstreamsFailsOver(t *testing.T) {
+	h := newMUHarness(t)
+	// A 一直失败（模拟额度花完/不可用），B 正常
+	upA := startMockUpstream(t, &mockUpstream{name: "up-a", apiKey: "sk-a", failStatus: 500, failTimes: -1})
+	upB := startMockUpstream(t, &mockUpstream{name: "up-b", apiKey: "sk-b"})
+
+	token := h.addUser(t, "arthur")
+	// 同一下游名 deepseek-flash：A 指到 upstream-a，B 指到 upstream-b
+	h.addProvider(t, "arthur", "up-a", upA.baseURL+"/v1", "sk-a",
+		`{"deepseek-flash": "upstream-a"}`)
+	h.addProvider(t, "arthur", "up-b", upB.baseURL+"/v1", "sk-b",
+		`{"deepseek-flash": "upstream-b"}`)
+
+	// 连发几次：应当全部 200，且都落到 B（A 全失败）
+	sawB := 0
+	for i := 0; i < 4; i++ {
+		resp, raw := h.post(t, "/v1/chat/completions", token, chatBody("deepseek-flash"))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("第 %d 次请求应当经 B 成功，实际 %d %s", i+1, resp.StatusCode, raw)
+		}
+		if resp.Header.Get("X-LLMProxy-Provider") == "up-b" {
+			sawB++
+		}
+	}
+	if sawB == 0 {
+		t.Fatalf("应当至少有一次落到 up-b；A 上游调用 %d 次，B %d 次", upA.Count(), upB.Count())
+	}
+	if upB.Count() == 0 {
+		t.Errorf("up-b 从未被调用，切换没发生")
+	}
+}
+
+// 模型目录的写法：下游名两家相同、上游名各自不同（别名），照样能切换。
+func TestSameDownstreamNameDifferentUpstreamNames(t *testing.T) {
+	h := newMUHarness(t)
+	upA := startMockUpstream(t, &mockUpstream{name: "up-a", apiKey: "sk-a", failStatus: 502, failTimes: -1})
+	upB := startMockUpstream(t, &mockUpstream{name: "up-b", apiKey: "sk-b"})
+
+	token := h.addUser(t, "arthur")
+	h.addProvider(t, "arthur", "plan-a", upA.baseURL+"/v1", "sk-a",
+		`{"my-df": "deepseek-chat"}`)
+	h.addProvider(t, "arthur", "plan-b", upB.baseURL+"/v1", "sk-b",
+		`{"my-df": "ds-v3-flash"}`)
+
+	resp, raw := h.post(t, "/v1/chat/completions", token, chatBody("my-df"))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("别名模型请求失败: %d %s", resp.StatusCode, raw)
+	}
+	// B 应当收到的是它自己的上游名 ds-v3-flash
+	calls := upB.Calls()
+	if len(calls) == 0 {
+		// 可能先打到 A 重试到 B
+		t.Fatalf("up-b 未被调用；A 调用 %d 次", upA.Count())
+	}
+	last := calls[len(calls)-1]
+	if last.Body["model"] != "ds-v3-flash" {
+		t.Errorf("up-b 应收到 ds-v3-flash，实际 %v", last.Body["model"])
+	}
+}

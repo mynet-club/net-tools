@@ -174,18 +174,46 @@
         要么自己配一个，要么让管理员把你的模式改成 consumption 来使用系统上游。</p>
     </section>
 
-    <!-- 我的模型：按下游模型名聚合 -->
-    <section class="card" id="my-models-card" hidden>
-      <h2>我的模型</h2>
-      <p class="sub">按客户端请求里 <code>model</code> 字段的名字汇总，看它现在挂在哪些上游上。
-        同一个模型挂在两家以上，就是负载均衡 + 失败自动切换。</p>
+    <!-- 我的模型：按下游模型名聚合，可在这里把同一名字映射到多家上游 -->
+    <section class="card" id="my-models-card">
+      <div class="head">
+        <h2>我的模型</h2>
+        <button type="button" id="mm-open" class="primary sm">映射模型</button>
+      </div>
+      <p class="sub">客户端请求里 <code>model</code> 填的是<strong>下游模型名</strong>。
+        同一个名字挂在两家以上：会话粘性优先钉住一家，这家失败（熔断）自动切到下一家 ——
+        两家都有 <code>deepseek-flash</code> 时，A 的额度花完就切 B，不用自己改配置。</p>
+
+      <form id="mmform" hidden>
+        <div class="pform-grid">
+          <div class="wide">
+            <label for="mm-name">下游模型名（客户端要填的）</label>
+            <input id="mm-name" class="mono" placeholder="如 deepseek-flash"
+                   autocomplete="off" spellcheck="false">
+          </div>
+        </div>
+        <div class="tablewrap">
+          <table id="mm-rows">
+            <thead><tr><th>上游</th><th>上游模型名</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <p class="muted" id="mm-hint">每家上游选它真正认的模型名。留空 = 这家不承接。
+          直通上游选一个具体名字后会改成「指定模型」，不再接收任意模型名。</p>
+        <div class="row">
+          <button type="submit" class="primary">保存映射</button>
+          <button type="button" id="mm-cancel" class="ghost">取消</button>
+          <span class="err" id="mm-err" hidden></span>
+        </div>
+      </form>
+
       <div class="tablewrap">
         <table id="my-models">
           <thead><tr><th>下游模型名</th><th>承接的上游</th><th></th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
-      <p class="muted" id="my-models-empty" hidden>还没有映射到具体模型名的上游。</p>
+      <p class="muted" id="my-models-empty" hidden>还没有映射到具体模型名的上游。点右上「映射模型」建一个。</p>
       <p class="muted" id="my-models-pass" hidden></p>
     </section>
 
