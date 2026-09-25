@@ -119,8 +119,11 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 	// 作用域同时决定熔断状态落在哪个桶里 —— 用户之间互不影响。
 	scope := auth.Scope
 
-	// 用户级限流与配额：都不依赖请求体，先判，省得白读一遍 body。
-	// 限流对两种模式都生效（单个用户打满网关跟模式无关），配额只对消费模式生效。
+	// 用户级限流与配额：限流不依赖请求体，先判，省得白读一遍 body。
+	// 限流对两种模式都生效（单个用户打满网关跟模式无关）。
+	// **配额不在这里判** —— 它只约束「花网关的钱」，而混合模式下同一个模型可能有
+	// 自有上游在承接（用户自己结算）。要等模型解析完、知道有没有自有候选之后再判，
+	// 否则「额度用完」会连他自己的上游一起挡住。见下面 providersFor 之后那一段。
 	if e := s.usersSnapshot().byName[scope]; e != nil {
 		release, err := s.meters.Acquire(e.Name, e.RPM, e.MaxConcurrent)
 		if err != nil {
@@ -133,13 +136,6 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 			return
 		}
 		defer release()
-
-		if e.Consumption {
-			if _, _, exceeded, msg := s.meters.CheckQuota(e.Name, e.QuotaMonthTokens, e.QuotaMonthCost); exceeded {
-				s.fail(w, rec, http.StatusPaymentRequired, "quota_exceeded", msg, 0, started)
-				return
-			}
-		}
 	}
 
 	// 请求体上限
@@ -171,9 +167,22 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 		return
 	}
 
-	// 上游池：消费模式要按「这个模型映射到哪个上游」来收窄，所以必须等 model 到手
-	providers, isSystem := s.providersFor(scope, probe.Model)
-	rec.SystemPaid = isSystem
+	// 上游池：消费模式要按「这个模型映射到哪个上游」来收窄，所以必须等 model 到手。
+	// 混合模式下这个池子可能同时含自有上游（用户自己付费）与系统池（网关付费），
+	// 所以这里给的是「池里有没有系统候选」的初值，**最终账按实际落地的候选定**
+	// （见循环里 cand 选中处的赋值）—— 否则自有上游命中却记成网关付费就是记错账。
+	providers, poolHasSystem := s.providersFor(scope, probe.Model)
+	rec.SystemPaid = poolHasSystem
+
+	// 配额只约束「花网关的钱」：池子里有自有候选（会优先被选中）时放行 ——
+	// 那是用户自己的上游，没理由拿网关的额度卡他。自有层全被排除后回落到系统池
+	// 才会真的花网关的钱，那种情况配额是软限制（见 README 三条语义）。
+	if e := s.usersSnapshot().byName[scope]; e != nil && e.Consumption && !poolHasOwn(providers) {
+		if _, _, exceeded, msg := s.meters.CheckQuota(e.Name, e.QuotaMonthTokens, e.QuotaMonthCost); exceeded {
+			s.fail(w, rec, http.StatusPaymentRequired, "quota_exceeded", msg, 0, started)
+			return
+		}
+	}
 	if len(providers) == 0 {
 		// 归因要分清：是「管理员把你能用的收窄了」，还是「系统池里根本没有这个模型」。
 		// 前者 403 并告诉用户找谁；后者是池子的问题，不是用户的权限问题。
@@ -240,6 +249,11 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 			break
 		}
 		attempts++
+
+		// 这次实际会花谁的钱：候选自带归属（自有上游 = 用户自己的，系统池 = 网关掏）。
+		// 放在这里而不是等成功 —— 失败路径也要按「最后试的那家」归类，
+		// 它们共用同一个 rec，落在哪家就记哪家的账。
+		rec.SystemPaid = cand.Provider.SystemPaid
 
 		// 观测：告诉调用方这次是按粘性选的（sticky）还是漂移过来的（drift），
 		// 或者本来就没粘性记录（new）。排障与上线验证都要看这一列。

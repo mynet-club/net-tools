@@ -219,20 +219,83 @@ func (s *Server) userProviderToConfig(up store.UserProvider) (config.Provider, e
 //     否则等于用户白嫖网关主人的上游。要消费就走 consumption 模式，那样才有计量与配额。
 func (s *Server) providersFor(scope, model string) (list []config.Provider, isSystem bool) {
 	if scope == "" {
-		return s.globalProviders(), true
+		return markSystem(s.globalProviders()), true
 	}
 	e := s.usersSnapshot().byName[scope]
 	if e == nil {
 		return nil, false
 	}
 	if e.Consumption {
-		if len(e.Models) == 0 {
-			// 方案 A：没配映射就继承系统池声明的全部模型，不必逐用户配
-			return s.globalProviders(), true
+		sys := s.systemPoolFor(e, model)
+		own := ownCandidatesFor(e, model)
+		if len(own) > 0 {
+			// 混合：自有上游优先（用户自己结算），自有全挂再回落系统池（走网关的账与配额）。
+			// 两层靠 Provider.SystemPaid 区分，选路时自有层排在前面（见 router 的池子选择），
+			// 计费按**最终落地的候选**判定，所以同一池子里两种归属可以共存。
+			return append(own, markSystem(sys)...), true
 		}
-		return s.scopedSystemProviders(e, model), true
+		return markSystem(sys), true
 	}
 	return e.Providers, false
+}
+
+// poolHasOwn 报告候选池里有没有「用户自己付费」的上游。
+func poolHasOwn(ps []config.Provider) bool {
+	for _, p := range ps {
+		if !p.SystemPaid {
+			return true
+		}
+	}
+	return false
+}
+
+// systemPoolFor 取消费用户能用到的系统池：没配映射就继承全部，配了则按映射收窄。
+func (s *Server) systemPoolFor(e *userEntry, model string) []config.Provider {
+	if e == nil {
+		return nil
+	}
+	if len(e.Models) == 0 {
+		return s.globalProviders()
+	}
+	return s.scopedSystemProviders(e, model)
+}
+
+// markSystem 给系统池的候选打上「网关付费」标记。**必须复制一份再改**：
+// globalProviders 返回的切片与 Provider 都可能被调用方共享，就地改会污染别的请求。
+func markSystem(ps []config.Provider) []config.Provider {
+	out := make([]config.Provider, len(ps))
+	for i, p := range ps {
+		p.SystemPaid = true
+		out[i] = p
+	}
+	return out
+}
+
+// ownCandidatesFor 取用户自有上游里**承接这个模型**的那些。
+//
+// 判据与系统池那条一致：这家自己的 models 声明了这个名字（或它是直通/catch-all）才算候选。
+// 自有上游本来就是「用户自己配的」，所以不加权重上的偏好 —— 优先级由「自有层整体先于系统层」
+// 体现，层内仍按各自的权重与健康度选。
+func ownCandidatesFor(e *userEntry, model string) []config.Provider {
+	if e == nil || len(e.Providers) == 0 {
+		return nil
+	}
+	out := make([]config.Provider, 0, len(e.Providers))
+	for _, p := range e.Providers {
+		if !p.Enabled {
+			continue
+		}
+		if model == "" {
+			// 没有模型名（列表类调用）时不做收窄，把全部自有上游交出去
+			out = append(out, p)
+			continue
+		}
+		if _, ok := p.UpstreamModel(model); !ok {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 // effectiveModels 返回一个消费用户实际能调的逻辑模型名，以及这份清单的来源。

@@ -85,27 +85,30 @@ function renderApp() {
   $('t-model').value = $('t-model').value || 'deepseek-chat';
 }
 
-// 消费模式：配额 + 可用模型（系统池）；byo：自己的上游 + 模型目录。
-// 「我的上游 / 我的模型」两边都显示：消费模式下也能先配好，切到 byo 就能直接用；
-// 但必须明确标出「当前不参与选路」，否则会像以前那样配了却不见生效。
+// 两种模式看到的卡片不同，但「我的上游 / 我的模型」都保留、都可配：
+// 消费模式下它们是**混合**的一半 —— 自有上游优先命中（自己结算），
+// 没命中或全挂才回落系统池（走网关的账与配额）。
 function renderMode(me) {
   const consumption = me.mode === 'consumption';
   $('quota-card').hidden = !consumption;
   $('models-card').hidden = !consumption;
 
   const note = $('byo-notice');
+  const sub = $('my-providers-sub');
   if (consumption) {
-    note.textContent = '当前是「消费模式」：请求走网关的系统上游，下面「我的上游 / 我的模型」' +
-      '只作为配置保存，**不参与选路**。要用它们自己的上游，让管理员把模式切成自带：' +
-      'llmproxy user mode ' + (me.name || '<你>') + ' byo（切完下面的配置立即生效）。';
+    note.textContent = '当前是「消费模式」：下面「我的上游 / 我的模型」里的模型会**优先**使用' +
+      '（花你自己的额度，自己的上游结算）；它们没承接、或全部不可用时，才回落到网关的系统上游，' +
+      '那部分才计入上面的配额。';
     note.hidden = false;
+    sub.textContent = '自有上游优先；承接不到这个模型、或全部不可用时，回落到网关的系统上游。';
   } else {
     note.hidden = true;
+    sub.textContent = '自己配了上游，请求就只走自己的 —— 不会落到网关的系统上游上。';
   }
   const myp = $('my-providers-card');
-  if (myp) myp.classList.toggle('dim', consumption);
+  if (myp) myp.classList.remove('dim');
   const mym = $('my-models-card');
-  if (mym) mym.classList.toggle('dim', consumption);
+  if (mym) mym.classList.remove('dim');
   if (!consumption) return;
 
   const q = me.quota || {};

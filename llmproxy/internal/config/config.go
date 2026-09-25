@@ -312,6 +312,10 @@ type Provider struct {
 	Proxy        ProxyRef
 	Models       ModelSpec
 	Index        int
+	// SystemPaid 是**运行期**标记：true = 这家来自系统池（config.yaml 的 providers），
+	// 这次消耗算网关主人的账，要进用户的配额与金额；false = 用户自己配的上游。
+	// 不参与 YAML 解析 —— 它由 providersFor 在拼候选池时按来源打上，用来决定计费归属。
+	SystemPaid bool
 }
 
 // Serves 报告该供应商是否承接下游模型 model。

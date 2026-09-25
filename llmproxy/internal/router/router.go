@@ -187,9 +187,11 @@ func (r *Router) PickFromPreferring(scope string, candidates []config.Provider, 
 		w       float64
 		healthy bool
 	}
-	// 分成「点名声明了这个模型」和「靠通配兜底」两堆。
-	// 详见下面挑池子时那段说明。
-	var explHealthy, explAll, fbHealthy, fbAll []weighted
+	// 分成「点名声明了这个模型」和「靠通配兜底」两堆，再横向分成
+	// 「自有上游」与「系统池」两层（SystemPaid）。两层用同一套堆次序，
+	// 只是自有层整层排在系统层前面 —— 用户自己配的上游优先，全挂才花网关的钱。
+	type buckets struct{ explHealthy, explAll, fbHealthy, fbAll []weighted }
+	var own, sys buckets
 	for _, p := range candidates {
 		if !p.Enabled {
 			continue
@@ -219,37 +221,50 @@ func (r *Router) PickFromPreferring(scope string, candidates []config.Provider, 
 		// explAll/fbAll 里也装着健康成员，这个标志不能只在写入 *Healthy 时才置位。
 		item.healthy = !now.Before(unhealthyUntil)
 
+		b := &own
+		if p.SystemPaid {
+			b = &sys
+		}
 		if declares {
-			explAll = append(explAll, item)
+			b.explAll = append(b.explAll, item)
 		} else {
-			fbAll = append(fbAll, item)
+			b.fbAll = append(b.fbAll, item)
 		}
 		if item.healthy {
 			if declares {
-				explHealthy = append(explHealthy, item)
+				b.explHealthy = append(b.explHealthy, item)
 			} else {
-				fbHealthy = append(fbHealthy, item)
+				b.fbHealthy = append(b.fbHealthy, item)
 			}
 		}
 	}
 
-	// 点名声明优先于通配兜底。
+	// 顺序即优先级，从高到低：
+	//   自有·点名·健康 → 自有·点名 → 自有·兜底·健康 → 自有·兜底 →
+	//   系统·点名·健康 → 系统·点名 → 系统·兜底·健康 → 系统·兜底
 	//
-	// 一家写 models: ["*"] 的供应商声明「任何模型名我都接」，于是它也会成为那些
-	// **别人点名声明过**的模型名的候选。两者若平权（各自按权重随机），一次请求走对
-	// 还是走错就全看运气 —— 表现就是同一个模型名时而正常、时而 400。
-	// 所以只要有人点名声明了这个模型，就只在它们里面选；一个点名的都没有，才轮到兜底的。
-	//
-	// 「先健康、兜不住了再拿不健康的顶上」这个既有次序不变，只是各自在自己那一堆里排。
-	pool := explHealthy
-	if len(pool) == 0 {
-		pool = explAll
-	}
-	if len(pool) == 0 {
-		pool = fbHealthy
-	}
-	if len(pool) == 0 {
-		pool = fbAll
+	// 两层的次序各自沿用两条既有规则：
+	//   1) 点名声明优先于通配兜底 —— 写 models: ["*"] 的那家声明「任何模型名都接」，
+	//      于是它也会成为**别人点名声明过**的模型名的候选。两者若平权，
+	//      一次请求走对还是走错就全看运气（表现是同一个模型名时而正常、时而 400）。
+	//   2) 先健康的、兜不住了再拿不健康的顶上。
+	// 最外层新增的是「自有优先于系统池」：用户自己配的上游先花他自己的钱，
+	// 整层都排除掉了才回落到网关付费的系统池。
+	var pool []weighted
+	for _, b := range []buckets{own, sys} {
+		pool = b.explHealthy
+		if len(pool) == 0 {
+			pool = b.explAll
+		}
+		if len(pool) == 0 {
+			pool = b.fbHealthy
+		}
+		if len(pool) == 0 {
+			pool = b.fbAll
+		}
+		if len(pool) > 0 {
+			break
+		}
 	}
 	if len(pool) == 0 {
 		return nil, fmt.Errorf("没有供应商能承接模型 %q（可能已被排除或未配置）", model)
