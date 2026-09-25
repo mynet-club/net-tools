@@ -84,7 +84,12 @@ button.link.danger { color: var(--danger); }
 .banner {
   background: var(--warn-bg); border: 1px solid var(--warn-bd);
   border-radius: 8px; padding: 10px 12px; margin: 0 0 16px; font-size: 12px;
+  white-space: pre-wrap;
 }
+
+/* 当前模式下不生效的卡片：降低视觉权重，但内容照旧可改 */
+.card.dim { opacity: 0.72; }
+.card.dim:hover { opacity: 1; }
 
 /* ── 顶栏 ─────────────────────────────────────────────────────────── */
 .bar { background: var(--surface); border-bottom: 1px solid var(--border); }

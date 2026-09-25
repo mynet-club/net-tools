@@ -86,13 +86,26 @@ function renderApp() {
 }
 
 // 消费模式：配额 + 可用模型（系统池）；byo：自己的上游 + 模型目录。
-// 两套互不参与：消费模式下配的「我的上游」**不会**被选路用到，藏起来免得误配。
+// 「我的上游 / 我的模型」两边都显示：消费模式下也能先配好，切到 byo 就能直接用；
+// 但必须明确标出「当前不参与选路」，否则会像以前那样配了却不见生效。
 function renderMode(me) {
   const consumption = me.mode === 'consumption';
   $('quota-card').hidden = !consumption;
   $('models-card').hidden = !consumption;
-  $('my-providers-card').hidden = consumption;
-  $('my-models-card').hidden = consumption;
+
+  const note = $('byo-notice');
+  if (consumption) {
+    note.textContent = '当前是「消费模式」：请求走网关的系统上游，下面「我的上游 / 我的模型」' +
+      '只作为配置保存，**不参与选路**。要用它们自己的上游，让管理员把模式切成自带：' +
+      'llmproxy user mode ' + (me.name || '<你>') + ' byo（切完下面的配置立即生效）。';
+    note.hidden = false;
+  } else {
+    note.hidden = true;
+  }
+  const myp = $('my-providers-card');
+  if (myp) myp.classList.toggle('dim', consumption);
+  const mym = $('my-models-card');
+  if (mym) mym.classList.toggle('dim', consumption);
   if (!consumption) return;
 
   const q = me.quota || {};
