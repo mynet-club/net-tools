@@ -108,7 +108,12 @@ td.dim { color: var(--muted); }
 .badge.off { background: #fdecea; color: var(--danger); }
 
 /* ── 布局 ─────────────────────────────────────────────────────────── */
-.wrap { max-width: 980px; margin: 0 auto; padding: 20px; display: grid; gap: 16px; }
+/* 单列栅格，但列宽必须写成 minmax(0, 1fr)：默认的 auto 列会按 max-content 撑开，
+   里面的宽表格（用量明细十几列、nowrap）会把整页顶宽，margin:0 auto 再把整页居中 ——
+   表现就是「内容整体右偏、还要横向拖动」。minmax(0,…) 允许列缩到比内容窄，
+   横向滚动交给 .tablewrap 自己处理。 */
+.wrap { max-width: 980px; margin: 0 auto; padding: 20px;
+        display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
 .head { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
 .head h2 { flex: 1; }
 .row { display: flex; align-items: center; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
