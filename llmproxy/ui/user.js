@@ -465,42 +465,58 @@ function collectModelMap(list) {
 }
 
 async function loadModelOverview() {
-  const { data } = await api('/v1/_me/providers');
-  const list = (data && data.providers) || [];
+  const [{ data: provData }, { data: plan }] = await Promise.all([
+    api('/v1/_me/providers'),
+    api('/v1/_me/routing'),
+  ]);
+  const list = (provData && provData.providers) || [];
   state.providers = list;
-  const { byModel, passthrough } = collectModelMap(list);
+  const { passthrough } = collectModelMap(list);
 
+  // 消费顺序直接用服务端算好的计划（router.PlanFor，与真实选路同一份档序定义）——
+  // 界面不自己推导，免得「看到的顺序」和「实际会走的顺序」两份代码各走各的。
+  const models = (plan && plan.models) || [];
   const rows = [];
-  for (const [down, ups] of [...byModel.entries()].sort()) {
+  for (const m of models) {
+    const tiers = m.tiers || [];
+    const seq = [];
+    tiers.forEach((t, i) => {
+      if (i > 0) seq.push(h('span', { class: 'seq-arrow', text: '→' }));
+      for (const it of t.items) {
+        seq.push(h('span', {
+          class: 'chip' + (it.healthy ? '' : ' cooling'),
+          title: t.label + ' · 上游模型 ' + it.upstream_model +
+            ' · 权重 ' + it.weight + (it.healthy ? '' : ' · 冷却中'),
+          text: (it.source === 'own' ? '' : '系统·') + it.provider +
+            (it.upstream_model && it.upstream_model !== m.model ? ' → ' + it.upstream_model : ''),
+        }));
+      }
+    });
+    if (!seq.length) seq.push(h('span', { class: 'muted', text: '没有上游承接' }));
+
+    // 多档 = 会按顺序回落；只有一档多成员 = 档内按权重分担
+    let note = h('span', { class: 'muted', text: '单路' });
+    if (tiers.length > 1) {
+      note = h('span', { class: 'tag ok', text: tiers.length + ' 档 · 依次回落' });
+    } else if (tiers.length === 1 && tiers[0].items.length > 1) {
+      note = h('span', { class: 'tag ok', text: '同档 ' + tiers[0].items.length + ' 家 · 粘性分担' });
+    }
+
     rows.push(h('tr', null,
-      h('td', null, h('code', { class: 'k', text: down })),
-      h('td', null, ...ups.map((u) => h('span', {
-        class: 'chip',
-        title: u.provider + ' → ' + u.up,
-        text: u.provider + ' → ' + u.up,
-      }))),
-      // 多路就是「同一模型挂多个上游」：粘性 + 失败自动切换
-      h('td', null,
-        ups.length > 1 ? h('span', { class: 'tag ok', text: '粘性 + 失败切换' }) : h('span', { class: 'muted', text: '单路' }),
+      h('td', null, h('code', { class: 'k', text: m.model })),
+      h('td', null, h('div', { class: 'seq' }, ...seq)),
+      h('td', null, note, ' ',
+        h('button', { type: 'button', class: 'link', text: '编辑', onclick: () => openModelForm(m.model) }),
         ' ',
-        h('button', {
-          type: 'button', class: 'link', text: '编辑',
-          onclick: () => openModelForm(down),
-        }),
-        ' ',
-        h('button', {
-          type: 'button', class: 'link danger', text: '移除',
-          onclick: () => removeModel(down),
-        })),
+        h('button', { type: 'button', class: 'link danger', text: '移除', onclick: () => removeModel(m.model) })),
     ));
   }
 
-  // 显示与否交给 renderMode（消费模式整卡藏起）；这里只填内容
   const tb = $('my-models').querySelector('tbody');
   tb.replaceChildren(...rows);
   const note = $('my-models-pass');
   if (passthrough.length) {
-    note.textContent = '这些上游目前是「全部直通」（接受任意模型名，不进上表）：' +
+    note.textContent = '这些上游目前是「全部直通」（接受任意模型名，不在上表逐个列出）：' +
       passthrough.join('、') + '。要让它参与同名切换，在「映射模型」里给它选一个具体模型名。';
     note.hidden = false;
   } else {

@@ -194,6 +194,12 @@ code.k { font-family: var(--mono); font-size: 12px; color: #4b5563; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 .chips .chip { font-size: 12px; padding: 3px 9px; }
 
+/* 消费顺序：一排 chip 用箭头串起来 */
+.seq { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.seq .chip { font-size: 12px; padding: 3px 9px; }
+.seq .seq-arrow { color: var(--muted); font-size: 12px; flex: none; }
+.chip.cooling { opacity: 0.55; text-decoration: line-through; }
+
 /* ── 模型编辑器（同步 + 勾选 + 别名）─────────────────────────────────── */
 .mmode { display: flex; gap: 18px; margin: 2px 0 10px; flex-wrap: wrap; }
 .mode-hint { color: var(--muted); font-size: 11px; }
@@ -244,8 +250,7 @@ select:focus { outline: 2px solid #c7c3f7; outline-offset: 1px; }
 .mm-add input { flex: 1; min-width: 150px; }
 .mm-add select { width: 190px; flex: none; }
 
-/* 模型映射表单：上游名 + 带候选的模型名输入 */
-#mm-rows { width: 100%; }
+/* 模型映射表单：上游名 + 带候选的模型名输入 */#mm-rows { width: 100%; }
 #mm-rows td { vertical-align: middle; }
 #mm-rows td:first-child { width: 30%; white-space: nowrap; }
 #mm-rows input.mm-up {

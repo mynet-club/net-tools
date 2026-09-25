@@ -412,6 +412,7 @@ log:
 | DELETE | `/v1/_me/providers/{name}` | 删掉一个上游 |
 | POST | `/v1/_me/providers/{name}/discover` | 用这个上游的地址与密钥拉一次 `/v1/models`，拿模型名列表给界面做勾选候选 |
 | GET | `/v1/_me/usage?days=N` | 按日 / 按模型的消耗 |
+| GET | `/v1/_me/routing` | 每个模型**实际会按什么顺序消费上游**（混合模式下尤其有用：自有档 → 系统档） |
 
 ### 管理接口（用 `server.admin_token` 鉴权）
 

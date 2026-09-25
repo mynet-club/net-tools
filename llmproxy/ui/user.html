@@ -184,8 +184,8 @@
         <button type="button" id="mm-open" class="primary sm">映射模型</button>
       </div>
       <p class="sub">客户端请求里 <code>model</code> 填的是<strong>下游模型名</strong>。
-        同一个名字挂在两家以上：会话粘性优先钉住一家，这家失败（熔断）自动切到下一家 ——
-        两家都有 <code>deepseek-flash</code> 时，A 的额度花完就切 B，不用自己改配置。</p>
+        下表是这个模型**实际会按什么顺序消费上游**：从左到右依次回落，同一格里多家则按权重分担
+        （会话粘性优先钉住上次那家）。自有上游优先，它接不住或都不可用时才走系统池（那部分才计配额）。</p>
 
       <form id="mmform" hidden>
         <div class="pform-grid">
@@ -212,7 +212,7 @@
 
       <div class="tablewrap">
         <table id="my-models">
-          <thead><tr><th>下游模型名</th><th>承接的上游</th><th></th></tr></thead>
+          <thead><tr><th>下游模型名</th><th>消费顺序（先走谁、再走谁）</th><th></th></tr></thead>
           <tbody></tbody>
         </table>
       </div>

@@ -648,8 +648,111 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, auth authResul
 		s.handleMeUsage(w, r, scope)
 		return
 	}
+	if rest == "routing" {
+		s.handleMeRouting(w, r, e)
+		return
+	}
 	writeJSONError(w, http.StatusNotFound, "invalid_request_error",
-		"可用路径：/v1/_me、/v1/_me/providers、/v1/_me/usage")
+		"可用路径：/v1/_me、/v1/_me/providers、/v1/_me/usage、/v1/_me/routing")
+}
+
+// handleMeRouting 回答「我这些模型到底会按什么顺序消费上游」。
+//
+// 混合模式下同一个模型可能先走自有上游、再回落系统池，光看配置看不出来实际次序 ——
+// 这个接口把真实选路的那份优先级（router.PlanFor，与 PickFromPreferring 共用分类逻辑）
+// 直接摊开给用户。只读，不改任何状态，也不创建供应商状态记录。
+func (s *Server) handleMeRouting(w http.ResponseWriter, r *http.Request, e *userEntry) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error", "只支持 GET")
+		return
+	}
+
+	// 这个用户能调到的下游模型名：自有上游声明的 + 系统池那边能用的 + 白名单点名要的。
+	set := map[string]bool{}
+	for _, p := range e.Providers {
+		if !p.Enabled || p.Models.Passthrough {
+			continue // 直通不贡献具体名字
+		}
+		for down := range p.Models.Map {
+			if down != "*" {
+				set[down] = true
+			}
+		}
+	}
+	if e.Consumption {
+		names, _, _ := s.effectiveModels(e)
+		for _, n := range names {
+			set[n] = true
+		}
+	}
+	for _, m := range e.Models {
+		if m.Enabled {
+			set[m.Model] = true
+		}
+	}
+
+	all := make([]string, 0, len(set))
+	for n := range set {
+		all = append(all, n)
+	}
+	sort.Strings(all)
+
+	models := make([]map[string]any, 0, len(all))
+	for _, model := range all {
+		providers, _ := s.providersFor(e.Name, model)
+		tiers := s.router.PlanFor(e.Name, providers, model)
+		if len(tiers) == 0 {
+			// 声明过但一家都接不了（被停用/收窄挡掉）：如实列出，别让它凭空消失
+			models = append(models, map[string]any{"model": model, "tiers": []any{}})
+			continue
+		}
+		out := make([]map[string]any, 0, len(tiers))
+		for i, t := range tiers {
+			entries := make([]map[string]any, 0, len(t.Providers))
+			for _, p := range t.Providers {
+				src := "own"
+				if p.Name != "" && s.providerIsSystem(e, p.Name) {
+					src = "system"
+				}
+				entries = append(entries, map[string]any{
+					"provider":       p.Name,
+					"source":         src,
+					"upstream_model": p.UpstreamModel,
+					"weight":         p.Weight,
+					"healthy":        p.Healthy,
+				})
+			}
+			out = append(out, map[string]any{
+				"rank":  i + 1,
+				"kind":  t.Kind,
+				"label": t.Label,
+				"items": entries,
+			})
+		}
+		models = append(models, map[string]any{"model": model, "tiers": out})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"mode":   modeOf(e),
+		"models": models,
+	})
+}
+
+// providerIsSystem 判断某个候选名是不是来自系统池（而不是用户自配的上游）。
+func (s *Server) providerIsSystem(e *userEntry, name string) bool {
+	if e != nil {
+		for _, p := range e.Providers {
+			if p.Name == name {
+				return false
+			}
+		}
+	}
+	for _, p := range s.globalProviders() {
+		if p.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // modeOf 把运行期视图还原成对外的模式名。

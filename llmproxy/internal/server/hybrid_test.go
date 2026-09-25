@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"testing"
@@ -163,5 +164,93 @@ func TestHybridPassthroughOwnDoesNotStealDeclaredModel(t *testing.T) {
 	}
 	if own.Count() != 0 {
 		t.Errorf("自有直通不该被尝试（它没有这个模型），实际调用 %d 次", own.Count())
+	}
+}
+
+// /v1/_me/routing：把「这个模型按什么顺序消费上游」摊开给用户看。
+func TestMeRoutingShowsConsumptionOrder(t *testing.T) {
+	stub := newUsageStub(t, 0)
+	h := newMUHarnessWith(t, hybridYAML(stub.srv.URL))
+	own := startMockUpstream(t, &mockUpstream{name: "my-plan-a", apiKey: "sk-mine"})
+
+	token := h.addUser(t, "arthur")
+	setConsumption(t, h, "arthur", "fast", "sys-model")
+	h.addProvider(t, "arthur", "my-plan-a", own.baseURL+"/v1", "sk-mine", `{"fast": "fast", "own-only": "x"}`)
+
+	_, raw := h.get(t, "/v1/_me/routing", token)
+	var out struct {
+		Mode   string `json:"mode"`
+		Models []struct {
+			Model string `json:"model"`
+			Tiers []struct {
+				Rank  int    `json:"rank"`
+				Kind  string `json:"kind"`
+				Label string `json:"label"`
+				Items []struct {
+					Provider string `json:"provider"`
+					Source   string `json:"source"`
+					Healthy  bool   `json:"healthy"`
+				} `json:"items"`
+			} `json:"tiers"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("解析失败: %v\n%s", err, raw)
+	}
+	if out.Mode != store.ModeConsumption {
+		t.Errorf("mode 应为 consumption，实际 %q", out.Mode)
+	}
+
+	// fast：自有上游点名在先，系统池派生的在后
+	var fast []struct {
+		Rank  int    `json:"rank"`
+		Kind  string `json:"kind"`
+		Label string `json:"label"`
+		Items []struct {
+			Provider string `json:"provider"`
+			Source   string `json:"source"`
+			Healthy  bool   `json:"healthy"`
+		} `json:"items"`
+	}
+	for _, m := range out.Models {
+		if m.Model == "fast" {
+			fast = m.Tiers
+		}
+	}
+	if len(fast) == 0 {
+		t.Fatalf("计划里应当有 fast: %s", raw)
+	}
+	if fast[0].Items[0].Provider != "my-plan-a" || fast[0].Items[0].Source != "own" {
+		t.Errorf("第一档应当是自有上游，实际 %+v", fast[0].Items[0])
+	}
+	if fast[0].Rank != 1 {
+		t.Errorf("第一档 rank 应为 1，实际 %d", fast[0].Rank)
+	}
+	// 自有上游里只有它自己接 fast
+	if len(fast[0].Items) != 1 {
+		t.Errorf("自有档应当只有 my-plan-a，实际 %+v", fast[0].Items)
+	}
+	// 系统池那一档要标 source=system
+	found := false
+	for _, tier := range fast {
+		for _, it := range tier.Items {
+			if it.Source == "system" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Errorf("计划里应当也有系统池那一档: %s", raw)
+	}
+
+	// 只有自有上游承接的模型也在计划里
+	seen := false
+	for _, m := range out.Models {
+		if m.Model == "own-only" {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Errorf("只由自有上游承接的模型也该列出: %s", raw)
 	}
 }

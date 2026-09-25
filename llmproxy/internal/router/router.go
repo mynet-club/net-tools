@@ -177,21 +177,24 @@ func (r *Router) PickFrom(scope string, candidates []config.Provider, model stri
 //  2. 那家正在冷却时**不生效**，直接按原规则漂移到别家（「后端不能用就换家」）。
 //     漂移之后上层会更新粘性，于是不会改回来——避免两家来回横跳把两边的缓存都弄冷。
 //  3. prefer 为空、或它不在候选里（停用/不承接这个模型/被 exclude），等同于没提。
-func (r *Router) PickFromPreferring(scope string, candidates []config.Provider, model string, exclude map[string]bool, prefer string) (*Candidate, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+//
+// scored 是候选 + 它的选择权重 + 此刻健不健康。
+type scored struct {
+	c       Candidate
+	w       float64
+	healthy bool
+}
 
+// buckets 把候选按「点名声明 / 通配兜底」×「健康 / 全部」分成四堆。
+type buckets struct{ explHealthy, explAll, fbHealthy, fbAll []scored }
+
+// bucketize 把候选按归属（自有 / 系统）、声明方式（点名 / 通配）、健康度分类。
+//
+// 选路（PickFromPreferring）与界面展示（PlanFor）共用这一份分类，两边的次序不会走偏 ——
+// 「界面上写的顺序」就是「真实会走的顺序」，这是这个函数存在的全部理由。
+// exclude 传 nil 表示不做排除（展示场景）。
+func (r *Router) bucketize(scope string, candidates []config.Provider, model string, exclude map[string]bool) (own, sys buckets) {
 	now := r.now()
-	type weighted struct {
-		c       Candidate
-		w       float64
-		healthy bool
-	}
-	// 分成「点名声明了这个模型」和「靠通配兜底」两堆，再横向分成
-	// 「自有上游」与「系统池」两层（SystemPaid）。两层用同一套堆次序，
-	// 只是自有层整层排在系统层前面 —— 用户自己配的上游优先，全挂才花网关的钱。
-	type buckets struct{ explHealthy, explAll, fbHealthy, fbAll []weighted }
-	var own, sys buckets
 	for _, p := range candidates {
 		if !p.Enabled {
 			continue
@@ -207,7 +210,7 @@ func (r *Router) PickFromPreferring(scope string, candidates []config.Provider, 
 		if w <= 0 {
 			w = 1
 		}
-		item := weighted{c: Candidate{Provider: p, UpstreamModel: up}, w: w}
+		item := scored{c: Candidate{Provider: p, UpstreamModel: up}, w: w}
 		declares := p.Declares(model)
 
 		// 只读查状态：Pick 不应为没跑过的供应商创建状态
@@ -238,26 +241,145 @@ func (r *Router) PickFromPreferring(scope string, candidates []config.Provider, 
 			}
 		}
 	}
+	return own, sys
+}
 
-	// 顺序即优先级，从高到低：
-	//   自有·点名·健康 → 自有·点名 → 系统·点名·健康 → 系统·点名 →
-	//   自有·兜底·健康 → 自有·兜底 → 系统·兜底·健康 → 系统·兜底
-	//
-	// 三条规则叠起来，**从外到内**依次是：
-	//   1) 点名声明优先于通配兜底 —— 写 models: ["*"] 的那家声明「任何模型名都接」，
-	//      于是它也会成为**别人点名声明过**的模型名的候选。两者若平权，
-	//      一次请求走对还是走错就全看运气（表现是同一个模型名时而正常、时而 400）。
-	//      这条必须排在最外层：某家用 `["*"]` 的自有上游不该抢走系统池里
-	//      **明确声明**了 gpt-5-sol 的那家 —— 直通上游根本没那个模型，抢过去只会 400。
-	//   2) 同一层里，自有上游优先于系统池：用户自己配的先花他自己的钱。
-	//   3) 层内先健康的，兜不住了再拿不健康的顶上。
-	var pool []weighted
-	for _, cand := range [][]weighted{
-		own.explHealthy, own.explAll,
-		sys.explHealthy, sys.explAll,
-		own.fbHealthy, own.fbAll,
-		sys.fbHealthy, sys.fbAll,
-	} {
+// tierKey 是优先级次序里的一格。整个次序由下面的 priorityTiers 唯一定义，
+// 选路（PickFromPreferring）与界面展示（PlanFor）都从它派生 ——
+// 档序只写一处，两边不可能走偏。
+type tierKey struct {
+	kind     string // own-declares / system-declares / own-wildcard / system-wildcard
+	label    string
+	sys      bool // true = 取系统池那组
+	declares bool // true = 取「点名声明」那堆，false = 「通配兜底」
+	healthy  bool // true = 只取健康的
+}
+
+// priorityTiers 是候选池的优先级次序，从高到低：
+//
+//	自有·点名·健康 → 自有·点名 → 系统·点名·健康 → 系统·点名 →
+//	自有·兜底·健康 → 自有·兜底 → 系统·兜底·健康 → 系统·兜底
+//
+// 三条规则叠起来，**从外到内**依次是：
+//
+//  1. 点名声明优先于通配兜底 —— 写 models: ["*"] 的那家声明「任何模型名都接」，
+//     于是它也会成为**别人点名声明过**的模型名的候选。两者若平权，
+//     一次请求走对还是走错就全看运气（表现是同一个模型名时而正常、时而 400）。
+//     这条必须排在最外层：某家用 `["*"]` 的自有上游不该抢走系统池里
+//     **明确声明**了 gpt-5-sol 的那家 —— 直通上游根本没那个模型，抢过去只会 400。
+//  2. 同一层里，自有上游优先于系统池：用户自己配的先花他自己的钱。
+//  3. 层内先健康的，兜不住了再拿不健康的顶上。
+var priorityTiers = []tierKey{
+	{"own-declares", "自有上游（点名）", false, true, true},
+	{"own-declares", "自有上游（点名）", false, true, false},
+	{"system-declares", "系统池（点名）", true, true, true},
+	{"system-declares", "系统池（点名）", true, true, false},
+	{"own-wildcard", "自有上游（直通）", false, false, true},
+	{"own-wildcard", "自有上游（直通）", false, false, false},
+	{"system-wildcard", "系统池（直通）", true, false, true},
+	{"system-wildcard", "系统池（直通）", true, false, false},
+}
+
+// pick 按 tierKey 从两组桶里取出对应的那一堆。
+func (k tierKey) pick(own, sys buckets) []scored {
+	b := own
+	if k.sys {
+		b = sys
+	}
+	switch {
+	case k.declares && k.healthy:
+		return b.explHealthy
+	case k.declares:
+		return b.explAll
+	case k.healthy:
+		return b.fbHealthy
+	default:
+		return b.fbAll
+	}
+}
+
+// priorityOrder 按优先级把 8 堆依次摊开，调用方取第一堆非空的。
+func priorityOrder(own, sys buckets) [][]scored {
+	out := make([][]scored, 0, len(priorityTiers))
+	for _, k := range priorityTiers {
+		out = append(out, k.pick(own, sys))
+	}
+	return out
+}
+
+// PlanFor 返回某个模型**会被按什么顺序消费**的分档清单，只读、不改任何状态。
+//
+// 给界面用：「我的模型」里要能看清这个模型先走哪家、再走哪家。档序取自
+// priorityTiers（与真实选路同一份定义），所以界面上看到的次序就是实际会走的次序。
+// 同一档内部的成员是**按权重随机 + 会话粘性**，不分先后，所以档内不再排序。
+func (r *Router) PlanFor(scope string, candidates []config.Provider, model string) []Tier {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	own, sys := r.bucketize(scope, candidates, model, nil)
+
+	out := []Tier{}
+	// 相邻两格是同一档的「健康 / 全部」，合并成一档看；档内健康在前、冷却在后
+	// （档内不保证先后 —— 选路是按权重随机，但「现在能用」该先看到）。
+	for i := 0; i < len(priorityTiers); i++ {
+		k := priorityTiers[i]
+		if !k.healthy {
+			continue // 只由 healthy 那格发起，避免同档重复
+		}
+		allKey := k
+		allKey.healthy = false
+		all := allKey.pick(own, sys)
+		if len(all) == 0 {
+			continue
+		}
+		items := make([]scored, 0, len(all))
+		for _, it := range all {
+			if it.healthy {
+				items = append(items, it)
+			}
+		}
+		for _, it := range all {
+			if !it.healthy {
+				items = append(items, it)
+			}
+		}
+		t := Tier{Kind: k.kind, Label: k.label}
+		for _, it := range items {
+			t.Providers = append(t.Providers, PlanEntry{
+				Name:          it.c.Provider.Name,
+				UpstreamModel: it.c.UpstreamModel,
+				Weight:        it.w,
+				Healthy:       it.healthy,
+			})
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
+// Tier 是「这个模型会被按什么顺序消费」里的一档。
+type Tier struct {
+	Kind      string      // own-declares / system-declares / own-wildcard / system-wildcard
+	Label     string      // 中文标签，直接给界面用
+	Providers []PlanEntry // 档内成员：按权重随机选，档内不分先后
+}
+
+// PlanEntry 是某一档里的一家上游。
+type PlanEntry struct {
+	Name          string
+	UpstreamModel string
+	Weight        float64
+	Healthy       bool
+}
+
+func (r *Router) PickFromPreferring(scope string, candidates []config.Provider, model string, exclude map[string]bool, prefer string) (*Candidate, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	own, sys := r.bucketize(scope, candidates, model, exclude)
+
+	var pool []scored
+	for _, cand := range priorityOrder(own, sys) {
 		if len(cand) > 0 {
 			pool = cand
 			break
