@@ -75,6 +75,7 @@ func (s *Server) adminUsersRoute(w http.ResponseWriter, r *http.Request, tail st
 			if s.meters != nil {
 				s.meters.Forget(name)
 			}
+			s.usageCache.InvalidateUser(name)
 			_ = s.SyncUsers()
 			s.log.Warnf("管理员删除了用户 %s", name)
 			writeJSON(w, http.StatusOK, map[string]any{"deleted": name})

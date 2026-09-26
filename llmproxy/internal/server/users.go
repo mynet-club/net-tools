@@ -1075,7 +1075,16 @@ func (s *Server) handleMeUsage(w http.ResponseWriter, r *http.Request, scope str
 
 // writeUsageReport 出一个用户的用量报表。用户自助（/v1/_me/usage）与管理员
 // （/v1/_admin/users/{name}/usage）共用同一份实现 —— 两处各写一遍迟早会漂移。
+//
+// 结果按 (用户, 天数) 缓存几秒：这是界面轮询的热点，每次都现算会把 store 那条
+// 唯一 SQLite 连接占满，连带拖慢请求落库。配额判断不走这份缓存（见 meters）。
 func (s *Server) writeUsageReport(w http.ResponseWriter, scope string, days int) {
+	cacheKey := usageReportKey{scope: scope, days: days}
+	if hit := s.usageCache.Get(cacheKey); hit != nil {
+		writeJSON(w, http.StatusOK, hit)
+		return
+	}
+
 	since := time.Now().AddDate(0, 0, -days)
 	rows, err := s.db.UsageByUser(since, scope)
 	if err != nil {
@@ -1151,7 +1160,7 @@ func (s *Server) writeUsageReport(w http.ResponseWriter, scope string, days int)
 		}
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	payload := map[string]any{
 		"days":   days,
 		"totals": tot,
 		"rows":   out,
@@ -1162,7 +1171,9 @@ func (s *Server) writeUsageReport(w http.ResponseWriter, scope string, days int)
 			"counted_upto": now.Format("2006-01-02"),
 			"note":         "只统计走系统上游的消耗；金额冻结优先（按请求开始时刻的价目行算好写死），未冻结的部分按 config.yaml 的 pricing 表估算兜底",
 		},
-	})
+	}
+	s.usageCache.Put(cacheKey, payload)
+	writeJSON(w, http.StatusOK, payload)
 }
 
 // ------------------------------------------------------------------ 管理接口

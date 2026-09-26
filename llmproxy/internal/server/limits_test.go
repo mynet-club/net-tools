@@ -134,7 +134,8 @@ func TestEnsureMonthLoadedDoesNotHoldLockWhileLoading(t *testing.T) {
 		return nil
 	}
 
-	m.ensureMonthLoaded("dave")
+	// 任一热路径都会触发装载：Snapshot 进 meterFor → loadMonthLocked
+	m.Snapshot("dave")
 
 	select {
 	case <-deadlock:

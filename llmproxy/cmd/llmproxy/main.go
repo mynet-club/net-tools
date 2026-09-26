@@ -421,6 +421,7 @@ func cmdStart(paths config.Paths) error {
 			// 不在这里同步的话，"改完立刻能用"就只能等下面那个 2 秒一次的轮询，
 			// 而窗口期内的请求会吃到 401 —— 看起来像"用户没建成"。
 			srv.SyncUsersIfChanged()
+			srv.InvalidateUsageCache() // CLI 也可能刚改过价目，报表不能继续吐旧缓存
 			// 继续等下一个信号
 			for sig = range sigCh {
 				if sig == syscall.SIGHUP {
@@ -432,6 +433,7 @@ func cmdStart(paths config.Paths) error {
 						lg.Infof("SIGHUP 配置已重载")
 					}
 					srv.SyncUsersIfChanged()
+					srv.InvalidateUsageCache()
 					continue
 				}
 				break
@@ -797,32 +799,15 @@ func humanMoney(v float64) string {
 	return fmt.Sprintf("%.2f", v)
 }
 
-// rowChargeOf 是 internal/server.rowCharge 的简化副本。
-//
-// 那个函数在 internal 包里、cmd 引不到，而 CLI 显示的金额必须与服务端口径一致
-// （冻结优先、未冻结按 legacy 表估算兜底）。这里把同一套算法复述一遍，
-// 避免出现「CLI 报一个数、API 报另一个数」。
-// TODO: 想真正消除重复，应当把 rowCharge 下沉到 internal/store 或 internal/config，
-// 让服务端与 CLI 共用一份。这是一次小重构，等下一轮再做。
+// rowChargeOf 让 CLI 与服务端走同一份算法（store.RowCharge）。
+// 以前这里是简化副本，两边一旦漂移就「CLI 报一个数、API 报另一个数」。
 func rowChargeOf(r store.UsageRow, p *config.PricingConfig, now time.Time) float64 {
-	if r.OK > 0 && r.FrozenCharges >= r.OK {
-		return r.Charge
-	}
-	hit, miss := r.CacheHitTokens, r.CacheMissTokens
-	if hit+miss == 0 && r.PromptTokens > 0 {
-		miss = r.PromptTokens
-	}
-	est := 0.0
-	if p != nil && p.Enabled() {
-		if v, ok := p.Cost(r.UpstreamModel, hit, miss, r.CompletionTokens, now); ok {
-			est = v
+	return store.RowCharge(r, func(model string, hit, miss, out int64, at time.Time) (float64, bool) {
+		if p == nil || !p.Enabled() {
+			return 0, false
 		}
-	}
-	if r.FrozenCharges == 0 || r.OK == 0 {
-		return est
-	}
-	unfrozen := float64(r.OK-r.FrozenCharges) / float64(r.OK)
-	return r.Charge + est*unfrozen
+		return p.Cost(model, hit, miss, out, at)
+	}, now)
 }
 
 func countEnabled(ps []config.Provider) int {

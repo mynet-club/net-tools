@@ -55,6 +55,9 @@ type Server struct {
 	// /discover 的频率与并发闸门（用户可控的出网探测，见 discover.go）
 	discoverGate *discoverGate
 
+	// 用量报表的短 TTL 缓存（界面轮询热点，见 statscache.go）
+	usageCache *usageReportCache
+
 	// persistFailures 是「请求已成功返回给客户端、但记账落库失败」的累计次数。
 	//
 	// 这个数必须是**可观测**的：落库失败时请求已经发出去了，账却永久丢失 ——
@@ -94,6 +97,7 @@ func New(cfgStore *config.Store, db *store.Store, r *router.Router, lg *logx.Log
 		startedAt:    time.Now(),
 		affinity:     newAffinityStore(affTTL, defaultAffinityMax),
 		discoverGate: newDiscoverGate(),
+		usageCache:   newUsageReportCache(),
 	}
 	s.uiHandler = s.newUIHandler()
 	s.configApplyWait = 4 * time.Second
@@ -108,6 +112,10 @@ func New(cfgStore *config.Store, db *store.Store, r *router.Router, lg *logx.Log
 
 func (s *Server) Router() *router.Router             { return s.router }
 func (s *Server) Transports() *dialer.TransportCache { return s.transports }
+
+// InvalidateUsageCache 丢掉用量报表缓存。
+// CLI 写价目/用户后发 SIGHUP，服务端要立刻反映新数据，不能等 TTL。
+func (s *Server) InvalidateUsageCache() { s.usageCache.Flush() }
 
 // egressCheck 给**用户可控上游**用的拨号层出网判定。strict 跟
 // server.block_local_upstream 走（热重载实时生效）；系统池不走这里。

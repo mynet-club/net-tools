@@ -231,6 +231,7 @@ func (s *Server) adminPutProviderPrice(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
+	s.usageCache.Flush() // 估算段金额跟着单价走
 	s.log.Infof("写入上游价目 %s / %s（自 %s，out=%v %s）",
 		p.Provider, p.UpstreamModel, p.ValidFrom.Format(time.RFC3339), p.Out, p.Currency)
 	writeJSON(w, http.StatusOK, map[string]any{"inserted": providerPriceJSON(*p)})
@@ -268,6 +269,7 @@ func (s *Server) adminPutUserPrice(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
+	s.usageCache.Flush() // 估算段金额跟着单价走
 	s.log.Infof("写入分发价目 %s / %s（自 %s，out=%v %s）",
 		p.Scope, p.Model, p.ValidFrom.Format(time.RFC3339), p.Out, p.Currency)
 	writeJSON(w, http.StatusOK, map[string]any{"inserted": userPriceJSON(*p)})
