@@ -20,7 +20,8 @@ func system(name string, spec config.ModelSpec) config.Provider {
 
 func declares(m map[string]string) config.ModelSpec { return config.ModelSpec{Map: m} }
 
-// PlanFor 给出的档序必须与真实选路一致：自有·点名 → 系统·点名 → 自有·直通 → 系统·直通。
+// PlanFor 给出的档序必须与真实选路一致。
+// 有映射就只走映射：点名档按 自有 → 系统 排；通配档在有人点名时整档出局。
 func TestPlanForTierOrder(t *testing.T) {
 	r := New(config.RoutingConfig{}, nil)
 	cands := []config.Provider{
@@ -30,11 +31,11 @@ func TestPlanForTierOrder(t *testing.T) {
 		owned("own-named", declares(map[string]string{"m": "m"})),
 	}
 	plan := r.PlanFor("", cands, "m")
-	if len(plan) != 4 {
-		t.Fatalf("应当有 4 档，实际 %d: %+v", len(plan), plan)
+	if len(plan) != 2 {
+		t.Fatalf("有点名映射时通配应出局，应当 2 档，实际 %d: %+v", len(plan), plan)
 	}
-	wantKinds := []string{"own-declares", "system-declares", "own-wildcard", "system-wildcard"}
-	wantNames := []string{"own-named", "sys-named", "own-wild", "sys-wild"}
+	wantKinds := []string{"own-declares", "system-declares"}
+	wantNames := []string{"own-named", "sys-named"}
 	for i, tier := range plan {
 		if tier.Kind != wantKinds[i] {
 			t.Errorf("第 %d 档 kind = %q，期望 %q", i+1, tier.Kind, wantKinds[i])
@@ -45,19 +46,38 @@ func TestPlanForTierOrder(t *testing.T) {
 	}
 }
 
-// 有人点名声明时，直通档就不该出现在计划里吗？—— 不，它**仍然在**，
-// 只是排在后面（选路时只有点名档空了才会轮到它）。这一点必须和 PlanFor 的语义一致。
-func TestPlanForKeepsWildcardButLower(t *testing.T) {
+// 有人点名声明时，通配档不该出现在计划里 ——
+// 「有映射按映射表来」，不是「映射优先、万能还能垫」。
+func TestPlanForDropsWildcardWhenNamedExists(t *testing.T) {
 	r := New(config.RoutingConfig{}, nil)
 	cands := []config.Provider{
 		owned("named", declares(map[string]string{"m": "m"})),
 		owned("wild", config.ModelSpec{Passthrough: true}),
 	}
 	plan := r.PlanFor("", cands, "m")
-	if len(plan) != 2 {
-		t.Fatalf("应当 2 档，实际 %d", len(plan))
+	if len(plan) != 1 {
+		t.Fatalf("应当只留点名 1 档，实际 %d: %+v", len(plan), plan)
 	}
-	if plan[0].Kind != "own-declares" || plan[1].Kind != "own-wildcard" {
+	if plan[0].Kind != "own-declares" {
+		t.Errorf("kind = %q，期望 own-declares", plan[0].Kind)
+	}
+	if len(plan[0].Providers) != 1 || plan[0].Providers[0].Name != "named" {
+		t.Errorf("成员应当只有 named，实际 %+v", plan[0].Providers)
+	}
+}
+
+// 没人点名时，通配档照常出现。
+func TestPlanForKeepsWildcardWhenNobodyDeclares(t *testing.T) {
+	r := New(config.RoutingConfig{}, nil)
+	cands := []config.Provider{
+		owned("own-wild", config.ModelSpec{Passthrough: true}),
+		system("sys-wild", config.ModelSpec{Passthrough: true}),
+	}
+	plan := r.PlanFor("", cands, "m")
+	if len(plan) != 2 {
+		t.Fatalf("应当 2 档，实际 %d: %+v", len(plan), plan)
+	}
+	if plan[0].Kind != "own-wildcard" || plan[1].Kind != "system-wildcard" {
 		t.Errorf("档序不对: %q, %q", plan[0].Kind, plan[1].Kind)
 	}
 }

@@ -519,7 +519,100 @@ async function loadModelOverview() {
   $('my-models-empty').hidden = rows.length > 0;
 }
 
+// 映射目标的四种模式 —— 界面四选一，语义刻意拆开，不再用「留空」一词两义。
+const MM_NONE = '';          // 不映射（默认）：这家不接这个下游名
+const MM_SAME = '__same__';  // 直通：原名转发（下游名 = 上游名）
+const MM_CUSTOM = '__custom__'; // 自定义：手填这家认的模型名
+// 其余 value = 列表里选中的具体上游模型名
+
+// 拉一家上游认得的模型名。优先用本会话缓存（编辑上游时「同步」写进去的那份），
+// 没有就现问 /discover —— 映射表单不能只靠缓存，否则从没同步过的家一条候选都没有。
+async function loadProviderCands(p) {
+  const key = 'llmproxy.cands.' + p.name;
+  try {
+    const raw = sessionStorage.getItem(key);
+    if (raw) return JSON.parse(raw);
+  } catch { /* 缓存坏了就当没有 */ }
+  try {
+    const { data } = await api('/v1/_me/providers/' + encodeURIComponent(p.name) + '/discover', {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+    const models = data.models || [];
+    try { sessionStorage.setItem(key, JSON.stringify(models)); } catch { /* 存不下只影响下次 */ }
+    return models;
+  } catch {
+    return [];
+  }
+}
+
+// 从控件读出「这家对这个下游名怎么接」。
+// 返回 { mode, up }：up 只在 mode=list/custom 时是真正要写库的上游名；
+// mode=same 表示同名直通，up 由调用方填下游名。
+function readUpRow(tr) {
+  const sel = tr.querySelector('select.mm-up-sel');
+  const customInp = tr.querySelector('input.mm-up-custom');
+  if (!sel) return { mode: MM_NONE, up: '' };
+  const v = sel.value;
+  if (v === MM_NONE) return { mode: MM_NONE, up: '' };
+  if (v === MM_SAME) return { mode: MM_SAME, up: '' };
+  if (v === MM_CUSTOM) return { mode: MM_CUSTOM, up: (customInp && customInp.value.trim()) || '' };
+  return { mode: 'list', up: v };
+}
+
+function syncUpRow(sel, customInp) {
+  const isCustom = sel.value === MM_CUSTOM;
+  customInp.hidden = !isCustom;
+  if (isCustom) customInp.focus();
+  else customInp.value = '';
+}
+
+// 把候选刷进「列表」分组，保持当前选中。
+// current: { mode, up }；down 用于「直通」选项的文案。
+function fillUpSelect(sel, customInp, cands, current, down) {
+  const dn = down || '（下游名）';
+  const mode = current.mode || MM_NONE;
+  const up = current.up || '';
+
+  const set = new Set();
+  for (const c of cands) {
+    if (!c || c === MM_SAME || c === MM_CUSTOM || c === MM_NONE) continue;
+    set.add(c);
+  }
+  // 同名走「直通」那一项，不往列表里塞下游名 —— 否则打字过程的中间值会被
+  // 一帧帧累进候选（x / xi / xia / …），列表被前缀碎片刷爆。
+  if (mode === 'list' && up) set.add(up);
+
+  sel.replaceChildren();
+  sel.append(h('option', { value: MM_NONE, text: '不映射 —— 这家不接' }));
+  sel.append(h('option', { value: MM_SAME, text: '直通 —— 原名 ' + dn + ' 转发' }));
+
+  const listGroup = h('optgroup', { label: '列表 —— 这家认的模型名' });
+  for (const c of [...set].sort()) {
+    listGroup.append(h('option', { value: c, text: c }));
+  }
+  if ([...set].length) sel.append(listGroup);
+
+  sel.append(h('option', { value: MM_CUSTOM, text: '自定义 —— 手填模型名' }));
+
+  if (mode === MM_SAME) {
+    sel.value = MM_SAME;
+  } else if (mode === MM_CUSTOM || (mode === 'list' && up && !set.has(up))) {
+    // 列表里没有的当前值落到自定义，绝不丢映射
+    sel.value = MM_CUSTOM;
+    customInp.value = up;
+  } else if (mode === 'list' && up) {
+    sel.value = up;
+  } else {
+    sel.value = MM_NONE;
+  }
+  syncUpRow(sel, customInp);
+}
+
 // 打开模型映射表单：down 为空 = 新建。
+// mmFormGen 用来丢弃过期的异步候选回填（表单已关/已换目标时不要写进来）。
+let mmFormGen = 0;
+
 function openModelForm(down) {
   const list = state.providers || [];
   if (!list.length) {
@@ -527,6 +620,7 @@ function openModelForm(down) {
     $('mmform').hidden = false;
     return;
   }
+  const gen = ++mmFormGen;
   $('mmform').hidden = false;
   $('mm-err').hidden = true;
   $('mm-name').value = down || '';
@@ -534,70 +628,129 @@ function openModelForm(down) {
 
   const tb = $('mm-rows').querySelector('tbody');
   tb.replaceChildren();
-  list.forEach((p, i) => {
+  list.forEach((p) => {
     const m = p.models || {};
-    const current = down && !m.passthrough ? ((m.map || {})[down] || '') : '';
-    // 候选：session 同步过的 + 当前值 + 这家已有的上游名
-    const cands = new Set();
-    try {
-      const raw = sessionStorage.getItem('llmproxy.cands.' + p.name);
-      if (raw) for (const c of JSON.parse(raw)) cands.add(c);
-    } catch { /* 没有就算了 */ }
-    if (current) cands.add(current);
-    if (!m.passthrough) {
-      for (const up of Object.values(m.map || {})) if (up !== '*') cands.add(up);
-    } else if (down) {
-      // 直通上游在映射一个具体名字时，最省事的是同名
-      cands.add(down);
+    // 当前值：有点名映射就是 list/custom/same；没有就是「不映射」
+    // （直通型上游对任意名字都接，但那是「万能匹配」，不是对这个下游名的点名映射）
+    let current = { mode: MM_NONE, up: '' };
+    if (down && !m.passthrough) {
+      const up = (m.map || {})[down];
+      if (up === down) current = { mode: MM_SAME, up: '' };
+      else if (up) current = { mode: 'list', up };
     }
 
-    const dl = h('datalist', { id: 'mm-cands-' + i });
-    for (const c of [...cands].sort()) dl.append(h('option', { value: c }));
-    const inp = h('input', {
-      type: 'text', class: 'mono mm-up', list: 'mm-cands-' + i,
-      placeholder: m.passthrough ? '留空 = 保持直通' : '留空 = 不使用这家',
-      autocomplete: 'off', spellcheck: 'false', value: current,
-    });
+    // baseCands：这家真正认得的模型名（缓存 + 已有映射里的上游名）。
+    // 不从 select.options 反读 —— 那里混着「直通/自定义」哨兵和下游名文案，会污染候选。
+    const baseCands = new Set();
+    try {
+      const raw = sessionStorage.getItem('llmproxy.cands.' + p.name);
+      if (raw) for (const c of JSON.parse(raw)) baseCands.add(c);
+    } catch { /* 没有就算了 */ }
+    if (!m.passthrough) {
+      for (const up of Object.values(m.map || {})) if (up && up !== '*') baseCands.add(up);
+    }
 
+    const sel = h('select', { class: 'mm-up-sel' });
+    const customInp = h('input', {
+      type: 'text', class: 'mono mm-up-custom', placeholder: '输入这家认得的模型名',
+      autocomplete: 'off', spellcheck: 'false', hidden: true,
+    });
+    sel.addEventListener('change', () => syncUpRow(sel, customInp));
+    fillUpSelect(sel, customInp, [...baseCands], current, down);
+
+    // 万能匹配标记：这家当前是「任意模型名都接」，只在没有点名映射时兜底
     const tag = m.passthrough
-      ? h('span', { class: 'tag', text: '直通', title: '现在接受任意模型名' })
+      ? h('span', { class: 'tag', text: '万能匹配', title: '这家当前接受任意模型名；只有没被点名映射的模型才会走到它' })
       : null;
-    tb.append(h('tr', null,
+    const st = h('span', { class: 'mm-cand-st muted', text: '' });
+    tb.append(h('tr', { 'data-provider': p.name },
       h('td', null, h('code', { class: 'k', text: p.name }), tag ? ' ' : '', tag),
-      h('td', null, inp, dl),
+      h('td', null,
+        h('div', { class: 'mm-pick' }, sel, customInp),
+        st),
     ));
+
+    loadProviderCands(p).then((models) => {
+      if (gen !== mmFormGen) return;
+      for (const c of models) baseCands.add(c);
+      const cur = readUpRow(trOf(tb, p.name));
+      fillUpSelect(sel, customInp, [...baseCands], cur, $('mm-name').value.trim() || down);
+      st.textContent = models.length ? '' : '这家没拉到模型列表，可用「自定义」手填';
+    });
   });
+
+  // 下游名后填：只改「直通 —— 原名 xxx」那条文案。
+  // 不把中间态塞进列表、也不从 options 反读候选 —— 否则每个按键都会
+  // 多留一条 x/xi/xia/… 的前缀碎片。
+  const onDownInput = () => {
+    const dn = $('mm-name').value.trim();
+    const label = '直通 —— 原名 ' + (dn || '（下游名）') + ' 转发';
+    for (const tr of tb.rows) {
+      const sel = tr.querySelector('select.mm-up-sel');
+      if (!sel) continue;
+      for (const o of sel.options) {
+        if (o.value === MM_SAME) o.textContent = label;
+      }
+    }
+  };
+  if (state.mmDownInput) $('mm-name').removeEventListener('input', state.mmDownInput);
+  state.mmDownInput = onDownInput;
+  $('mm-name').addEventListener('input', onDownInput);
+  if (down) onDownInput();
+
   $('mm-name').focus();
   $('mm-name').scrollIntoView({ block: 'center', behavior: 'smooth' });
 }
 
+function trOf(tb, name) {
+  for (const tr of tb.rows) {
+    if (tr.dataset.provider === name) return tr;
+  }
+  return null;
+}
+
 function closeModelForm() {
+  mmFormGen++;
+  if (state.mmDownInput) {
+    $('mm-name').removeEventListener('input', state.mmDownInput);
+    state.mmDownInput = null;
+  }
   $('mmform').hidden = true;
   $('mm-err').hidden = true;
 }
 
-// 读表单：返回 [{provider, up}]，up 为空串表示这家不承接。
+// 读表单：返回 [{provider, up, mode}]，up 为空串表示这家不承接。
 function collectModelForm() {
   const tb = $('mm-rows').querySelector('tbody');
   const out = [];
   for (const tr of tb.rows) {
-    const provider = tr.cells[0].querySelector('code')?.textContent?.trim();
-    const inp = tr.cells[1].querySelector('input.mm-up');
+    const provider = tr.dataset.provider || tr.cells[0].querySelector('code')?.textContent?.trim();
     if (!provider) continue;
-    out.push({ provider, up: (inp && inp.value.trim()) || '' });
+    out.push({ provider, ...readUpRow(tr) });
   }
   return out;
 }
 
 // 把「下游名 → 各上游的上游名」写回每家上游的 models 声明。
 // 只动这一个下游键，别家的映射、catch_all、其它字段一律原样。
+//
+// 保存语义对齐心智模型：
+//   不映射        → 从这家的映射表里删掉该下游名（这家不点名接它）
+//   直通          → map[down] = down（点名同名，不是万能匹配）
+//   列表 / 自定义 → map[down] = 选定的上游名
+// 万能匹配（passthrough / catch_all）是另一层：没被点名映射的模型才靠它兜底。
+// 给万能匹配的家加点名映射时，**保留**它的 catch_all —— 其它模型仍可走万能匹配。
 async function saveModelMap(ev) {
   ev.preventDefault();
   const down = $('mm-name').value.trim();
   if (!down) return showErr($('mm-err'), '下游模型名必填');
-  const assigns = collectModelForm();
+  // 「直通」= 同名点名映射
+  const assigns = collectModelForm().map((a) => ({
+    ...a,
+    up: a.mode === MM_SAME ? down : (a.up || ''),
+  }));
   const touched = assigns.filter((a) => a.up);
-  if (!touched.length) return showErr($('mm-err'), '至少给一家上游选一个模型名');
+  if (!touched.length) return showErr($('mm-err'), '至少给一家选「直通 / 列表 / 自定义」');
 
   const btn = $('mmform').querySelector('button[type=submit]');
   btn.disabled = true;
@@ -607,6 +760,7 @@ async function saveModelMap(ev) {
       const p = (state.providers || []).find((x) => x.name === a.provider);
       if (!p) continue;
       const m = p.models || {};
+      // 纯万能匹配（passthrough）时映射表是空的；catch_all 存在 map['*']
       const oldMap = m.passthrough ? {} : { ...(m.map || {}) };
       const newMap = { ...oldMap };
       if (a.up) newMap[down] = a.up;
@@ -617,12 +771,14 @@ async function saveModelMap(ev) {
       const now = a.up || '';
       if (had === now && !(m.passthrough && a.up)) continue;
 
-      // 完全没映射了：回退成直通，否则服务端会拒「models 为空」
       let models;
       if (!a.up && Object.keys(newMap).length === 0 && !m.catch_all) {
+        // 点名映射全删光了：退回纯万能匹配，否则服务端会拒「models 为空」
         models = ['*'];
-      } else if (a.up && m.passthrough) {
-        // 从直通改成指定模型：保留 catch_all 会让人以为「还接任意名」，这里明确收窄
+      } else if (m.passthrough && a.up) {
+        // 原来是纯万能匹配，现在给这个下游名加了点名映射。
+        // 万能匹配要**留住**：其它没点名的模型仍靠它兜底（有映射走映射，没映射走万能匹配）。
+        newMap['*'] = '*';
         models = newMap;
       } else {
         if (m.catch_all) newMap['*'] = '*';

@@ -536,18 +536,32 @@ func TestPickDeclaredStaysPreferredEvenWhenUnhealthy(t *testing.T) {
 	}
 }
 
-// 重试时把点名的那家排除掉（它刚失败），这时才轮到兜底的顶上。
-func TestPickDeclaredExcludedThenFallsBack(t *testing.T) {
+// 重试时把点名的那家排除掉（它刚失败），**也不该**落到万能匹配上 ——
+// 映射还在，只是这轮跳过它；放去不认识这个模型的直通上游只会再吃一个 400。
+func TestPickDeclaredExcludedDoesNotFallBackToWildcard(t *testing.T) {
 	r := New(config.RoutingConfig{}, []config.Provider{
 		mapped("declared", 1, map[string]string{"m": "m"}),
 		passthrough("fallback", 1),
 	})
-	c, err := r.Pick("m", map[string]bool{"declared": true})
+	_, err := r.Pick("m", map[string]bool{"declared": true})
+	if err == nil {
+		t.Fatal("点名那家被排除后应当失败，不该落到万能匹配")
+	}
+}
+
+// 多家点名映射时，排除其一仍走另一家点名，而不是通配。
+func TestPickDeclaredExcludedUsesOtherNamed(t *testing.T) {
+	r := New(config.RoutingConfig{}, []config.Provider{
+		mapped("declared-a", 1, map[string]string{"m": "m"}),
+		mapped("declared-b", 1, map[string]string{"m": "m2"}),
+		passthrough("fallback", 1),
+	})
+	c, err := r.Pick("m", map[string]bool{"declared-a": true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Provider.Name != "fallback" {
-		t.Errorf("点名那家被排除后应当由兜底顶上，实际 %q", c.Provider.Name)
+	if c.Provider.Name != "declared-b" {
+		t.Errorf("应当走另一家点名 %q，实际 %q", "declared-b", c.Provider.Name)
 	}
 }
 

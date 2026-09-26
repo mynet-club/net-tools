@@ -272,14 +272,22 @@ select:focus { outline: 2px solid #c7c3f7; outline-offset: 1px; }
 .mm-add input { flex: 1; min-width: 150px; }
 .mm-add select { width: 190px; flex: none; }
 
-/* 模型映射表单：上游名 + 带候选的模型名输入 */#mm-rows { width: 100%; }
+/* 模型映射表单：上游名 + 可选的目标模型下拉（拉不到候选时可手填） */
+#mm-rows { width: 100%; }
 #mm-rows td { vertical-align: middle; }
-#mm-rows td:first-child { width: 30%; white-space: nowrap; }
-#mm-rows input.mm-up {
+#mm-rows td:first-child { width: 28%; white-space: nowrap; }
+.mm-pick { display: flex; flex-direction: column; gap: 6px; min-width: 220px; max-width: 420px; }
+#mm-rows select.mm-up-sel {
   width: 100%; padding: 8px 10px; border: 1px solid var(--border);
   border-radius: 7px; background: #fff; font-family: var(--mono); font-size: 12px;
 }
-#mm-rows input.mm-up:focus { outline: 2px solid #c7c3f7; outline-offset: 1px; }
+#mm-rows select.mm-up-sel:focus,
+#mm-rows input.mm-up-custom:focus { outline: 2px solid #c7c3f7; outline-offset: 1px; }
+#mm-rows input.mm-up-custom {
+  width: 100%; padding: 8px 10px; border: 1px solid var(--border);
+  border-radius: 7px; background: #fff; font-family: var(--mono); font-size: 12px;
+}
+.mm-cand-st { display: block; margin-top: 4px; font-size: 11px; }
 
 /* ── config.yaml 的 providers 编辑器 ──────────────────────────────── */
 .prow { border: 1px solid var(--border); border-radius: 9px; padding: 14px; margin-top: 12px; background: #fcfcfd; }

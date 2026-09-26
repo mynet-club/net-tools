@@ -183,9 +183,10 @@
         <h2>我的模型</h2>
         <button type="button" id="mm-open" class="primary sm">映射模型</button>
       </div>
-      <p class="sub">客户端请求里 <code>model</code> 填的是<strong>下游模型名</strong>。
-        下表是这个模型**实际会按什么顺序消费上游**：从左到右依次回落，同一格里多家则按权重分担
-        （会话粘性优先钉住上次那家）。自有上游优先，它接不住或都不可用时才走系统池（那部分才计配额）。</p>
+      <p class="sub">请求里的 <code>model</code> 是<strong>下游模型名</strong>。
+        选路规则：<strong>有映射就只走映射表</strong>；完全没配映射的模型，才走开了「万能匹配」的上游（原名转发）。
+        下表是这个模型<strong>实际会按什么顺序消费上游</strong>：从左到右依次回落，同一格里多家按权重分担
+        （会话粘性优先钉住上次那家）。自有上游优先，接不住或都不可用时才走系统池（那部分计配额）。</p>
 
       <form id="mmform" hidden>
         <div class="pform-grid">
@@ -197,12 +198,13 @@
         </div>
         <div class="tablewrap">
           <table id="mm-rows">
-            <thead><tr><th>上游</th><th>这家的上游模型名</th></tr></thead>
+            <thead><tr><th>上游</th><th>这家怎么接（四选一）</th></tr></thead>
             <tbody></tbody>
           </table>
         </div>
-        <p class="muted" id="mm-hint">每家填它真正认的模型名，点输入框会出候选。留空 = 这家不承接。
-          直通上游填了具体名字后会改成「指定模型」。</p>
+        <p class="muted" id="mm-hint">每家四选一：<strong>不映射</strong>（默认，这家不接）·
+          <strong>直通</strong>（原名转发）· <strong>列表</strong>（选这家认的模型名，打开时自动拉取）·
+          <strong>自定义</strong>（手填）。至少选一家。有点名映射的模型不会再串到万能匹配。</p>
         <div class="row">
           <button type="submit" class="primary">保存映射</button>
           <button type="button" id="mm-cancel" class="ghost">取消</button>

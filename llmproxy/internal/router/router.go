@@ -195,9 +195,21 @@ type buckets struct{ explHealthy, explAll, fbHealthy, fbAll []scored }
 // exclude 传 nil 表示不做排除（展示场景）。
 func (r *Router) bucketize(scope string, candidates []config.Provider, model string, exclude map[string]bool) (own, sys buckets) {
 	now := r.now()
+	// 先看这个模型有没有**启用中**的点名映射（exclude 也算：重试排除的那家
+	// 映射还在，不该因此放万能匹配进来）。有就只走映射，没有才用通配。
+	hasNamed := false
+	for _, p := range candidates {
+		if p.Enabled && p.Declares(model) {
+			hasNamed = true
+			break
+		}
+	}
 	for _, p := range candidates {
 		if !p.Enabled {
 			continue
+		}
+		if hasNamed && !p.Declares(model) {
+			continue // 有映射就只走映射，通配整档出局
 		}
 		up, ok := p.UpstreamModel(model)
 		if !ok {
@@ -262,11 +274,10 @@ type tierKey struct {
 //
 // 三条规则叠起来，**从外到内**依次是：
 //
-//  1. 点名声明优先于通配兜底 —— 写 models: ["*"] 的那家声明「任何模型名都接」，
-//     于是它也会成为**别人点名声明过**的模型名的候选。两者若平权，
-//     一次请求走对还是走错就全看运气（表现是同一个模型名时而正常、时而 400）。
-//     这条必须排在最外层：某家用 `["*"]` 的自有上游不该抢走系统池里
-//     **明确声明**了 gpt-5-sol 的那家 —— 直通上游根本没那个模型，抢过去只会 400。
+//  1. 点名声明**独占**，通配兜底不参战 —— 只要有人点名声明了这个模型名，
+//     写 models: ["*"] / catch-all 的家就整档出局（见 bucketize 末尾）。
+//     心智模型：「有映射按映射表来，没映射才看万能匹配」。
+//     若两者并存，mimo 之类的请求会被串到根本没有该模型的直通上游上，白白 400。
 //  2. 同一层里，自有上游优先于系统池：用户自己配的先花他自己的钱。
 //  3. 层内先健康的，兜不住了再拿不健康的顶上。
 var priorityTiers = []tierKey{
