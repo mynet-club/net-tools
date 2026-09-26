@@ -52,6 +52,9 @@ type Server struct {
 	// 见 affinity.go 与 forwarder.go 里的接线。
 	affinity *affinityStore
 
+	// /discover 的频率与并发闸门（用户可控的出网探测，见 discover.go）
+	discoverGate *discoverGate
+
 	// persistFailures 是「请求已成功返回给客户端、但记账落库失败」的累计次数。
 	//
 	// 这个数必须是**可观测**的：落库失败时请求已经发出去了，账却永久丢失 ——
@@ -83,13 +86,14 @@ func New(cfgStore *config.Store, db *store.Store, r *router.Router, lg *logx.Log
 		affTTL = time.Duration(c.Server.AffinityTTL()) * time.Millisecond
 	}
 	s := &Server{
-		cfgStore:   cfgStore,
-		db:         db,
-		router:     r,
-		log:        lg,
-		transports: dialer.NewTransportCache(),
-		startedAt:  time.Now(),
-		affinity:   newAffinityStore(affTTL, defaultAffinityMax),
+		cfgStore:     cfgStore,
+		db:           db,
+		router:       r,
+		log:          lg,
+		transports:   dialer.NewTransportCache(),
+		startedAt:    time.Now(),
+		affinity:     newAffinityStore(affTTL, defaultAffinityMax),
+		discoverGate: newDiscoverGate(),
 	}
 	s.uiHandler = s.newUIHandler()
 	s.configApplyWait = 4 * time.Second
@@ -104,6 +108,30 @@ func New(cfgStore *config.Store, db *store.Store, r *router.Router, lg *logx.Log
 
 func (s *Server) Router() *router.Router             { return s.router }
 func (s *Server) Transports() *dialer.TransportCache { return s.transports }
+
+// egressCheck 给**用户可控上游**用的拨号层出网判定。strict 跟
+// server.block_local_upstream 走（热重载实时生效）；系统池不走这里。
+//
+// 这是「配置校验 + 实际拨号再校验」的第二层：配置时 CheckUpstreamEgress 看到的
+// DNS 结果可能在拨号前被改掉（rebinding），所以真正 connect 前还要再判一次。
+func (s *Server) egressCheck() dialer.IPCheck {
+	return func(ip net.IP) error {
+		strict := false
+		if c := s.cfgStore.Current(); c != nil {
+			strict = c.Server.BlockLocalUpstream
+		}
+		return config.CheckResolvedIP(ip, strict)
+	}
+}
+
+// transportFor 按候选归属拿连接池：用户自有上游带拨号层出网校验，系统池不带
+// （运营者自己写的 base_url，自己负责）。两套不能混用同一个缓存条目。
+func (s *Server) transportFor(systemPaid bool, proxyURL string) (*http.Transport, error) {
+	if systemPaid {
+		return s.transports.Get(proxyURL)
+	}
+	return s.transports.GetChecked(proxyURL, s.egressCheck())
+}
 
 // SetAffinityTTL 热重载时更新会话粘性的保留时长。
 //

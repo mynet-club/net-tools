@@ -896,32 +896,18 @@ func ParseBaseURL(raw string) (*url.URL, error) {
 //     `server.block_local_upstream`；真要收紧到「只许公网」，网络层（防火墙 / 安全组）
 //     比在这里猜意图可靠。
 //
-// 局限（明确接受）：主机名是**在校验时**解析的，所以挡不住 DNS rebinding ——
-// 校验通过后域名被改指到 169.254.169.254，拨号时就会打过去。要彻底堵住得在
-// `net.Dialer.Control` 里对**解析后的 IP** 再判一次，那需要把这条策略一路传到
-// dialer 层；当前先把「直接写 IP」和「解析结果就是内网」这两种绝大多数情况挡住。
+// 局限（明确接受）：主机名是**在校验时**解析的，所以这一层挡不住 DNS rebinding ——
+// 校验通过后域名被改指到 169.254.169.254，拨号时就会打过去。拨号路径上还会用
+// CheckResolvedIP 对最终解析 IP 再判一次（dialer 层的 Control / CONNECT 前检查），
+// 两层叠起来才闭环。
 func CheckUpstreamEgress(u *url.URL, strict bool) error {
 	host := u.Hostname()
 	if host == "" {
 		return errors.New("base_url 缺少主机名")
 	}
-	check := func(ip net.IP) error {
-		if v4 := ip.To4(); v4 != nil {
-			ip = v4 // IPv4-mapped IPv6（::ffff:169.254.169.254）要先还原，否则下面的判断会漏
-		}
-		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
-			return fmt.Errorf("base_url 不能指向 %s：link-local（含云元数据 169.254.169.254）"+
-				"与未指定地址不允许作为上游", describeIP(ip))
-		}
-		if strict && (ip.IsLoopback() || ip.IsPrivate()) {
-			return fmt.Errorf("base_url 不能指向 %s：已开启 server.block_local_upstream，"+
-				"回环与私网地址都不允许作为上游", describeIP(ip))
-		}
-		return nil
-	}
 
 	if ip := net.ParseIP(host); ip != nil {
-		return check(ip)
+		return CheckResolvedIP(ip, strict)
 	}
 	// 域名：解析后逐个 IP 判。解析失败不在这里报错 —— 拨号时会再失败一次，
 	// 那里的错误信息更准确（而且在这里报错会把「DNS 暂时不可用」误判成「配置非法」）。
@@ -930,9 +916,33 @@ func CheckUpstreamEgress(u *url.URL, strict bool) error {
 		return nil
 	}
 	for _, ip := range addrs {
-		if err := check(ip); err != nil {
+		if err := CheckResolvedIP(ip, strict); err != nil {
 			return fmt.Errorf("%s（主机名 %s 解析所得）", err.Error(), host)
 		}
+	}
+	return nil
+}
+
+// CheckResolvedIP 对**已经解析出来的 IP** 做出网判定，供配置校验与拨号路径共用。
+// 拨号路径必须再判一次：配置校验时的 DNS 结果可能与真正拨号时不同（rebinding）。
+//
+// 两档界线与 CheckUpstreamEgress 一致：
+//   - 一律拒绝 link-local（含云元数据）与未指定地址；
+//   - strict 时再拒绝回环与私网。
+func CheckResolvedIP(ip net.IP, strict bool) error {
+	if ip == nil {
+		return errors.New("缺少 IP 地址")
+	}
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4 // IPv4-mapped IPv6（::ffff:169.254.169.254）要先还原，否则下面的判断会漏
+	}
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		return fmt.Errorf("上游地址 %s 不合法：link-local（含云元数据 169.254.169.254）"+
+			"与未指定地址不允许作为上游", describeIP(ip))
+	}
+	if strict && (ip.IsLoopback() || ip.IsPrivate()) {
+		return fmt.Errorf("上游地址 %s 不合法：已开启 server.block_local_upstream，"+
+			"回环与私网地址都不允许作为上游", describeIP(ip))
 	}
 	return nil
 }

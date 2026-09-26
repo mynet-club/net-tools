@@ -270,7 +270,7 @@ func (s *Server) adminTestProvider(w http.ResponseWriter, r *http.Request, name 
 			writeJSON(w, http.StatusOK, testOutcome{Error: "上游代理配置有问题：" + err.Error()})
 			return
 		}
-		ids, err := s.fetchModelIDs(r.Context(), prov.BaseURL, prov.APIKey, proxyURL)
+		ids, err := s.fetchModelIDs(r.Context(), prov.BaseURL, prov.APIKey, proxyURL, true)
 		if err != nil {
 			writeJSON(w, http.StatusOK, testOutcome{
 				Error: "这家上游是直通型、又没声明模型名，想自动挑一个来测，但它没给出模型列表：" +

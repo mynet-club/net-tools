@@ -15,15 +15,18 @@ import (
 //
 // 实现细节：目标主机名一律以 ATYP=3（域名）交给代理解析，行为等价 socks5h。
 // 这样上游域名不会泄漏到本地 DNS，也避免域名解析结果与代理出口地理位置不一致。
+// 出网判定在本地做一次（checkTarget），见 egress.go 对代理路径 TOCTOU 的说明。
 type socks5Dialer struct {
 	proxyURL *url.URL
 	base     *net.Dialer
+	check    IPCheck
 }
 
-func newSOCKS5Dialer(u *url.URL) *socks5Dialer {
+func newSOCKS5Dialer(u *url.URL, check IPCheck) *socks5Dialer {
 	return &socks5Dialer{
 		proxyURL: u,
-		base:     &net.Dialer{Timeout: DefaultTimeout, KeepAlive: 30 * time.Second},
+		base:     baseDialer(check),
+		check:    check,
 	}
 }
 
@@ -42,6 +45,10 @@ func (d *socks5Dialer) DialContext(ctx context.Context, network, addr string) (n
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, fmt.Errorf("目标地址 %q 不合法（需要 host:port）: %w", addr, err)
+	}
+	// 目标出网判定：见 egress.go。base Dialer 的 Control 判的是代理地址。
+	if err := checkTarget(addr, d.check); err != nil {
+		return nil, err
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil || port < 1 || port > 65535 {

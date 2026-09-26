@@ -278,7 +278,8 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 			continue
 		}
 
-		tr, err := s.transports.Get(proxyURL)
+		// 用户自有上游带拨号层出网校验（防 DNS rebinding）；系统池不带
+		tr, err := s.transportFor(cand.Provider.SystemPaid, proxyURL)
 		if err != nil {
 			s.log.Errorf("供应商 %s 构造代理失败: %v", cand.Provider.Name, err)
 			lastErr = err

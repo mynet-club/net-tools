@@ -522,7 +522,14 @@ func healthURL(cfg *config.Config) string {
 // 用健康端点而不是 /proc/<pid>/comm：后者在 macOS 上不存在，健康端点两个平台一样。
 // 判据也不是「证明这个 pid 是 llmproxy」，而是「确实有一个 llmproxy 在服务」——
 // 如果没有，那 PID 文件就是陈旧的，谁都不该发信号。
+//
+// cfg 为 nil 时直接报「不在服务」，不去猜默认地址：配置读不出来时无从知道该探
+// 哪个端口，而 8787 上随便一个回 200 的服务都会被当成 llmproxy，进而给一个
+// 可能无关的 pid 发终止信号。与 notifyRunningService 的「宁可不发」同一立场。
 func serviceResponding(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
 	client := &http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Get(healthURL(cfg))
 	if err != nil {
@@ -534,8 +541,8 @@ func serviceResponding(cfg *config.Config) bool {
 }
 
 // cfgForSignal 读一份配置出来，只为了知道该探哪个地址。
-// 读不出来就返回 nil —— 那时 serviceResponding 会退回默认地址，
-// 探不通就不发信号（宁可不发，也不要打错进程）。
+// 读不出来就返回 nil —— serviceResponding(nil) 恒为 false，于是不发信号
+// （宁可不发，也不要打错进程）。
 func cfgForSignal(paths config.Paths) *config.Config {
 	cfg, err := config.LoadFileLenient(paths.ConfigFile)
 	if err != nil {

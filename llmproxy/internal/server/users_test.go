@@ -386,6 +386,42 @@ func TestSelfServiceProviders(t *testing.T) {
 	}
 }
 
+// 用户可控的 provider 数量必须有上限：每条背后是 base_url + 连接池，
+// 没有上限就能靠堆上游把网关内存吃光。
+func TestUserProviderCountCapped(t *testing.T) {
+	h := newMUHarness(t)
+	alice := h.addUser(t, "alice")
+	up := startMockUpstream(t, &mockUpstream{name: "cap", apiKey: "sk"})
+
+	for i := 0; i < maxUserProviders; i++ {
+		r, raw := h.put(t, fmt.Sprintf("/v1/_me/providers/p%02d", i), alice, map[string]any{
+			"base_url": up.baseURL + "/v1",
+			"api_key":  "sk",
+			"models":   []string{"*"},
+		})
+		if r.StatusCode != 200 {
+			t.Fatalf("第 %d 个上游应当能建: %d %s", i+1, r.StatusCode, raw)
+		}
+	}
+	// 第 maxUserProviders+1 个必须被拒
+	r, raw := h.put(t, "/v1/_me/providers/overflow", alice, map[string]any{
+		"base_url": up.baseURL + "/v1",
+		"api_key":  "sk",
+		"models":   []string{"*"},
+	})
+	if r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("超出上限应当 400，实际 %d %s", r.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), "上限") {
+		t.Errorf("错误应说明是数量上限: %s", raw)
+	}
+	// 更新已有条目不受上限影响
+	r2, raw2 := h.put(t, "/v1/_me/providers/p00", alice, map[string]any{"weight": 2})
+	if r2.StatusCode != 200 {
+		t.Errorf("更新已有上游不该被上限拦住: %d %s", r2.StatusCode, raw2)
+	}
+}
+
 // 停用的用户一律 403，且错误类型可区分。
 func TestDisabledUserRejected(t *testing.T) {
 	h := newMUHarness(t)

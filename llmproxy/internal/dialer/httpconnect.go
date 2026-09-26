@@ -27,36 +27,19 @@ type Dialer interface {
 // DefaultTimeout 是直连与代理握手的默认超时。
 const DefaultTimeout = 30 * time.Second
 
-// New 按代理 URL 构造 Dialer。proxyURL 为空表示直连。
-func New(proxyURL string) (Dialer, error) {
-	if strings.TrimSpace(proxyURL) == "" || strings.EqualFold(proxyURL, "direct") {
-		return &net.Dialer{Timeout: DefaultTimeout, KeepAlive: 30 * time.Second}, nil
-	}
-	u, err := url.Parse(proxyURL)
-	if err != nil {
-		return nil, fmt.Errorf("代理 URL 不合法 %q: %w", proxyURL, err)
-	}
-	switch strings.ToLower(u.Scheme) {
-	case "http", "https":
-		return newHTTPConnectDialer(u), nil
-	case "socks5", "socks5h", "socks":
-		return newSOCKS5Dialer(u), nil
-	default:
-		return nil, fmt.Errorf("不支持的代理协议 %q（支持 http/https/socks5/socks5h）", u.Scheme)
-	}
-}
-
 // ------------------------------------------------------------------ HTTP CONNECT
 
 type httpConnectDialer struct {
 	proxyURL *url.URL
 	base     *net.Dialer
+	check    IPCheck
 }
 
-func newHTTPConnectDialer(u *url.URL) *httpConnectDialer {
+func newHTTPConnectDialer(u *url.URL, check IPCheck) *httpConnectDialer {
 	return &httpConnectDialer{
 		proxyURL: u,
-		base:     &net.Dialer{Timeout: DefaultTimeout, KeepAlive: 30 * time.Second},
+		base:     baseDialer(check),
+		check:    check,
 	}
 }
 
@@ -89,6 +72,11 @@ func (d *httpConnectDialer) DialContext(ctx context.Context, network, addr strin
 	}
 	if _, _, err := net.SplitHostPort(addr); err != nil {
 		return nil, fmt.Errorf("目标地址 %q 不合法（需要 host:port）: %w", addr, err)
+	}
+	// 目标出网判定：代理只负责转发，最终连到哪是这里说了算的「意图」，
+	// 必须在建隧道之前判掉。base Dialer 的 Control 判的是代理地址。
+	if err := checkTarget(addr, d.check); err != nil {
+		return nil, err
 	}
 
 	proxyAddr, err := d.proxyAddr()

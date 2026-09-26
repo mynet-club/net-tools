@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net"
 	"net/url"
 	"strings"
 	"testing"
@@ -120,4 +121,48 @@ func TestCheckUpstreamEgressResolvesHostname(t *testing.T) {
 	if err := CheckUpstreamEgress(u, false); err != nil {
 		t.Errorf("localhost 默认不该被拒: %v", err)
 	}
+}
+
+// CheckResolvedIP 是拨号路径共用的那一条判定：DNS rebinding 的第二层防护。
+// 两档界线必须与 CheckUpstreamEgress 完全一致，否则配置放行、拨号却拒（或反过来）
+// 会变成说不清的间歇故障。
+func TestCheckResolvedIPMatchesEgressTiers(t *testing.T) {
+	always := []string{"169.254.169.254", "169.254.1.1", "fe80::1", "0.0.0.0", "::"}
+	for _, raw := range always {
+		ip := mustIP(t, raw)
+		for _, strict := range []bool{false, true} {
+			if err := CheckResolvedIP(ip, strict); err == nil {
+				t.Errorf("%s 在 strict=%v 下应当被拒", raw, strict)
+			}
+		}
+	}
+	strictOnly := []string{"127.0.0.1", "::1", "10.0.0.5", "192.168.1.1", "fd00::1"}
+	for _, raw := range strictOnly {
+		ip := mustIP(t, raw)
+		if err := CheckResolvedIP(ip, false); err != nil {
+			t.Errorf("%s 默认不该被拒: %v", raw, err)
+		}
+		if err := CheckResolvedIP(ip, true); err == nil {
+			t.Errorf("%s 在 strict 下应当被拒", raw)
+		}
+	}
+	// IPv4-mapped IPv6 要先还原，否则 169.254 会漏判
+	if err := CheckResolvedIP(mustIP(t, "::ffff:169.254.169.254"), false); err == nil {
+		t.Error("IPv4-mapped 的 link-local 也应当被拒")
+	}
+	if err := CheckResolvedIP(mustIP(t, "8.8.8.8"), true); err != nil {
+		t.Errorf("公网 IP 不该被拒: %v", err)
+	}
+	if err := CheckResolvedIP(nil, false); err == nil {
+		t.Error("nil IP 应当被拒")
+	}
+}
+
+func mustIP(t *testing.T, raw string) net.IP {
+	t.Helper()
+	ip := net.ParseIP(raw)
+	if ip == nil {
+		t.Fatalf("解析 IP %q 失败", raw)
+	}
+	return ip
 }

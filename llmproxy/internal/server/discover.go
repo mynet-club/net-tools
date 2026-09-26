@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/config"
@@ -24,6 +25,70 @@ import (
 //     这不扩大权限：用户本来就能把同一个地址配成上游、让网关拿他的密钥去请求。
 const discoverTimeout = 15 * time.Second
 
+// /discover 是「带鉴权的出网探测」：用户侧接口拿它扫内网、打爆上游都只花网关
+// 的连接，所以频率和并发都要钉住。全局并发用信号量，单用户用简单计数窗口。
+const (
+	discoverMaxConcurrent = 4
+	discoverPerUserPerMin = 10
+)
+
+// discoverGate 管着 /discover 的全局并发与单用户频率。
+type discoverGate struct {
+	mu      sync.Mutex
+	sem     chan struct{}
+	windows map[string]*discoverWindow
+	nowFn   func() time.Time
+}
+
+type discoverWindow struct {
+	minute string
+	count  int
+}
+
+func newDiscoverGate() *discoverGate {
+	return &discoverGate{
+		sem:     make(chan struct{}, discoverMaxConcurrent),
+		windows: make(map[string]*discoverWindow),
+		nowFn:   time.Now,
+	}
+}
+
+// Acquire 占一个全局并发位，并检查该用户这一分钟的次数。
+//
+// 成功时返回的 release **必须**调用。失败时并发位已经还回（或本来就没占到），
+// 调用方不要再去 release —— 两种失败路径都不泄漏信号量。
+func (g *discoverGate) Acquire(user string) (release func(), err error) {
+	select {
+	case g.sem <- struct{}{}:
+	default:
+		return func() {}, fmt.Errorf("探测请求过于繁忙（全局最多 %d 个并发），请稍后再试", discoverMaxConcurrent)
+	}
+	release = func() { <-g.sem }
+
+	now := g.nowFn()
+	minute := now.UTC().Format("2006-01-02T15:04")
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	w := g.windows[user]
+	if w == nil || w.minute != minute {
+		w = &discoverWindow{minute: minute}
+		g.windows[user] = w
+	}
+	if w.count >= discoverPerUserPerMin {
+		// 顺手清掉过期窗口，免得 map 跟着用户数无限长
+		for k, v := range g.windows {
+			if v.minute != minute {
+				delete(g.windows, k)
+			}
+		}
+		// 频率超限：并发位要还回去，否则一次超频就永久漏掉一个槽
+		<-g.sem
+		return func() {}, fmt.Errorf("探测过于频繁（每分钟最多 %d 次），请稍后再试", discoverPerUserPerMin)
+	}
+	w.count++
+	return release, nil
+}
+
 // upstreamFetchError 把探测失败翻译成「对下游返回什么状态 + 什么话术」。
 type upstreamFetchError struct {
 	status int
@@ -38,7 +103,7 @@ func (e *upstreamFetchError) Error() string { return e.msg }
 // 失败时返回 *upstreamFetchError，调用方直接照它的 status/kind/msg 回给客户端；
 // 这里已经把「连不上 / 密钥被拒 / 没有这个接口 / 解析不出模型」四种情况分开了 ——
 // 它们的处理方式完全不同（前两种要排障，后两种是常态，该引导手动填写）。
-func (s *Server) fetchModelIDs(ctx context.Context, baseURL, apiKey, proxyURL string) ([]string, error) {
+func (s *Server) fetchModelIDs(ctx context.Context, baseURL, apiKey, proxyURL string, systemPaid bool) ([]string, error) {
 	if _, err := config.ParseBaseURL(baseURL); err != nil {
 		return nil, &upstreamFetchError{http.StatusBadRequest, "invalid_request_error",
 			"base_url " + err.Error()}
@@ -48,8 +113,9 @@ func (s *Server) fetchModelIDs(ctx context.Context, baseURL, apiKey, proxyURL st
 			"缺少上游 api_key：先保存一次，或在请求里带上"}
 	}
 
-	// 上游该走代理就走代理：与转发时用同一套连接层
-	tr, err := s.transports.Get(proxyURL)
+	// 上游该走代理就走代理：与转发时用同一套连接层。
+	// 用户侧探测走带出网校验的池子（systemPaid=false），管理侧不带。
+	tr, err := s.transportFor(systemPaid, proxyURL)
 	if err != nil {
 		return nil, &upstreamFetchError{http.StatusInternalServerError, "internal",
 			"构造上游连接失败: " + err.Error()}
@@ -112,6 +178,14 @@ func (s *Server) discoverUpstreamModels(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
+	// 频率与并发闸门：这是用户可控的出网探测，不限就是免费的内网扫描器
+	release, err := s.discoverGate.Acquire(e.Name)
+	if err != nil {
+		writeJSONError(w, http.StatusTooManyRequests, "rate_limited", err.Error())
+		return
+	}
+	defer release()
+
 	var req struct {
 		BaseURL string `json:"base_url"`
 		APIKey  string `json:"api_key"`
@@ -163,7 +237,7 @@ func (s *Server) discoverUpstreamModels(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 
-	models, err := s.fetchModelIDs(r.Context(), baseURL, apiKey, proxyURL)
+	models, err := s.fetchModelIDs(r.Context(), baseURL, apiKey, proxyURL, false)
 	s.writeDiscoverResult(w, models, err, baseURL)
 }
 
@@ -176,6 +250,14 @@ func (s *Server) discoverSystemModels(w http.ResponseWriter, r *http.Request, na
 		writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error", "只支持 GET / POST")
 		return
 	}
+	// 管理侧也走闸门：admin_token 一旦泄漏，这里就是不限次的出网探测
+	release, err := s.discoverGate.Acquire("admin")
+	if err != nil {
+		writeJSONError(w, http.StatusTooManyRequests, "rate_limited", err.Error())
+		return
+	}
+	defer release()
+
 	// 允许在请求里内联 base_url / api_key：**新加的供应商还没保存**时也要能先看模型列表，
 	// 否则界面只能逼着用户「先保存再探测」，而那正是最别扭的顺序。
 	var req struct {
@@ -216,7 +298,7 @@ func (s *Server) discoverSystemModels(w http.ResponseWriter, r *http.Request, na
 	if p := strings.TrimSpace(req.Proxy); p != "" {
 		proxyURL = p
 	}
-	models, err := s.fetchModelIDs(r.Context(), baseURL, apiKey, proxyURL)
+	models, err := s.fetchModelIDs(r.Context(), baseURL, apiKey, proxyURL, true)
 	s.writeDiscoverResult(w, models, err, baseURL)
 }
 

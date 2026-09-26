@@ -848,6 +848,10 @@ func (s *Server) handleMeProviders(w http.ResponseWriter, r *http.Request, e *us
 	}
 }
 
+// maxUserProviders 是单用户可保存的自有上游数量上限。每条背后是 base_url +
+// 可选代理 + 一套连接池，没有上限就能靠堆上游把内存吃光。
+const maxUserProviders = 32
+
 // providerReq 是自助接口的上游配置入参。字段用指针以区分「没传」和「传了零值」，
 // 这样更新时可以只改一个字段而不必重传密钥。
 type providerReq struct {
@@ -874,6 +878,21 @@ func (s *Server) upsertMyProvider(w http.ResponseWriter, r *http.Request, userNa
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
+	}
+
+	// 用户可控的 provider 数量要钉上限：每条背后是 base_url + 代理 + 连接池，
+	// 没有上限就能靠建一堆上游把网关内存和出网连接吃光。
+	if existing == nil {
+		list, lerr := s.db.ListUserProviders(userName)
+		if lerr != nil {
+			writeJSONError(w, http.StatusInternalServerError, "internal", lerr.Error())
+			return
+		}
+		if len(list) >= maxUserProviders {
+			writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
+				fmt.Sprintf("上游数量已达上限 %d 个，先删掉不用的再添加", maxUserProviders))
+			return
+		}
 	}
 
 	baseURL := ""
