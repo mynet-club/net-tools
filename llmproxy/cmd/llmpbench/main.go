@@ -142,6 +142,7 @@ func main() {
 		keep        = flag.Bool("keep", false, "保留临时运行时目录")
 		asJSON      = flag.Bool("json", false, "以 JSON 输出结果")
 		yes         = flag.Bool("yes", false, "live 模式确认：真的会打到上游并可能触发熔断")
+		scenario    = flag.String("scenario", "", "场景模式：sticky | retry | multiuser | all（覆盖默认梯度加压）")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `llmpbench — llmproxy 并发压测
@@ -159,11 +160,49 @@ func main() {
   # 压真实网关（会花钱、可能触发 60 秒熔断，务必想清楚再跑）
   go run ./cmd/llmpbench -mode live -key $LLMPROXY_KEY -concurrency 4,8 -n 16 -yes
 
+  # 场景：粘性 / 重试 / 多用户限流（行为正确性，stub 模式）
+  go run ./cmd/llmpbench -scenario all
+
 选项:
 `)
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	// 场景模式：行为正确性，不是容量梯度
+	if strings.TrimSpace(*scenario) != "" {
+		o := options{
+			mode:        "stub",
+			model:       *model,
+			promptBytes: *promptBytes,
+			proxyBin:    *proxyBin,
+			keep:        *keep,
+			asJSON:      *asJSON,
+			timeout:     time.Duration(*timeoutS) * time.Second,
+		}
+		names := []string{strings.TrimSpace(*scenario)}
+		if names[0] == "all" {
+			names = []string{"sticky", "retry", "multiuser"}
+		}
+		list, err := runScenarios(names, o)
+		if *asJSON {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(list)
+		} else {
+			printScenarioResults(list)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+			os.Exit(1)
+		}
+		for _, r := range list {
+			if !r.Passed {
+				os.Exit(1)
+			}
+		}
+		return
+	}
 
 	levels, err := parseLevels(*concList)
 	if err != nil {
@@ -363,6 +402,8 @@ type stubUpstream struct {
 	srv   *http.Server
 	url   string
 	delay time.Duration
+	// failAll 让这个假上游对所有对话请求回 500（重试场景用）
+	failAll bool
 
 	inflight int64
 	peak     int64
@@ -424,6 +465,12 @@ func (s *stubUpstream) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	if s.delay > 0 {
 		time.Sleep(s.delay)
+	}
+	if s.failAll {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"stub failAll","type":"server_error"}}`))
+		return
 	}
 
 	// token 数按字节粗估，只用于让网关记账路径有真实数据可写
