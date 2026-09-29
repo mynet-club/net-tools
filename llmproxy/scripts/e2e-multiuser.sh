@@ -564,5 +564,79 @@ chk "冻结行带上了币种" \
   "CNY"
 
 echo
+echo "=== 22. 优雅退出与数据库重开演练 ==="
+# 记下重开前的账，用来看有没有丢
+USERS_BEFORE=$(sqlite3 "$DB" "SELECT COUNT(*) FROM users;")
+REQS_BEFORE=$(sqlite3 "$DB" "SELECT COUNT(*) FROM requests;")
+PROVIDERS_BEFORE=$(curl -s "$GW/healthz" | sed 's/.*"providers":\([0-9]*\).*/\1/')
+
+# 22a. 优雅退出（SIGTERM）：进程退干净、库能重开、账不丢
+"$BIN" stop >/dev/null 2>&1
+sleep 0.4
+if curl -sf "$GW/healthz" >/dev/null 2>&1; then
+  fail "stop 之后 healthz 还在应答"
+else
+  pass "stop 之后 healthz 已下线"
+fi
+# WAL 检查点：优雅退出应当把 -wal 落进主库（残留 -wal 允许存在，但 -shm 不该再有读者）
+if [ -f "$DB-wal" ]; then
+  WALSZ=$(wc -c < "$DB-wal" | tr -d ' ')
+  if [ "$WALSZ" -lt 100000 ]; then
+    pass "优雅退出后 WAL 很小（已 checkpoint，$WALSZ 字节）"
+  else
+    fail "优雅退出后 WAL 仍有 $WALSZ 字节，checkpoint 可能没做"
+  fi
+else
+  pass "优雅退出后 WAL 文件已消失（完全 checkpoint）"
+fi
+
+# 22b. 重开：数据原样
+"$BIN" start > "$H/svc2.log" 2>&1 &
+for _ in $(seq 1 40); do
+  curl -sf "$GW/healthz" >/dev/null 2>&1 && break
+  sleep 0.25
+done
+if curl -sf "$GW/healthz" >/dev/null 2>&1; then
+  pass "重启后 healthz 恢复"
+else
+  fail "重启后 healthz 起不来；日志："
+  sed -n '1,8p' "$H/svc2.log" 2>/dev/null | sed 's/^/       /'
+fi
+chk "重启后用户数不变" "$(sqlite3 "$DB" "SELECT COUNT(*) FROM users;")" "$USERS_BEFORE"
+chk "重启后请求明细数不变" "$(sqlite3 "$DB" "SELECT COUNT(*) FROM requests;")" "$REQS_BEFORE"
+chk "重启后供应商数不变" "$(curl -s "$GW/healthz" | sed 's/.*"providers":\([0-9]*\).*/\1/')" "$PROVIDERS_BEFORE"
+# 账还在、能读：冻结金额那一行不能因为重启变成估算
+chk "冻结行重启后仍在" \
+  "$(sqlite3 "$DB" "SELECT COUNT(*) FROM requests WHERE upstream_model='$PROBE' AND price_upstream_id>0 AND cost_upstream>0;")" \
+  "1"
+
+# 22c. 硬杀（SIGKILL）再重开：最坏情况也不该丢库（WAL 回放）
+PID=$(cat "$H/llmproxy.pid" 2>/dev/null || true)
+if [ -z "$PID" ]; then
+  PID=$(pgrep -f "$BIN" | head -1)
+fi
+if [ -n "$PID" ]; then
+  kill -9 "$PID" 2>/dev/null
+  sleep 0.4
+  # 崩溃不会清 PID 文件：先让 stop 把陈旧 pid 抹掉，否则 start 会拒「已在运行」
+  LLMPROXY_HOME=$H "$BIN" stop >/dev/null 2>&1 || true
+  rm -f "$H/llmproxy.pid"
+  "$BIN" start > "$H/svc3.log" 2>&1 &
+  for _ in $(seq 1 40); do
+    curl -sf "$GW/healthz" >/dev/null 2>&1 && break
+    sleep 0.25
+  done
+  if curl -sf "$GW/healthz" >/dev/null 2>&1; then
+    pass "SIGKILL 后重开仍能起（WAL 回放）"
+  else
+    fail "SIGKILL 后重开失败；日志："
+    sed -n '1,8p' "$H/svc3.log" 2>/dev/null | sed 's/^/       /'
+  fi
+  chk "SIGKILL 后请求明细仍在" "$(sqlite3 "$DB" "SELECT COUNT(*) FROM requests;")" "$REQS_BEFORE"
+else
+  fail "找不到进程 pid，无法做 SIGKILL 演练"
+fi
+
+echo
 echo "================ 结果：通过 $PASS 项，失败 $FAIL 项 ================"
 [ "$FAIL" -eq 0 ] || exit 1
