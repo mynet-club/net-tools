@@ -116,11 +116,12 @@ type Stats struct {
 }
 
 type Store struct {
-	db *sql.DB
+	db      *sql.DB
+	dialect Dialect
 }
 
 // schema 只放 DDL。连接级参数（busy_timeout / journal_mode / synchronous / _txlock）
-// 一律在 dsn() 里给 —— 它们必须对**每一条**连接生效，而 db.Exec(schema) 只作用于
+// 一律在 sqliteDSN() 里给 —— 它们必须对**每一条**连接生效，而 db.Exec(schema) 只作用于
 // 当时那一条。详见 dsn 的注释。
 const schema = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -197,7 +198,7 @@ CREATE TABLE IF NOT EXISTS usage_daily (
 );
 `
 
-// dsn 把库路径与连接级参数拼成 modernc.org/sqlite 的 file: URI。
+// sqliteDSN 把库路径与连接级参数拼成 modernc.org/sqlite 的 file: URI。
 //
 // 这些参数必须走 DSN，不能只靠 schema 开头那几行 PRAGMA：journal_mode=WAL 写进库文件头、
 // 是持久的，但 busy_timeout 与 synchronous 是**每连接**属性 —— 靠一次性 db.Exec(schema)
@@ -214,7 +215,7 @@ CREATE TABLE IF NOT EXISTS usage_daily (
 // 用 file: URI 而不是「裸路径 + ?query」：裸路径形式下驱动按第一个 '?' 切分 DSN，
 // 路径里真带 '?' 就会切错；URI 形式交给 SQLite 解析，路径部分由 url.URL 百分号转义
 // （空格、'?'、'#' 三种路径都有测试覆盖）。
-func dsn(path string) string {
+func sqliteDSN(path string) string {
 	u := url.URL{
 		Scheme: "file",
 		Path:   path,
@@ -227,23 +228,32 @@ func dsn(path string) string {
 }
 
 // Open 打开（必要时创建）SQLite 数据库。文件权限强制 0600。
+// 等价于 OpenDialect("sqlite", path) —— 保留这个入口，CLI 与测试少写一个参数。
 func Open(path string) (*Store, error) {
-	if path == "" {
-		return nil, errors.New("数据库路径为空")
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, fmt.Errorf("创建数据库目录失败: %w", err)
-	}
-	db, err := sql.Open("sqlite", dsn(path))
-	if err != nil {
-		return nil, fmt.Errorf("打开 SQLite 失败: %w", err)
-	}
-	// modernc.org/sqlite 是单连接语义，开多了反而容易 SQLITE_BUSY
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	db.SetConnMaxLifetime(0)
+	return OpenDialect("sqlite", path)
+}
 
-	if _, err := db.Exec(schema); err != nil {
+// OpenDialect 按 driver 名打开数据库并跑完全部迁移。
+// pathOrDSN：sqlite 是文件路径；mysql/postgres 是 DSN（支持 ${ENV} 由 config 层展开）。
+func OpenDialect(driver, pathOrDSN string) (*Store, error) {
+	d, err := dialectByName(driver)
+	if err != nil {
+		return nil, err
+	}
+	if d.Name() == "sqlite" {
+		if strings.TrimSpace(pathOrDSN) == "" {
+			return nil, errors.New("数据库路径为空")
+		}
+		if err := os.MkdirAll(filepath.Dir(pathOrDSN), 0o700); err != nil {
+			return nil, fmt.Errorf("创建数据库目录失败: %w", err)
+		}
+	}
+	db, err := d.Open(pathOrDSN)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := db.Exec(d.Rebind(schema)); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("初始化数据库结构失败: %w", err)
 	}
@@ -271,13 +281,15 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("迁移计价冻结列失败: %w", err)
 	}
-	// WAL 模式下会生成 -wal/-shm 文件，一并收紧权限
-	for _, p := range []string{path, path + "-wal", path + "-shm"} {
-		if _, err := os.Stat(p); err == nil {
-			_ = os.Chmod(p, 0o600)
+	// SQLite：WAL 模式下会生成 -wal/-shm 文件，一并收紧权限
+	if d.Name() == "sqlite" {
+		for _, p := range []string{pathOrDSN, pathOrDSN + "-wal", pathOrDSN + "-shm"} {
+			if _, err := os.Stat(p); err == nil {
+				_ = os.Chmod(p, 0o600)
+			}
 		}
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, dialect: d}, nil
 }
 
 // migrateProviderStatsScope 把单用户时代的 provider_stats（主键只有 name）
