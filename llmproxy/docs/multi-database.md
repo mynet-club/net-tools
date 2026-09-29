@@ -84,11 +84,24 @@ schema 常量只维护 **SQLite 一份**，`RewriteDDL` 负责翻译；
 
 ## 测试矩阵
 
-| 层 | 覆盖 |
-|---|---|
-| 单测 | `dialect_test.go`：Rebind / Upsert / RewriteDDL / splitStatements |
-| 集成 | 现有 suite 全部跑在 SQLite（默认） |
-| 真库 | 需要 MySQL/PG 实例；`store.OpenDialect("mysql", dsn)` 打真库跑同一套 store 测试 |
+| 层 | 覆盖 | 怎么跑 |
+|---|---|---|
+| 单测 | `dialect_test.go`：Rebind / Upsert / RewriteDDL / splitStatements | `go test ./internal/store` |
+| 集成（SQLite） | `integration_test.go` 业务语义套件，**始终跑** | 同上 |
+| 集成（MySQL / PG） | 同一套断言打真库 | 见下 |
 
-在 CI 里加 mysql/pg service 容器后，把 `go test ./internal/store/` 扩成三驱动即可。
-当前提交先保证方言语法正确；真库集成是下一步。
+真库由环境变量驱动，没配就 `t.Skip`（绝不静默假绿）：
+
+```bash
+export LLMPROXY_TEST_MYSQL_DSN='user:pass@tcp(127.0.0.1:3306)/llmproxy_test?parseTime=true'
+export LLMPROXY_TEST_PG_DSN='postgres://user:pass@127.0.0.1:5432/llmproxy_test?sslmode=disable'
+go test ./internal/store -run Integration -v
+```
+
+一键脚本：
+
+```bash
+./scripts/test-matrix.sh              # 只 SQLite
+./scripts/test-matrix.sh --docker     # 起一次性 mysql:8.0 / postgres:16 容器再跑
+./scripts/test-matrix.sh --all        # docker + 已有 *_DSN
+```
