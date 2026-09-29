@@ -4,6 +4,33 @@
 
 ---
 
+## v2.1.0 — 2026-09-30
+
+可观测与可持续发布。**数据库 schema 无变更**，从 2.0.0 直接换二进制即可。
+
+### 运行指标
+
+- `/healthz` 增加 `metrics` 段（JSON，字段一旦进入即视为接口）：
+  `inflight` / `requests` / `ok` / `client_err` / `upstream_err` / `client_gone` /
+  `rate_limited` / `retries` / `circuit_cools` / `db_write_ms` / `db_write_fail`，
+  以及 `latency_ms.p50/p95/p99/max`（环形采样现算）、
+  `affinity_entries` / `transport_cache` / `usage_cache` / `discover_inflight`。
+- 热路径只做 atomic 累加，不引入 Prometheus 客户端。
+
+### 发布与回归
+
+- `scripts/release-check.sh`：vet + test + `-race` + 四平台构建 + SHA256 自检，一条命令；
+  `--quick` 只跑 vet+test。
+- e2e 第 22 节：优雅退出（WAL checkpoint）与 SIGKILL 后重开（WAL 回放）不丢账。
+- `llmpbench -scenario all`：sticky / retry / multiuser 三组行为场景，NG 即非 0 退出。
+
+### 性能（续 2.0）
+
+- 限流热路径：map 读写锁 + **每用户一把锁**，装载当月基数只挡该用户。
+- 用量报表 5 秒 TTL 缓存；改价 / 删用户 / SIGHUP 主动失效。
+
+---
+
 ## v2.0.0 — 2026-09-26
 
 从 1.9.x 开发线（`v1.9.20-dev` 及之后的本地构建）收束成的第一个正式大版本。
