@@ -253,31 +253,31 @@ func OpenDialect(driver, pathOrDSN string) (*Store, error) {
 		return nil, err
 	}
 
-	if _, err := db.Exec(d.Rebind(schema)); err != nil {
+	if err := execSchema(db, d, schema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("初始化数据库结构失败: %w", err)
 	}
 	// 单用户时代的 provider_stats 主键只有 name，这里补上 scope 维度
-	if err := migrateProviderStatsScope(db); err != nil {
+	if err := migrateProviderStatsScope(db, d); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("迁移 provider_stats 失败: %w", err)
 	}
-	if _, err := db.Exec(userSchema); err != nil {
+	if err := execSchema(db, d, userSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("初始化多用户表结构失败: %w", err)
 	}
 	// 消费模式：users 加列 + usage_user_daily 重建（主键要加 system_paid）
-	if err := migrateConsumption(db); err != nil {
+	if err := migrateConsumption(db, d); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("迁移消费模式表结构失败: %w", err)
 	}
 	// 计价与成本模型：provider_prices（上游价）+ user_prices（分发价），都带历史
-	if _, err := db.Exec(pricingSchema); err != nil {
+	if err := execSchema(db, d, pricingSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("初始化计价表结构失败: %w", err)
 	}
 	// 已有库补上请求行的冻结列（新库在上面的 DDL 里就有了）
-	if err := migratePricingColumns(db); err != nil {
+	if err := migratePricingColumns(db, d); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("迁移计价冻结列失败: %w", err)
 	}
@@ -292,17 +292,46 @@ func OpenDialect(driver, pathOrDSN string) (*Store, error) {
 	return &Store{db: db, dialect: d}, nil
 }
 
+// execSchema 按方言改写 DDL 并逐条执行。
+// 不一次 Exec 整段：MySQL/PG 驱动对多语句 Exec 支持不一，拆开最稳。
+func execSchema(db *sql.DB, d Dialect, ddl string) error {
+	for _, stmt := range splitStatements(d.RewriteDDL(ddl)) {
+		if _, err := db.Exec(d.Rebind(stmt)); err != nil {
+			return fmt.Errorf("执行 DDL 失败（%s）: %w", firstLine(stmt), err)
+		}
+	}
+	return nil
+}
+
+// splitStatements 按分号切 DDL，丢掉空段。字符串字面量里不写分号（本包 DDL 遵守）。
+func splitStatements(ddl string) []string {
+	var out []string
+	for _, part := range strings.Split(ddl, ";") {
+		p := strings.TrimSpace(part)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return strings.TrimSpace(s[:i])
+	}
+	return strings.TrimSpace(s)
+}
+
 // migrateProviderStatsScope 把单用户时代的 provider_stats（主键只有 name）
 // 升级成 (scope, name)：已有行归入 scope=”，也就是「全局配置里的供应商」。
 //
 // SQLite 不能改主键，只能重建。用列是否存在来判断，重复调用无副作用。
-func migrateProviderStatsScope(db *sql.DB) error {
-	var n int
-	if err := db.QueryRow(
-		`SELECT COUNT(*) FROM pragma_table_info('provider_stats') WHERE name='scope'`).Scan(&n); err != nil {
+func migrateProviderStatsScope(db *sql.DB, d Dialect) error {
+	has, err := d.HasColumn(db, "provider_stats", "scope")
+	if err != nil {
 		return err
 	}
-	if n > 0 {
+	if has {
 		return nil
 	}
 

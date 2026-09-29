@@ -13,8 +13,8 @@ import (
 //   - users 表早先版本就有数据，只能加列（SQLite 的 ALTER TABLE ADD COLUMN 是安全的）；
 //   - usage_user_daily 的主键要从 (day,user,provider,model) 加上 system_paid，
 //     主键变了只能重建表再搬数据（与 provider_stats 加 scope 时同一套做法）。
-func migrateConsumption(db *sql.DB) error {
-	if err := addColumnsIfMissing(db, "users", map[string]string{
+func migrateConsumption(db *sql.DB, d Dialect) error {
+	if err := addColumnsIfMissing(db, d, "users", map[string]string{
 		"mode":               "TEXT NOT NULL DEFAULT 'byo'",
 		"quota_month_tokens": "INTEGER NOT NULL DEFAULT 0",
 		"quota_month_cost":   "REAL NOT NULL DEFAULT 0",
@@ -23,21 +23,16 @@ func migrateConsumption(db *sql.DB) error {
 	}); err != nil {
 		return err
 	}
-	return migrateUsageUserDaily(db)
+	return migrateUsageUserDaily(db, d)
 }
 
-func hasColumn(db *sql.DB, table, col string) (bool, error) {
-	var n int
-	// 表名是本包内的常量，不是外部输入
-	q := fmt.Sprintf(`SELECT COUNT(*) FROM pragma_table_info('%s') WHERE name = ?`, table)
-	if err := db.QueryRow(q, col).Scan(&n); err != nil {
-		return false, err
-	}
-	return n > 0, nil
+func hasColumn(db *sql.DB, d Dialect, table, col string) (bool, error) {
+	return d.HasColumn(db, table, col)
 }
 
 // addColumnsIfMissing 按列名排序后逐个补齐，保证多次运行行为一致。
-func addColumnsIfMissing(db *sql.DB, table string, cols map[string]string) error {
+// 列类型以 SQLite 方言书写，ALTER 前经 RewriteDDL 翻译。
+func addColumnsIfMissing(db *sql.DB, d Dialect, table string, cols map[string]string) error {
 	names := make([]string, 0, len(cols))
 	for name := range cols {
 		names = append(names, name)
@@ -45,14 +40,15 @@ func addColumnsIfMissing(db *sql.DB, table string, cols map[string]string) error
 	sort.Strings(names)
 
 	for _, name := range names {
-		ok, err := hasColumn(db, table, name)
+		ok, err := hasColumn(db, d, table, name)
 		if err != nil {
 			return err
 		}
 		if ok {
 			continue
 		}
-		q := fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, name, cols[name])
+		typ := d.RewriteDDL(cols[name])
+		q := d.Rebind(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, name, typ))
 		if _, err := db.Exec(q); err != nil {
 			return fmt.Errorf("给 %s 增加列 %s 失败: %w", table, name, err)
 		}
@@ -60,8 +56,8 @@ func addColumnsIfMissing(db *sql.DB, table string, cols map[string]string) error
 	return nil
 }
 
-func migrateUsageUserDaily(db *sql.DB) error {
-	ok, err := hasColumn(db, "usage_user_daily", "system_paid")
+func migrateUsageUserDaily(db *sql.DB, d Dialect) error {
+	ok, err := hasColumn(db, d, "usage_user_daily", "system_paid")
 	if err != nil {
 		return err
 	}
@@ -80,7 +76,7 @@ func migrateUsageUserDaily(db *sql.DB) error {
 	// upstream_model 老表没有，用下游名顶上（同名直通时两者本来就相同）。
 	for _, q := range []string{
 		`ALTER TABLE usage_user_daily RENAME TO _usage_user_daily_legacy`,
-		usageUserDailyDDL,
+		d.RewriteDDL(usageUserDailyDDL),
 		`INSERT INTO usage_user_daily (
 		   day, user_name, provider, model, upstream_model, system_paid,
 		   requests, ok, failed,
@@ -91,7 +87,7 @@ func migrateUsageUserDaily(db *sql.DB) error {
 		 FROM _usage_user_daily_legacy`,
 		`DROP TABLE _usage_user_daily_legacy`,
 	} {
-		if _, err := tx.Exec(q); err != nil {
+		if _, err := tx.Exec(d.Rebind(q)); err != nil {
 			return fmt.Errorf("迁移 usage_user_daily 失败: %w", err)
 		}
 	}

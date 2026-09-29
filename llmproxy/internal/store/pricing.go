@@ -587,22 +587,22 @@ func (s *Store) ListUserPrices(scope, model string) ([]UserPrice, error) {
 
 // migratePricingColumns 给**已有**的库补上计价冻结相关列。
 // 新库由 schema 里的 DDL 一次建全，这里只管老库升级（生产上的库已经有 requests/usage_daily 数据）。
-func migratePricingColumns(db *sql.DB) error {
+func migratePricingColumns(db *sql.DB, d Dialect) error {
 	// 峰谷时区是后加的：老库的价目表已经有 peak_hours / off_peak_ratio
 	//（user_prices 连这两个都没有），这里一次补齐。
-	if err := addColumnsIfMissing(db, "provider_prices", map[string]string{
+	if err := addColumnsIfMissing(db, d, "provider_prices", map[string]string{
 		"peak_tz": "TEXT NOT NULL DEFAULT ''",
 	}); err != nil {
 		return err
 	}
-	if err := addColumnsIfMissing(db, "user_prices", map[string]string{
+	if err := addColumnsIfMissing(db, d, "user_prices", map[string]string{
 		"peak_hours":     "TEXT NOT NULL DEFAULT ''",
 		"off_peak_ratio": "REAL",
 		"peak_tz":        "TEXT NOT NULL DEFAULT ''",
 	}); err != nil {
 		return err
 	}
-	if err := addColumnsIfMissing(db, "requests", map[string]string{
+	if err := addColumnsIfMissing(db, d, "requests", map[string]string{
 		"cache_write_tokens":  "INTEGER",
 		"price_upstream_id":   "INTEGER NOT NULL DEFAULT 0",
 		"cost_upstream":       "REAL",
@@ -612,13 +612,13 @@ func migratePricingColumns(db *sql.DB) error {
 	}); err != nil {
 		return err
 	}
-	if err := addColumnsIfMissing(db, "usage_daily", map[string]string{
+	if err := addColumnsIfMissing(db, d, "usage_daily", map[string]string{
 		"cost_upstream":   "REAL NOT NULL DEFAULT 0",
 		"frozen_requests": "INTEGER NOT NULL DEFAULT 0",
 	}); err != nil {
 		return err
 	}
-	return addColumnsIfMissing(db, "usage_user_daily", map[string]string{
+	return addColumnsIfMissing(db, d, "usage_user_daily", map[string]string{
 		"charge":         "REAL NOT NULL DEFAULT 0",
 		"frozen_charges": "INTEGER NOT NULL DEFAULT 0",
 	})

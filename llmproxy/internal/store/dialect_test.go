@@ -52,10 +52,74 @@ func TestDialectByName(t *testing.T) {
 			t.Errorf("dialectByName(%q) = %v, %v", name, d, err)
 		}
 	}
+	if _, err := dialectByName("mysql"); err != nil {
+		t.Errorf("mysql 应当可用: %v", err)
+	}
+	if _, err := dialectByName("postgres"); err != nil {
+		t.Errorf("postgres 应当可用: %v", err)
+	}
 	if _, err := dialectByName("oracle"); err == nil {
 		t.Error("未知驱动应当报错")
 	} else if !strings.Contains(err.Error(), "sqlite") {
 		t.Errorf("错误信息该列出支持的驱动: %v", err)
+	}
+}
+
+// MySQL：upsert 换成 ON DUPLICATE KEY；DDL 把 AUTOINCREMENT / REAL / INTEGER 翻过去。
+func TestMySQLDialect(t *testing.T) {
+	d := MySQLDialect{}
+	up := d.Upsert("usage_daily", "day, provider, model, requests", "day, provider, model", "requests, ok")
+	if !strings.Contains(up, "ON DUPLICATE KEY UPDATE") {
+		t.Errorf("MySQL upsert 语法不对: %s", up)
+	}
+	if strings.Contains(up, "ON CONFLICT") {
+		t.Errorf("MySQL 不该出现 ON CONFLICT: %s", up)
+	}
+	if !strings.Contains(up, "requests = VALUES(requests)") {
+		t.Errorf("MySQL 赋值应当用 VALUES(): %s", up)
+	}
+	ddl := d.RewriteDDL("id INTEGER PRIMARY KEY AUTOINCREMENT, cost REAL, n INTEGER")
+	if strings.Contains(ddl, "AUTOINCREMENT") || strings.Contains(ddl, "REAL") {
+		t.Errorf("MySQL DDL 未翻译: %s", ddl)
+	}
+	if !strings.Contains(ddl, "AUTO_INCREMENT") || !strings.Contains(ddl, "DOUBLE") {
+		t.Errorf("MySQL DDL 翻译不全: %s", ddl)
+	}
+	if d.Rebind("SELECT ?") != "SELECT ?" {
+		t.Error("MySQL 占位符仍是 ?")
+	}
+}
+
+// PostgreSQL：$n 占位符 + 与 SQLite 同形的 ON CONFLICT。
+func TestPostgresDialect(t *testing.T) {
+	d := PostgresDialect{}
+	up := d.Upsert("usage_daily", "day, provider, model, requests", "day, provider, model", "requests, ok")
+	if !strings.Contains(up, "ON CONFLICT(day, provider, model)") {
+		t.Errorf("PG upsert 语法不对: %s", up)
+	}
+	if !strings.Contains(up, "VALUES ($1,$2,$3,$4)") {
+		t.Errorf("PG 占位符应当是 $n: %s", up)
+	}
+	if !strings.Contains(up, "requests = excluded.requests") {
+		t.Errorf("PG 赋值应当用 excluded: %s", up)
+	}
+	ddl := d.RewriteDDL("id INTEGER PRIMARY KEY AUTOINCREMENT, cost REAL")
+	if !strings.Contains(ddl, "BIGSERIAL") || !strings.Contains(ddl, "DOUBLE PRECISION") {
+		t.Errorf("PG DDL 翻译不全: %s", ddl)
+	}
+}
+
+// execSchema / splitStatements：多条 DDL 要拆开逐条跑。
+func TestSplitStatements(t *testing.T) {
+	stmts := splitStatements("CREATE TABLE a (x);\n\nCREATE TABLE b (y);\n")
+	if len(stmts) != 2 {
+		t.Fatalf("应当 2 条，实际 %d: %v", len(stmts), stmts)
+	}
+	if !strings.HasPrefix(stmts[0], "CREATE TABLE a") || !strings.HasPrefix(stmts[1], "CREATE TABLE b") {
+		t.Errorf("切分不对: %v", stmts)
+	}
+	if firstLine("CREATE TABLE a (\n  x INT\n);") != "CREATE TABLE a (" {
+		t.Errorf("firstLine = %q", firstLine("CREATE TABLE a (\n  x INT\n);"))
 	}
 }
 

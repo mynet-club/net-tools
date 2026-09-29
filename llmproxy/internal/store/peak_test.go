@@ -177,7 +177,7 @@ INSERT INTO provider_prices (provider, upstream_model, peak_hours, off_peak_rati
 		{"user_prices", "peak_hours"},
 		{"user_prices", "off_peak_ratio"},
 	} {
-		ok, err := hasColumn(s.db, c.table, c.col)
+		ok, err := hasColumn(s.db, SQLiteDialect{}, c.table, c.col)
 		if err != nil || !ok {
 			t.Errorf("%s.%s 应当在迁移后存在（ok=%v err=%v）", c.table, c.col, ok, err)
 		}

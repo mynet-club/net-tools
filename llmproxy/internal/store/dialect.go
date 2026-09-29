@@ -23,6 +23,9 @@ type Dialect interface {
 	// Upsert 生成插入并按冲突键更新的语句。
 	// insertCols 与 updateCols 是逗号分隔的列名；conflictCols 是冲突键。
 	Upsert(table, insertCols, conflictCols, updateCols string) string
+	// RewriteDDL 把以 SQLite 方言书写的 DDL 改写成该方言。
+	// schema 常量只维护一份；差异（AUTOINCREMENT / REAL / INTEGER）在这里翻译。
+	RewriteDDL(sql string) string
 	// HasTable 报告表是否存在（迁移用）。
 	HasTable(db *sql.DB, table string) (bool, error)
 	// HasColumn 报告列是否存在（迁移用）。
@@ -52,6 +55,8 @@ func (SQLiteDialect) Open(pathOrDSN string) (*sql.DB, error) {
 }
 
 func (SQLiteDialect) Rebind(query string) string { return query }
+
+func (SQLiteDialect) RewriteDDL(sql string) string { return sql }
 
 func (d SQLiteDialect) Upsert(table, insertCols, conflictCols, updateCols string) string {
 	ph := placeholders(strings.Count(insertCols, ",") + 1)
@@ -104,12 +109,15 @@ func rebindDollar(query string) string {
 }
 
 // dialectByName 按配置里的 driver 名取方言。
-// 目前只有 sqlite；mysql / postgres 的实现在后续提交里挂上来。
 func dialectByName(name string) (Dialect, error) {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "", "sqlite":
 		return SQLiteDialect{}, nil
+	case "mysql":
+		return MySQLDialect{}, nil
+	case "postgres", "postgresql", "pg":
+		return PostgresDialect{}, nil
 	default:
-		return nil, fmt.Errorf("不支持的 database.driver %q（当前仅 sqlite；mysql / postgres 在路上）", name)
+		return nil, fmt.Errorf("不支持的 database.driver %q（支持 sqlite / mysql / postgres）", name)
 	}
 }
