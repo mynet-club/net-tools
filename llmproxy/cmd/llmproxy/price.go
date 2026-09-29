@@ -117,7 +117,7 @@ func openPriceStore(paths config.Paths) (*store.Store, *config.Config, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	db, err := store.Open(cfg.Database.Path)
+	db, err := openStore(cfg.Database)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -112,8 +112,41 @@ providers:
 	}
 }
 
-// retain_days 的三档语义必须分得清：没配 = 90 天、显式 0 = 永久、负数 = 拒绝。
-//
+// database.driver：sqlite 默认；mysql/postgres 必须带 dsn。
+func TestDatabaseDriverAndDSN(t *testing.T) {
+	base := `
+providers:
+  - name: x
+    base_url: https://x/v1
+    api_key: k
+    models: ["*"]
+`
+	cfg, err := Parse([]byte(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Database.DriverOrDefault(); got != "sqlite" {
+		t.Errorf("默认 driver = %q", got)
+	}
+	if drv, target := cfg.Database.Target(); drv != "sqlite" || target == "" {
+		t.Errorf("sqlite Target = %q %q", drv, target)
+	}
+
+	cfg, err = Parse([]byte(base + "database:\n  driver: mysql\n  dsn: \"${MYSQL_DSN}\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ${ENV} 由加载层展开；这里至少确认字段进来了
+	if cfg.Database.DriverOrDefault() != "mysql" {
+		t.Errorf("driver = %q", cfg.Database.DriverOrDefault())
+	}
+
+	// mysql 却没 dsn：应当在加载阶段就拒绝
+	if _, err := Parse([]byte(base + "database:\n  driver: mysql\n")); err == nil {
+		t.Error("driver=mysql 且 dsn 为空应当被拒")
+	}
+}
+
 // 「显式 0 = 永久」是 README 与 config.example.yaml 都写明的承诺，而 requests 表正是
 // 计价冻结账本的唯一载体 —— 悄悄把 0 当成「没配」而规范化成 90，等于让照着文档配的人
 // 在第 90 天丢掉账本，剩下的聚合表只有金额合计、没有价目行 id，无法复核。

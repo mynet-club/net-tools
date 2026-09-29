@@ -265,7 +265,7 @@ func cmdStart(paths config.Paths) error {
 		fmt.Fprintf(os.Stderr, "警告: %s\n", w)
 	}
 
-	db, err := store.Open(cfg.Database.Path)
+	db, err := openStore(cfg.Database)
 	if err != nil {
 		return err
 	}
@@ -694,7 +694,7 @@ func cmdStatus(paths config.Paths) error {
 
 	// 本月用量与配额 + 价目覆盖
 	if cfg != nil {
-		db, err := openReadOnly(cfg.Database.Path)
+		db, err := openReadOnly(cfg.Database)
 		if err != nil {
 			fmt.Printf("（读不到数据库：%v）\n", err)
 			return nil
@@ -852,7 +852,7 @@ func cmdProviders(paths config.Paths) error {
 		return nil
 	}
 
-	db, err := openReadOnly(cfg.Database.Path)
+	db, err := openReadOnly(cfg.Database)
 	if err != nil {
 		return fmt.Errorf("打开数据库失败: %w", err)
 	}
@@ -984,14 +984,28 @@ func truncate(s string, n int) string {
 
 // ------------------------------------------------------------------ stats / logs
 
-func openReadOnly(path string) (*store.Store, error) {
-	if path == "" {
+// openStore 按配置打开数据库（sqlite 路径或 mysql/postgres DSN）。
+func openStore(dbCfg config.DatabaseConfig) (*store.Store, error) {
+	driver, target := dbCfg.Target()
+	if driver == "sqlite" && target == "" {
 		return nil, fmt.Errorf("数据库路径未配置")
 	}
-	if _, err := os.Stat(path); err != nil {
-		return nil, fmt.Errorf("数据库文件不存在：%s（服务启动后会自动创建）", path)
+	return store.OpenDialect(driver, target)
+}
+
+// openReadOnly 打开已存在的库（CLI 查询用）。sqlite 会先确认文件在，
+// 免得误把「路径写错了」报成「库里没有数据」。
+func openReadOnly(dbCfg config.DatabaseConfig) (*store.Store, error) {
+	driver, target := dbCfg.Target()
+	if driver == "sqlite" {
+		if target == "" {
+			return nil, fmt.Errorf("数据库路径未配置")
+		}
+		if _, err := os.Stat(target); err != nil {
+			return nil, fmt.Errorf("数据库文件不存在：%s（服务启动后会自动创建）", target)
+		}
 	}
-	return store.Open(path)
+	return store.OpenDialect(driver, target)
 }
 
 func cmdStats(paths config.Paths, args []string) error {
@@ -1005,7 +1019,7 @@ func cmdStats(paths config.Paths, args []string) error {
 	if err != nil {
 		return err
 	}
-	db, err := openReadOnly(cfg.Database.Path)
+	db, err := openReadOnly(cfg.Database)
 	if err != nil {
 		return err
 	}

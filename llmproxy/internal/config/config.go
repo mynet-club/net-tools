@@ -208,7 +208,16 @@ func (p *ProviderRaw) IsEnabled() bool {
 }
 
 type DatabaseConfig struct {
+	// Driver 选择存储后端：sqlite（默认）| mysql | postgres。
+	// 换驱动是 v2.2 的「通用数据库操作界面」：业务层只认 store.DB，
+	// 方言差异关在 store.Dialect 里。
+	Driver string `yaml:"driver"`
+	// Path 是 sqlite 的文件路径（driver 留空或 sqlite 时用）。
 	Path string `yaml:"path"`
+	// DSN 是 mysql/postgres 的连接串，支持 ${ENV} 展开。
+	//   mysql:   user:pass@tcp(host:3306)/dbname?parseTime=true
+	//   postgres: postgres://user:pass@host:5432/db?sslmode=disable
+	DSN string `yaml:"dsn"`
 	// RetainDays 是请求明细的保留天数；**显式 0 = 永久保留**（不清理）。
 	//
 	// 指针是为了区分「没配」（用默认 90 天）和「显式写 0」（永久）—— 用普通 int 的话
@@ -218,6 +227,23 @@ type DatabaseConfig struct {
 	// 按 90 天删掉等于给「记录历史计价、每笔都能回溯」加了一个硬期限，
 	// 剩下的聚合表只有金额合计、没有价目行 id，无法复核。
 	RetainDays *int `yaml:"retain_days"`
+}
+
+// DriverOrDefault 给出 database.driver；没配时是 sqlite。
+func (d DatabaseConfig) DriverOrDefault() string {
+	if s := strings.ToLower(strings.TrimSpace(d.Driver)); s != "" {
+		return s
+	}
+	return "sqlite"
+}
+
+// Target 给出 OpenDialect 的两个参数：driver + 路径/DSN。
+func (d DatabaseConfig) Target() (driver, pathOrDSN string) {
+	driver = d.DriverOrDefault()
+	if driver == "sqlite" {
+		return driver, d.Path
+	}
+	return driver, d.DSN
 }
 
 // EffectiveRetainDays 给出实际的保留天数：没配 = 90 天；显式 0 = 永久（Prune 直接 no-op）。
@@ -712,10 +738,16 @@ func (c *Config) normalize(opts LoadOptions) error {
 	}
 
 	// database / log
-	if c.Database.Path == "" {
-		c.Database.Path = filepath.Join(GetRuntimeDir(), "data", ToolName+".db")
-	} else {
-		c.Database.Path = expandTilde(c.Database.Path)
+	// sqlite 默认落运行时目录；mysql/postgres 走 DSN，path 不再参与
+	if c.Database.DriverOrDefault() == "sqlite" {
+		if c.Database.Path == "" {
+			c.Database.Path = filepath.Join(GetRuntimeDir(), "data", ToolName+".db")
+		} else {
+			c.Database.Path = expandTilde(c.Database.Path)
+		}
+	} else if strings.TrimSpace(c.Database.DSN) == "" {
+		// 校验放在加载阶段：DSN 为空时后面 Open 必失败，不如在这里说清楚
+		return fmt.Errorf("database.driver=%s 时必须配置 database.dsn", c.Database.DriverOrDefault())
 	}
 	// 单价表：消费模式用它估算金额。不配不算错，只是没金额可看。
 	if err := c.Pricing.normalize(); err != nil {
