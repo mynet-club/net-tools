@@ -487,7 +487,8 @@ func (r *Router) ReportSuccessFor(scope, name string) {
 func (r *Router) ReportFailure(name string, err error) { r.ReportFailureFor("", name, err) }
 
 // ReportFailureFor 累加连续失败；达到阈值后进入冷却。
-func (r *Router) ReportFailureFor(scope, name string, err error) {
+// 返回值表示「这一次失败刚刚把该供应商压进冷却」—— 观测指标用它数熔断次数。
+func (r *Router) ReportFailureFor(scope, name string, err error) (enteredCooldown bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	st := r.stateLocked(scope, name)
@@ -503,8 +504,11 @@ func (r *Router) ReportFailureFor(scope, name string, err error) {
 	now := r.now()
 	st.LastFailureAt = now
 	if st.ConsecutiveFailures >= r.routing.FailureThreshold && r.routing.CooldownSeconds > 0 {
+		wasCooling := !st.UnhealthyUntil.IsZero() && st.UnhealthyUntil.After(now)
 		st.UnhealthyUntil = now.Add(time.Duration(r.routing.CooldownSeconds) * time.Second)
+		return !wasCooling
 	}
+	return false
 }
 
 // Snapshot 是 SnapshotFor 在全局作用域上的快捷方式。

@@ -58,6 +58,9 @@ type Server struct {
 	// 用量报表的短 TTL 缓存（界面轮询热点，见 statscache.go）
 	usageCache *usageReportCache
 
+	// 运行指标（/healthz 的 metrics 段，见 metrics.go）
+	metrics *runtimeMetrics
+
 	// persistFailures 是「请求已成功返回给客户端、但记账落库失败」的累计次数。
 	//
 	// 这个数必须是**可观测**的：落库失败时请求已经发出去了，账却永久丢失 ——
@@ -98,6 +101,7 @@ func New(cfgStore *config.Store, db *store.Store, r *router.Router, lg *logx.Log
 		affinity:     newAffinityStore(affTTL, defaultAffinityMax),
 		discoverGate: newDiscoverGate(),
 		usageCache:   newUsageReportCache(),
+		metrics:      newRuntimeMetrics(),
 	}
 	s.uiHandler = s.newUIHandler()
 	s.configApplyWait = 4 * time.Second
@@ -396,6 +400,16 @@ func writeJSONError(w http.ResponseWriter, status int, code, msg string) {
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	cfg := s.cfgStore.Current()
+	m := s.metrics.snapshot()
+	// 结构规模放 metrics 旁边：粘性表与 Transport 缓存都是「有上限但要盯」的内存。
+	m["affinity_entries"] = s.affinity.Len()
+	m["transport_cache"] = s.transports.Len()
+	if s.usageCache != nil {
+		m["usage_cache"] = s.usageCache.Len()
+	}
+	if s.discoverGate != nil {
+		m["discover_inflight"] = s.discoverGate.Inflight()
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"status":    "ok",
@@ -406,6 +420,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		// 非 0 表示有请求已经成功返回给客户端、但记账没落库 —— 账在丢，要查磁盘/锁。
 		// 刻意不影响 status：转发本身是好的，把它标成不健康会让监控误判成服务不可用。
 		"persist_failures": s.persistFailures.Load(),
+		"metrics":          m,
 	})
 }
 

@@ -223,15 +223,122 @@ llmproxy 是一个 Go 单二进制 LLM 转发网关。它负责下游 OpenAI 兼
 
 每个提交只解决一类问题，避免安全修复、账务修复和性能重构混在同一个提交中。
 
+---
+
+# 下一个版本
+
+## v2.1.0 — 可观测与可持续发布
+
+主题：把 2.0 的安全/账本改动变成**可测、可看、可重复发布**。不改产品边界、不改 schema、不改计费语义。
+
+### 提交拆分
+
+按顺序四笔，每笔独立可审查、可回滚：
+
+| # | 提交 | 范围 | 验收 |
+|---|---|---|---|
+| 1 | `server: expose runtime metrics on healthz` | `/healthz` 增加：请求计数（按状态类）、延迟分位（p50/p95/p99）、重试/熔断/限流拒绝计数、当前并发、DB 写耗时合计、粘性表与 Transport 缓存规模、`persist_failures` 保持 | 管理台只读一栏；JSON 字段稳定、可被脚本解析 |
+| 2 | `llmpbench: sticky / pricing / retry / multi-user scenarios` | 四组场景开关：粘性命中率、价目切换后冻结不漂移、失败重试路径、多用户并发限流；输出 markdown/JSON 对比表 | 本机 stub 可跑通；报告含前后版本对比位 |
+| 3 | `ci: release-check with race and four-platform build` | `scripts/release-check.sh`：`go test ./...` + `-race` + `go vet` + `build.sh` 四平台 + `SHA256SUMS` 校验；缺工具时明确失败 | 一条命令跑完；退出码可进 CI |
+| 4 | `e2e: graceful shutdown and db reopen drill` | 扩 `e2e-multiuser.sh`：SIGTERM 优雅退出（WAL checkpoint）、杀进程后重开库、旧库打开兼容 | 失败即非 0 退出 |
+
+指标实现约束（避免之后扯皮）：
+
+- 进程内原子计数 + 定长环形缓冲采样延迟，**不引入** Prometheus 客户端库；
+- 热路径只做 `atomic` 累加，百分位在查询时对环形样本现算；
+- 字段一旦进 `/healthz` 视为接口，删改要写 CHANGELOG。
+
+## v2.2.0 — 多数据库支持（建议，未开工）
+
+> 这是对 §3.2「SQLite 唯一事实存储」的**有意放宽**，只做存储可替换，不做分布式、不做连接池中间件。
+
+### 目标
+
+- 同一套 `store` 行为可跑在 **SQLite / MySQL / PostgreSQL**；
+- 对上层（server / CLI / UI）提供**通用数据库操作界面**：单一 `store.Store` 接口，业务包不感知方言；
+- 默认仍是 SQLite（零依赖、单二进制），MySQL/PG 靠配置切换。
+
+### 通用数据库操作界面
+
+把 `store` 从「具体实现」收成接口 + 方言层：
+
+```go
+// store/store.go —— 业务只认这一层
+type Store interface {
+    // 用户 / 上游 / 模型授权
+    CreateUser(name, tokenHash string) error
+    ListUsers() ([]User, error)
+    // …
+    // 账本
+    InsertRequest(rec RequestRecord) error
+    UsageByUser(since time.Time, user string) ([]UsageRow, error)
+    RowCharge… // 已是纯函数，不动
+    // 价目
+    InsertProviderPrice(p *ProviderPrice) error
+    ProviderPriceAt(provider, model string, t time.Time) (*ProviderPrice, error)
+    // 状态
+    SaveProviderStatus(list []ProviderStatus) error
+    LoadProviderStatus() ([]ProviderStatus, error)
+    Close() error
+}
+
+// store/dialect.go —— 只有这里有 SQL 方言差异
+type dialect interface {
+    Name() string
+    Placeholder(n int) string      // $1 / ?
+    UpsertSQL(table string, …) string
+    NowExpr() string
+    Open(dsn string) (*sql.DB, error)
+}
+```
+
+要求：
+
+1. **业务包零 SQL**：凡 `db.Query/Exec` 只许出现在 `store/`；
+2. **占位符与 upsert 走 dialect**，禁止在业务 SQL 里手写 `?` / `$1` / `ON CONFLICT`；
+3. **事务边界不变**：价格冻结、请求账本、用户状态仍在同一事务内；
+4. **连接参数**：`busy_timeout` / WAL 是 SQLite 专有，方言层吞掉；MySQL/PG 映射到 `max_conns` / `lock_timeout`。
+
+### 配置形状
+
+```yaml
+database:
+  driver: sqlite          # sqlite | mysql | postgres
+  path: ""                # sqlite
+  dsn: ""                 # mysql/postgres，支持 ${ENV}
+  max_open_conns: 0       # 0 = 方言默认（sqlite=1）
+  retain_days: 90
+```
+
+### 实施顺序（建议 4 笔）
+
+| # | 提交 | 说明 |
+|---|---|---|
+| 1 | `store: extract Store interface and dialect layer` | 纯重构，行为不变，现有测试全绿 |
+| 2 | `store: add mysql dialect` | 含迁移与并发写测试 |
+| 3 | `store: add postgres dialect` | 同上 |
+| 4 | `docs: multi-db migration and rollback` | 含 schema 对照表 |
+
+### 风险与代价（必须正视）
+
+| 风险 | 处理 |
+|---|---|
+| SQL 方言（`ON CONFLICT`、`AUTOINCREMENT`、时间类型） | 全部收口 dialect，用集成测试钉住三端同一行为 |
+| SQLite 单连接假设（`SetMaxOpenConns(1)`、锁语义） | MySQL/PG 用连接池；`rowCharge`/冻结语义不随隔离级别漂 |
+| schema 迁移 | v2.2 的迁移是「出 SQLite」，需每方言一份 DDL 对照；**旧库不自动搬**，提供导出/导入脚本 |
+| 测试矩阵 | CI 从「1 库 × 1 OS」变「3 库」；dev 用 docker 起 mysql/pg |
+| 体积与依赖 | mysql/pg 驱动是纯 Go，可接受；继续禁止 CGO |
+
+**先决条件**：v2.1 的 race/e2e/release-check 必须先落地 —— 换存储没有回归网就是裸奔。
+
 ## 7. 暂不实施的事项
 
 以下事项暂不列入近期优化：
 
-- 迁移到 PostgreSQL、Redis 或消息队列；
+- ~~迁移到 PostgreSQL、MySQL~~ → 移入 **v2.2.0**（多数据库支持，见上）；
+- Redis 或消息队列（仍不做）；
 - 支付、充值、发票和完整多租户运营；
 - 非 OpenAI 协议的原生适配；
 - 自动汇率换算；
 - 复杂时区和法定节假日价格计算；
 - 为追求抽象而引入大型 Web 或网络框架。
-
-这些变化会扩大产品边界或运行复杂度，必须在出现明确业务需求和容量证据后单独立项。

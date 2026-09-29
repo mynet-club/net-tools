@@ -97,3 +97,13 @@ func (c *usageReportCache) Flush() {
 	defer c.mu.Unlock()
 	c.entries = make(map[usageReportKey]*usageReportEntry)
 }
+
+// Len 返回当前缓存条目数（观测用）。
+func (c *usageReportCache) Len() int {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.entries)
+}

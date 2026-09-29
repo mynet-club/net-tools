@@ -53,6 +53,14 @@ func newDiscoverGate() *discoverGate {
 	}
 }
 
+// Inflight 返回当前占用的全局并发位（观测用）。
+func (g *discoverGate) Inflight() int {
+	if g == nil {
+		return 0
+	}
+	return len(g.sem)
+}
+
 // Acquire 占一个全局并发位，并检查该用户这一分钟的次数。
 //
 // 成功时返回的 release **必须**调用。失败时并发位已经还回（或本来就没占到），

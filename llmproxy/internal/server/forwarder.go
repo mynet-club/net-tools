@@ -100,6 +100,8 @@ func (u *usageInfo) cacheSplit() usageCache {
 func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth authResult) {
 	cfg := s.cfgStore.Current()
 	started := time.Now()
+	doneInflight := s.metrics.beginRequest()
+	defer doneInflight()
 	requestID := r.Header.Get("X-Request-Id")
 	if requestID == "" {
 		requestID = newRequestID()
@@ -390,6 +392,7 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 				// 额度不足 / 被限流：这是**明确**的信号，一次就该让这家让位 ——
 				// 攒够失败次数再冷却太慢，规则 B 会一遍遍把请求送到已经没额度的家。
 				s.router.CoolFor(scope, cand.Provider.Name, ruleBQuotaCooldown)
+				s.metrics.noteCircuitCool()
 				s.log.Warnf("供应商 %s 返回 %d，压 %s 冷却（规则 B 下次改用次便宜的）",
 					cand.Provider.Name, resp.StatusCode, ruleBQuotaCooldown)
 			}
@@ -420,8 +423,10 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 		if outcome == relayOK {
 			s.router.ReportSuccessFor(scope, cand.Provider.Name)
 		} else if outcome == relayUpstreamFailed {
-			s.router.ReportFailureFor(scope, cand.Provider.Name,
-				fmt.Errorf("上游在响应中途失败：%s", rec.ErrorMsg))
+			if entered := s.router.ReportFailureFor(scope, cand.Provider.Name,
+				fmt.Errorf("上游在响应中途失败：%s", rec.ErrorMsg)); entered {
+				s.metrics.noteCircuitCool()
+			}
 		}
 
 		// 记录/更新粘性，同样看 relay 的结果。只有真正跑完的响应才钉住这家；
@@ -593,21 +598,112 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 			rec.ErrorMsg = "客户端在响应结束前断开"
 			outcome = relayClientGone
 		default:
+			msg := copyErr.Error()
+			// HTTP/2 对端 RST_STREAM（INTERNAL_ERROR 等）是上游明确发的流重置，
+			// 不是归因不明 —— 记成上游故障，好让熔断看见。线上那条「约 5 分钟
+			// INTERNAL_ERROR + 空正文」就是这个形状。
+			if strings.Contains(msg, "stream error") && strings.Contains(msg, "received from peer") {
+				rec.ErrorType = "upstream_stream_reset"
+				rec.ErrorMsg = fmt.Sprintf("上游 %s 重置了响应流：%s", rec.Provider, msg)
+				outcome = relayUpstreamFailed
+				break
+			}
 			// 归因不明：可能是读上游出错，也可能是写下游出错（MultiWriter 把两边
 			// 的错误合成了一个）。分不清就不赖供应商 —— 宁可漏记一次失败，
 			// 也不要因为下游的破网络把好上游打进冷却。
 			rec.ErrorType = "relay_error"
-			rec.ErrorMsg = copyErr.Error()
+			rec.ErrorMsg = msg
 			outcome = relayAmbiguous
 		}
+	}
+
+	// 空正文兜底：流式已经 200 发出去、正文几乎没吐就断了时，客户端只能看到
+	// 「模型未返回有效内容」这种空壳提示，既不知道发生了什么，也不知道该干嘛。
+	// 这里补发一条**人读友好 + 机器可识别**的指令：让下游提示用户（或自己）
+	// 压缩会话后重试。见 emptyCompletionHint。
+	if isSSE && shouldEmitEmptyHint(rec, scanner) {
+		writeEmptyCompletionHint(dest, rec)
 	}
 
 	// 计价冻结：按**请求开始时刻**生效的价目行把成本/收费算好写死（见 freeze.go）。
 	// 上游成本（我们付供应商多少）与分发金额（我们向用户收多少）分别冻结、各自带价目行 id。
 	s.freezeUpstreamCost(rec, started)
 	s.freezeDownstreamCharge(rec, started)
+	s.metrics.observe(rec)
 	s.persist(rec)
 	return outcome
+}
+
+// ------------------------------------------------------------------ 空正文指令
+
+// 下游动作指令：流被掐且没有有效正文时，告诉客户端该做什么。
+// message 给人看，code/action 给程序看 —— 支持自动压缩的客户端认到 code
+// 就主动压缩会话再重试；只展示文本的客户端至少能看到该干嘛。
+const (
+	emptyHintCode   = "compact_context_and_retry"
+	emptyHintAction = "compact_context"
+	emptyHintMsg    = "上游中断了响应流，且没有返回有效正文。" +
+		"请压缩会话历史（精简/截断旧消息）后重试；" +
+		"若客户端支持自动压缩，请立即压缩会话并重新发送。"
+)
+
+// shouldEmitEmptyHint：**流已经失败**且正文基本没吐时才补指令。
+// 刻意不覆盖「干净跑完但 completion 为空」—— 那种上游已经发过 [DONE]，
+// 再插一帧只会让客户端看到重复收尾。空补全另案处理。
+func shouldEmitEmptyHint(rec *store.RequestRecord, sc *usageScanner) bool {
+	if rec == nil || sc == nil {
+		return false
+	}
+	// 客户端自己走掉了，写什么它也收不到
+	if rec.ErrorType == "client_gone" {
+		return false
+	}
+	if rec.OK {
+		return false
+	}
+	// 上游已经正常收过尾，说明不是「被掐断」
+	if sc.sawDone {
+		return false
+	}
+	// 有正文就说明模型其实说话了，别用指令覆盖掉
+	if sc.contentBytes() > 0 {
+		return false
+	}
+	return true
+}
+
+// writeEmptyCompletionHint 往已开始的 SSE 流里补一条错误帧：
+// OpenAI 风格 error 对象（message 给人看）+ llmproxy 机器指令（code/action）。
+// 客户端若认识 error.code 就能自动压缩；不认识至少把 message 显示出来。
+func writeEmptyCompletionHint(w io.Writer, rec *store.RequestRecord) {
+	if w == nil {
+		return
+	}
+	payload := map[string]any{
+		"error": map[string]any{
+			"message": emptyHintMsg,
+			"type":    "upstream_empty_completion",
+			"code":    emptyHintCode,
+		},
+		// 机器可读指令：下游 SDK / 桌面端认到就主动压缩会话
+		"llmproxy_action": emptyHintAction,
+		"llmproxy_code":   emptyHintCode,
+		"llmproxy_retry":  true,
+	}
+	if rec != nil {
+		payload["llmproxy_provider"] = rec.Provider
+		payload["llmproxy_request_id"] = rec.RequestID
+	}
+	blob, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(w, "data: %s\n\n", blob)
+	// 规范结束标记，免得客户端一直等 [DONE] 把连接挂住
+	fmt.Fprint(w, "data: [DONE]\n\n")
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // describeModels 汇总这组候选里可用声明的模型名，用于「模型不可用」时的报错提示。
@@ -646,6 +742,10 @@ func (s *Server) fail(w http.ResponseWriter, rec store.RequestRecord, status int
 	rec.OK = false
 	rec.ErrorType = errType
 	rec.ErrorMsg = truncateMsg(msg, 400)
+	s.metrics.observe(&rec)
+	if errType == "rate_limited" || errType == "concurrency_limited" {
+		s.metrics.noteRateLimited()
+	}
 	s.persist(&rec)
 	s.log.Warnf("请求失败 id=%s model=%s status=%d type=%s msg=%s",
 		rec.RequestID, rec.Model, status, errType, rec.ErrorMsg)
@@ -663,7 +763,10 @@ func (s *Server) persist(rec *store.RequestRecord) {
 	if s.db == nil {
 		return
 	}
-	if err := s.db.InsertRequest(*rec); err != nil {
+	t0 := time.Now()
+	err := s.db.InsertRequest(*rec)
+	s.metrics.noteDBWrite(time.Since(t0), err)
+	if err != nil {
 		// 请求已经成功返回给客户端了，这笔账却永久丢了 —— 计数器 + 日志双管齐下，
 		// 因为只写日志的话没人盯着就永远发现不了（详见 Server.persistFailures 的注释）。
 		n := s.persistFailures.Add(1)
@@ -761,13 +864,20 @@ func (fw *flushWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// Flush 让 flushWriter 也满足 http.Flusher，下游补帧后可以再冲一次。
+func (fw *flushWriter) Flush() { fw.f.Flush() }
+
 // usageScanner 从响应中提取 usage 与 TTFT，**不保留任何内容**。
+// contentLen 只累计 delta/message 里 content 字符串的字节数，用来判断
+// 「模型到底有没有说话」—— 不存原文，不碰隐私。
 type usageScanner struct {
-	start   time.Time
-	ttft    time.Duration
-	gotTTFT bool
-	buf     []byte
-	usage   struct {
+	start      time.Time
+	ttft       time.Duration
+	gotTTFT    bool
+	sawDone    bool // 上游发过 [DONE]：流是干净收尾的
+	buf        []byte
+	contentLen int
+	usage      struct {
 		PromptTokens     *int64
 		CompletionTokens *int64
 		TotalTokens      *int64
@@ -796,10 +906,15 @@ func (u *usageScanner) Write(p []byte) (int, error) {
 		line := u.buf[:i]
 		u.buf = u.buf[i+1:]
 		trimmed := bytes.TrimSpace(line)
+		if bytes.Contains(trimmed, []byte("[DONE]")) {
+			u.sawDone = true
+		}
 		if !bytes.HasPrefix(trimmed, []byte("data:")) {
 			continue
 		}
 		data := bytes.TrimSpace(trimmed[5:])
+		// 顺手量一下 content 字节：只累加长度，不存字符串
+		u.noteContent(data)
 		if !bytes.Contains(data, []byte(`"usage"`)) {
 			continue
 		}
@@ -832,6 +947,7 @@ func (u *usageScanner) consumeJSON(b []byte) {
 		u.ttft = time.Since(u.start)
 		u.gotTTFT = true
 	}
+	u.noteContent(b)
 	if !bytes.Contains(b, []byte(`"usage"`)) {
 		return
 	}
@@ -861,6 +977,51 @@ func (u *usageScanner) TTFT() *int64 {
 	}
 	v := u.ttft.Milliseconds()
 	return &v
+}
+
+// noteContent 从一帧 JSON 里量出 content 字段的字节数并累加。
+// 轻量字符串扫描：只认 `"content":"..."` 这种 JSON 字符串值，不解析全文 ——
+// 量个长度而已，不值得为它把每帧都 Unmarshal 一遍。
+func (u *usageScanner) noteContent(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	// 非流式整体也可能很大；上限保护，避免恶意大字段把计数撑爆
+	const maxScan = 256 << 10
+	scan := data
+	if len(scan) > maxScan {
+		scan = scan[:maxScan]
+	}
+	key := []byte(`"content":"`)
+	rest := scan
+	for {
+		i := bytes.Index(rest, key)
+		if i < 0 {
+			return
+		}
+		rest = rest[i+len(key):]
+		// 找字符串结束的引号（跳过简单转义）
+		for j := 0; j < len(rest); j++ {
+			c := rest[j]
+			if c == '\\' {
+				j++
+				continue
+			}
+			if c == '"' {
+				u.contentLen += j
+				rest = rest[j+1:]
+				break
+			}
+		}
+	}
+}
+
+// contentBytes 返回累计的 content 字符串字节数（判断「有没有说话」用）。
+func (u *usageScanner) contentBytes() int {
+	if u == nil {
+		return 0
+	}
+	return u.contentLen
 }
 
 func readSnippet(r io.Reader, n int) string {
