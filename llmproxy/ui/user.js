@@ -496,9 +496,13 @@ async function loadModelOverview() {
       note = h('span', { class: 'tag ok', text: '同档 ' + tiers[0].items.length + ' 家 · 粘性分担' });
     }
 
+    const priceTxt = m.price
+      ? (m.price.in_miss + ' / ' + m.price.out + ' ' + (m.price.currency || '')).trim()
+      : '';
     rows.push(h('tr', null,
       h('td', null, h('code', { class: 'k', text: m.model })),
       h('td', null, h('div', { class: 'seq' }, ...seq)),
+      h('td', { class: 'muted mono' }, priceTxt),
       h('td', null, note, ' ',
         h('button', { type: 'button', class: 'link', text: '编辑', onclick: () => openModelForm(m.model) }),
         ' ',

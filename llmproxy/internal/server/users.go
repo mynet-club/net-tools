@@ -698,12 +698,25 @@ func (s *Server) handleMeRouting(w http.ResponseWriter, r *http.Request, e *user
 	sort.Strings(all)
 
 	models := make([]map[string]any, 0, len(all))
+	now := time.Now()
 	for _, model := range all {
 		providers, _ := s.providersFor(e.Name, model)
 		tiers := s.router.PlanFor(e.Name, providers, model)
+		// 分发价（向用户收多少）：有 DB 价目就报出来，界面做模型目录用
+		var price map[string]any
+		if p, err := s.db.UserPriceAt(e.Name, model, now); err == nil && p != nil {
+			price = map[string]any{
+				"currency":  p.Currency,
+				"in_miss":   p.InMiss,
+				"in_hit":    p.InHit,
+				"in_write":  p.InWrite,
+				"out":       p.Out,
+				"valid_from": p.ValidFrom.Format(time.RFC3339),
+			}
+		}
 		if len(tiers) == 0 {
 			// 声明过但一家都接不了（被停用/收窄挡掉）：如实列出，别让它凭空消失
-			models = append(models, map[string]any{"model": model, "tiers": []any{}})
+			models = append(models, map[string]any{"model": model, "tiers": []any{}, "price": price})
 			continue
 		}
 		out := make([]map[string]any, 0, len(tiers))
@@ -729,7 +742,7 @@ func (s *Server) handleMeRouting(w http.ResponseWriter, r *http.Request, e *user
 				"items": entries,
 			})
 		}
-		models = append(models, map[string]any{"model": model, "tiers": out})
+		models = append(models, map[string]any{"model": model, "tiers": out, "price": price})
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
