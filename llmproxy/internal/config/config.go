@@ -48,6 +48,8 @@ type Config struct {
 	Log       LogConfig      `yaml:"log"`
 	// Pricing 是消费模式的单价表；不配则消费模式只按 token 记量、不算钱。
 	Pricing PricingConfig `yaml:"pricing"`
+	// Alerts 是配额预警（webhook / 日志）。
+	Alerts AlertsConfig `yaml:"alerts"`
 
 	// 下面是校验后的派生结构，供运行期直接使用
 	ProxyIndex map[string]ProxyDef `yaml:"-"`
@@ -258,6 +260,22 @@ type LogConfig struct {
 	Level string `yaml:"level"`
 	MaxMB int    `yaml:"max_mb"`
 	Keep  int    `yaml:"keep"`
+}
+
+// AlertsConfig 是配额告警（v2.3）。为空 = 只写日志，不外呼。
+type AlertsConfig struct {
+	// WebhookURL 收 JSON POST；空则只记日志。
+	WebhookURL string `yaml:"webhook_url"`
+	// WarnRatio 是「用掉多少比例算预警」，默认 0.8。1.0 表示只在超限时告警。
+	WarnRatio float64 `yaml:"warn_ratio"`
+}
+
+// EffectiveWarnRatio 给出预警比例；未配或非法 → 0.8。
+func (a AlertsConfig) EffectiveWarnRatio() float64 {
+	if a.WarnRatio <= 0 || a.WarnRatio > 1 {
+		return 0.8
+	}
+	return a.WarnRatio
 }
 
 // ProxyRef 是校验后的代理引用：direct / named / inline。

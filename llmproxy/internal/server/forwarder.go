@@ -180,7 +180,12 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 	// 那是用户自己的上游，没理由拿网关的额度卡他。自有层全被排除后回落到系统池
 	// 才会真的花网关的钱，那种情况配额是软限制（见 README 三条语义）。
 	if e := s.usersSnapshot().byName[scope]; e != nil && e.Consumption && !poolHasOwn(providers) {
-		if _, _, exceeded, msg := s.meters.CheckQuota(e.Name, e.QuotaMonthTokens, e.QuotaMonthCost); exceeded {
+		usedT, usedC, exceeded, msg := s.meters.CheckQuota(e.Name, e.QuotaMonthTokens, e.QuotaMonthCost)
+		if lvl := s.quotaAlerts.Check(e.Name, usedT, e.QuotaMonthTokens, usedC, e.QuotaMonthCost); lvl != "" {
+			s.log.Warnf("配额预警 level=%s user=%s used_tokens=%d/%d used_cost=%.2f/%.2f",
+				lvl, e.Name, usedT, e.QuotaMonthTokens, usedC, e.QuotaMonthCost)
+		}
+		if exceeded {
 			s.fail(w, rec, http.StatusPaymentRequired, "quota_exceeded", msg, 0, started)
 			return
 		}

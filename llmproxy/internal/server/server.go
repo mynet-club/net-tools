@@ -58,6 +58,9 @@ type Server struct {
 	// 用量报表的短 TTL 缓存（界面轮询热点，见 statscache.go）
 	usageCache *usageReportCache
 
+	// 配额预警（webhook / 日志，见 alerts.go）
+	quotaAlerts *quotaAlert
+
 	// 运行指标（/healthz 的 metrics 段，见 metrics.go）
 	metrics *runtimeMetrics
 
@@ -102,6 +105,11 @@ func New(cfgStore *config.Store, db *store.Store, r *router.Router, lg *logx.Log
 		discoverGate: newDiscoverGate(),
 		usageCache:   newUsageReportCache(),
 		metrics:      newRuntimeMetrics(),
+	}
+	if ac := cfgStore.Current(); ac != nil {
+		s.quotaAlerts = newQuotaAlert(ac.Alerts.WebhookURL, ac.Alerts.EffectiveWarnRatio())
+	} else {
+		s.quotaAlerts = newQuotaAlert("", 0.8)
 	}
 	s.uiHandler = s.newUIHandler()
 	s.configApplyWait = 4 * time.Second
