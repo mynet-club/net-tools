@@ -47,6 +47,8 @@ type DB interface {
 	TotalByUser(since time.Time, userName string) (UserTotals, error)
 	SystemUsageSince(userName string, since time.Time) (SystemUsage, error)
 	SystemUsageRowsSince(userName string, since time.Time) ([]UsageRow, error)
+	UsageExportRows(f UsageExportFilter) ([]UsageExportRow, error)
+	MonthlyRollup(since, until time.Time, userName string) ([]MonthlyRollupRow, error)
 	Prune(retainDays int) (int64, error)
 
 	// ── 价目（上游成本 / 分发价，都带历史） ────────────────────
