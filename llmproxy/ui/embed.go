@@ -8,5 +8,5 @@ package ui
 
 import "embed"
 
-//go:embed user.html user.js admin.html admin.js common.js app.css
+//go:embed user.html user.js admin.html admin.js common.js app.css openapi.yaml
 var FS embed.FS

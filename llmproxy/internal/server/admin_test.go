@@ -406,3 +406,21 @@ func TestAdminAuditLog(t *testing.T) {
 		t.Errorf("审计不得含密钥明文: %s", text)
 	}
 }
+
+// OpenAPI spec 可访问且像份 OpenAPI 3。
+func TestOpenAPISpec(t *testing.T) {
+	h := newMUHarness(t)
+	resp, raw := h.get(t, "/v1/openapi.yaml", "")
+	if resp.StatusCode != 200 {
+		t.Fatalf("openapi = %d %s", resp.StatusCode, raw)
+	}
+	text := string(raw)
+	for _, want := range []string{"openapi: 3", "paths:", "/v1/chat/completions", "/v1/_admin/usage/export"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("spec 缺 %q", want)
+		}
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "yaml") {
+		t.Errorf("content-type = %q", ct)
+	}
+}

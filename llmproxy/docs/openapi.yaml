@@ -1,0 +1,264 @@
+openapi: 3.0.3
+info:
+  title: llmproxy API
+  description: |
+    自托管 LLM 转发网关。下游 OpenAI 兼容；管理与自助接口在 `/v1/_admin` / `/v1/_me`。
+
+    鉴权：下游用 `Authorization: Bearer <api_key 或用户 token>`；
+    管理接口用 `Authorization: Bearer <admin_token>`。
+  version: "2.3.0"
+servers:
+  - url: http://127.0.0.1:8787
+    description: 本机默认
+tags:
+  - name: openai
+    description: OpenAI 兼容下游
+  - name: me
+    description: 用户自助
+  - name: admin
+    description: 管理接口
+paths:
+  /v1/chat/completions:
+    post:
+      tags: [openai]
+      summary: 对话补全
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChatRequest' }
+      responses:
+        '200':
+          description: 成功（非流式 JSON 或流式 SSE）
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChatResponse' }
+            text/event-stream:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { description: 配额不足 }
+        '429': { description: 限流 }
+        '502': { description: 上游不可用 }
+  /v1/models:
+    get:
+      tags: [openai]
+      summary: 可用模型列表
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          description: 模型列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { type: string, example: list }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Model' }
+  /v1/_me:
+    get:
+      tags: [me]
+      summary: 身份、上游与累计用量
+      security: [{bearerAuth: []}]
+      responses:
+        '200': { description: OK }
+  /v1/_me/providers:
+    get:
+      tags: [me]
+      summary: 我的上游（密钥脱敏）
+      security: [{bearerAuth: []}]
+      responses:
+        '200': { description: OK }
+  /v1/_me/providers/{name}:
+    put:
+      tags: [me]
+      summary: 新增/覆盖一个上游
+      security: [{bearerAuth: []}]
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UserProvider' }
+      responses:
+        '200': { description: OK }
+    delete:
+      tags: [me]
+      summary: 删除上游
+      security: [{bearerAuth: []}]
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: OK }
+  /v1/_me/providers/{name}/discover:
+    post:
+      tags: [me]
+      summary: 拉一次上游 /v1/models 拿模型名
+      security: [{bearerAuth: []}]
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: 模型名列表 }
+        '429': { description: 探测过于频繁 }
+  /v1/_me/usage:
+    get:
+      tags: [me]
+      summary: 我的用量
+      security: [{bearerAuth: []}]
+      parameters:
+        - { name: days, in: query, schema: { type: integer, default: 30 } }
+      responses:
+        '200': { description: OK }
+  /v1/_me/routing:
+    get:
+      tags: [me]
+      summary: 每个模型实际会按什么顺序消费上游
+      security: [{bearerAuth: []}]
+      responses:
+        '200': { description: OK }
+  /v1/_admin/users:
+    get:
+      tags: [admin]
+      summary: 用户列表
+      security: [{adminAuth: []}]
+      responses:
+        '200': { description: OK }
+    post:
+      tags: [admin]
+      summary: 建用户（返回明文 token，只此一次）
+      security: [{adminAuth: []}]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        '201': { description: Created }
+  /v1/_admin/users/{name}:
+    get:
+      tags: [admin]
+      summary: 用户详情
+      security: [{adminAuth: []}]
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: OK }
+    put:
+      tags: [admin]
+      summary: 改配额/限流/模式/启用
+      security: [{adminAuth: []}]
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: OK }
+    delete:
+      tags: [admin]
+      summary: 删用户
+      security: [{adminAuth: []}]
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: OK }
+  /v1/_admin/usage/export:
+    get:
+      tags: [admin]
+      summary: 用量 CSV 导出
+      security: [{adminAuth: []}]
+      parameters:
+        - { name: user, in: query, schema: { type: string } }
+        - { name: since, in: query, schema: { type: string, format: date } }
+        - { name: until, in: query, schema: { type: string, format: date } }
+        - { name: monthly, in: query, schema: { type: boolean } }
+      responses:
+        '200':
+          description: CSV
+          content:
+            text/csv:
+              schema: { type: string }
+  /v1/_admin/audit:
+    get:
+      tags: [admin]
+      summary: 最近管理操作审计
+      security: [{adminAuth: []}]
+      parameters:
+        - { name: n, in: query, schema: { type: integer, default: 100 } }
+      responses:
+        '200': { description: OK }
+  /v1/_admin/prices/provider:
+    put:
+      tags: [admin]
+      summary: 录一条上游价目
+      security: [{adminAuth: []}]
+      responses:
+        '200': { description: OK }
+  /v1/_admin/prices/user:
+    put:
+      tags: [admin]
+      summary: 录一条分发价目
+      security: [{adminAuth: []}]
+      responses:
+        '200': { description: OK }
+  /healthz:
+    get:
+      tags: [openai]
+      summary: 健康与运行指标
+      responses:
+        '200': { description: OK }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: 下游 API key 或用户 token
+    adminAuth:
+      type: http
+      scheme: bearer
+      description: admin_token
+  responses:
+    Unauthorized:
+      description: 未鉴权
+  schemas:
+    ChatRequest:
+      type: object
+      required: [model, messages]
+      properties:
+        model: { type: string }
+        messages:
+          type: array
+          items:
+            type: object
+            properties:
+              role: { type: string }
+              content: { type: string }
+        stream: { type: boolean }
+        temperature: { type: number }
+    ChatResponse:
+      type: object
+      properties:
+        id: { type: string }
+        object: { type: string }
+        choices: { type: array, items: { type: object } }
+        usage: { type: object }
+    Model:
+      type: object
+      properties:
+        id: { type: string }
+        object: { type: string }
+    UserProvider:
+      type: object
+      properties:
+        base_url: { type: string }
+        api_key: { type: string }
+        weight: { type: number }
+        timeout_ms: { type: integer }
+        proxy: { type: string }
+        models:
+          description: '"*" 或 映射表'
+          oneOf:
+            - { type: string }
+            - { type: object }

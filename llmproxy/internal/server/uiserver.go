@@ -22,9 +22,11 @@ import (
 var (
 	userAppFiles = map[string]bool{
 		"user.html": true, "user.js": true, "common.js": true, "app.css": true,
+		"openapi.yaml": true,
 	}
 	adminAppFiles = map[string]bool{
 		"admin.html": true, "admin.js": true, "common.js": true, "app.css": true,
+		"openapi.yaml": true,
 	}
 )
 
@@ -82,4 +84,17 @@ func (s *Server) serveApp(w http.ResponseWriter, r *http.Request, prefix, index 
 	rr := r.Clone(r.Context())
 	rr.URL.Path = "/" + name
 	s.uiHandler.ServeHTTP(w, rr)
+}
+
+// handleOpenAPI 提供 OpenAPI 3 描述（嵌在二进制里）。
+// 可直接贴进 Swagger UI / Redoc；也方便脚本生成客户端。
+func (s *Server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
+	b, err := ui.FS.ReadFile("openapi.yaml")
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	_, _ = w.Write(b)
 }

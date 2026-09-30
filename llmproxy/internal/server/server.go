@@ -167,6 +167,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/ui/", s.handleUserUI)
 	mux.HandleFunc("/admin", s.handleAdminUI)
 	mux.HandleFunc("/admin/", s.handleAdminUI)
+	mux.HandleFunc("/v1/openapi.yaml", s.handleOpenAPI)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/_providers", s.handleProviders)
 	// /v1 要显式注册：只注册 /v1/ 的话 ServeMux 会把 GET /v1 用 301 重定向到 /v1/，
