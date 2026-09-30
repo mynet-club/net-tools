@@ -4,6 +4,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -102,4 +103,30 @@ func parseExportDay(s string) (time.Time, error) {
 		return time.Time{}, nil
 	}
 	return time.ParseInLocation("2006-01-02", s, time.Local)
+}
+
+// audit 记一条管理操作（密钥/令牌永不进 detail）。
+func (s *Server) audit(actor, action, target, detail string) {
+	if s.db == nil {
+		return
+	}
+	if err := s.db.Audit(actor, action, target, detail); err != nil {
+		s.log.Errorf("写审计日志失败: %v", err)
+	}
+}
+
+// adminAuditLog：GET /v1/_admin/audit?n=100
+func (s *Server) adminAuditLog(w http.ResponseWriter, r *http.Request) {
+	n := 100
+	if v := r.URL.Query().Get("n"); v != "" {
+		if x, err := strconv.Atoi(v); err == nil && x > 0 && x <= 1000 {
+			n = x
+		}
+	}
+	list, err := s.db.AuditRecent(n)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": list})
 }

@@ -321,6 +321,10 @@ func OpenDialect(driver, pathOrDSN string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("初始化多用户表结构失败: %w", err)
 	}
+	if err := execSchema(db, d, auditSchema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("初始化审计表失败: %w", err)
+	}
 	// 消费模式：users 加列 + usage_user_daily 重建（主键要加 system_paid）
 	if err := migrateConsumption(db, d); err != nil {
 		_ = db.Close()

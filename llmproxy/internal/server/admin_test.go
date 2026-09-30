@@ -378,3 +378,31 @@ func TestAdminUsageExportCSV(t *testing.T) {
 		t.Errorf("月合计 CSV 缺 month 列: %s", body)
 	}
 }
+
+// 审计：建用户、改价都要留下记录，且不回显密钥。
+func TestAdminAuditLog(t *testing.T) {
+	h := newMUHarness(t)
+	// 建用户
+	resp, body := h.post(t, "/v1/_admin/users", adminToken, map[string]any{"name": "auditee"})
+	if resp.StatusCode != 201 && resp.StatusCode != 200 {
+		t.Fatalf("建用户: %d %s", resp.StatusCode, body)
+	}
+	// 删用户
+	req, _ := http.NewRequest(http.MethodDelete, h.gateway.URL+"/v1/_admin/users/auditee", nil)
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	if resp, err := http.DefaultClient.Do(req); err == nil {
+		resp.Body.Close()
+	}
+
+	code, body := adminGet(t, h, "/v1/_admin/audit")
+	if code != 200 {
+		t.Fatalf("audit = %d %s", code, body)
+	}
+	text := string(body)
+	if !strings.Contains(text, "user.create") || !strings.Contains(text, "user.delete") {
+		t.Errorf("审计应含 create/delete: %s", text)
+	}
+	if strings.Contains(text, "sk-") {
+		t.Errorf("审计不得含密钥明文: %s", text)
+	}
+}

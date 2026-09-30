@@ -1201,6 +1201,8 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		s.adminPricesRoute(w, r, strings.Trim(strings.TrimPrefix(rest, "prices"), "/"))
 	case rest == "usage/export" || rest == "usage/export/":
 		s.adminUsageExport(w, r)
+	case rest == "audit" || rest == "audit/":
+		s.adminAuditLog(w, r)
 	case rest == "providers":
 		s.adminListSystemProviders(w, r)
 	case strings.HasPrefix(rest, "providers/"):
@@ -1249,6 +1251,7 @@ func (s *Server) adminCreateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.SyncUsers()
+	s.audit("admin", "user.create", name, "")
 	s.log.Warnf("管理员创建了用户 %s", name)
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"name":  name,

@@ -232,6 +232,8 @@ func (s *Server) adminPutProviderPrice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.usageCache.Flush() // 估算段金额跟着单价走
+	s.audit("admin", "price.provider", p.Provider+"/"+p.UpstreamModel,
+		fmt.Sprintf("valid_from=%s out=%v %s", p.ValidFrom.Format(time.RFC3339), p.Out, p.Currency))
 	s.log.Infof("写入上游价目 %s / %s（自 %s，out=%v %s）",
 		p.Provider, p.UpstreamModel, p.ValidFrom.Format(time.RFC3339), p.Out, p.Currency)
 	writeJSON(w, http.StatusOK, map[string]any{"inserted": providerPriceJSON(*p)})
@@ -270,6 +272,8 @@ func (s *Server) adminPutUserPrice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.usageCache.Flush() // 估算段金额跟着单价走
+	s.audit("admin", "price.user", p.Scope+"/"+p.Model,
+		fmt.Sprintf("valid_from=%s out=%v %s", p.ValidFrom.Format(time.RFC3339), p.Out, p.Currency))
 	s.log.Infof("写入分发价目 %s / %s（自 %s，out=%v %s）",
 		p.Scope, p.Model, p.ValidFrom.Format(time.RFC3339), p.Out, p.Currency)
 	writeJSON(w, http.StatusOK, map[string]any{"inserted": userPriceJSON(*p)})

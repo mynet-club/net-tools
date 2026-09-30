@@ -77,6 +77,7 @@ func (s *Server) adminUsersRoute(w http.ResponseWriter, r *http.Request, tail st
 			}
 			s.usageCache.InvalidateUser(name)
 			_ = s.SyncUsers()
+			s.audit("admin", "user.delete", name, "")
 			s.log.Warnf("管理员删除了用户 %s", name)
 			writeJSON(w, http.StatusOK, map[string]any{"deleted": name})
 		default:
