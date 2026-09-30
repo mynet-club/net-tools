@@ -13,6 +13,7 @@ package store
 // 跳过条件写死在 openIntegration：环境变量为空就 t.Skip，绝不静默假绿。
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -28,6 +29,9 @@ func runIntegrationSuite(t *testing.T, driver, pathOrDSN string) {
 	}
 	defer s.Close()
 
+	// 真库是共享的：用户名带上时间戳，避免上次跑挂了留下的残留撞 UNIQUE
+	uid := fmt.Sprintf("it-%d", time.Now().UnixNano()%1e9)
+
 	// 表建出来了
 	has, err := s.dialect.HasTable(s.db, "requests")
 	if err != nil || !has {
@@ -35,35 +39,37 @@ func runIntegrationSuite(t *testing.T, driver, pathOrDSN string) {
 	}
 
 	// 用户
-	if err := s.CreateUser("it-user", TokenHash("sk-it")); err != nil {
+	if err := s.CreateUser(uid, TokenHash("sk-"+uid)); err != nil {
 		t.Fatal(err)
 	}
-	u, err := s.GetUser("it-user")
-	if err != nil || u == nil || u.Name != "it-user" {
+	u, err := s.GetUser(uid)
+	if err != nil || u == nil || u.Name != uid {
 		t.Fatalf("GetUser: %+v %v", u, err)
 	}
 
 	// 上游 + 模型映射
 	if err := s.UpsertUserProvider(UserProvider{
-		UserName: "it-user", Name: "up", BaseURL: "https://api.example.com/v1", Enabled: true,
+		UserName: uid, Name: "up", BaseURL: "https://api.example.com/v1", Enabled: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.UpsertUserModel(UserModel{
-		UserName: "it-user", Model: "m", Upstream: "m-up", Enabled: true,
+		UserName: uid, Model: "m", Upstream: "m-up", Enabled: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	// 价目（整点）
+	// 价目（整点）：provider/model 也带后缀，避免真库上撞「只追加」
 	hour := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
+	prov := "p-" + uid
 	if err := s.InsertProviderPrice(&ProviderPrice{
-		Provider: "p", UpstreamModel: "m-up", ValidFrom: hour, InMiss: 2, Out: 8,
+		Provider: prov, UpstreamModel: "m-up", ValidFrom: hour, InMiss: 2, Out: 8,
 	}); err != nil {
 		t.Fatal(err)
 	}
+	model := "m-" + uid
 	if err := s.InsertUserPrice(&UserPrice{
-		Scope: ScopeDefault, Model: "m", ValidFrom: hour, InMiss: 2, Out: 8,
+		Scope: ScopeDefault, Model: model, ValidFrom: hour, InMiss: 2, Out: 8,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -71,8 +77,8 @@ func runIntegrationSuite(t *testing.T, driver, pathOrDSN string) {
 	// 请求账本 + 冻结
 	cost, charge := 1.5, 3.5
 	if err := s.InsertRequest(RequestRecord{
-		Ts: time.Now(), RequestID: "it-1", UserName: "it-user", Model: "m",
-		Provider: "p", UpstreamModel: "m-up", SystemPaid: true, OK: true,
+		Ts: time.Now(), RequestID: "it-" + uid, UserName: uid, Model: model,
+		Provider: prov, UpstreamModel: "m-up", SystemPaid: true, OK: true,
 		PromptTokens: i64(100), CompletionTokens: i64(50), TotalTokens: i64(150),
 		CacheMissTokens: 100, Attempts: 1,
 		CostUpstream: &cost, Charge: &charge, Currency: "CNY",
@@ -80,7 +86,7 @@ func runIntegrationSuite(t *testing.T, driver, pathOrDSN string) {
 		t.Fatal(err)
 	}
 
-	rows, err := s.SystemUsageRowsSince("it-user", time.Now().AddDate(0, 0, -1))
+	rows, err := s.SystemUsageRowsSince(uid, time.Now().AddDate(0, 0, -1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,14 +100,14 @@ func runIntegrationSuite(t *testing.T, driver, pathOrDSN string) {
 	}
 
 	// 价目按整点查询
-	p, err := s.ProviderPriceAt("p", "m-up", hour.Add(time.Minute))
+	p, err := s.ProviderPriceAt(prov, "m-up", hour.Add(time.Minute))
 	if err != nil || p == nil || p.Out != 8 {
 		t.Fatalf("ProviderPriceAt: %+v %v", p, err)
 	}
 
 	// 熔断状态
 	if err := s.SaveProviderStatus([]ProviderStatus{
-		{Scope: "it-user", Name: "up", Enabled: true, ConsecutiveFailures: 2},
+		{Scope: uid, Name: "up", Enabled: true, ConsecutiveFailures: 2},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +117,7 @@ func runIntegrationSuite(t *testing.T, driver, pathOrDSN string) {
 	}
 	found := false
 	for _, st := range sts {
-		if st.Scope == "it-user" && st.Name == "up" && st.ConsecutiveFailures == 2 {
+		if st.Scope == uid && st.Name == "up" && st.ConsecutiveFailures == 2 {
 			found = true
 		}
 	}
@@ -120,13 +126,13 @@ func runIntegrationSuite(t *testing.T, driver, pathOrDSN string) {
 	}
 
 	// 删用户：配置级联清掉、账本保留
-	if err := s.DeleteUser("it-user"); err != nil {
+	if err := s.DeleteUser(uid); err != nil {
 		t.Fatal(err)
 	}
-	if ms, _ := s.ListUserModels("it-user"); len(ms) != 0 {
+	if ms, _ := s.ListUserModels(uid); len(ms) != 0 {
 		t.Errorf("删用户后模型映射应清掉: %+v", ms)
 	}
-	if rows, _ := s.SystemUsageRowsSince("it-user", time.Now().AddDate(0, 0, -1)); len(rows) == 0 {
+	if rows, _ := s.SystemUsageRowsSince(uid, time.Now().AddDate(0, 0, -1)); len(rows) == 0 {
 		t.Error("删用户后用量账本应当保留")
 	}
 }

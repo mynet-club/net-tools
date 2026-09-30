@@ -204,7 +204,7 @@ func (s *Store) CreateUser(name, tokenHash string) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := tx.Exec(
+	if _, err := txExec(tx, s.dialect,
 		`INSERT INTO users (name, token_hash, enabled, created_at, updated_at) VALUES (?,?,1,?,?)`,
 		name, tokenHash, now, now); err != nil {
 		if isUniqueViolation(err) {
@@ -212,7 +212,7 @@ func (s *Store) CreateUser(name, tokenHash string) error {
 		}
 		return fmt.Errorf("创建用户失败: %w", err)
 	}
-	if err := bumpRevision(tx); err != nil {
+	if err := bumpRevision(tx, s.dialect); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -238,7 +238,7 @@ func scanUser(sc interface{ Scan(...any) error }) (User, error) {
 
 // ListUsers 按名字返回全部用户（含已禁用的）。
 func (s *Store) ListUsers() ([]User, error) {
-	rows, err := s.db.Query(`SELECT ` + userColumns + ` FROM users ORDER BY name`)
+	rows, err := s.query(`SELECT ` + userColumns + ` FROM users ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -266,7 +266,7 @@ func (s *Store) GetUserByTokenHash(hash string) (*User, error) {
 }
 
 func (s *Store) getUser(where string, arg any) (*User, error) {
-	row := s.db.QueryRow(`SELECT `+userColumns+` FROM users `+where, arg)
+	row := s.queryRow(`SELECT `+userColumns+` FROM users `+where, arg)
 	u, err := scanUser(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -307,14 +307,14 @@ func (s *Store) userUpdate(setClause string, setArgs []any, name string) error {
 	defer func() { _ = tx.Rollback() }()
 
 	args := append(append([]any{}, setArgs...), time.Now().UnixMilli(), name)
-	res, err := tx.Exec(`UPDATE users SET `+setClause+`, updated_at = ? WHERE name = ?`, args...)
+	res, err := txExec(tx, s.dialect, `UPDATE users SET `+setClause+`, updated_at = ? WHERE name = ?`, args...)
 	if err != nil {
 		return fmt.Errorf("更新用户失败: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return fmt.Errorf("用户 %q 不存在", name)
 	}
-	if err := bumpRevision(tx); err != nil {
+	if err := bumpRevision(tx, s.dialect); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -345,23 +345,23 @@ func (s *Store) DeleteUser(name string) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := tx.Exec(`DELETE FROM user_providers WHERE user_name = ?`, name); err != nil {
+	if _, err := txExec(tx, s.dialect, `DELETE FROM user_providers WHERE user_name = ?`, name); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM user_models WHERE user_name = ?`, name); err != nil {
+	if _, err := txExec(tx, s.dialect, `DELETE FROM user_models WHERE user_name = ?`, name); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM provider_stats WHERE scope = ?`, name); err != nil {
+	if _, err := txExec(tx, s.dialect, `DELETE FROM provider_stats WHERE scope = ?`, name); err != nil {
 		return err
 	}
-	res, err := tx.Exec(`DELETE FROM users WHERE name = ?`, name)
+	res, err := txExec(tx, s.dialect, `DELETE FROM users WHERE name = ?`, name)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return fmt.Errorf("用户 %q 不存在", name)
 	}
-	if err := bumpRevision(tx); err != nil {
+	if err := bumpRevision(tx, s.dialect); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -392,7 +392,7 @@ func (s *Store) UpsertUserProvider(p UserProvider) error {
 	defer func() { _ = tx.Rollback() }()
 
 	var exists int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM users WHERE name = ?`, p.UserName).Scan(&exists); err != nil {
+	if err := txQueryRow(tx, s.dialect, `SELECT COUNT(*) FROM users WHERE name = ?`, p.UserName).Scan(&exists); err != nil {
 		return err
 	}
 	if exists == 0 {
@@ -403,7 +403,7 @@ func (s *Store) UpsertUserProvider(p UserProvider) error {
 	if p.Enabled {
 		enabled = 1
 	}
-	if _, err := tx.Exec(`
+	if _, err := txExec(tx, s.dialect, `
 INSERT INTO user_providers (
   user_name, name, base_url, api_key_enc, weight, enabled, timeout_ms, proxy, models_json,
   created_at, updated_at
@@ -421,7 +421,7 @@ ON CONFLICT(user_name, name) DO UPDATE SET
 		now, now); err != nil {
 		return fmt.Errorf("保存上游失败: %w", err)
 	}
-	if err := bumpRevision(tx); err != nil {
+	if err := bumpRevision(tx, s.dialect); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -429,7 +429,7 @@ ON CONFLICT(user_name, name) DO UPDATE SET
 
 // ListUserProviders 返回某用户的全部上游，按名字排序。
 func (s *Store) ListUserProviders(userName string) ([]UserProvider, error) {
-	rows, err := s.db.Query(`
+	rows, err := s.query(`
 SELECT user_name, name, base_url, api_key_enc, weight, enabled, timeout_ms, proxy, models_json,
        created_at, updated_at
 FROM user_providers WHERE user_name = ? ORDER BY name`, userName)
@@ -442,7 +442,7 @@ FROM user_providers WHERE user_name = ? ORDER BY name`, userName)
 
 // ListAllUserProviders 一次取回所有用户的上游，供服务端构建快照用。
 func (s *Store) ListAllUserProviders() (map[string][]UserProvider, error) {
-	rows, err := s.db.Query(`
+	rows, err := s.query(`
 SELECT user_name, name, base_url, api_key_enc, weight, enabled, timeout_ms, proxy, models_json,
        created_at, updated_at
 FROM user_providers ORDER BY user_name, name`)
@@ -487,13 +487,13 @@ func (s *Store) DeleteUserProvider(userName, name string) (bool, error) {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	res, err := tx.Exec(`DELETE FROM user_providers WHERE user_name = ? AND name = ?`, userName, name)
+	res, err := txExec(tx, s.dialect, `DELETE FROM user_providers WHERE user_name = ? AND name = ?`, userName, name)
 	if err != nil {
 		return false, err
 	}
 	n, _ := res.RowsAffected()
 	if n > 0 {
-		if err := bumpRevision(tx); err != nil {
+		if err := bumpRevision(tx, s.dialect); err != nil {
 			return false, err
 		}
 	}
@@ -514,7 +514,7 @@ func (s *Store) UsageByUser(since time.Time, userName string) ([]UsageRow, error
 		where += ` AND day >= ?`
 		args = append(args, since.Format("2006-01-02"))
 	}
-	rows, err := s.db.Query(`
+	rows, err := s.query(`
 SELECT day, provider, model, upstream_model, system_paid,
        SUM(requests), SUM(ok), SUM(failed),
        SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
@@ -575,7 +575,7 @@ func (s *Store) TotalByUser(since time.Time, userName string) (UserTotals, error
 	}
 	var out UserTotals
 	var first, last sql.NullString
-	err := s.db.QueryRow(`
+	err := s.queryRow(`
 SELECT COALESCE(SUM(requests),0), COALESCE(SUM(ok),0), COALESCE(SUM(failed),0),
        COALESCE(SUM(total_tokens),0), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
        COALESCE(SUM(cache_hit_tokens),0), COALESCE(SUM(cache_miss_tokens),0),

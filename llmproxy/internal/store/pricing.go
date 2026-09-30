@@ -268,7 +268,7 @@ func (s *Store) InsertProviderPrice(p *ProviderPrice) error {
 	defer func() { _ = tx.Rollback() }()
 
 	var latest int64
-	err = tx.QueryRow(`SELECT COALESCE(MAX(valid_from),0) FROM provider_prices WHERE provider=? AND upstream_model=?`,
+	err = txQueryRow(tx, s.dialect, `SELECT COALESCE(MAX(valid_from),0) FROM provider_prices WHERE provider=? AND upstream_model=?`,
 		p.Provider, p.UpstreamModel).Scan(&latest)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
@@ -278,7 +278,7 @@ func (s *Store) InsertProviderPrice(p *ProviderPrice) error {
 			p.Provider, p.UpstreamModel, time.UnixMilli(latest).UTC().Format(time.RFC3339))
 	}
 
-	if _, err := tx.Exec(`UPDATE provider_prices SET valid_to=? WHERE provider=? AND upstream_model=? AND valid_to=0`,
+	if _, err := txExec(tx, s.dialect, `UPDATE provider_prices SET valid_to=? WHERE provider=? AND upstream_model=? AND valid_to=0`,
 		p.ValidFrom.UnixMilli(), p.Provider, p.UpstreamModel); err != nil {
 		return err
 	}
@@ -286,7 +286,7 @@ func (s *Store) InsertProviderPrice(p *ProviderPrice) error {
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = now
 	}
-	res, err := tx.Exec(`INSERT INTO provider_prices
+	res, err := txExec(tx, s.dialect, `INSERT INTO provider_prices
 		(provider, upstream_model, currency, in_miss, in_hit, in_write, out, reasoning_out,
 		 per_request_fee, peak_hours, off_peak_ratio, peak_tz, valid_from, valid_to, note, created_at)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
@@ -318,7 +318,7 @@ func (s *Store) InsertUserPrice(p *UserPrice) error {
 	defer func() { _ = tx.Rollback() }()
 
 	var latest int64
-	err = tx.QueryRow(`SELECT COALESCE(MAX(valid_from),0) FROM user_prices WHERE scope=? AND model=?`,
+	err = txQueryRow(tx, s.dialect, `SELECT COALESCE(MAX(valid_from),0) FROM user_prices WHERE scope=? AND model=?`,
 		p.Scope, p.Model).Scan(&latest)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
@@ -328,7 +328,7 @@ func (s *Store) InsertUserPrice(p *UserPrice) error {
 			p.Scope, p.Model, time.UnixMilli(latest).UTC().Format(time.RFC3339))
 	}
 
-	if _, err := tx.Exec(`UPDATE user_prices SET valid_to=? WHERE scope=? AND model=? AND valid_to=0`,
+	if _, err := txExec(tx, s.dialect, `UPDATE user_prices SET valid_to=? WHERE scope=? AND model=? AND valid_to=0`,
 		p.ValidFrom.UnixMilli(), p.Scope, p.Model); err != nil {
 		return err
 	}
@@ -336,7 +336,7 @@ func (s *Store) InsertUserPrice(p *UserPrice) error {
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = now
 	}
-	res, err := tx.Exec(`INSERT INTO user_prices
+	res, err := txExec(tx, s.dialect, `INSERT INTO user_prices
 		(scope, model, currency, in_miss, in_hit, in_write, out, reasoning_out,
 		 per_request_fee, peak_hours, off_peak_ratio, peak_tz, valid_from, valid_to, note, created_at)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
@@ -441,7 +441,7 @@ func (s *Store) ProviderPriceAt(provider, upstreamModel string, t time.Time) (*P
 		return nil, errors.New("provider 与 upstream_model 不能为空")
 	}
 	ts := t.UnixMilli()
-	row := s.db.QueryRow(`SELECT `+providerPriceCols+` FROM provider_prices
+	row := s.queryRow(`SELECT `+providerPriceCols+` FROM provider_prices
 		WHERE provider=? AND upstream_model=? AND valid_from<=? AND (valid_to=0 OR valid_to>?)
 		ORDER BY valid_from DESC, id DESC LIMIT 1`, provider, upstreamModel, ts, ts)
 	p, err := scanProviderPrice(row)
@@ -455,7 +455,7 @@ func (s *Store) ProviderPriceAt(provider, upstreamModel string, t time.Time) (*P
 // 路由（规则 B）用它算「现在谁便宜」。
 func (s *Store) ProviderPricesEffective(t time.Time) ([]ProviderPrice, error) {
 	ts := t.UnixMilli()
-	rows, err := s.db.Query(`SELECT `+providerPriceCols+` FROM provider_prices
+	rows, err := s.query(`SELECT `+providerPriceCols+` FROM provider_prices
 		WHERE valid_from<=? AND (valid_to=0 OR valid_to>?)
 		ORDER BY provider, upstream_model`, ts, ts)
 	if err != nil {
@@ -485,7 +485,7 @@ func (s *Store) UserPriceAt(userName, model string, t time.Time) (*UserPrice, er
 		scopes = []string{ScopeUser(userName), ScopeDefault} // 最具体的那条生效
 	}
 	for _, scope := range scopes {
-		row := s.db.QueryRow(`SELECT `+userPriceCols+` FROM user_prices
+		row := s.queryRow(`SELECT `+userPriceCols+` FROM user_prices
 			WHERE scope=? AND model=? AND valid_from<=? AND (valid_to=0 OR valid_to>?)
 			ORDER BY valid_from DESC, id DESC LIMIT 1`, scope, model, ts, ts)
 		p, err := scanUserPrice(row)
@@ -512,7 +512,7 @@ func (s *Store) HasEffectiveUserPrices(userName string, t time.Time) (bool, erro
 		scopes = append(scopes, ScopeUser(userName))
 	}
 	var found int
-	err := s.db.QueryRow(`SELECT 1 FROM user_prices
+	err := s.queryRow(`SELECT 1 FROM user_prices
 		WHERE scope IN (?,?) AND valid_from<=? AND (valid_to=0 OR valid_to>?) LIMIT 1`,
 		scopes[0], scopes[len(scopes)-1], ts, ts).Scan(&found)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -528,7 +528,7 @@ func (s *Store) HasEffectiveUserPrices(userName string, t time.Time) (bool, erro
 // 供 `llmproxy status` / `llmproxy price list` 展示价目覆盖情况用。
 func (s *Store) UserPricesEffective(t time.Time) ([]UserPrice, error) {
 	ts := t.UnixMilli()
-	rows, err := s.db.Query(`SELECT `+userPriceCols+` FROM user_prices
+	rows, err := s.query(`SELECT `+userPriceCols+` FROM user_prices
 		WHERE valid_from<=? AND (valid_to=0 OR valid_to>?)
 		ORDER BY scope, model`, ts, ts)
 	if err != nil {
@@ -549,7 +549,7 @@ func (s *Store) UserPricesEffective(t time.Time) ([]UserPrice, error) {
 // ListProviderPrices 列出某个 (供应商, 上游模型) 的全部价目行（含历史），按 valid_from 升序。
 // 界面与排障用：要看「这个模型什么时候涨过价」时直接读它。
 func (s *Store) ListProviderPrices(provider, upstreamModel string) ([]ProviderPrice, error) {
-	rows, err := s.db.Query(`SELECT `+providerPriceCols+` FROM provider_prices
+	rows, err := s.query(`SELECT `+providerPriceCols+` FROM provider_prices
 		WHERE provider=? AND upstream_model=? ORDER BY valid_from ASC`, provider, upstreamModel)
 	if err != nil {
 		return nil, err
@@ -568,7 +568,7 @@ func (s *Store) ListProviderPrices(provider, upstreamModel string) ([]ProviderPr
 
 // ListUserPrices 列出某个 (scope, model) 的全部分发价目行（含历史），按 valid_from 升序。
 func (s *Store) ListUserPrices(scope, model string) ([]UserPrice, error) {
-	rows, err := s.db.Query(`SELECT `+userPriceCols+` FROM user_prices
+	rows, err := s.query(`SELECT `+userPriceCols+` FROM user_prices
 		WHERE scope=? AND model=? ORDER BY valid_from ASC`, scope, model)
 	if err != nil {
 		return nil, err

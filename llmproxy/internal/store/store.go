@@ -120,6 +120,42 @@ type Store struct {
 	dialect Dialect
 }
 
+// rebind 把 SQL 交给方言改写（占位符、upsert、保留字）。dialect 为 nil 时原样。
+func (s *Store) rebind(q string) string {
+	if s == nil || s.dialect == nil {
+		return q
+	}
+	return s.dialect.Rebind(q)
+}
+
+// exec / query / queryRow：业务 SQL 一律走这三个，**不要**直接摸 s.db ——
+// 否则 MySQL 的 ON CONFLICT、PG 的 ? 占位符会漏改写。
+func (s *Store) exec(q string, args ...any) (sql.Result, error) {
+	return s.db.Exec(s.rebind(q), args...)
+}
+
+func (s *Store) query(q string, args ...any) (*sql.Rows, error) {
+	return s.db.Query(s.rebind(q), args...)
+}
+
+func (s *Store) queryRow(q string, args ...any) *sql.Row {
+	return s.db.QueryRow(s.rebind(q), args...)
+}
+
+func txExec(tx *sql.Tx, d Dialect, q string, args ...any) (sql.Result, error) {
+	if d != nil {
+		q = d.Rebind(q)
+	}
+	return tx.Exec(q, args...)
+}
+
+func txQueryRow(tx *sql.Tx, d Dialect, q string, args ...any) *sql.Row {
+	if d != nil {
+		q = d.Rebind(q)
+	}
+	return tx.QueryRow(q, args...)
+}
+
 // schema 只放 DDL。连接级参数（busy_timeout / journal_mode / synchronous / _txlock）
 // 一律在 sqliteDSN() 里给 —— 它们必须对**每一条**连接生效，而 db.Exec(schema) 只作用于
 // 当时那一条。详见 dsn 的注释。
@@ -294,13 +330,28 @@ func OpenDialect(driver, pathOrDSN string) (*Store, error) {
 
 // execSchema 按方言改写 DDL 并逐条执行。
 // 不一次 Exec 整段：MySQL/PG 驱动对多语句 Exec 支持不一，拆开最稳。
+// MySQL 的 CREATE INDEX 没有 IF NOT EXISTS，重复执行报 1061 —— 这里吞掉，
+// 保证同一套 schema 多次 Open 幂等。
 func execSchema(db *sql.DB, d Dialect, ddl string) error {
 	for _, stmt := range splitStatements(d.RewriteDDL(ddl)) {
 		if _, err := db.Exec(d.Rebind(stmt)); err != nil {
+			if isIgnorableDDL(d, stmt, err) {
+				continue
+			}
 			return fmt.Errorf("执行 DDL 失败（%s）: %w", firstLine(stmt), err)
 		}
 	}
 	return nil
+}
+
+// isIgnorableDDL 判定「已经建过」类错误：MySQL 重复索引名 1061。
+func isIgnorableDDL(d Dialect, stmt string, err error) bool {
+	if d.Name() != "mysql" {
+		return false
+	}
+	msg := err.Error()
+	return strings.HasPrefix(firstLine(stmt), "CREATE INDEX") &&
+		(strings.Contains(msg, "1061") || strings.Contains(msg, "Duplicate key name"))
 }
 
 // splitStatements 按分号切 DDL，丢掉空段。字符串字面量里不写分号（本包 DDL 遵守）。
@@ -365,7 +416,7 @@ func migrateProviderStatsScope(db *sql.DB, d Dialect) error {
 		 FROM _provider_stats_legacy`,
 		`DROP TABLE _provider_stats_legacy`,
 	} {
-		if _, err := tx.Exec(q); err != nil {
+		if _, err := txExec(tx, d, q); err != nil {
 			return fmt.Errorf("迁移步骤失败: %w", err)
 		}
 	}
@@ -445,7 +496,7 @@ func (s *Store) InsertRequest(rec RequestRecord) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	_, err = tx.Exec(`
+	_, err = txExec(tx, s.dialect, `
 INSERT INTO requests (
   ts, request_id, client_key_hash, client_label, client_ip,
   model, provider, upstream_model, stream,
@@ -475,7 +526,7 @@ INSERT INTO requests (
 		if rec.CostUpstream != nil {
 			frozen, cost = 1, *rec.CostUpstream
 		}
-		_, err = tx.Exec(`
+		_, err = txExec(tx, s.dialect, `
 INSERT INTO usage_daily (
   day, provider, model, requests, ok, failed,
   prompt_tokens, completion_tokens, total_tokens, latency_sum_ms,
@@ -515,7 +566,7 @@ ON CONFLICT(day, provider, model) DO UPDATE SET
 		if rec.Charge != nil {
 			chargeVal, chargeFrozen = *rec.Charge, 1
 		}
-		_, err = tx.Exec(`
+		_, err = txExec(tx, s.dialect, `
 INSERT INTO usage_user_daily (
   day, user_name, provider, model, upstream_model, system_paid,
   requests, ok, failed,
@@ -555,7 +606,7 @@ func (s *Store) SaveProviderStatus(statuses []ProviderStatus) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	stmt, err := tx.Prepare(`
+	stmt, err := tx.Prepare(s.rebind(`
 INSERT INTO provider_stats (
   scope, name, enabled, consecutive_failures, unhealthy_until,
   last_error, last_success_at, last_failure_at,
@@ -570,7 +621,7 @@ ON CONFLICT(scope, name) DO UPDATE SET
   last_failure_at      = excluded.last_failure_at,
   total_requests       = excluded.total_requests,
   total_failures       = excluded.total_failures,
-  updated_at           = excluded.updated_at`)
+  updated_at           = excluded.updated_at`))
 	if err != nil {
 		return err
 	}
@@ -600,7 +651,7 @@ ON CONFLICT(scope, name) DO UPDATE SET
 // 全局供应商，恢复时无法还原（SplitScopeKey 只能猜）。ORDER BY 则让恢复结果不依赖
 // SQL 的返回顺序：同一份库两次读出来必须一样。
 func (s *Store) LoadProviderStatus() ([]ProviderStatus, error) {
-	rows, err := s.db.Query(`
+	rows, err := s.query(`
 SELECT COALESCE(scope,''), name, enabled, consecutive_failures, unhealthy_until,
        COALESCE(last_error,''), COALESCE(last_success_at,0), COALESCE(last_failure_at,0),
        total_requests, total_failures
@@ -640,7 +691,7 @@ func (s *Store) Prune(retainDays int) (int64, error) {
 		return 0, nil
 	}
 	cutoff := time.Now().AddDate(0, 0, -retainDays).UnixMilli()
-	res, err := s.db.Exec(`DELETE FROM requests WHERE ts < ?`, cutoff)
+	res, err := s.exec(`DELETE FROM requests WHERE ts < ?`, cutoff)
 	if err != nil {
 		return 0, err
 	}
@@ -652,13 +703,13 @@ func (s *Store) Prune(retainDays int) (int64, error) {
 // 运行中的服务靠轮询它发现「CLI 在另一个进程里改了配置」。
 func (s *Store) Revision() (int64, error) {
 	var v int64
-	err := s.db.QueryRow(`SELECT COALESCE((SELECT value FROM meta WHERE key='revision'),0)`).Scan(&v)
+	err := s.queryRow(`SELECT COALESCE((SELECT value FROM meta WHERE key='revision'),0)`).Scan(&v)
 	return v, err
 }
 
 // bumpRevision 在事务里把修订号 +1。
-func bumpRevision(tx *sql.Tx) error {
-	_, err := tx.Exec(`INSERT INTO meta(key,value) VALUES('revision',1)
+func bumpRevision(tx *sql.Tx, d Dialect) error {
+	_, err := txExec(tx, d, `INSERT INTO meta(key,value) VALUES('revision',1)
 	  ON CONFLICT(key) DO UPDATE SET value = value + 1`)
 	return err
 }
@@ -692,7 +743,7 @@ func (s *Store) Stats(since time.Time, recentLimit int) (*Stats, error) {
 	// 注意残留的边界误差（数据模型决定，无法消除）：总计按毫秒精确过滤，
 	// 而两张聚合表只能按整天过滤，所以 since 当天里早于 since 时刻的那部分
 	// 会出现在聚合表里、却不在总计里。要更细就得让 usage_daily 按小时聚合。
-	err := s.db.QueryRow(`
+	err := s.queryRow(`
 SELECT COUNT(*),
        COALESCE(SUM(CASE WHEN ok=1 THEN 1 ELSE 0 END),0),
        COALESCE(SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END),0),
@@ -703,7 +754,7 @@ FROM requests`+where, args...).Scan(
 		return nil, err
 	}
 
-	rows, err := s.db.Query(`
+	rows, err := s.query(`
 SELECT '-', provider, model,
        SUM(requests), SUM(ok), SUM(failed),
        SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
@@ -732,7 +783,7 @@ LIMIT 200`, dayArgs...)
 		return nil, err
 	}
 
-	rows2, err := s.db.Query(`
+	rows2, err := s.query(`
 SELECT day, '-', '-',
        SUM(requests), SUM(ok), SUM(failed),
        SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
@@ -770,7 +821,7 @@ LIMIT 90`, dayArgs...)
 }
 
 func (s *Store) loadRecent(out *Stats, limit int) error {
-	rows, err := s.db.Query(`
+	rows, err := s.query(`
 SELECT ts, request_id, COALESCE(client_key_hash,''), COALESCE(client_label,''), COALESCE(client_ip,''),
        model, COALESCE(provider,''), COALESCE(upstream_model,''), stream,
        status_code, ok, latency_ms, ttft_ms,

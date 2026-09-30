@@ -85,6 +85,17 @@ func TestMySQLDialect(t *testing.T) {
 	if !strings.Contains(ddl, "AUTO_INCREMENT") || !strings.Contains(ddl, "DOUBLE") {
 		t.Errorf("MySQL DDL 翻译不全: %s", ddl)
 	}
+	// TEXT 不能带 DEFAULT（MySQL 1101）；短字段走 VARCHAR(191)，长正文放宽
+	ddl = d.RewriteDDL("currency TEXT NOT NULL DEFAULT '', error_msg TEXT")
+	if strings.Contains(ddl, "TEXT") {
+		t.Errorf("TEXT 应当被替换掉: %s", ddl)
+	}
+	if !strings.Contains(ddl, "VARCHAR(128) NOT NULL DEFAULT") {
+		t.Errorf("带 DEFAULT 的 TEXT 应成 VARCHAR(128): %s", ddl)
+	}
+	if !strings.Contains(ddl, "error_msg VARCHAR(1024)") {
+		t.Errorf("错误正文应放宽到 VARCHAR(1024): %s", ddl)
+	}
 	if d.Rebind("SELECT ?") != "SELECT ?" {
 		t.Error("MySQL 占位符仍是 ?")
 	}

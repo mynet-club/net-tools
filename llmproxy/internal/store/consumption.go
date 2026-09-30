@@ -115,7 +115,7 @@ func (s *Store) SetUserLimits(name string, rpm, maxConcurrent int) error {
 
 // ListUserModels 返回某用户的模型映射（按模型名排序）。
 func (s *Store) ListUserModels(userName string) ([]UserModel, error) {
-	rows, err := s.db.Query(`
+	rows, err := s.query(`
 SELECT user_name, model, upstream, provider, enabled, created_at, updated_at
 FROM user_models WHERE user_name = ? ORDER BY model`, userName)
 	if err != nil {
@@ -127,7 +127,7 @@ FROM user_models WHERE user_name = ? ORDER BY model`, userName)
 
 // ListAllUserModels 一次取出全部用户的模型映射，供服务端构建快照用。
 func (s *Store) ListAllUserModels() (map[string][]UserModel, error) {
-	rows, err := s.db.Query(`
+	rows, err := s.query(`
 SELECT user_name, model, upstream, provider, enabled, created_at, updated_at
 FROM user_models ORDER BY user_name, model`)
 	if err != nil {
@@ -180,7 +180,7 @@ func (s *Store) UpsertUserModel(m UserModel) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := tx.Exec(`
+	if _, err := txExec(tx, s.dialect, `
 INSERT INTO user_models (user_name, model, upstream, provider, enabled, created_at, updated_at)
 VALUES (?,?,?,?,?,?,?)
 ON CONFLICT(user_name, model) DO UPDATE SET
@@ -191,7 +191,7 @@ ON CONFLICT(user_name, model) DO UPDATE SET
 		m.UserName, m.Model, m.Upstream, m.Provider, enabled, now, now); err != nil {
 		return fmt.Errorf("写入 user_models 失败: %w", err)
 	}
-	if err := bumpRevision(tx); err != nil {
+	if err := bumpRevision(tx, s.dialect); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -205,13 +205,13 @@ func (s *Store) DeleteUserModel(userName, model string) (bool, error) {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	res, err := tx.Exec(`DELETE FROM user_models WHERE user_name = ? AND model = ?`, userName, model)
+	res, err := txExec(tx, s.dialect, `DELETE FROM user_models WHERE user_name = ? AND model = ?`, userName, model)
 	if err != nil {
 		return false, err
 	}
 	n, _ := res.RowsAffected()
 	if n > 0 {
-		if err := bumpRevision(tx); err != nil {
+		if err := bumpRevision(tx, s.dialect); err != nil {
 			return false, err
 		}
 	}
@@ -227,13 +227,13 @@ func (s *Store) ClearUserModels(userName string) (int64, error) {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	res, err := tx.Exec(`DELETE FROM user_models WHERE user_name = ?`, userName)
+	res, err := txExec(tx, s.dialect, `DELETE FROM user_models WHERE user_name = ?`, userName)
 	if err != nil {
 		return 0, err
 	}
 	n, _ := res.RowsAffected()
 	if n > 0 {
-		if err := bumpRevision(tx); err != nil {
+		if err := bumpRevision(tx, s.dialect); err != nil {
 			return 0, err
 		}
 	}
@@ -258,7 +258,7 @@ type SystemUsage struct {
 // SystemUsageSince 汇总 userName 从 since 起的系统付费用量。
 func (s *Store) SystemUsageSince(userName string, since time.Time) (SystemUsage, error) {
 	var out SystemUsage
-	err := s.db.QueryRow(`
+	err := s.queryRow(`
 SELECT COALESCE(SUM(requests),0), COALESCE(SUM(ok),0), COALESCE(SUM(failed),0),
        COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(cache_hit_tokens),0),
        COALESCE(SUM(cache_miss_tokens),0), COALESCE(SUM(completion_tokens),0),
@@ -277,7 +277,7 @@ WHERE user_name = ? AND system_paid = 1 AND day >= ?`,
 // 内存计数在进程重启后要从库里重建金额，而金额必须按每个上游模型各自的单价算，
 // 所以这里不能只返回一个总数，得带上 upstream_model 与缓存拆分。
 func (s *Store) SystemUsageRowsSince(userName string, since time.Time) ([]UsageRow, error) {
-	rows, err := s.db.Query(`
+	rows, err := s.query(`
 SELECT '', provider, model, upstream_model, system_paid,
        SUM(requests), SUM(ok), SUM(failed),
        SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
