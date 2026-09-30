@@ -343,3 +343,38 @@ func TestAdminQuotaTakesEffectForUser(t *testing.T) {
 	}
 	_ = time.Now
 }
+
+// 导出 CSV：字段齐全、金额与 rowCharge 同一口径。
+func TestAdminUsageExportCSV(t *testing.T) {
+	stub := newUsageStub(t, 0)
+	h := newConsumptionHarness(t, stub, testPricing)
+	token := h.addUser(t, "carol")
+	setConsumption(t, h, "carol", "sys-model", "")
+	if resp, body := h.post(t, "/v1/chat/completions", token, map[string]any{
+		"model": "sys-model", "messages": []map[string]string{{"role": "user", "content": "hi"}},
+	}); resp.StatusCode != 200 {
+		t.Fatalf("请求失败: %d %s", resp.StatusCode, body)
+	}
+
+	code, body := adminGet(t, h, "/v1/_admin/usage/export")
+	if code != 200 {
+		t.Fatalf("export = %d %s", code, body)
+	}
+	text := string(body)
+	for _, col := range []string{"day", "user_name", "amount", "currency", "charge_frozen"} {
+		if !strings.Contains(text, col) {
+			t.Errorf("CSV 缺列 %q: %s", col, text)
+		}
+	}
+	if !strings.Contains(text, "carol") {
+		t.Errorf("应当含 carol 的行: %s", text)
+	}
+
+	code, body = adminGet(t, h, "/v1/_admin/usage/export?monthly=1")
+	if code != 200 {
+		t.Fatalf("monthly export = %d %s", code, body)
+	}
+	if !strings.Contains(string(body), "month") {
+		t.Errorf("月合计 CSV 缺 month 列: %s", body)
+	}
+}

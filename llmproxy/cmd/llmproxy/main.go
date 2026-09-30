@@ -51,6 +51,7 @@ const usageText = `llmproxy %s — 自用 LLM 转发网关
   user usage <名字>    看某个用户的按日消耗
   user rm <名字>       删除用户及其全部上游
   stats [-days N] [-recent N]   查看消耗统计
+  export [-user U] [-since D] [-until D] [-monthly] [-out f.csv]  导出用量 CSV
   logs [-n N] [-f]    查看日志
   test [-model M] [-stream]     通过本机网关发一条测试请求
   admin token         打印管理凭证（管理台 /admin/ 用）
@@ -103,6 +104,8 @@ func main() {
 		err = cmdProviders(paths)
 	case "stats":
 		err = cmdStats(paths, args)
+	case "export":
+		err = cmdExport(paths, args)
 	case "logs":
 		err = cmdLogs(paths, args)
 	case "test":
