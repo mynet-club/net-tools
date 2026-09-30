@@ -1,0 +1,83 @@
+{
+  "title": "llmproxy",
+  "uid": "llmproxy",
+  "tags": ["llmproxy"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "请求量（按结果）",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "rate(llmproxy_ok_total[5m])", "legendFormat": "ok" },
+        { "expr": "rate(llmproxy_client_err_total[5m])", "legendFormat": "4xx" },
+        { "expr": "rate(llmproxy_upstream_err_total[5m])", "legendFormat": "5xx" },
+        { "expr": "rate(llmproxy_rate_limited_total[5m])", "legendFormat": "限流" }
+      ],
+      "datasource": { "type": "prometheus", "uid": "${datasource}" }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "延迟分位 (ms)",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        { "expr": "llmproxy_latency_ms{q=\"p50\"}", "legendFormat": "p50" },
+        { "expr": "llmproxy_latency_ms{q=\"p95\"}", "legendFormat": "p95" },
+        { "expr": "llmproxy_latency_ms{q=\"p99\"}", "legendFormat": "p99" }
+      ],
+      "datasource": { "type": "prometheus", "uid": "${datasource}" }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "在途 / 粘性表 / Transport 缓存",
+      "gridPos": { "x": 0, "y": 8, "w": 8, "h": 6 },
+      "targets": [
+        { "expr": "llmproxy_inflight", "legendFormat": "inflight" },
+        { "expr": "llmproxy_affinity_entries", "legendFormat": "affinity" },
+        { "expr": "llmproxy_transport_cache", "legendFormat": "transports" }
+      ],
+      "datasource": { "type": "prometheus", "uid": "${datasource}" }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "记账与落库",
+      "gridPos": { "x": 8, "y": 8, "w": 8, "h": 6 },
+      "targets": [
+        { "expr": "llmproxy_persist_failures", "legendFormat": "落库失败" },
+        { "expr": "llmproxy_db_write_fail_total", "legendFormat": "写库失败" },
+        { "expr": "increase(llmproxy_db_write_ms_total[5m])", "legendFormat": "写库耗时" }
+      ],
+      "datasource": { "type": "prometheus", "uid": "${datasource}" }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "重试与熔断",
+      "gridPos": { "x": 16, "y": 8, "w": 8, "h": 6 },
+      "targets": [
+        { "expr": "rate(llmproxy_retries_total[5m])", "legendFormat": "重试" },
+        { "expr": "increase(llmproxy_circuit_cools_total[5m])", "legendFormat": "熔断" }
+      ],
+      "datasource": { "type": "prometheus", "uid": "${datasource}" }
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 2
+      }
+    ]
+  }
+}
