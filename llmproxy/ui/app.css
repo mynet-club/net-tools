@@ -332,3 +332,9 @@ select:focus { outline: 2px solid #c7c3f7; outline-offset: 1px; }
 }
 .testres.ok { color: var(--ok); }
 .testres.bad { color: var(--danger); }
+
+/* 日用量条形图 */
+.ubars { display: flex; align-items: flex-end; gap: 6px; height: 72px; margin: 8px 0 14px; }
+.ubar { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; height: 100%; min-width: 14px; }
+.ubar-fill { background: #6c7cff; border-radius: 3px 3px 0 0; min-height: 4px; }
+.ubar-lab { font-size: 9px; color: var(--muted); text-align: center; margin-top: 2px; }

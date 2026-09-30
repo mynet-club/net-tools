@@ -884,6 +884,23 @@ async function loadUsage() {
       h('td', { class: 'num', text: r.cost != null ? r.cost.toFixed(4) : '—' }),
     ));
   }
+
+  // 日用量条形图：按天合计 token，给一眼看「哪天烧得多」
+  const byDay = {};
+  for (const r of rows) {
+    byDay[r.day] = (byDay[r.day] || 0) + (r.total_tokens || 0);
+  }
+  const days = Object.keys(byDay).sort();
+  const max = Math.max(1, ...days.map((d) => byDay[d]));
+  const bars = days.slice(-14).map((d) => h('div', { class: 'ubar', title: d + ' · ' + num(byDay[d]) + ' tok' },
+    h('div', {
+      class: 'ubar-fill',
+      style: 'height:' + Math.max(4, Math.round((byDay[d] / max) * 100)) + '%',
+    }),
+    h('span', { class: 'ubar-lab', text: d.slice(5) }),
+  ));
+  const uc = $('ubars');
+  if (uc) uc.replaceChildren(...bars);
 }
 
 /* ── 试一下 ───────────────────────────────────────────────────────── */
@@ -950,6 +967,15 @@ $('mm-open').addEventListener('click', () => openModelForm(''));
 $('mm-cancel').addEventListener('click', closeModelForm);
 $('mmform').addEventListener('submit', saveModelMap);
 $('t-send').addEventListener('click', trySend);
+$('rotate-token') && $('rotate-token').addEventListener('click', async () => {
+  if (!confirm('轮换后旧 token 立即失效，确定？')) return;
+  try {
+    const { data } = await api('/v1/_me/token', { method: 'POST' });
+    alert('新 token（只显示这一次）：\n' + (data && data.token));
+  } catch (e) {
+    alert('失败：' + e.message);
+  }
+});
 $('m-sync').addEventListener('click', mmSync);
 $('m-manual-add').addEventListener('click', mmAddManual);
 $('m-manual').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); mmAddManual(); } });

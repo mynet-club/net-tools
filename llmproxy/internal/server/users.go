@@ -652,8 +652,12 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, auth authResul
 		s.handleMeRouting(w, r, e)
 		return
 	}
+	if rest == "token" {
+		s.handleMeRotateToken(w, r, e)
+		return
+	}
 	writeJSONError(w, http.StatusNotFound, "invalid_request_error",
-		"可用路径：/v1/_me、/v1/_me/providers、/v1/_me/usage、/v1/_me/routing")
+		"可用路径：/v1/_me、/v1/_me/providers、/v1/_me/usage、/v1/_me/routing、/v1/_me/token")
 }
 
 // handleMeRouting 回答「我这些模型到底会按什么顺序消费上游」。
@@ -1271,5 +1275,29 @@ func (s *Server) adminCreateUser(w http.ResponseWriter, r *http.Request) {
 		"token": token,
 		"note":  "明文只在这里返回一次，请立刻交给用户",
 		"usage": "用户拿这个 token 调 /v1/chat/completions，并用 PUT /v1/_me/providers/{name} 配自己的上游",
+	})
+}
+
+// handleMeRotateToken：用户自助轮换下游 token（旧的立即失效）。
+// 明文只在这一次返回 —— 之后再也拿不到，忘掉就只能再来一次。
+func (s *Server) handleMeRotateToken(w http.ResponseWriter, r *http.Request, e *userEntry) {
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error", "只支持 POST")
+		return
+	}
+	token, err := store.NewToken()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	if err := s.db.SetUserToken(e.Name, store.TokenHash(token)); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	_ = s.SyncUsers()
+	s.audit(e.Name, "user.rotate_token", e.Name, "自助轮换")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"token": token,
+		"note":  "明文只在这里返回一次，旧 token 已失效",
 	})
 }
