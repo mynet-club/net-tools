@@ -156,6 +156,25 @@ func txQueryRow(tx *sql.Tx, d Dialect, q string, args ...any) *sql.Row {
 	return tx.QueryRow(q, args...)
 }
 
+// insertID 执行 INSERT 并取回自增主键。
+// PostgreSQL / SQLite 用 RETURNING id；MySQL 驱动不支持 RETURNING，走 LastInsertId。
+func insertID(tx *sql.Tx, d Dialect, q string, args ...any) (int64, error) {
+	name := ""
+	if d != nil {
+		name = d.Name()
+	}
+	if name == "mysql" {
+		res, err := txExec(tx, d, q, args...)
+		if err != nil {
+			return 0, err
+		}
+		return res.LastInsertId()
+	}
+	var id int64
+	err := txQueryRow(tx, d, q+" RETURNING id", args...).Scan(&id)
+	return id, err
+}
+
 // schema 只放 DDL。连接级参数（busy_timeout / journal_mode / synchronous / _txlock）
 // 一律在 sqliteDSN() 里给 —— 它们必须对**每一条**连接生效，而 db.Exec(schema) 只作用于
 // 当时那一条。详见 dsn 的注释。
@@ -533,15 +552,15 @@ INSERT INTO usage_daily (
   cost_upstream, frozen_requests
 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(day, provider, model) DO UPDATE SET
-  requests          = requests + excluded.requests,
-  ok                = ok + excluded.ok,
-  failed            = failed + excluded.failed,
-  prompt_tokens     = prompt_tokens + excluded.prompt_tokens,
-  completion_tokens = completion_tokens + excluded.completion_tokens,
-  total_tokens      = total_tokens + excluded.total_tokens,
-  latency_sum_ms    = latency_sum_ms + excluded.latency_sum_ms,
-  cost_upstream     = cost_upstream + excluded.cost_upstream,
-  frozen_requests   = frozen_requests + excluded.frozen_requests`,
+  requests          = usage_daily.requests + excluded.requests,
+  ok                = usage_daily.ok + excluded.ok,
+  failed            = usage_daily.failed + excluded.failed,
+  prompt_tokens     = usage_daily.prompt_tokens + excluded.prompt_tokens,
+  completion_tokens = usage_daily.completion_tokens + excluded.completion_tokens,
+  total_tokens      = usage_daily.total_tokens + excluded.total_tokens,
+  latency_sum_ms    = usage_daily.latency_sum_ms + excluded.latency_sum_ms,
+  cost_upstream     = usage_daily.cost_upstream + excluded.cost_upstream,
+  frozen_requests   = usage_daily.frozen_requests + excluded.frozen_requests`,
 			day, provider, model, 1, okInc, failedInc,
 			int64Val(rec.PromptTokens), int64Val(rec.CompletionTokens), int64Val(rec.TotalTokens),
 			rec.LatencyMs, cost, frozen,
@@ -574,17 +593,17 @@ INSERT INTO usage_user_daily (
   charge, frozen_charges
 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(day, user_name, provider, model, upstream_model, system_paid) DO UPDATE SET
-  requests          = requests + excluded.requests,
-  ok                = ok + excluded.ok,
-  failed            = failed + excluded.failed,
-  prompt_tokens     = prompt_tokens + excluded.prompt_tokens,
-  cache_hit_tokens  = cache_hit_tokens + excluded.cache_hit_tokens,
-  cache_miss_tokens = cache_miss_tokens + excluded.cache_miss_tokens,
-  completion_tokens = completion_tokens + excluded.completion_tokens,
-  total_tokens      = total_tokens + excluded.total_tokens,
-  latency_sum_ms    = latency_sum_ms + excluded.latency_sum_ms,
-  charge            = charge + excluded.charge,
-  frozen_charges    = frozen_charges + excluded.frozen_charges`,
+  requests          = usage_user_daily.requests + excluded.requests,
+  ok                = usage_user_daily.ok + excluded.ok,
+  failed            = usage_user_daily.failed + excluded.failed,
+  prompt_tokens     = usage_user_daily.prompt_tokens + excluded.prompt_tokens,
+  cache_hit_tokens  = usage_user_daily.cache_hit_tokens + excluded.cache_hit_tokens,
+  cache_miss_tokens = usage_user_daily.cache_miss_tokens + excluded.cache_miss_tokens,
+  completion_tokens = usage_user_daily.completion_tokens + excluded.completion_tokens,
+  total_tokens      = usage_user_daily.total_tokens + excluded.total_tokens,
+  latency_sum_ms    = usage_user_daily.latency_sum_ms + excluded.latency_sum_ms,
+  charge            = usage_user_daily.charge + excluded.charge,
+  frozen_charges    = usage_user_daily.frozen_charges + excluded.frozen_charges`,
 			day, rec.UserName, provider, model, upstream, systemPaid, 1, okInc, failedInc,
 			int64Val(rec.PromptTokens), rec.CacheHitTokens, rec.CacheMissTokens,
 			int64Val(rec.CompletionTokens), int64Val(rec.TotalTokens),
@@ -708,9 +727,12 @@ func (s *Store) Revision() (int64, error) {
 }
 
 // bumpRevision 在事务里把修订号 +1。
+//
+// `value = meta.value + 1` 带表名限定：PostgreSQL 里裸 `value` 会与
+// EXCLUDED.value 撞成「column reference is ambiguous」；MySQL/SQLite 也接受这写法。
 func bumpRevision(tx *sql.Tx, d Dialect) error {
 	_, err := txExec(tx, d, `INSERT INTO meta(key,value) VALUES('revision',1)
-	  ON CONFLICT(key) DO UPDATE SET value = value + 1`)
+	  ON CONFLICT(key) DO UPDATE SET value = meta.value + 1`)
 	return err
 }
 

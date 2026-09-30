@@ -35,6 +35,7 @@ func (PostgresDialect) RewriteDDL(sql string) string {
 	s = strings.ReplaceAll(s, "INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
 	s = strings.ReplaceAll(s, "INTEGER", "BIGINT")
 	s = strings.ReplaceAll(s, "REAL", "DOUBLE PRECISION")
+	s = strings.ReplaceAll(s, "BLOB", "BYTEA")
 	return s
 }
 

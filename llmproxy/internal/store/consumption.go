@@ -286,7 +286,7 @@ SELECT '', provider, model, upstream_model, system_paid,
        COALESCE(SUM(charge),0), COALESCE(SUM(frozen_charges),0)
 FROM usage_user_daily
 WHERE user_name = ? AND system_paid = 1 AND day >= ?
-GROUP BY provider, model, upstream_model`, userName, since.Format("2006-01-02"))
+GROUP BY provider, model, upstream_model, system_paid`, userName, since.Format("2006-01-02"))
 	if err != nil {
 		return nil, err
 	}

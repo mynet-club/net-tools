@@ -286,7 +286,7 @@ func (s *Store) InsertProviderPrice(p *ProviderPrice) error {
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = now
 	}
-	res, err := txExec(tx, s.dialect, `INSERT INTO provider_prices
+	id, err := insertID(tx, s.dialect, `INSERT INTO provider_prices
 		(provider, upstream_model, currency, in_miss, in_hit, in_write, out, reasoning_out,
 		 per_request_fee, peak_hours, off_peak_ratio, peak_tz, valid_from, valid_to, note, created_at)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
@@ -296,9 +296,7 @@ func (s *Store) InsertProviderPrice(p *ProviderPrice) error {
 	if err != nil {
 		return err
 	}
-	if p.ID, err = res.LastInsertId(); err != nil {
-		return err
-	}
+	p.ID = id
 	return tx.Commit()
 }
 
@@ -336,7 +334,7 @@ func (s *Store) InsertUserPrice(p *UserPrice) error {
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = now
 	}
-	res, err := txExec(tx, s.dialect, `INSERT INTO user_prices
+	id, err := insertID(tx, s.dialect, `INSERT INTO user_prices
 		(scope, model, currency, in_miss, in_hit, in_write, out, reasoning_out,
 		 per_request_fee, peak_hours, off_peak_ratio, peak_tz, valid_from, valid_to, note, created_at)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
@@ -346,9 +344,7 @@ func (s *Store) InsertUserPrice(p *UserPrice) error {
 	if err != nil {
 		return err
 	}
-	if p.ID, err = res.LastInsertId(); err != nil {
-		return err
-	}
+	p.ID = id
 	return tx.Commit()
 }
 
