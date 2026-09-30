@@ -61,6 +61,9 @@ type Server struct {
 	// 配额预警（webhook / 日志，见 alerts.go）
 	quotaAlerts *quotaAlert
 
+	// 主动探活系统池上游（见 probe.go）
+	probe *activeProbe
+
 	// 运行指标（/healthz 的 metrics 段，见 metrics.go）
 	metrics *runtimeMetrics
 
@@ -287,12 +290,17 @@ func (s *Server) Start() error {
 		// 由每个上游请求自己的 timeout 控制。
 		MaxHeaderBytes: 1 << 20,
 	}
+	s.probe = newActiveProbe(60 * time.Second)
+	s.probe.Start(s)
 	s.log.Infof("监听 %s", s.httpSrv.Addr)
 	return s.httpSrv.ListenAndServe()
 }
 
 // Shutdown 优雅退出。
 func (s *Server) Shutdown(timeout time.Duration) {
+	if s.probe != nil {
+		s.probe.Stop()
+	}
 	if s.httpSrv == nil {
 		return
 	}
