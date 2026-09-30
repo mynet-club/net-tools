@@ -111,3 +111,25 @@ func (a *quotaAlert) deliver(payload map[string]any) {
 	}
 	_ = resp.Body.Close()
 }
+
+// hardPauseOnQuota：配额用尽时按配置自动停用用户（硬熔断）。
+// 停用后下个请求走「账号已停用」，管理员 llmproxy user enable 一键恢复。
+func (s *Server) hardPauseOnQuota(user, msg string) {
+	if s == nil || s.db == nil {
+		return
+	}
+	cfg := s.cfgStore.Current()
+	if cfg == nil || !cfg.Alerts.AutoPauseOnExceeded {
+		return
+	}
+	if err := s.db.SetUserEnabled(user, false); err != nil {
+		s.log.Errorf("配额硬熔断停用用户 %s 失败: %v", user, err)
+		return
+	}
+	s.audit("system", "user.auto_pause", user, msg)
+	_ = s.SyncUsers()
+	if s.meters != nil {
+		s.meters.Forget(user)
+	}
+	s.log.Warnf("配额硬熔断：已停用用户 %s（%s），管理员 user enable 可恢复", user, msg)
+}

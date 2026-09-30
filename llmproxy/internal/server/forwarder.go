@@ -186,6 +186,7 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 				lvl, e.Name, usedT, e.QuotaMonthTokens, usedC, e.QuotaMonthCost)
 		}
 		if exceeded {
+			s.hardPauseOnQuota(e.Name, msg)
 			s.fail(w, rec, http.StatusPaymentRequired, "quota_exceeded", msg, 0, started)
 			return
 		}

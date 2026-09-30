@@ -268,6 +268,9 @@ type AlertsConfig struct {
 	WebhookURL string `yaml:"webhook_url"`
 	// WarnRatio 是「用掉多少比例算预警」，默认 0.8。1.0 表示只在超限时告警。
 	WarnRatio float64 `yaml:"warn_ratio"`
+	// AutoPauseOnExceeded：配额用尽时自动停用该用户（硬熔断）。
+	// 管理员可再启用（user enable）。默认关闭，避免误伤还在写完最后一条请求的用户。
+	AutoPauseOnExceeded bool `yaml:"auto_pause_on_exceeded"`
 }
 
 // EffectiveWarnRatio 给出预警比例；未配或非法 → 0.8。
