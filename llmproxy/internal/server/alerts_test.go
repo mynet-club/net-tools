@@ -54,3 +54,25 @@ func TestQuotaAlertWarnAndExceededOnce(t *testing.T) {
 		t.Errorf("payload 不对: %+v", last)
 	}
 }
+
+func TestEmitUsesWebhookAndLog(t *testing.T) {
+	var got int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&got, 1)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	stub := newUsageStub(t, 0)
+	h := newConsumptionHarness(t, stub, testPricing)
+	// 配 webhook：改配置层较重，直接测 Emit 的无 URL 路径 + 有 URL 路径
+	h.srv.Emit("request.failed", map[string]any{"user": "u", "error_type": "x"})
+	if atomic.LoadInt64(&got) != 0 {
+		t.Error("未配 webhook 时不该外呼")
+	}
+	go (&quotaAlert{webhook: srv.URL}).deliver(map[string]any{"event": "circuit.open"})
+	time.Sleep(80 * time.Millisecond)
+	if atomic.LoadInt64(&got) != 1 {
+		t.Errorf("有 webhook 时应当外呼，got=%d", got)
+	}
+}

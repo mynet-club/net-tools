@@ -92,6 +92,30 @@ func (a *quotaAlert) Check(user string, usedTokens, limitTokens int64, usedCost,
 	return level
 }
 
+// Emit 发一条通用事件（fire-and-forget）。事件名见 roadmap：request.failed /
+// quota.exceeded / circuit.open / user.auto_pause。
+func (s *Server) Emit(event string, fields map[string]any) {
+	if s == nil {
+		return
+	}
+	cfg := s.cfgStore.Current()
+	url := ""
+	if cfg != nil {
+		url = cfg.Alerts.WebhookURL
+	}
+	payload := map[string]any{"event": event, "ts": time.Now().UTC().Format(time.RFC3339)}
+	for k, v := range fields {
+		payload[k] = v
+	}
+	// 没配 webhook 就只记日志（与配额预警同一约定）
+	if url == "" {
+		b, _ := json.Marshal(payload)
+		s.log.Infof("事件 %s: %s", event, b)
+		return
+	}
+	go (&quotaAlert{webhook: url}).deliver(payload)
+}
+
 func (a *quotaAlert) deliver(payload map[string]any) {
 	body, _ := json.Marshal(payload)
 	if a.webhook == "" {

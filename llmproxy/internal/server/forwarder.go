@@ -432,6 +432,9 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 			if entered := s.router.ReportFailureFor(scope, cand.Provider.Name,
 				fmt.Errorf("上游在响应中途失败：%s", rec.ErrorMsg)); entered {
 				s.metrics.noteCircuitCool()
+				s.Emit("circuit.open", map[string]any{
+					"scope": scope, "provider": cand.Provider.Name, "model": rec.Model,
+				})
 			}
 		}
 
@@ -752,6 +755,11 @@ func (s *Server) fail(w http.ResponseWriter, rec store.RequestRecord, status int
 	if errType == "rate_limited" || errType == "concurrency_limited" {
 		s.metrics.noteRateLimited()
 	}
+	// 事件外呼：失败样本（不做节流，按需在接收端聚合）
+	s.Emit("request.failed", map[string]any{
+		"user": rec.UserName, "model": rec.Model, "provider": rec.Provider,
+		"error_type": errType, "status": status, "attempts": attempts,
+	})
 	s.persist(&rec)
 	s.log.Warnf("请求失败 id=%s model=%s status=%d type=%s msg=%s",
 		rec.RequestID, rec.Model, status, errType, rec.ErrorMsg)
