@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -133,5 +134,29 @@ func TestHealthzSafeWithoutMetrics(t *testing.T) {
 	resp, raw := h.get(t, "/healthz", "")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("metrics 为 nil 时 healthz 仍应 200: %d %s", resp.StatusCode, raw)
+	}
+}
+
+func TestPrometheusMetrics(t *testing.T) {
+	up := startMockUpstream(t, &mockUpstream{name: "a", apiKey: "sk-a"})
+	h := newHarness(t, cfgYAML(map[string]string{"a": up.baseURL}, []string{"sk-local"}))
+	if resp, _ := h.post(t, "/v1/chat/completions", "sk-local", chatBody("m")); resp.StatusCode != 200 {
+		t.Fatal("请求失败")
+	}
+	resp, raw := h.get(t, "/metrics", "")
+	if resp.StatusCode != 200 {
+		t.Fatalf("metrics = %d %s", resp.StatusCode, raw)
+	}
+	text := string(raw)
+	for _, name := range []string{
+		"llmproxy_requests_total", "llmproxy_ok_total", "llmproxy_inflight",
+		"llmproxy_latency_ms", "llmproxy_persist_failures",
+	} {
+		if !strings.Contains(text, name) {
+			t.Errorf("缺指标 %s:\n%s", name, text)
+		}
+	}
+	if !strings.Contains(text, `llmproxy_latency_ms{q="p99"}`) {
+		t.Errorf("延迟分位标签不对:\n%s", text)
 	}
 }

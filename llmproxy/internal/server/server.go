@@ -163,6 +163,7 @@ func (s *Server) SetAffinityTTL(d time.Duration) { s.affinity.SetTTL(d) }
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/ui", s.handleUserUI)
 	mux.HandleFunc("/ui/", s.handleUserUI)
 	mux.HandleFunc("/admin", s.handleAdminUI)
