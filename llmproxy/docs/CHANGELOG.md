@@ -4,6 +4,29 @@
 
 ---
 
+## v2.2.0 — 2026-09-30
+
+多数据库支持。**默认仍是 SQLite**，0.4 部署不改配置即可；MySQL/PG 备用。
+
+### 存储可替换
+
+- `store.DB` 接口 + `store.Dialect`：业务包不感知驱动，方言差异（占位符 / upsert / DDL / 保留字）关在 `Dialect`
+- `database.driver`: `sqlite`（默认）| `mysql` | `postgres`；非 sqlite 需配 `database.dsn`（支持 `${ENV}`）
+- schema 只维护 SQLite 一份，`RewriteDDL` 翻译；金额/冻结/`retain_days` 语义不变
+
+### 真库验证
+
+- `TestIntegrationSQLite / MySQL / PostgreSQL` 同一套业务断言三库全绿
+- 本机 MySQL 8 与 192.168.0.32 的 PG 16 实测通过
+- `scripts/test-matrix.sh [--docker]` 一键跑矩阵
+
+### 注意
+
+- 从 SQLite 迁到 MySQL/PG **不自动搬数据**，步骤见 `docs/multi-database.md`
+- 生产切库前请先跑 `./scripts/test-matrix.sh` 与 `./scripts/release-check.sh`
+
+---
+
 ## v2.1.0 — 2026-09-30
 
 可观测与可持续发布。**数据库 schema 无变更**，从 2.0.0 直接换二进制即可。
