@@ -4,6 +4,38 @@
 
 ---
 
+## v2.5.0 — 2026-09-30
+
+v2.3 计费闭环 + v2.4 开发者体验 + v2.5 规模生态，一次收束。
+
+### v2.3 计费与运营
+
+- `llmproxy export` 与 `GET /v1/_admin/usage/export`：用量 CSV / 月合计
+- 配额 80%/100% 预警：`alerts.webhook_url`，每用户每档每自然月一次
+- 管理审计：`GET /v1/_admin/audit`，建删用户、改价可查，不记密钥
+- 配额硬熔断：`alerts.auto_pause_on_exceeded` 用尽自动停用
+
+### v2.4 体验
+
+- OpenAPI 3：`GET /v1/openapi.yaml`（嵌在二进制里）
+- 试一下：显示粘性与 token 数
+- 模型目录带分发价目（`/v1/_me/routing` 附 price）
+- `POST /v1/_me/token` 自助轮换；日用量条形图
+- 事件 webhook：`request.failed` / `circuit.open` / 配额档
+
+### v2.5 生态
+
+- Prometheus 文本 `GET /metrics`（指标名稳定）
+- 系统池上游主动探活（60s，熔断不等用户撞）
+- `docs/grafana-llmproxy.json` dashboard 模板
+- `docs/multi-instance.md` 多实例取舍（Redis 不进默认路径）
+
+### 部署提示
+
+0.4 继续用 **SQLite**（`database.driver` 省略即可）。多库与告警都是可选能力。
+
+---
+
 ## v2.2.0 — 2026-09-30
 
 多数据库支持。**默认仍是 SQLite**，0.4 部署不改配置即可；MySQL/PG 备用。
