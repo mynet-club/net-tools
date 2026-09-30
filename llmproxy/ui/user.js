@@ -905,10 +905,19 @@ async function trySend() {
     const content = data && data.choices && data.choices[0] &&
       data.choices[0].message && data.choices[0].message.content;
 
-    $('t-meta').textContent =
-      '上游 ' + (res.headers.get('X-LLMProxy-Provider') || '?') +
-      ' · ' + elapsed + 'ms' +
-      (res.headers.get('X-LLMProxy-Request-Id') ? ' · id ' + res.headers.get('X-LLMProxy-Request-Id') : '');
+    const bits = [
+      '上游 ' + (res.headers.get('X-LLMProxy-Provider') || '?'),
+      elapsed + 'ms',
+    ];
+    const aff = res.headers.get('X-Llmproxy-Affinity');
+    if (aff) bits.push('粘性 ' + aff);
+    const u = data && data.usage;
+    if (u) {
+      bits.push('tokens ' + (u.total_tokens || '?'));
+    }
+    const rid = res.headers.get('X-LLMProxy-Request-Id');
+    if (rid) bits.push('id ' + rid);
+    $('t-meta').textContent = bits.join(' · ');
     out.textContent = content != null ? content : JSON.stringify(data, null, 2);
     await Promise.all([loadUsage(), refreshMe()]);
   } catch (e) {
