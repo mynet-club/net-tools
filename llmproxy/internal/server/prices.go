@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 	"github.com/mynet-club/net-tools/llmproxy/internal/store"
 )
 
@@ -232,7 +233,8 @@ func (s *Server) adminPutProviderPrice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.usageCache.Flush() // 估算段金额跟着单价走
-	s.audit("admin", "price.provider", p.Provider+"/"+p.UpstreamModel,
+	// 上游价目是全局成本，没有「属于某个用户/组织」这一说，所以落系统范围是事实陈述。
+	s.auditAt(policy.SystemScope, "admin", "price.provider", p.Provider+"/"+p.UpstreamModel,
 		fmt.Sprintf("valid_from=%s out=%v %s", p.ValidFrom.Format(time.RFC3339), p.Out, p.Currency))
 	s.log.Infof("写入上游价目 %s / %s（自 %s，out=%v %s）",
 		p.Provider, p.UpstreamModel, p.ValidFrom.Format(time.RFC3339), p.Out, p.Currency)
@@ -272,7 +274,7 @@ func (s *Server) adminPutUserPrice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.usageCache.Flush() // 估算段金额跟着单价走
-	s.audit("admin", "price.user", p.Scope+"/"+p.Model,
+	s.auditLegacyPriceScope("admin", "price.user", p.Scope, p.Model,
 		fmt.Sprintf("valid_from=%s out=%v %s", p.ValidFrom.Format(time.RFC3339), p.Out, p.Currency))
 	s.log.Infof("写入分发价目 %s / %s（自 %s，out=%v %s）",
 		p.Scope, p.Model, p.ValidFrom.Format(time.RFC3339), p.Out, p.Currency)

@@ -12,6 +12,8 @@ import (
 	"testing"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/config"
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
+	"github.com/mynet-club/net-tools/llmproxy/internal/store"
 )
 
 // §3.H 写侧（发布 / 撤下 / 回滚 / 生效版 / 模式开关）的测试。
@@ -954,5 +956,130 @@ func TestAdminPolicyBundlesInspectShowsDrift(t *testing.T) {
 	refs, _ = out["refs"].([]any)
 	if len(refs) != 1 || refs[0].(map[string]any)["file_error"] == nil {
 		t.Errorf("坏文件应带 file_error: %v", refs)
+	}
+}
+
+// ── 审计闭环（§3.H + §2.7 规则 2）─────────────────────────
+
+// auditByAction 把当前审计按动作标识归堆。写侧的落盘通道是唯一的审计点，
+// 所以这里读的就是接口留下的全部证据。
+func auditByAction(t *testing.T, h *muHarness) map[string][]store.ScopedAuditEntry {
+	t.Helper()
+	list, err := h.srv.db.AuditRecentAll(500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string][]store.ScopedAuditEntry{}
+	for _, e := range list {
+		out[e.Action] = append(out[e.Action], e)
+	}
+	return out
+}
+
+// mustScopeOf 断言某个动作恰好留了一条审计，并返回它的归属范围与说明。
+func mustScopeOf(t *testing.T, byAction map[string][]store.ScopedAuditEntry, action string) (string, string) {
+	t.Helper()
+	got := byAction[action]
+	if len(got) != 1 {
+		t.Fatalf("%s 应有 1 条审计，实际 %d 条: %+v", action, len(got), got)
+	}
+	return got[0].Scope.Display(), got[0].Detail
+}
+
+func TestAdminPolicyWriteLandsScopedAudit(t *testing.T) {
+	h := publishHarness(t, "shadow")
+	const sentinel = "topsecret-project-value"
+	rules := []map[string]any{teacherRule(sentinel)}
+
+	// 校验不过的写不留审计：审计的意义是「这件事发生了」，不是「有人试过」。
+	if code, _, raw := policyReq(t, h, http.MethodPut, "/v1/_admin/policy/bundles/lab", adminToken,
+		bundleBody(0, "project:cs-lab-7", rules)); code != http.StatusBadRequest {
+		t.Fatalf("version=0 应 400，实际 %d: %s", code, raw)
+	}
+	for action, entries := range auditByAction(t, h) {
+		if strings.HasPrefix(action, "policy.") {
+			t.Fatalf("失败的写操作也留了审计 %s: %+v", action, entries)
+		}
+	}
+
+	pub := func(id string, version int, scope string) {
+		t.Helper()
+		if code, _, raw := policyReq(t, h, http.MethodPut, "/v1/_admin/policy/bundles/"+id, adminToken,
+			bundleBody(version, scope, rules)); code != http.StatusOK {
+			t.Fatalf("发布 %s v%d 应 200: %d %s", id, version, code, raw)
+		}
+	}
+	pub("lab", 2, "project:cs-lab-7")
+
+	by := auditByAction(t, h)
+	sc, detail := mustScopeOf(t, by, "policy.bundle.publish")
+	if sc != "project:cs-lab-7" {
+		t.Errorf("发布到项目范围的审计归属错: %s", sc)
+	}
+	if strings.Contains(detail, sentinel) || strings.Contains(detail, "Conditions") {
+		t.Errorf("审计说明不得带条件值: %q", detail)
+	}
+	if !strings.Contains(detail, "v2") {
+		t.Errorf("审计说明要能回答「换成了哪一版」: %q", detail)
+	}
+
+	// 撤下与重新引用：归属跟着被操作的那条引用，不是跟着按按钮的人。
+	if code, _, raw := policyReq(t, h, http.MethodDelete, "/v1/_admin/policy/bundles/t-open", adminToken, nil); code != http.StatusOK {
+		t.Fatalf("撤下 t-open 应 200: %d %s", code, raw)
+	}
+	by = auditByAction(t, h)
+	if sc, _ = mustScopeOf(t, by, "policy.bundle.withdraw"); sc != "system:gateway" {
+		t.Errorf("撤下的归属 = %s，想要 system:gateway", sc)
+	}
+	if code, _, raw := policyReq(t, h, http.MethodPost, "/v1/_admin/policy/bundles/t-open/reference", adminToken,
+		map[string]any{"active": false}); code != http.StatusOK {
+		t.Fatalf("重新引用应 200: %d %s", code, raw)
+	}
+	by = auditByAction(t, h)
+	if sc, _ = mustScopeOf(t, by, "policy.bundle.reference"); sc != "system:gateway" {
+		t.Errorf("重新引用的归属 = %s", sc)
+	}
+
+	// 回滚：再来一版才有可回滚的备份。
+	pub("lab", 3, "project:cs-lab-7")
+	if code, _, raw := policyReq(t, h, http.MethodPost, "/v1/_admin/policy/bundles/lab/rollback", adminToken,
+		map[string]any{"version": 2}); code != http.StatusOK {
+		t.Fatalf("回滚应 200: %d %s", code, raw)
+	}
+	by = auditByAction(t, h)
+	if sc, _ = mustScopeOf(t, by, "policy.bundle.rollback"); sc != "project:cs-lab-7" {
+		t.Errorf("回滚的归属 = %s", sc)
+	}
+	// 两次发布落在同一个范围，所以按范围导账要拿得到完整历史（规则 2 的正身）。
+	published := by["policy.bundle.publish"]
+	if len(published) != 2 {
+		t.Errorf("按动作应有 2 条发布审计，实际 %d", len(published))
+	}
+	for _, e := range published {
+		if !e.Scope.Is(policy.MustScope(policy.ScopeProject, "cs-lab-7")) {
+			t.Errorf("发布审计的归属应全在 project:cs-lab-7: %+v", e)
+		}
+	}
+
+	// 生效包与模式是全局开关：改一次影响所有范围，所以固定落系统范围。
+	if code, _, raw := policyReq(t, h, http.MethodPost, "/v1/_admin/policy/active", adminToken,
+		map[string]any{"bundle": "t-open"}); code != http.StatusOK {
+		t.Fatalf("切生效包应 200: %d %s", code, raw)
+	}
+	by = auditByAction(t, h)
+	if sc, _ = mustScopeOf(t, by, "policy.active.set"); sc != "system:global" {
+		t.Errorf("切生效包的归属 = %s", sc)
+	}
+	if code, _, raw := policyReq(t, h, http.MethodPost, "/v1/_admin/policy/mode", adminToken,
+		map[string]any{"mode": "legacy"}); code != http.StatusOK {
+		t.Fatalf("切 legacy（应急开关）应 200: %d %s", code, raw)
+	}
+	by = auditByAction(t, h)
+	sc, detail = mustScopeOf(t, by, "policy.mode.set")
+	if sc != "system:global" {
+		t.Errorf("切模式的归属 = %s", sc)
+	}
+	if !strings.Contains(detail, "legacy") {
+		t.Errorf("模式开关的审计要写明切到了哪一档: %q", detail)
 	}
 }

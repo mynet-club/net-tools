@@ -150,7 +150,7 @@ func (s *Server) hardPauseOnQuota(user, msg string) {
 		s.log.Errorf("配额硬熔断停用用户 %s 失败: %v", user, err)
 		return
 	}
-	s.audit("system", "user.auto_pause", user, msg)
+	s.auditUser("system", "user.auto_pause", user, msg)
 	_ = s.SyncUsers()
 	if s.meters != nil {
 		s.meters.Forget(user)

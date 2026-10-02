@@ -1,11 +1,5 @@
 package store
 
-import (
-	"time"
-
-	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
-)
-
 // auditSchema 是 var：scope 两列的定义与老库 ALTER 共用 scope_schema.go 那一份。
 //
 // 按范围导审计（§2.7 规则 2：组织/项目管理员只看得到自己范围内的那些动作）的索引
@@ -25,45 +19,18 @@ CREATE TABLE IF NOT EXISTS audit_log (
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
 `
 
-// AuditEntry 是一条管理操作审计。detail **不许**写密钥明文。
-type AuditEntry struct {
-	Ts     time.Time `json:"ts"`
-	Actor  string    `json:"actor"`
-	Action string    `json:"action"`
-	Target string    `json:"target"`
-	Detail string    `json:"detail"`
-}
-
-// Audit 记一条管理操作（2.x 的无范围接口）。
+// AuditEntry 与无范围的 Audit / AuditRecent 已经随 §2.7 规则 8 删除：审计表从 2.x 起
+// 就有 scope_kind + scope_id 两列，一个不带范围的读写接口只是把它们假装丢掉。
 //
-// 2.x 的 audit_log 只记管理员的全局操作，那些操作**本来就**属于 (system,'global')，
-// 所以这里固定落到系统范围是事实陈述，不是给缺省值猜一个桶。组织/项目内的操作
-// 必须改走 AuditScope，把真正的范围传进来。
-//
-// §2.7 规则 8：主线接线完成后删除，调用方改用 AuditScope。
-func (s *Store) Audit(actor, action, target, detail string) error {
-	return s.AuditScope(policy.SystemScope, actor, action, target, detail)
-}
+// 写侧唯一入口是 AuditScope（scope 由调用方给出「这条动作关于哪个范围」），
+// 读侧是 AuditRecentAll / AuditRecentByScope / AuditRecentForScopes，
+// 三者都返回 ScopedAuditEntry —— Detail 沿用旧口径：不许写密钥明文。
 
-// AuditRecent 返回最近 n 条审计（新的在前）。
-func (s *Store) AuditRecent(n int) ([]AuditEntry, error) {
-	if n <= 0 {
-		n = 100
-	}
-	rows, err := s.query(`SELECT ts, actor, action, target, detail FROM audit_log ORDER BY id DESC LIMIT ?`, n)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []AuditEntry{}
-	for rows.Next() {
-		var e AuditEntry
-		var ts int64
-		if err := rows.Scan(&ts, &e.Actor, &e.Action, &e.Target, &e.Detail); err != nil {
-			return nil, err
-		}
-		e.Ts = time.UnixMilli(ts)
-		out = append(out, e)
-	}
-	return out, rows.Err()
+// AuditRecentAll 返回最近 n 条审计（新的在前），不分范围。
+//
+// 这是网关管理员的全局面板用的那一条；组织/项目管理员的视图走 AuditRecentForScopes。
+// 返回条目带 scope，所以「全量列一下」也不会把归属信息读丢。
+func (s *Store) AuditRecentAll(n int) ([]ScopedAuditEntry, error) {
+	return s.queryScopedAudit(`SELECT `+auditScopedCols+` FROM audit_log ORDER BY id DESC LIMIT ?`,
+		auditLimit(n))
 }

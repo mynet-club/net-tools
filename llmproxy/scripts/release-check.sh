@@ -134,6 +134,13 @@ gate_tests_present() {
   return 0
 }
 
+# gate_ui_refs 检查管理台/用户页的 JS 元素引用（scripts/check-ui-refs.sh）。
+# 这一层没有任何 Go 侧的编译能覆盖它，所以由独立脚本承担。
+gate_ui_refs() {
+  step "UI 元素引用（\$('id') 与 HTML 的 id 对得上）"
+  ./scripts/check-ui-refs.sh || fail "UI 元素引用对不上"
+}
+
 # run_pkg_checks 按包跑 vet + test（+ 可选 race），逐包标注归属，在途包不拦停。
 run_pkg_checks() {
   local with_race=$1
@@ -194,6 +201,7 @@ fi
 if [ "$ONLY3P0" -eq 1 ]; then
   gate_gofmt
   gate_tests_present
+  gate_ui_refs
   step "3.0 OWNED 包全量 vet + test"
   # 目标一律从 DOMAIN_OWNED 派生：硬编码包名会让「把某个包升成 OWNED」需要同时改
   # 变量和三行命令，漏改的那一行不会报错，只会让该包从此红也不拦。
@@ -224,6 +232,7 @@ fi
 # ---- 完整发布门禁：以下步骤与用法保持原样 ----
 gate_gofmt
 gate_tests_present
+gate_ui_refs
 
 step "go vet"
 go vet ./... || fail "go vet 未通过"

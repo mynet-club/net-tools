@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 	"github.com/mynet-club/net-tools/llmproxy/internal/store"
 )
 
@@ -105,17 +106,56 @@ func parseExportDay(s string) (time.Time, error) {
 	return time.ParseInLocation("2006-01-02", s, time.Local)
 }
 
-// audit 记一条管理操作（密钥/令牌永不进 detail）。
-func (s *Server) audit(actor, action, target, detail string) {
+// auditAt 记一条带范围的审计（密钥/令牌永不进 detail）。
+//
+// scope 的口径是「这条动作**关于**哪个范围」，不是「谁按下的按钮」：管理员给别人
+// 建用户、改价、停用，动作的归属都在那个范围里 —— §2.7 规则 2 要的是「按范围导得出去」，
+// 而 actor 那一列本来就单独记着谁。
+// 无范围的 store.Audit 已随规则 8 删除，所以这里没有「忘了给范围」这条路可走。
+func (s *Server) auditAt(scope policy.ScopeRef, actor, action, target, detail string) {
 	if s.db == nil {
 		return
 	}
-	if err := s.db.Audit(actor, action, target, detail); err != nil {
+	if err := s.db.AuditScope(scope, actor, action, target, detail); err != nil {
 		s.log.Errorf("写审计日志失败: %v", err)
 	}
 }
 
-// adminAuditLog：GET /v1/_admin/audit?n=100
+// auditUser 记一条「关于某个用户」的动作。
+//
+// 用户名是运行期输入，不能 panic 也不能靠 MustScope（那是给编译期常量用的）。
+// 真遇到不能成形的 id（老库里留下的脏名字），记到系统范围并把原值写进 detail：
+// 一条归属可疑的记录远比一条被静默丢弃的记录有用。
+func (s *Server) auditUser(actor, action, user, detail string) {
+	scope, err := policy.NewScopeRef(policy.ScopeUser, user)
+	if err != nil {
+		s.auditAt(policy.SystemScope, actor, action, user, detail+" （名字无法成为范围："+err.Error()+"）")
+		return
+	}
+	s.auditAt(scope, actor, action, user, detail)
+}
+
+// auditLegacyPriceScope 记一条「关于某个分发范围」的价目动作。
+//
+// 旧分发价接口收到的还是 'default' / 'user:<名>' 裸串，解析只此一处（复用 store 的
+// 那一个映射点），不在 server 里再立一套前缀约定。
+//
+// §2.7 规则 8：调用方改用结构化 ScopePrice 后随 store.DecodeLegacyPriceScope 一起删除。
+func (s *Server) auditLegacyPriceScope(actor, action, legacyScope, model, detail string) {
+	scope, err := store.DecodeLegacyPriceScope(legacyScope)
+	if err != nil {
+		s.auditAt(policy.SystemScope, actor, action, legacyScope+"/"+model,
+			detail+" （旧 scope 串当不了范围键："+err.Error()+"）")
+		return
+	}
+	s.auditAt(scope, actor, action, legacyScope+"/"+model, detail)
+}
+
+// adminAuditLog：GET /v1/_admin/audit?n=100[&scope=kind:id&scope=kind:id…]
+//
+// 不带 scope = 全量（网关管理员的面板）；带 scope = 只看这些范围的并集，
+// 组织管理员要的是「本组织 + 名下项目」。范围一律写成 kind:id ——
+// 裸用户名那种有歧义的旧形式不认（§2.7 规则 1）。
 func (s *Server) adminAuditLog(w http.ResponseWriter, r *http.Request) {
 	n := 100
 	if v := r.URL.Query().Get("n"); v != "" {
@@ -123,10 +163,40 @@ func (s *Server) adminAuditLog(w http.ResponseWriter, r *http.Request) {
 			n = x
 		}
 	}
-	list, err := s.db.AuditRecent(n)
+	var list []store.ScopedAuditEntry
+	var err error
+	if raw := r.URL.Query()["scope"]; len(raw) > 0 {
+		scopes := make([]policy.ScopeRef, 0, len(raw))
+		for _, sv := range raw {
+			ref, perr := parseAuditScope(sv)
+			if perr != nil {
+				writeJSONError(w, http.StatusBadRequest, "invalid_request_error", perr.Error())
+				return
+			}
+			scopes = append(scopes, ref)
+		}
+		list, err = s.db.AuditRecentForScopes(scopes, n)
+	} else {
+		list, err = s.db.AuditRecentAll(n)
+	}
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"entries": list})
+}
+
+// parseAuditScope 把查询参数落成一个精确范围引用。
+// 只认 kind:id 的精确形式：通配选择器（organization:*）在服务端没有对应索引，
+// 与其静默返回半集，不如让调用方显式列出关心的范围。
+func parseAuditScope(s string) (policy.ScopeRef, error) {
+	sel, err := policy.ParseScopeSelector(s)
+	if err != nil {
+		return policy.ScopeRef{}, err
+	}
+	if sel.All || sel.ID == "*" {
+		return policy.ScopeRef{}, fmt.Errorf(
+			"scope 需要是精确的 kind:id（通配请逐个列出范围），当前是 %q", s)
+	}
+	return policy.NewScopeRef(sel.Kind, sel.ID)
 }

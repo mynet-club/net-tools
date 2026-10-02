@@ -99,6 +99,18 @@ func (s *Server) adminPolicyBundlesRoute(w http.ResponseWriter, r *http.Request,
 
 // ── 发布 ───────────────────────────────────────────────────
 
+// auditScopeOfRef 把配置里那条引用的 scope 串落成审计范围。
+//
+// 手改过的配置文件可能写着解析不了的 scope：那种情况下记到系统范围，
+// 让 note（就是 detail）里的原串继续可查 —— 一条归属可疑的审计胜过没有这一条。
+func auditScopeOfRef(raw string) policy.ScopeRef {
+	scope, err := config.ParseScopeRef(raw)
+	if err != nil {
+		return policy.SystemScope
+	}
+	return scope
+}
+
 // adminPolicyBundlesInspect 把「配置里的引用」与「磁盘上的内容文件」并排列出来。
 //
 // 为什么值得单独一屏：加载是「引用与内容逐字段核对、全有或全无」，所以两边任何
@@ -340,7 +352,8 @@ func (s *Server) adminPublishBundle(w http.ResponseWriter, r *http.Request, id s
 	if old != nil && old.Version != bundle.Version {
 		note += fmt.Sprintf("（原引用是 v%d）", old.Version)
 	}
-	resp, ok := s.commitPolicyConfig(w, path, src, newSrc, note, undo)
+	resp, ok := s.commitPolicyConfig(w, path, src, newSrc, note, undo,
+		policyAudit{action: "policy.bundle.publish", scope: scope, target: id})
 	if !ok {
 		return
 	}
@@ -405,7 +418,8 @@ func (s *Server) adminWithdrawBundle(w http.ResponseWriter, r *http.Request, id 
 	}
 	note := fmt.Sprintf("已撤下对 %s 的引用（v%d）；生效包 = %s。内容文件仍留在 %s —— 它不再被任何引用加载，"+
 		"重新引用同一版就能立刻回来", id, ref.Version, p.ActiveBundle, policyBundleDir(path, p))
-	resp, ok := s.commitPolicyConfig(w, path, src, newSrc, note, nil)
+	resp, ok := s.commitPolicyConfig(w, path, src, newSrc, note, nil,
+		policyAudit{action: "policy.bundle.withdraw", scope: auditScopeOfRef(ref.Scope), target: id})
 	if !ok {
 		return
 	}
@@ -501,7 +515,8 @@ func (s *Server) adminReferenceBundle(w http.ResponseWriter, r *http.Request, id
 	}
 	note := fmt.Sprintf("已按磁盘上的 %s 重新建立引用（v%d，scope=%s，%d 条规则）；生效包 = %s",
 		id, content.Version, content.Scope.Display(), len(content.Entitlements), p.ActiveBundle)
-	resp, ok := s.commitPolicyConfig(w, path, src, newSrc, note, nil)
+	resp, ok := s.commitPolicyConfig(w, path, src, newSrc, note, nil,
+		policyAudit{action: "policy.bundle.reference", scope: content.Scope, target: id})
 	if !ok {
 		return
 	}
@@ -659,7 +674,8 @@ func (s *Server) adminRollbackBundle(w http.ResponseWriter, r *http.Request, id 
 	}
 	note := fmt.Sprintf("策略包 %s 已回滚到 v%d（来源备份 %s），引用同步改到 v%d",
 		id, restored.Version, filepath.Base(target), restored.Version)
-	resp, ok := s.commitPolicyConfig(w, path, src, newSrc, note, undo)
+	resp, ok := s.commitPolicyConfig(w, path, src, newSrc, note, undo,
+		policyAudit{action: "policy.bundle.rollback", scope: auditScopeOfRef(scope), target: id})
 	if !ok {
 		return
 	}
@@ -684,7 +700,7 @@ func (s *Server) adminPolicySetActive(w http.ResponseWriter, r *http.Request) {
 			"bundle 必填：要生效的那个策略包 id（必须是 policy.bundles 里已有的一条）")
 		return
 	}
-	s.editPolicySection(w, r, func(p *config.PolicyConfig) (string, error) {
+	s.editPolicySection(w, r, "policy.active.set", id, func(p *config.PolicyConfig) (string, error) {
 		if findBundleRef(p.Bundles, id) == nil {
 			return "", fmt.Errorf("包 %q 不在 policy.bundles 里（可用：%s）—— 先发布它，再切生效版",
 				id, refIDs(p.Bundles))
@@ -718,7 +734,7 @@ func (s *Server) adminPolicySetMode(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("mode 是 %q，只能是 legacy、shadow 或 enforce", body.Mode))
 		return
 	}
-	s.editPolicySection(w, r, func(p *config.PolicyConfig) (string, error) {
+	s.editPolicySection(w, r, "policy.mode.set", mode, func(p *config.PolicyConfig) (string, error) {
 		prev := p.Mode
 		if prev == "" {
 			prev = "legacy（配置里还没有 policy 段）"
@@ -754,8 +770,21 @@ func (s *Server) adminPolicySetMode(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// policyAudit 是一次策略写操作要落的审计描述。
+//
+// 它是 commitPolicyConfig 的**必填**参数，不是可选项：改判定规则是这台网关上后果最大
+// 的一类动作（一次误发布能让整个组织的模型可用性变掉），而 §3.H 要的是「谁在什么时候
+// 把哪一版换成了哪一版」事后查得回来。放在落盘通道上而不是各调用点里，是为了让
+// 「新增一个写接口却忘了记审计」在编译期就不成立。
+type policyAudit struct {
+	action string          // 动作标识，如 policy.bundle.publish
+	scope  policy.ScopeRef // 这条动作**关于**哪个范围（§2.7 规则 2）
+	target string          // 被操作的对象标识，如策略包 id
+}
+
 // editPolicySection 是「只改 policy 段本身、不动内容文件」那类动作的公共通道。
-func (s *Server) editPolicySection(w http.ResponseWriter, r *http.Request,
+// 这类动作（切生效包、切模式）都是全局开关，所以归属固定在系统范围。
+func (s *Server) editPolicySection(w http.ResponseWriter, r *http.Request, action, target string,
 	mutate func(*config.PolicyConfig) (string, error)) {
 	path := s.cfgStore.Path()
 	src, err := os.ReadFile(path)
@@ -778,7 +807,8 @@ func (s *Server) editPolicySection(w http.ResponseWriter, r *http.Request,
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	resp, ok := s.commitPolicyConfig(w, path, src, newSrc, note, nil)
+	resp, ok := s.commitPolicyConfig(w, path, src, newSrc, note, nil,
+		policyAudit{action: action, scope: policy.SystemScope, target: target})
 	if !ok {
 		return
 	}
@@ -794,7 +824,7 @@ func (s *Server) editPolicySection(w http.ResponseWriter, r *http.Request,
 // 否则磁盘上留下一份配置没引用的新内容 —— 下一次发布的「旧内容」就成了它。
 // 返回的 resp 只到「写成功」为止，调用方补自己的字段后再 writeJSON。
 func (s *Server) commitPolicyConfig(w http.ResponseWriter, path string, src, newSrc []byte,
-	note string, undo func()) (map[string]any, bool) {
+	note string, undo func(), pa policyAudit) (map[string]any, bool) {
 	fail := func(status int, code, msg string) (map[string]any, bool) {
 		if undo != nil {
 			undo()
@@ -840,6 +870,10 @@ func (s *Server) commitPolicyConfig(w http.ResponseWriter, path string, src, new
 		s.log.Warnf("收紧配置文件权限失败: %v", err)
 	}
 	s.log.Warnf("管理员通过控制台改写了 policy 段：%s（配置备份 %s）", note, filepath.Base(backup))
+	// 审计与日志同一条落盘点：detail 就是那句 note（说了从哪版换到哪版、备份文件名在
+	// 响应里给），不含规则条件值。actor 固定 "admin" —— 这个端点只认 admin_token，
+	// 目前不存在「哪个管理员」的身份，编一个名字比不写更糟。
+	s.auditAt(pa.scope, "admin", pa.action, pa.target, note)
 
 	version := ""
 	if set != nil {

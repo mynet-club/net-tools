@@ -1292,7 +1292,7 @@ func (s *Server) adminCreateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.SyncUsers()
-	s.audit("admin", "user.create", name, "")
+	s.auditUser("admin", "user.create", name, "")
 	s.log.Warnf("管理员创建了用户 %s", name)
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"name":  name,
@@ -1319,7 +1319,7 @@ func (s *Server) handleMeRotateToken(w http.ResponseWriter, r *http.Request, e *
 		return
 	}
 	_ = s.SyncUsers()
-	s.audit(e.Name, "user.rotate_token", e.Name, "自助轮换")
+	s.auditUser(e.Name, "user.rotate_token", e.Name, "自助轮换")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token": token,
 		"note":  "明文只在这里返回一次，旧 token 已失效",

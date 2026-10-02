@@ -120,11 +120,16 @@ func encodeLegacyProviderScope(scope policy.ScopeRef) (string, error) {
 	}
 }
 
-// decodeLegacyPriceScope 把 user_prices 的旧 scope 串映射成结构化范围：
+// DecodeLegacyPriceScope 把 user_prices 的旧 scope 串映射成结构化范围：
 //
 //	'default'      → (system, 'global')
 //	'user:<名>'    → (user, '<名>')
-func decodeLegacyPriceScope(s string) (policy.ScopeRef, error) {
+//
+// 导出它的唯一理由：分发价的管理接口收到的还是旧串，而写审计必须有范围 ——
+// 让 server 自己再解析一遍 'default' / 'user:' 前缀就是跨包复制业务规则。
+//
+// §2.7 规则 8：随旧分发价接口一起删除（调用方改用结构化 ScopePrice 后无人需要解析旧串）。
+func DecodeLegacyPriceScope(s string) (policy.ScopeRef, error) {
 	switch {
 	case s == legacyPriceScopeDefault:
 		return policy.SystemScope, nil

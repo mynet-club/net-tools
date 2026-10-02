@@ -41,6 +41,8 @@ async function enterAdmin() {
   $('admin').hidden = false;
   $('admin-base').textContent = state.base;
   await Promise.all([loadSysProviders(), loadAdminUsers(), loadPolicy()]);
+  // 用户列表与策略包是并行拉回来的，范围选项此时才完整（列表本身 loadPolicy 已经查过）。
+  fillAuditScopes();
 }
 
 function adminLogout() {
@@ -562,6 +564,10 @@ async function loadPolicy(keepMsg) {
   renderPolicyBundles(data);
   renderPolicyWrite();
   fillSimScopes();
+  // 策略写侧每次都落审计（policypublish.go 的落盘通道），所以这一屏刷新过之后
+  // 审计列表也要跟着刷新：面板停在改动前的记录，等于把刚按下的按钮记的那条藏起来。
+  fillAuditScopes();
+  loadAudit();
 }
 
 function renderPolicyStats(d) {
@@ -1122,6 +1128,63 @@ async function runTrace() {
   }
 }
 
+/* ── 操作审计 ────────────────────────────────────────────────────── */
+
+// 范围下拉只列这个网关真的会写出的归属：全局开关与上游价目（system:global）、
+// 每个用户、策略包自己声明的范围（组织/项目）。选项从已有状态里拼，不另开接口 ——
+// 精确的 kind:id 可以直接敲在 URL 上，界面没必要把参数空间穷举一遍。
+function fillAuditScopes() {
+  const sel = $('ad-scope');
+  const cur = sel.value;
+  const opts = [
+    { v: '', t: '（全部范围）' },
+    { v: 'system:global', t: 'system:global（全局开关、上游价目）' },
+  ];
+  const seen = new Set(opts.map((o) => o.v));
+  (ADM.users || []).forEach((u) => {
+    const v = 'user:' + u.name;
+    if (!seen.has(v)) { seen.add(v); opts.push({ v, t: v }); }
+  });
+  ((ADM.policy && ADM.policy.bundles) || []).forEach((b) => {
+    if (b && b.scope && !seen.has(b.scope)) {
+      seen.add(b.scope);
+      opts.push({ v: b.scope, t: b.scope + '（策略包范围）' });
+    }
+  });
+  sel.replaceChildren(...opts.map((o) => h('option', { value: o.v, text: o.t })));
+  sel.value = opts.some((o) => o.v === cur) ? cur : '';
+}
+
+async function loadAudit() {
+  showErr($('ad-err'), '');
+  const btn = $('ad-run');
+  btn.disabled = true;
+  try {
+    const scope = $('ad-scope').value;
+    const n = $('ad-n').value.trim() || '100';
+    const q = '/v1/_admin/audit?n=' + encodeURIComponent(n) +
+      (scope ? '&scope=' + encodeURIComponent(scope) : '');
+    const { data } = await adminApi(q);
+    const list = (data && data.entries) || [];
+    const tb = $('ad-table').querySelector('tbody');
+    tb.replaceChildren(...list.map((e) => h('tr', null,
+      h('td', { class: 'mono', text: e.ts ? new Date(e.ts).toLocaleString('zh-CN', { hour12: false }) : '—' }),
+      h('td', null, h('code', { class: 'k', text: (e.scope && e.scope.kind ? e.scope.kind + ':' + e.scope.id : '—') })),
+      h('td', null, e.actor || '—'),
+      h('td', null, h('span', { class: 'tag' + (String(e.action || '').startsWith('policy.') ? ' ok' : ''), text: e.action || '' })),
+      h('td', { class: 'mono', text: e.target || '—' }),
+      h('td', { class: 'muted', text: e.detail || '' }))));
+    $('ad-empty').hidden = list.length > 0;
+  } catch (e) {
+    tbClear();
+    showErr($('ad-err'), e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function tbClear() { $('ad-table').querySelector('tbody').replaceChildren(); $('ad-empty').hidden = true; }
+
 /* ── 用户列表 ────────────────────────────────────────────────────── */
 
 function moneyShort(v) {
@@ -1161,6 +1224,7 @@ async function loadAdminUsers() {
     );
   }));
   $('u-empty').hidden = ADM.users.length > 0;
+  fillAuditScopes(); // 新建/删除的用户要立刻能在审计的归属筛选里选到
   // 模拟的范围下拉要用这份名单；两处都调一次是因为进台时它们是并发加载的，
   // 谁先回来都不能让下拉空着。
   fillSimScopes();
@@ -1581,6 +1645,9 @@ $('sim-run').addEventListener('click', runSimulate);
 $('sim-model').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); runSimulate(); } });
 $('sim-rid').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); runSimulate(); } });
 $('tr-run').addEventListener('click', runTrace);
+$('ad-refresh').addEventListener('click', () => { fillAuditScopes(); loadAudit(); });
+$('ad-run').addEventListener('click', loadAudit);
+$('ad-scope').addEventListener('change', loadAudit);
 $('tr-rid').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); runTrace(); } });
 $('pick-close').addEventListener('click', closePick);
 $('pick-ok').addEventListener('click', applyPick);

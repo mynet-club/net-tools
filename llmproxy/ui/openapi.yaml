@@ -183,12 +183,21 @@ paths:
   /v1/_admin/audit:
     get:
       tags: [admin]
-      summary: 最近管理操作审计
+      summary: 最近管理操作审计（可按分发范围筛选）
+      description: |
+        每条审计都带 scope（scope_kind + scope_id 两列，§2.7 规则 1）：归属看的是这条动作
+        **关于**哪个范围，而不是谁按了按钮。detail 永不包含密钥或令牌。
       security: [{adminAuth: []}]
       parameters:
-        - { name: n, in: query, schema: { type: integer, default: 100 } }
+        - { name: n, in: query, schema: { type: integer, default: 100, maximum: 1000 } }
+        - name: scope
+          in: query
+          description: 精确范围 kind:id（可重复给，取并集）；缺省 = 全部范围
+          required: false
+          schema: { type: string, example: organization:university }
       responses:
-        '200': { description: OK }
+        '200': { description: 'entries: [{ts, scope{kind,id}, actor, action, target, detail}]' }
+        '400': { description: scope 不是精确的 kind:id（裸用户名、通配、未知类型都拒） }
   /v1/_admin/config:
     get:
       tags: [admin]

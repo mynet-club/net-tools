@@ -277,6 +277,35 @@
       </div>
       <p class="muted" id="ud-usage-empty" hidden>最近没有记录。</p>
     </section>
+
+    <!-- 操作审计（§3.H）：谁在什么时候把哪一版换成了哪一版 -->
+    <section class="card" id="audit">
+      <div class="head">
+        <h2>操作审计</h2>
+        <span class="grow"></span>
+        <button type="button" id="ad-refresh" class="ghost sm">刷新</button>
+      </div>
+      <p class="sub">每条动作都带<b>归属范围</b>：落在哪个范围看它「关于谁」，而不是谁按了按钮 ——
+        给别人建用户、录分发价，都记在那个用户名下；全局开关与上游价目记在 <code>system:global</code>。
+        密钥与令牌永不进说明列。</p>
+      <div class="row">
+        <select id="ad-scope"></select>
+        <input id="ad-n" class="mono" type="number" min="1" max="1000" step="50" value="100"
+               title="取最近多少条（1~1000）">
+        <button type="button" id="ad-run" class="primary sm">查询</button>
+        <span class="grow"></span>
+        <span class="err" id="ad-err" hidden></span>
+      </div>
+      <div class="tablewrap">
+        <table id="ad-table">
+          <thead>
+            <tr><th>时间</th><th>归属范围</th><th>操作者</th><th>动作</th><th>对象</th><th>说明</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="muted" id="ad-empty" hidden>这个范围下没有记录。</p>
+    </section>
   </main>
 </div>
 

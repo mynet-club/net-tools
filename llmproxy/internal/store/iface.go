@@ -59,7 +59,8 @@ type DB interface {
 	// 是 2.x 的 'default' / 'user:<名>' 前缀适配层，主线接线完成后连同
 	// UserPrice 结构一起删除，调用方改用下面那组 ScopePrice*。
 	// SaveProviderStatus / LoadProviderStatus 与 ProviderStatus.Scope 同理
-	// （换成 ProviderBucketState），审计的 Audit/AuditRecent 换成 AuditScope/AuditRecentByScope，
+	// （换成 ProviderBucketState）。审计侧已经收干净了：无范围的 Audit/AuditRecent
+	// 已删除，写侧只剩 AuditScope，读侧三条都返回带范围的条目。
 	// 用量侧的 UsageByUser/TotalByUser/SystemUsageSince/SystemUsageRowsSince 换成 Scope* 那组。
 	//
 	// 配额侧已经没有遗留项可删了：2.x 的 SetUserQuota/SetUserLimits 与「读不到配额行就
@@ -108,8 +109,9 @@ type DB interface {
 	ScopeChargeTotal(scope policy.ScopeRef, since, until time.Time, cost CostFunc) (float64, error)
 	ScopeUsageExportRows(scope policy.ScopeRef, since, until time.Time) ([]ScopeUsageRow, error)
 
-	// 审计：带范围
+	// 审计：写侧一律带范围；读侧全量那条也返回带范围的条目
 	AuditScope(scope policy.ScopeRef, actor, action, target, detail string) error
+	AuditRecentAll(n int) ([]ScopedAuditEntry, error)
 	AuditRecentByScope(scope policy.ScopeRef, n int) ([]ScopedAuditEntry, error)
 	AuditRecentForScopes(scopes []policy.ScopeRef, n int) ([]ScopedAuditEntry, error)
 

@@ -440,7 +440,7 @@ func checkLegacyUserPricesMapping(db *sql.DB, d Dialect, rep *ScopeMigrationRepo
 			return err
 		}
 		total++
-		if _, err := decodeLegacyPriceScope(strings.TrimSpace(scope)); err != nil {
+		if _, err := DecodeLegacyPriceScope(strings.TrimSpace(scope)); err != nil {
 			return fmt.Errorf("%w：user_prices 有作用域 %q（模型 %s，valid_from=%d）——"+
 				"旧约定只认 %q 与 %q<用户名>", ErrScopeMigration, scope, model, validFrom,
 				legacyPriceScopeDefault, legacyPriceScopeUserPfx)
@@ -902,7 +902,7 @@ func (p *scopeMigrationPlan) migrateUserPrices(st scopeSchemaState, _ *ScopeMigr
 	}
 
 	for _, k := range keys {
-		ref, err := decodeLegacyPriceScope(strings.TrimSpace(k.scope))
+		ref, err := DecodeLegacyPriceScope(strings.TrimSpace(k.scope))
 		if err != nil {
 			return fmt.Errorf("%w: user_prices id=%d 的作用域 %q: %w", ErrScopeMigration, k.id, k.scope, err)
 		}

@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -419,4 +420,114 @@ func TestOpenAPISpec(t *testing.T) {
 	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "yaml") {
 		t.Errorf("content-type = %q", ct)
 	}
+}
+
+// 审计归属 + 按范围查询（§2.7 规则 2）：一条动作落在哪个范围，取决于它**关于**谁，
+// 而不是谁按下了按钮 —— 管理员给别人建用户、录分发价，归属都在那个范围里。
+func TestAdminAuditScopedQuery(t *testing.T) {
+	h := newMUHarness(t)
+	if resp, raw := h.post(t, "/v1/_admin/users", adminToken, map[string]any{"name": "auditee"}); resp.StatusCode >= 300 {
+		t.Fatalf("建用户: %d %s", resp.StatusCode, raw)
+	}
+	base := hourFloor(time.Now().Add(-time.Hour))
+	putPrice := func(scope, model string) {
+		t.Helper()
+		resp, raw := h.put(t, "/v1/_admin/prices/user", adminToken, map[string]any{
+			"scope": scope, "model": model,
+			"valid_from": base.Format(time.RFC3339),
+			"in_miss":    1.0, "out": 4.0,
+		})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("录分发价 %s/%s: %d %s", scope, model, resp.StatusCode, raw)
+		}
+	}
+	putPrice("user:auditee", "per-user-model")
+	putPrice("default", "default-model")
+
+	entries := func(query string) []map[string]any {
+		t.Helper()
+		code, body := adminGet(t, h, "/v1/_admin/audit"+query)
+		if code != http.StatusOK {
+			t.Fatalf("audit%s = %d %s", query, code, body)
+		}
+		var out struct {
+			Entries []map[string]any `json:"entries"`
+		}
+		if err := json.Unmarshal(body, &out); err != nil {
+			t.Fatalf("解析审计响应: %v\n%s", err, body)
+		}
+		return out.Entries
+	}
+	actionsWith := func(list []map[string]any, action string) []map[string]any {
+		var hit []map[string]any
+		for _, e := range list {
+			if e["action"] == action {
+				hit = append(hit, e)
+			}
+		}
+		return hit
+	}
+	scopeOf := func(e map[string]any) (string, string) {
+		m, _ := e["scope"].(map[string]any)
+		s, _ := m["kind"].(string)
+		i, _ := m["id"].(string)
+		return s, i
+	}
+
+	// 每条都带归属：无范围的读接口已经退役，「全量列一下」也不该把归属读丢。
+	all := entries("?n=200")
+	if len(all) == 0 {
+		t.Fatal("全量审计为空")
+	}
+	for _, e := range all {
+		if k, _ := scopeOf(e); k == "" {
+			t.Errorf("审计条目缺 scope: %+v", e)
+		}
+	}
+
+	// 建用户归那个用户，不归 admin 按钮所在的系统范围。
+	own := entries("?n=200&scope=user:auditee")
+	created := actionsWith(own, "user.create")
+	if len(created) != 1 {
+		t.Fatalf("user:auditee 下应有 1 条 user.create，实际 %+v", created)
+	}
+	if k, i := scopeOf(created[0]); k != "user" || i != "auditee" {
+		t.Errorf("user.create 归属错: %s:%s", k, i)
+	}
+	// 单用户覆盖价进用户范围，全局默认价进系统范围。
+	if got := actionsWith(own, "price.user"); len(got) != 1 {
+		t.Fatalf("user:auditee 下应有 1 条 price.user，实际 %+v", got)
+	} else if !strings.Contains(stringified(got[0]), "per-user-model") {
+		t.Errorf("用户覆盖价的审计没指到那条价: %+v", got[0])
+	}
+	sys := entries("?n=200&scope=system:global")
+	def := actionsWith(sys, "price.user")
+	if len(def) != 1 || !strings.Contains(stringified(def[0]), "default-model") {
+		t.Errorf("default 分发价应落在 system:global，实际 %+v", def)
+	}
+	// 两个范围的并集 = 各自之和，且不掺别人的。
+	both := entries("?n=200&scope=user:auditee&scope=system:global")
+	if len(actionsWith(both, "price.user")) != 2 {
+		t.Errorf("并集应含 2 条 price.user: %+v", actionsWith(both, "price.user"))
+	}
+	if len(actionsWith(both, "user.create")) != 1 {
+		t.Error("并集里的 user.create 数量不对")
+	}
+	// 没配过的范围：200 空集，而不是「读不到就返回全量」。
+	if got := entries("?n=200&scope=organization:nobody-here"); len(got) != 0 {
+		t.Errorf("无关范围应返回空集，实际 %+v", got)
+	}
+	// 裸用户名与通配都不认：前者是 3.0 要清掉的歧义旧形式，后者服务端没有对应语义。
+	for _, bad := range []string{"auditee", "organization:*", "*", "bogus:x"} {
+		code, _ := adminGet(t, h, "/v1/_admin/audit?scope="+url.QueryEscape(bad))
+		if code != http.StatusBadRequest {
+			t.Errorf("scope=%q 应 400，实际 %d", bad, code)
+		}
+	}
+}
+
+// stringified 把一条审计响应序列化回文本，便于做包含性断言。
+func stringified(e map[string]any) string {
+	b, _ := json.Marshal(e)
+	return string(b)
 }

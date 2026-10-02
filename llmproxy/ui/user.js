@@ -900,7 +900,10 @@ async function loadUsage() {
     h('span', { class: 'ubar-lab', text: d.slice(5) }),
   ));
   const uc = $('ubars');
-  if (uc) uc.replaceChildren(...bars);
+  if (uc) {
+    uc.replaceChildren(...bars);
+    uc.hidden = bars.length === 0; // 没记录时留出空白没意义
+  }
 }
 
 /* ── 试一下 ───────────────────────────────────────────────────────── */

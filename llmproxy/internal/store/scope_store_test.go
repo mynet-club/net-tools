@@ -507,3 +507,63 @@ func TestDeleteProviderBucketsForScope(t *testing.T) {
 		t.Error("全局池的桶没了")
 	}
 }
+
+// ------------------------------------------------------------------ 审计：按范围读写
+
+func TestAuditScopedRoundtripAndIsolation(t *testing.T) {
+	s := openTestStore(t)
+	alice := policy.MustScope(policy.ScopeUser, "alice")
+	org := policy.MustScope(policy.ScopeOrganization, "university")
+	proj := policy.MustScope(policy.ScopeProject, "proj-lab-7")
+
+	for _, sc := range []policy.ScopeRef{alice, org, proj, policy.SystemScope} {
+		if err := s.AuditScope(sc, "admin", "user.create", sc.Display(), "关于 "+sc.Display()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 零值范围必须报错而不是落进某个默认桶 —— 「忘了传 scope」变成脏数据最难查。
+	if err := s.AuditScope(policy.ScopeRef{}, "admin", "user.create", "x", ""); err == nil {
+		t.Fatal("零值 ScopeRef 必须被拒绝")
+	}
+
+	all, err := s.AuditRecentAll(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 4 {
+		t.Fatalf("全量应含 4 条，实际 %d", len(all))
+	}
+	for _, e := range all {
+		if e.Scope.Kind == "" || e.Scope.ID == "" {
+			t.Errorf("全量读回来的条目丢了归属: %+v", e)
+		}
+	}
+
+	// 组织管理员要的是「本组织 + 名下项目」的并集，且看不见别人的用户范围。
+	list, err := s.AuditRecentForScopes([]policy.ScopeRef{org, proj}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("并集应是 2 条，实际 %d: %+v", len(list), list)
+	}
+	for _, e := range list {
+		if e.Scope.Is(alice) {
+			t.Errorf("alice 的审计漏进了组织并集: %+v", e)
+		}
+	}
+
+	single, err := s.AuditRecentByScope(alice, 10)
+	if err != nil || len(single) != 1 || !single[0].Scope.Is(alice) {
+		t.Fatalf("单范围查询 = %d 条 err=%v", len(single), err)
+	}
+	if _, err := s.AuditRecentByScope(alice, 0); err != nil {
+		t.Errorf("n<=0 应按缺省条数处理: %v", err)
+	}
+	if _, err := s.AuditRecentForScopes(nil, 10); err == nil {
+		t.Error("空范围集合必须报错，不能退化成全量")
+	}
+	if _, err := s.AuditRecentByScope(policy.ScopeRef{}, 10); err == nil {
+		t.Error("零值范围的单查询必须被拒绝")
+	}
+}

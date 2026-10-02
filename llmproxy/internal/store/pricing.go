@@ -225,7 +225,7 @@ func legacyUserPriceToScope(p *UserPrice) (*ScopePrice, error) {
 		scopeStr = ScopeDefault
 		p.Scope = ScopeDefault
 	}
-	scope, err := decodeLegacyPriceScope(scopeStr)
+	scope, err := DecodeLegacyPriceScope(scopeStr)
 	if err != nil {
 		return nil, err
 	}
@@ -510,7 +510,7 @@ func (s *Store) ListProviderPrices(provider, upstreamModel string) ([]ProviderPr
 //
 // §2.7 规则 8：主线接线完成后删除，调用方改用 ListScopePrices。
 func (s *Store) ListUserPrices(scope, model string) ([]UserPrice, error) {
-	ref, err := decodeLegacyPriceScope(strings.TrimSpace(scope))
+	ref, err := DecodeLegacyPriceScope(strings.TrimSpace(scope))
 	if err != nil {
 		if errors.Is(err, ErrLegacyScope) {
 			return []UserPrice{}, nil
