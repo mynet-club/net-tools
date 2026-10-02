@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -160,6 +161,40 @@ func configEqual(a, b *Config) bool {
 			return false
 		}
 	}
+	if !policyEqual(a.Policy, b.Policy) {
+		return false
+	}
+	return true
+}
+
+// policyEqual 比较 policy 段的生效语义 —— 它是热加载能「按 scope 回滚」的前提。
+//
+// 漏掉这段的后果不是少打一行日志：§3.0 的回滚动作就是改 policy.mode（或改引用
+// 的 version / bundle_dir / data_level），比不出变更 → revision 不推进 →
+// server.policyFor 继续返回缓存着的旧 policyRuntime，运维改完配置一切照旧，
+// 而审计里的策略版本还会一直报着回滚前那一版。回滚开关按下去没反应，
+// 比没有开关更糟。
+//
+// 一律比**解析后的值**而不是原始字段：「没写 fallback」与「显式写 true」行为完全
+// 一致就该判等（同 databaseEqual 的理由），而 mode/data_level 在加载期已被归一化成
+// 派生的枚举值（TrimSpace + 解析），比派生值才能同时躲开指针身份和「写法不同、
+// 语义相同」两个坑。
+func policyEqual(a, b PolicyConfig) bool {
+	if a.ModeResolved() != b.ModeResolved() ||
+		a.DataLevelResolved() != b.DataLevelResolved() ||
+		a.FallbackToLegacyEnabled() != b.FallbackToLegacyEnabled() ||
+		strings.TrimSpace(a.BundleDir) != strings.TrimSpace(b.BundleDir) ||
+		strings.TrimSpace(a.ActiveBundle) != strings.TrimSpace(b.ActiveBundle) {
+		return false
+	}
+	if len(a.Bundles) != len(b.Bundles) {
+		return false
+	}
+	for i := range a.Bundles {
+		if a.Bundles[i] != b.Bundles[i] {
+			return false
+		}
+	}
 	return true
 }
 
@@ -205,10 +240,17 @@ func serverEqual(a, b ServerConfig) bool {
 	return true
 }
 
+// providerEqual 逐字段比较归一化后的供应商。
+//
+// MaxDataLevel 必须在列：它是 3.0 分级门的事实来源，把一家上游从 confidential 降
+// 到 internal 是一次**降敏动作**，静默不生效等于让敏感流量继续留在已经声明「不接」
+// 的上游里。漏比一个字段在这个函数里没有编译器提示，只能靠测试钉住
+// （TestConfigEqualDetectsPolicyFacts）。
 func providerEqual(a, b Provider) bool {
 	if a.Name != b.Name || a.Enabled != b.Enabled || a.BaseURL != b.BaseURL ||
 		a.APIKey != b.APIKey || a.Weight != b.Weight || a.TimeoutMs != b.TimeoutMs ||
-		a.Proxy != b.Proxy || a.Models.Passthrough != b.Models.Passthrough ||
+		a.Proxy != b.Proxy || a.MaxDataLevel != b.MaxDataLevel ||
+		a.Models.Passthrough != b.Models.Passthrough ||
 		a.Models.CatchAll != b.Models.CatchAll {
 		return false
 	}

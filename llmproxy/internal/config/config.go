@@ -13,9 +13,12 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 )
 
 const ToolName = "llmproxy"
@@ -207,6 +210,12 @@ type ProviderRaw struct {
 	TimeoutMs    int               `yaml:"timeout_ms"`
 	Models       yaml.Node         `yaml:"models"`
 	ExtraHeaders map[string]string `yaml:"extra_headers"`
+	// MaxDataLevel 声明这家上游**最多能承接哪个数据分级**（§2.3 的四级词表）。
+	// 3.0 的分级门比的就是这个事实：请求的有效分级高于它时，这家不参与选路。
+	// 启用 3.0（policy.mode ≠ legacy）时已启用的供应商必须显式写它 ——
+	// 猜 public 会把敏感流量放行到不该去的上游，猜 restricted 会让分级门永不生效，
+	// 两种猜法都会在审计里留下「看起来配好了」的计划（同 policy.data_level 不给缺省）。
+	MaxDataLevel string `yaml:"max_data_level"`
 }
 
 func (p *ProviderRaw) IsEnabled() bool {
@@ -366,6 +375,12 @@ type Provider struct {
 	Proxy        ProxyRef
 	Models       ModelSpec
 	Index        int
+	// MaxDataLevel 是这家上游声明的**可承接最高分级**（§2.3）。
+	//
+	// 零值 LevelUnknown 表示「没声明」：配置里的供应商在启用 3.0 时会在加载期被拦下
+	// （见 checkProviderDataLevels），运行期构造的 Provider（用户自配上游）没有申报
+	// 渠道，取分级时按最低级处理（见 DataLevelCeiling）。
+	MaxDataLevel policy.DataLevel
 	// SystemPaid 是**运行期**标记：true = 这家来自系统池（config.yaml 的 providers），
 	// 这次消耗算网关主人的账，要进用户的配额与金额；false = 用户自己配的上游。
 	// 不参与 YAML 解析 —— 它由 providersFor 在拼候选池时按来源打上，用来决定计费归属。
@@ -410,6 +425,20 @@ func (p *Provider) Declares(model string) bool {
 	}
 	_, ok := p.Models.Map[model]
 	return ok
+}
+
+// DataLevelCeiling 返回这家上游在本次判定里应当使用的分级上限。
+//
+// 未声明时返回 public（最低级），方向是**收紧**而不是放开：
+// 配置里的供应商本来就在加载期被要求声明（checkProviderDataLevels），走到这里的
+// 未声明项只可能是运行期构造的用户自建上游 —— 那是网关主人以外的人随手填的入口，
+// 没有任何人核对过它能承接哪一等级的数据。把它当成 restricted 会让分级门对
+// 用户上游永久失效，当成「不判定」则会在审计里伪装成一条经过合规比对的计划。
+func (p *Provider) DataLevelCeiling() policy.DataLevel {
+	if p == nil || !p.MaxDataLevel.Valid() {
+		return policy.LevelPublic
+	}
+	return p.MaxDataLevel
 }
 
 // ------------------------------------------------------------------ 路径
@@ -725,6 +754,16 @@ func (c *Config) normalize(opts LoadOptions) error {
 		if err != nil {
 			return err
 		}
+		// 分级声明：没写就是没声明（LegacyDataLevel 决定后果），写了就必须是四个等级之一。
+		// 拼错不能降级成「当作没配」：那会让一条本来想收紧的规则静默变成不收紧。
+		var maxLevel policy.DataLevel
+		if raw := strings.TrimSpace(p.MaxDataLevel); raw != "" {
+			lv, err := policy.ParseDataLevel(raw)
+			if err != nil {
+				return fmt.Errorf("%s.max_data_level: %w", where, err)
+			}
+			maxLevel = lv
+		}
 
 		c.Normalized = append(c.Normalized, Provider{
 			Name:         p.Name,
@@ -737,6 +776,7 @@ func (c *Config) normalize(opts LoadOptions) error {
 			Proxy:        proxyRef,
 			Models:       spec,
 			Index:        i,
+			MaxDataLevel: maxLevel,
 		})
 	}
 
@@ -810,7 +850,38 @@ func (c *Config) normalize(opts LoadOptions) error {
 	if err := c.normalizeSchemaVersion(); err != nil {
 		return err
 	}
-	return c.Policy.normalize(opts.KnownScopes, &c.Warnings)
+	if err := c.Policy.normalize(opts.KnownScopes, &c.Warnings); err != nil {
+		return err
+	}
+	return c.checkProviderDataLevels()
+}
+
+// checkProviderDataLevels 在 3.0 真正参与判定时要求每家已启用的供应商声明分级上限。
+//
+// 为什么放在 policy 校验之后、而不是供应商循环里：mode 是否生效要到这一步才知道，
+// 而 legacy 部署不该被一个它用不上的字段拦在启动门外。
+// 为什么是错误而不是警告：D 的候选必须有 MaxDataLevel（policy.RouteCandidate.Validate
+// 直接拒绝未指定），接线只能自己补一个值 —— 补哪个都是猜（见 ProviderRaw 的注释），
+// 而猜出来的分级会让审计里出现一份「看起来经过合规判定」的计划。
+// 报错点选在加载期而不是请求期：后者表现为 enforce 下整池 candidate_level_excluded
+// 或 shadow 下 0% 一致率，运维看不出这是漏配。
+func (c *Config) checkProviderDataLevels() error {
+	if !c.Policy.UsesPolicy() {
+		return nil
+	}
+	var missing []string
+	for _, p := range c.Normalized {
+		if p.Enabled && !p.MaxDataLevel.Valid() {
+			missing = append(missing, p.Name)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	sort.Strings(missing)
+	return fmt.Errorf("policy.mode=%s 时已启用的供应商必须逐家声明 max_data_level（public/internal/confidential/restricted）：%s —— "+
+		"分级门要用的是上游确实能承接的最高等级，未声明不能按最宽松处理；暂时不启用 3.0 就写 policy.mode: legacy",
+		c.Policy.ModeResolved(), strings.Join(missing, "、"))
 }
 
 // normalizeSchemaVersion 校验 config_schema_version 并定下缺省值。

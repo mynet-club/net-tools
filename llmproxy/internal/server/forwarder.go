@@ -176,6 +176,49 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 	providers, poolHasSystem := s.providersFor(scope, probe.Model)
 	rec.SystemPaid = poolHasSystem
 
+	// 会话粘性：下游（MiMoCode 等）会在 x-session-affinity 里带会话 id，没有这个头
+	// 就没有粘性，照旧按权重随机。粘性的键是 (用户, 会话, 模型) —— 上游的前缀缓存
+	// 本来就按模型分区，一个会话还会调多个模型。配置里 affinity_ttl_ms=0 时整体关闭，
+	// 这时连观测头都不写，免得留一条永远是 new 的字段来混淆排障。
+	//
+	// 这一段在 3.0 判定**之前**读：粘性是纯读操作，而影子对比要拿同一个粘性当输入，
+	// 否则计划算出的首选和线上真实首选永远不一致，差异报告全是噪音。
+	affinityOn := s.affinity.Enabled()
+	affinitySession := ""
+	affinityPrefer := ""
+	if affinityOn {
+		affinitySession = r.Header.Get("X-Session-Affinity")
+		affinityPrefer = s.affinity.Get(scope, affinitySession, probe.Model) // 头为空时返回 ""
+	}
+
+	// §3.0 接线：策略判定排在配额与选路之前。顺序是语义问题不是风格问题 ——
+	// deny 回答「能不能用这家」，配额回答「这个月还花得起吗」，把配额排在前面
+	// 会让一次策略拒绝显示成一次超额，运维去找财务而真正该改的是策略包。
+	// 影子模式在这里只产出差异报告；enforce 才允许拒绝请求与指定首选。
+	shot := s.policyEvaluate(s.policyFor(cfg), scope, probe.Model, requestID, r.URL.Path,
+		providers, affinityPrefer, started)
+	if shot != nil {
+		// 影子也写 policy_version（§3.0 明文要求）；routing_seed 与候选摘要**不写**，
+		// 那两个字段描述的是真正跑过的计划，写进去等于让回放在复现一次没发生的决策。
+		rec.PolicyVersion = shot.Version
+		if shot.Blocked != "" {
+			s.fail(w, rec, http.StatusForbidden, "policy_denied", shot.Blocked, 0, started)
+			return
+		}
+		// enforce 的逐家收窄：计划里被**策略类**原因排除的上游不再进入选路池（§3.0 规则 2）。
+		// 只在拿到计划（Applied）之后收窄：PlanErr 那种「整池都没活下来」的形态已经由
+		// fallback_to_legacy 决定回落还是拒绝，回落时再顺手过滤一半池子，
+		// 等于把一个「3.0 没结论」执行成半套 3.0 结论。
+		// 收窄后为空则不动池子 —— 回滚开关不该有「把所有上游一起关掉」的威力。
+		if shot.Applied && len(shot.Excluded) > 0 {
+			if narrowed, n := withoutPolicyExcluded(providers, shot.Excluded); n > 0 {
+				providers = narrowed
+				s.log.Infof("event=policy_enforce_narrow request_id=%s policy_version=%s kept=%s dropped=%s",
+					requestID, shot.Version, namesOf(narrowed), describeExcluded(shot.Excluded))
+			}
+		}
+	}
+
 	// 配额只约束「花网关的钱」：池子里有自有候选（会优先被选中）时放行 ——
 	// 那是用户自己的上游，没理由拿网关的额度卡他。自有层全被排除后回落到系统池
 	// 才会真的花网关的钱，那种情况配额是软限制（见 README 三条语义）。
@@ -230,23 +273,7 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 	)
 	attempts := 0
 
-	// 会话粘性：下游（MiMoCode 等）会在 x-session-affinity 里带会话 id，没有这个头
-	// 就没有粘性，照旧按权重随机。粘性的键是 (用户, 会话, 模型) —— 上游的前缀缓存
-	// 本来就按模型分区，一个会话还会调多个模型。配置里 affinity_ttl_ms=0 时整体关闭，
-	// 这时连观测头都不写，免得留一条永远是 new 的字段来混淆排障。
-	affinityOn := s.affinity.Enabled()
-	affinitySession := ""
-	affinityPrefer := ""
-	if affinityOn {
-		affinitySession = r.Header.Get("X-Session-Affinity")
-		affinityPrefer = s.affinity.Get(scope, affinitySession, probe.Model) // 头为空时返回 ""
-	}
-	// 规则 B：没有粘性可用时（新会话，或粘性那家已不适用）按**当前上游价**挑最便宜的。
-	// 挑不出来就留空、回落到按权重随机 —— 没录价目时行为与以前完全一致。
-	prefer := affinityPrefer
-	if prefer == "" {
-		prefer = s.cheapestProvider(scope, providers, probe.Model)
-	}
+	prefer := s.routingPrefer(scope, probe.Model, affinityPrefer, shot, providers)
 
 	for i := 0; i < maxAttempts; i++ {
 		cand, err := s.router.PickFromPreferring(scope, providers, probe.Model, exclude, prefer)

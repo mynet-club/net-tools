@@ -31,6 +31,16 @@ type runtimeMetrics struct {
 	lat     []int64 // 环形缓冲，毫秒
 	latPos  int
 	latFull bool
+
+	// 影子运行统计（§3.0：shadow 必须记录决策差异和性能）。
+	// 单独一组计数而不是塞进请求计数：影子判定不是请求终态，混在一起会让
+	// 「一致率」看起来像成功率。
+	shadowMu    sync.Mutex
+	shadowBy    map[string]int64
+	shadowMs    int64
+	shadowCount int64
+	// policyVersion 是当前生效的策略内容版本串（legacy 时为空）。
+	policyVersion atomic.Value
 }
 
 // latRingSize 足够估出 p99，又不至于在高 QPS 下变成延迟采样器的内存负担。
@@ -96,6 +106,57 @@ func (m *runtimeMetrics) noteCircuitCool() {
 	}
 }
 
+// observeShadow 累计一次影子判定。kind 是 classifyShadowDiff 的结论，
+// d 是这次判定自身花掉的时间（§3.0 要求影子同时记差异和性能）。
+func (m *runtimeMetrics) observeShadow(kind string, d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.shadowMu.Lock()
+	if m.shadowBy == nil {
+		m.shadowBy = map[string]int64{}
+	}
+	m.shadowBy[kind]++
+	m.shadowCount++
+	m.shadowMs += d.Milliseconds()
+	m.shadowMu.Unlock()
+}
+
+// setPolicyVersion 记下当前生效的策略版本串，供 /healthz 直接读出「现在是哪一版」。
+func (m *runtimeMetrics) setPolicyVersion(v string) {
+	if m == nil {
+		return
+	}
+	m.policyVersion.Store(v)
+}
+
+// shadowSnapshot 给出影子统计的一致率与均耗时。
+//
+// 单独一组计数而不是塞进请求计数：影子判定不是请求终态，混在一起会让
+// 「一致率」看起来像成功率。
+func (m *runtimeMetrics) shadowSnapshot() map[string]any {
+	if m == nil {
+		return nil
+	}
+	m.shadowMu.Lock()
+	defer m.shadowMu.Unlock()
+	by := make(map[string]int64, len(m.shadowBy))
+	for k, v := range m.shadowBy {
+		by[k] = v
+	}
+	version, _ := m.policyVersion.Load().(string)
+	out := map[string]any{
+		"evaluated":      m.shadowCount,
+		"by_verdict":     by,
+		"policy_version": version,
+	}
+	if m.shadowCount > 0 {
+		out["agree_percent"] = float64(by["agreed"]) * 100 / float64(m.shadowCount)
+		out["avg_eval_ms"] = m.shadowMs / m.shadowCount
+	}
+	return out
+}
+
 func (m *runtimeMetrics) noteDBWrite(d time.Duration, err error) {
 	if m == nil {
 		return
@@ -134,6 +195,7 @@ func (m *runtimeMetrics) snapshot() map[string]any {
 		"db_write_fail":  m.dbWriteFail.Load(),
 		"latency_ms":     latencyPercentiles(samples),
 		"latency_sample": n,
+		"policy_shadow":  m.shadowSnapshot(),
 	}
 }
 

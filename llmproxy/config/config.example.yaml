@@ -51,12 +51,20 @@ proxies:
     url: socks5://user:password@127.0.0.1:1081
 
 providers:
+  # max_data_level = 这家上游**最多能承接哪个数据分级**（public < internal <
+  # confidential < restricted，见 §2.3）。3.0 的分级门直接比它：请求的有效分级
+  # 高于它时，这一家不参与选路（enforce 下会被排除）。
+  # policy.mode ≠ legacy 时，**已启用的供应商必须逐家显式写它** —— 加载期就会拒绝：
+  # 猜 public 会把敏感流量放行到不该去的上游，猜 restricted 会让分级门永不生效，
+  # 两种猜法都会在审计里留下「看起来配好了」的计划。暂时不启用 3.0 就写
+  # policy.mode: legacy，这个字段可以不填（填了也不参与判定，拼错照样报错）。
   # ---- OpenAI 官方 ----
   - name: openai-main
     enabled: true
     base_url: https://api.openai.com/v1
     api_key: ${OPENAI_API_KEY}      # 支持 ${ENV_VAR} 展开，避免密钥写进文件
     weight: 10                      # 相对权重，越大被选中概率越高
+    max_data_level: internal        # 3.0 参与判定时的必填项（见本段开头）
     proxy: us-http                  # direct / 留空 = 直连；也可写代理名或内联 URL
     timeout_ms: 120000
     models:                         # 下游模型名 → 上游真实模型名

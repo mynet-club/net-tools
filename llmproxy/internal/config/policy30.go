@@ -58,6 +58,18 @@ type PolicyConfig struct {
 	Mode string `yaml:"mode"`
 	// ActiveBundle 指向 bundles 里生效的那一条（按 id）。
 	ActiveBundle string `yaml:"active_bundle"`
+	// BundleDir 是策略包**内容**所在目录（相对配置文件所在目录）。
+	// 配置里只放引用（id/version/scope），内容按 id 一文件（<id>.yaml）加载 ——
+	// 把 entitlements 也塞进主配置会让策略发布出现两个真值来源，
+	// 回滚时文件与库互相打脸（见 PolicyBundleRef 的注释）。
+	BundleDir string `yaml:"bundle_dir"`
+	// DataLevel 是本次部署对请求数据的**声明级**（§2.3 的 user_level 那一项）。
+	//
+	// 影子与强制都不读正文（§3.0 规则 1、§2.9），所以 detected_level 恒缺；
+	// 在目录声明（B）接进请求路径之前，分级只能由部署显式写。这里**不给缺省值**：
+	// 猜 public 等于把敏感流量当公开流量放行，猜 restricted 会让每条 deny 规则都命中，
+	// 两种猜法都会让差异报告失去意义，而错误的方式是「看起来配好了」。
+	DataLevel string `yaml:"data_level"`
 	// FallbackToLegacy 报告 3.0 算不出可用计划时是否回落旧路由。
 	// 缺省 true：§3.0 要求「任何新路径都必须可以按 scope 回滚到 legacy」，
 	// 关掉它是显式的 fail-closed 决定，只在 enforce 下有意义。
@@ -66,8 +78,29 @@ type PolicyConfig struct {
 
 	// --- 加载期解析出的派生值，运行期只读 ---
 	mode      PolicyMode
+	dataLevel policy.DataLevel
 	refIndex  map[string]PolicyBundleRef
 	scopeRefs map[string]policy.ScopeRef
+}
+
+// BundleRefs 返回配置声明的策略包引用（原样切片，运行期只读）。
+//
+// 暴露它而不是让接线包直接遍历字段：调用方拿到的是「配置承诺加载哪些包」，
+// nil 接收者也要能问 —— legacy 时返回空，空就是「不加载任何内容」。
+func (p *PolicyConfig) BundleRefs() []PolicyBundleRef {
+	if p == nil {
+		return nil
+	}
+	return p.Bundles
+}
+
+// ScopeOf 返回某个引用的生效范围。
+func (p *PolicyConfig) ScopeOf(id string) (policy.ScopeRef, bool) {
+	if p == nil {
+		return policy.ScopeRef{}, false
+	}
+	s, ok := p.scopeRefs[strings.TrimSpace(id)]
+	return s, ok
 }
 
 // ModeResolved 返回接线模式（加载期已定值，未加载时按 legacy）。
@@ -76,6 +109,18 @@ func (p *PolicyConfig) ModeResolved() PolicyMode {
 		return PolicyModeLegacy
 	}
 	return p.mode
+}
+
+// DataLevelResolved 返回部署声明的数据分级。
+//
+// 3.0 参与判定时它在加载期就必填（见 DataLevel 字段注释）；这里返回零值
+// policy.LevelUnknown 只可能出现在 legacy 或未经 normalize 的配置上，
+// 调用方拿到零值就该当成「没有分级依据」，不许替它猜一个。
+func (p *PolicyConfig) DataLevelResolved() policy.DataLevel {
+	if p == nil {
+		return policy.LevelUnknown
+	}
+	return p.dataLevel
 }
 
 // UsesPolicy 报告 3.0 是否参与本次请求（shadow 也算参与，只是不改路由）。
@@ -235,6 +280,14 @@ func (p *PolicyConfig) normalize(known KnownScopes, warnings *[]string) error {
 		return fmt.Errorf("policy.active_bundle=%q 不在 policy.bundles 里（可用：%s）",
 			p.ActiveBundle, strings.Join(ids, "、"))
 	}
+	// 分级只在 3.0 真正参与判定时才要求：legacy 下没有 PolicyContext，逼用户填一个
+	// 用不上的字段只会让人以为「升级必须先改配置」。
+	level, err := policy.ParseDataLevel(p.DataLevel)
+	if err != nil {
+		return fmt.Errorf("policy.data_level 必须显式写成 public、internal、confidential 或 restricted"+
+			"（影子与强制模式都不读正文，检测级恒缺，分级只能由部署声明）: %w", err)
+	}
+	p.dataLevel = level
 	if p.FallbackToLegacy != nil && !*p.FallbackToLegacy && p.mode == PolicyModeShadow {
 		// shadow 不改路由，这个开关在影子模式下没有任何作用点。
 		// 留着它会让配置看起来像「影子也 fail-closed」，而真出事时才发现

@@ -197,7 +197,10 @@ func cfgYAML(baseURLs map[string]string, apiKeys []string) string {
 	}
 	b.WriteString("routing:\n  retry: 2\n  failure_threshold: 3\n  cooldown_seconds: 60\nproviders:\n")
 	for name, u := range baseURLs {
-		fmt.Fprintf(&b, "  - name: %s\n    base_url: %s\n    api_key: sk-%s\n    weight: 1\n    models: [\"*\"]\n", name, u, name)
+		// max_data_level 一起给：3.0 参与（policy.mode ≠ legacy）时它是已启用供应商的
+		// 必填项（config.checkProviderDataLevels），夹具统一带上，
+		// 免得每个策略用例都要自己重拼一份供应商段。
+		fmt.Fprintf(&b, "  - name: %s\n    base_url: %s\n    api_key: sk-%s\n    weight: 1\n    max_data_level: internal\n    models: [\"*\"]\n", name, u, name)
 	}
 	b.WriteString("database:\n  retain_days: 90\nlog:\n  level: error\n")
 	return b.String()

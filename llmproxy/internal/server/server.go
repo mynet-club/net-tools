@@ -81,6 +81,16 @@ type Server struct {
 	// 规则 B 比价用的时钟。留空走 time.Now，测试可换成固定时刻 ——
 	// 「空闲时段谁便宜」这种判断依赖当前时间，不给测试一个把手就没法稳定断言。
 	nowFn func() time.Time
+
+	// 3.0 接线运行态（§3.0），按配置修订号整体替换，见 policy30.go。
+	//
+	// 用互斥锁而不是 atomic.Pointer：替换的原子性要求「同一份配置只加载一次磁盘」，
+	// 而 atomic 只能保证读到的指针一致，挡不住 N 个请求同时撞开策略包目录。
+	// 配置热加载是低频事件，请求路径上这一下是无锁竞争的轻量临界区。
+	policyMu     sync.Mutex
+	policyRun    *policyRuntime
+	policyRunRev int64
+	policyBadRev int64
 }
 
 // now 返回当前时刻；测试可以通过 nowFn 固定它。
