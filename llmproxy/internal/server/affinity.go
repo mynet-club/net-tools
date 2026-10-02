@@ -95,11 +95,14 @@ func newAffinityStore(ttl time.Duration, max int) *affinityStore {
 // Get 返回该会话该模型上次用的供应商；没粘过、已过期、或功能关闭时返回空串。
 // 命中会刷新「最近使用」并移到队首，让淘汰是真 LRU。
 func (s *affinityStore) Get(scope, session, model string) string {
-	if !affinityPartOK(session) || !affinityPartOK(model) || s == nil || s.ttl <= 0 {
+	if !affinityPartOK(session) || !affinityPartOK(model) || s == nil {
 		return ""
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.ttl <= 0 {
+		return ""
+	}
 	k := affinityKey{scope: scope, session: session, model: model}
 	el, ok := s.entries[k]
 	if !ok {
@@ -118,11 +121,14 @@ func (s *affinityStore) Get(scope, session, model string) string {
 // Set 记录该会话该模型这次用的是哪家。provider 为空表示"忘掉它"
 // （例如那家已经不再承接这个模型）。
 func (s *affinityStore) Set(scope, session, model, provider string) {
-	if !affinityPartOK(session) || !affinityPartOK(model) || s == nil || s.ttl <= 0 {
+	if !affinityPartOK(session) || !affinityPartOK(model) || s == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.ttl <= 0 {
+		return
+	}
 	k := affinityKey{scope: scope, session: session, model: model}
 	if el, ok := s.entries[k]; ok {
 		if provider == "" {
@@ -157,7 +163,7 @@ func (s *affinityStore) Len() int {
 // 要不要读头、要不要写观测字段 —— 关着时应当完全不可见，而不是留一条
 // 永远是 new 的观测头来混淆排障。
 func (s *affinityStore) Enabled() bool {
-	return s != nil && s.ttl > 0
+	return s.TTL() > 0
 }
 
 // TTL 返回当前的保留时长（观测/测试用）。

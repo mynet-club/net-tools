@@ -40,6 +40,23 @@ func TestAffinityDefaultTTLFromConfig(t *testing.T) {
 	}
 }
 
+func TestAffinitySetTTLConcurrentAccess(t *testing.T) {
+	s := newAffinityStore(time.Hour, 32)
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 1000; i++ {
+			s.SetTTL(time.Duration(i+1) * time.Second)
+		}
+		close(done)
+	}()
+	for i := 0; i < 1000; i++ {
+		s.Set("u", "session", "model", "provider")
+		_ = s.Get("u", "session", "model")
+		_ = s.Enabled()
+	}
+	<-done
+}
+
 // 配置里显式写 0 = 关闭：请求照旧按权重随机，不写粘性表，也不写观测头 ——
 // 关着时应当完全不可见，而不是留一条永远是 new 的字段来混淆排障。
 func TestAffinityDisabledByConfig(t *testing.T) {
