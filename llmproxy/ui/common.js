@@ -18,6 +18,10 @@ function h(tag, props, ...kids) {
     if (k === 'class') n.className = v;
     else if (k === 'text') n.textContent = v;
     else if (k.startsWith('on')) n.addEventListener(k.slice(2).toLowerCase(), v);
+    // style 必须走 CSSOM，不能 setAttribute：本页的 CSP 是 style-src 'self'，
+    // 内联 style **属性**会被浏览器静默丢掉（配额条因此一直是 0 宽，界面看着像没数据）。
+    // CSSOM 赋值不在 style-src 的管辖范围内，所以这是唯一不动 CSP 就能保住样式的写法。
+    else if (k === 'style') n.style.cssText = v;
     else n.setAttribute(k, v);
   }
   for (const kid of kids.flat()) {

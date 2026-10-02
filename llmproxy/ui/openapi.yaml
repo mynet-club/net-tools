@@ -189,6 +189,35 @@ paths:
         - { name: n, in: query, schema: { type: integer, default: 100 } }
       responses:
         '200': { description: OK }
+  /v1/_admin/config:
+    get:
+      tags: [admin]
+      summary: 读配置（密钥一律脱敏）
+      description: |
+        下发 `api_key: ""` + `has_key` + `api_key_hint`（尾 4 位或 `${ENV}` 变量名）。
+        留空在保存时意味着「沿用原值」，所以界面上回显脱敏值不会把密钥清掉。
+      security: [{adminAuth: []}]
+      responses:
+        '200': { description: OK }
+  /v1/_admin/config/providers:
+    put:
+      tags: [admin]
+      summary: 保存供应商段（只替换 providers 段，段外内容与注释原样）
+      description: |
+        写回前后各做一次加载校验（宽松通道 + 严格通道），通过后备份再原子替换。
+        段外的注释、`server:` 与 `policy:` 等段落一字不动 —— 管理台改一处不该重排整份配置。
+      security: [{adminAuth: []}]
+      responses:
+        '200': { description: 'written / applied / backup / strict_ok' }
+        '400': { description: 校验不通过，原文件未改动 }
+  /v1/_admin/config/validate:
+    post:
+      tags: [admin]
+      summary: 试算同一份保存逻辑，不落盘
+      security: [{adminAuth: []}]
+      responses:
+        '200': { description: 能加载 }
+        '400': { description: 加载失败，附错误原文 }
   /v1/_admin/policy:
     get:
       tags: [admin]
@@ -197,6 +226,9 @@ paths:
         回答「3.0 现在到底跑到哪一步」：模式、生效中的策略包版本、声明但未加载的包，
         以及**没生效时的原因**（legacy 或加载失败 + 错误原文）。
         「配了 shadow 但一根 3.0 线索都没有」是推进期最常见的困惑，这里必须说清是哪种。
+        `data_level` 是**参与判定的那一层**：legacy 下它必然是 `unknown`（没有 PolicyContext，
+        服务端不替配置猜一级）。配置里实际声明的值另在 `declared_data_level` 给出 ——
+        两者不等就说明「这一级已经写好了，只是当前模式不用它」，别让管理台把它说成没配。
       security: [{adminAuth: []}]
       responses:
         '200': { description: OK }
@@ -241,6 +273,206 @@ paths:
         '200': { description: OK }
         '400': { description: 缺 request_id }
         '404': { description: 没有这条请求的痕迹 }
+  /v1/_admin/policy/bundles:
+    get:
+      tags: [admin]
+      summary: 引用与内容文件并排的核对视图（只读）
+      description: |
+        加载是「按引用逐字段核对内容文件、全有或全无」，所以两边任一处漂了，表现都是
+        **整段策略不生效**，而 `policy.mode` 仍然写着 shadow。这里把配置里的每条引用
+        与磁盘上的 `<id>.yaml` 并排列出来：`matches` / `drift` 点名是哪一条，
+        `drift_warning` 说明下一次热加载会发生什么，`orphans` 列出磁盘上有、配置没引用的包。
+        规则只出选择器与条件**键名**，条件值与密钥不外泄。
+        `data_level` / `declared_data_level` 的口径与 `GET /v1/_admin/policy` 一致：
+        前者是参与判定的那一层（legacy 下必然是 `unknown`），后者是配置里声明的那一行。
+      security: [{adminAuth: []}]
+      responses:
+        '200': { description: OK }
+    post:
+      tags: [admin]
+      summary: 不接受（发布必须点名到 id）
+      responses:
+        '405': { description: '用 PUT /v1/_admin/policy/bundles/{id} 发布，POST /v1/_admin/policy/active 切生效版' }
+  /v1/_admin/policy/bundles/{id}:
+    put:
+      tags: [admin]
+      summary: 发布一个策略包版本（引用与内容文件同时改）
+      description: |
+        一次调用同时写两处：`policy.bundles` 里这条引用的 version/scope，以及
+        `policy-bundles/<id>.yaml` 的内容。两边分开改会当场触发加载失败（两个真值来源），
+        所以这里没有「只改一边」的入口。
+        落盘前依次做：领域校验（未知条件键、选择器形态、效果与分级取值）→ 写内容文件 →
+        改引用 → 整份配置宽松+严格加载 → **按引用加载策略集** → 备份 → 原子替换。
+        任何一步失败都还原内容文件，配置文件一字不动（响应 4xx）。
+        `active` 缺省为 true：发布即把这一版设为生效包；带 `"active": false` 只发布不切换。
+        配置里还没有 `policy:` 段时返回 409 并指向 `/v1/_admin/policy/mode` ——
+        服务端不替部署选模式。
+      security: [{adminAuth: []}]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string },
+            description: 会当文件名用：仅字母、数字、点、下划线、短横，1~64 位 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version, scope, entitlements]
+              additionalProperties: false
+              properties:
+                version: { type: integer, minimum: 1, description: 显式给：策略版本串是审计与回放的输入 }
+                scope: { type: string, description: 'kind:id，如 system:gateway、project:cs-lab' }
+                active: { type: boolean, default: true, description: false = 发布但不切生效包 }
+                entitlements:
+                  type: array
+                  items:
+                    type: object
+                    required: [subject, resource, action, effect]
+                    properties:
+                      subject: { type: string, description: 'subject、*、role:、group:、project:、organization:' }
+                      resource: { type: string, description: 'model:gpt-4o 或 model:*（通配只在尾部）' }
+                      action: { type: string, description: use / search / …，可尾部通配 }
+                      effect: { type: string, enum: [allow, deny] }
+                      conditions:
+                        type: object
+                        description: |
+                          保留键：purpose、organization、project、source、data-level、
+                          max-data-level、min-data-level、role、group、auth-method。
+                          写了非保留键直接 400 —— 判定期它是 fail-closed（规则静默不生效），
+                          那正是「配了 deny 却一路放行」的事故形态。
+                      expires_at: { type: string, format: date-time }
+                      source: { type: string }
+                      version: { type: string }
+      responses:
+        '200': { description: 已发布（written/applied/policy_version/backup/note） }
+        '400': { description: 校验不通过，未写任何东西 }
+        '409': { description: 还没有 policy 段，或引用与内容按加载器读会对不上 }
+    delete:
+      tags: [admin]
+      summary: 撤下一条引用（内容文件保留）
+      description: |
+        只从 `policy.bundles` 里去掉这条引用，内容文件留在磁盘上（进 `orphans`），
+        重新引用同一版就能立刻回来（`POST /v1/_admin/policy/bundles/{id}/reference`）——
+        所以撤下是可回退的动作，不是删除策略。
+        撤的正是生效包时必须用 `?active=<其它包>` 指定接棒者；撤掉最后一条引用返回 409
+        并指向 `mode=legacy`：停用 3.0 有专门的应急开关，不该靠删引用实现。
+      security: [{adminAuth: []}]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: active, in: query, schema: { type: string },
+            description: 撤生效包时接棒的包 id }
+      responses:
+        '200': { description: 已撤下 }
+        '400': { description: 需要接棒者 / 接棒者不在引用里 }
+        '404': { description: 配置里没有这条引用 }
+        '409': { description: 这是唯一的策略包，请改用 mode=legacy }
+  /v1/_admin/policy/bundles/{id}/reference:
+    post:
+      tags: [admin]
+      summary: 按磁盘上已有的内容文件重新建立引用（撤下的逆操作）
+      description: |
+        读 `policy-bundles/<id>.yaml` 那一版内容，只在配置里补回引用（内容文件一个字不改，
+        因此不会凭空多出一版历史）。它存在的理由很具体：条件值不经读侧外泄，
+        如果「重新启用」只能走 PUT 发布，运维就得把带条件的规则手抄回来 ——
+        既是误抄的来源，也把泄露面引到了剪贴板。
+        服务端以路径上的 id 为准核对内容里的 id，两者不一致时拒绝（否则会写出一条
+        「挂在 foo 名下、内容却自称 bar」的引用）。配置里还没有 `policy.mode` 时返回 409
+        并指向 `/v1/_admin/policy/mode`，与发布同一判断。
+        `active` 缺省为 true；带 `"active": false` 只恢复引用不抢生效包。
+      security: [{adminAuth: []}]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                version: { type: integer, description: 给定时当作核对闸门：磁盘上不是这一版就 409 }
+                active: { type: boolean, default: true, description: false = 引用但不切生效包 }
+      responses:
+        '200': { description: 已引用（bundle 视图只出选择器与条件键名） }
+        '400': { description: id 不合法 / 请求体有未知键 }
+        '409': { description: 已在引用中 / 还没有 policy 段 / 内容文件读不回来 / id 或 version 对不上 }
+  /v1/_admin/policy/bundles/{id}/backups:
+    get:
+      tags: [admin]
+      summary: 某个包的内容文件历史（只读）
+      description: 按时间升序；只出文件名、版本、scope 与规则条数，不出规则内容。
+      security: [{adminAuth: []}]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        '200': { description: OK }
+  /v1/_admin/policy/bundles/{id}/rollback:
+    post:
+      tags: [admin]
+      summary: 把内容回滚到历史某一版（引用同步跟回去）
+      description: |
+        只认这个包自己的 `.bak-` 历史：请求体里的 `backup` 取文件名，路径会被剥掉，
+        因此这个端点不能用来读任意文件。引用与内容一起回 —— 只换内容会让两边当场打脸。
+        当前内容在替换前会另存为新的备份，所以回滚本身也可回滚。
+      security: [{adminAuth: []}]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                backup: { type: string, description: 备份文件名；缺省用最近一份 }
+                version: { type: integer, description: 按版本号挑历史备份 }
+      responses:
+        '200': { description: 已回滚 }
+        '400': { description: 指定的备份不属于这个包 }
+        '404': { description: 没有历史备份 / 没有这一版历史 }
+        '409': { description: 这个包当前没被引用（要重新启用请 PUT 发布） }
+  /v1/_admin/policy/active:
+    post:
+      tags: [admin]
+      summary: 切换生效包（不改任何内容文件）
+      description: |
+        只换 `policy.active_bundle`，即「哪一版参与判定」。引用与内容文件都不动，
+        因此它是 A/B 与「切回上一版」的最小动作。目标包必须已在 `policy.bundles` 里。
+      security: [{adminAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [bundle]
+              properties:
+                bundle: { type: string }
+      responses:
+        '200': { description: 已切换 }
+        '400': { description: 缺 bundle 或该包不在引用里（错误里列出可用的） }
+  /v1/_admin/policy/mode:
+    post:
+      tags: [admin]
+      summary: 切换接线模式（含应急切回 legacy）
+      description: |
+        `legacy` 是应急开关：改一行即刻让 3.0 停止参与判定，已配置的引用与内容原样保留，
+        切回时不用重抄。`shadow`/`enforce` 要求段里同时有 `data_level`、至少一条引用和
+        生效包指针 —— 缺哪一条就在错误里点名哪一条，服务端不替部署猜。
+        `fallback_to_legacy: false`（策略判无可判就回 5xx，不回落旧路由）只在 enforce 下有意义。
+      security: [{adminAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mode]
+              properties:
+                mode: { type: string, enum: [legacy, shadow, enforce] }
+                data_level: { type: string, enum: [public, internal, confidential, restricted] }
+                fallback_to_legacy: { type: boolean }
+      responses:
+        '200': { description: 已切换 }
+        '400': { description: 模式非法，或该模式要求的字段缺失 }
   /v1/_admin/prices/provider:
     put:
       tags: [admin]

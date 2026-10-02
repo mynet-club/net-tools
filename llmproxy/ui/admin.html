@@ -74,21 +74,27 @@
         <span class="grow"></span>
         <button type="button" id="pl-refresh" class="ghost sm">刷新</button>
       </div>
-      <p class="sub">这一屏只读：改 <code>policy.mode</code>、发布与回滚策略包仍然是编辑
-        <code>config.yaml</code> 与包目录的事（改完网关按修订自动重载）。
-        这里回答的是推进 shadow→enforce 时唯一要看的那三件事。</p>
+      <p class="sub">这一屏回答推进 shadow→enforce 时唯一要看的那三件事：现在生效的是什么、
+        切 enforce 会怎么判、当时判成了什么。判定全部由服务端的判定核给出，界面不复算权限。</p>
       <p class="banner" id="pl-status" hidden></p>
       <div id="pl-stats" class="gridn"></div>
       <div id="pl-bundles"></div>
+
+      <h3 class="sub-h">模式、生效包与版本发布</h3>
+      <p class="sub">这三件事都会改 <code>config.yaml</code>（改前自动备份，段外内容与注释原样）。
+        发布一次同时写引用与 <code>policy-bundles/&lt;id&gt;.yaml</code>，任何一步校验不过就整笔还原。
+        <b>注意</b>：下面的表格只回显规则的<b>选择器与条件键名</b>（条件值不经这个端点外泄），
+        所以规则正文要从你自己的策略源文件粘贴进来 —— 拿界面上的回显当原件发布会丢条件值。</p>
+      <div id="pl-write"></div>
 
       <h3 class="sub-h">路由模拟</h3>
       <p class="sub">与线上请求走<b>同一个判定核</b>，所以「模拟通过」和「线上通过」是同一个答案。
         它不写影子差异统计、不碰熔断/粘性/计量 —— 否则差异报告里的「一致率」就掺进了人为流量。
         响应只有标识与结论：规则只列选择器与条件<b>键名</b>，不含条件值、上游地址与密钥。</p>
       <div class="row">
-        <select id="sim-scope" style="max-width:220px"></select>
-        <input id="sim-model" class="mono" placeholder="模型名，如 gpt-4o-mini" autocomplete="off" style="flex:1;min-width:180px">
-        <input id="sim-rid" class="mono" placeholder="request_id（留空=每次新生成）" autocomplete="off" style="flex:1;min-width:200px">
+        <select id="sim-scope"></select>
+        <input id="sim-model" class="mono" placeholder="模型名，如 gpt-4o-mini" autocomplete="off">
+        <input id="sim-rid" class="mono" placeholder="request_id（留空=每次新生成）" autocomplete="off">
         <button type="button" id="sim-run" class="primary sm">模拟</button>
         <span class="err" id="sim-err" hidden></span>
       </div>
@@ -99,7 +105,7 @@
         只有 enforce 且计划真的作用到请求上才谈得上<b>逐位复现</b>；影子请求与回落旧路由的请求
         只能做解释性回放，这里会照实写出来。</p>
       <div class="row">
-        <input id="tr-rid" class="mono" placeholder="request_id" autocomplete="off" style="flex:1;min-width:240px">
+        <input id="tr-rid" class="mono" placeholder="request_id" autocomplete="off">
         <button type="button" id="tr-run" class="sm">查询</button>
         <span class="err" id="tr-err" hidden></span>
       </div>

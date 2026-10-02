@@ -174,6 +174,13 @@ code.k { font-family: var(--mono); font-size: 12px; color: #4b5563; }
 .pform-grid .wide { grid-column: 1 / -1; }
 .pform-grid > div > label { font-size: 12px; }
 
+/* 路由模拟 / 决策痕迹那一排：宽度只能写在样式表里 —— 本页 CSP 是 style-src 'self'，
+   HTML 上的内联 style 属性会被浏览器直接丢掉（写在 style="..." 里等于没写）。 */
+#sim-scope { max-width: 220px; }
+#sim-model { flex: 1; min-width: 180px; }
+#sim-rid { flex: 1; min-width: 200px; }
+#tr-rid { flex: 1; min-width: 240px; }
+
 /* ── 管理台：用户详情 ───────────────────────────────────────────────── */
 /* 编辑区按职责分组：模式 / 状态与操作 / 配额与限流。
    保存按钮在卡片右上角、单独一个，不和「删除用户」这种危险操作挤在一排 ——
@@ -253,7 +260,24 @@ code.k { font-family: var(--mono); font-size: 12px; color: #4b5563; }
   font-size: 10px; background: #eef0f4; color: #4b5563; vertical-align: middle;
 }
 .tag.ok { background: #e6f4ea; color: var(--ok); }
+/* 引用与内容对不上、内容文件读不回来 —— 这一屏里唯一必须一眼看见的异常状态 */
+.tag.err { background: #fdecea; color: #8a2f26; }
+.tag.act { background: #e8f0fe; color: var(--accent); }
 .mt { margin-top: 10px; }
+
+/* 策略写侧：行内的备份展开（summary 用普通文字，靠 cursor 提示可点） */
+.inline-backup { display: inline-flex; flex-direction: column; gap: 6px; min-width: 0; }
+.inline-backup summary { cursor: pointer; font-size: 12px; list-style: none; }
+.inline-backup summary::-webkit-details-marker { display: none; }
+.inline-backup summary::before { content: '▸ '; color: var(--muted); }
+.inline-backup[open] summary::before { content: '▾ '; color: var(--muted); }
+/* 规则正文：等宽、能看清缩进 —— 粘贴 JSON 时错位一眼就能看出来 */
+textarea.pl-rules {
+  width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 7px;
+  background: #fff; color: var(--ink);
+  font-family: var(--mono); font-size: 12px; line-height: 1.5; resize: vertical;
+}
+textarea.pl-rules:focus { outline: 2px solid #c7c3f7; outline-offset: 1px; }
 #m-manual { flex: 1; min-width: 240px; }
 
 /* ── 管理员视图 ───────────────────────────────────────────────────── */

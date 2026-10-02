@@ -1,6 +1,7 @@
 'use strict';
 
-const ADM = { users: [], sys: [], cfg: { providers: [] }, cands: {}, editing: null, detail: null };
+const ADM = { users: [], sys: [], cfg: { providers: [] }, cands: {}, editing: null, detail: null,
+  policy: null, plb: null, plbErr: '', plDraft: null };
 
 // 管理台的请求都用 state.token（里面存的就是 admin_token），与公共 api() 是同一套
 const adminApi = (path, opts) => api(path, opts);
@@ -495,9 +496,11 @@ async function validateConfig() {
   }
 }
 
-/* ── 策略与路由（§3.H：只读可见性）──────────────────────────────
-   数据来源只有 /v1/_admin/policy[/simulate|/trace] 三个只读端点。
-   界面不参与任何判定：结论由接线层的判定核给出 —— 界面上说「会通过」而线上拒了，
+/* ── 策略与路由（§3.H：可见性 + 版本发布/回滚）─────────────────────
+   读的是 /v1/_admin/policy[/simulate|/trace|/bundles…]，写的是
+   /v1/_admin/policy[/bundles/{id}[/rollback]|/active|/mode]。
+   界面不参与任何判定，也不在前端复算权限：结论由接线层的判定核给出，
+   写侧的校验由服务端整份配置的加载通道给出 —— 界面上说「会通过」而线上拒了，
    这种误差会让人彻底放弃策略包。响应里也不会有条件值、上游地址或密钥。 */
 
 const VERDICT = {
@@ -517,8 +520,8 @@ function showPlStatus(msg, kind) {
   el.hidden = !msg;
 }
 
-async function loadPolicy() {
-  showPlStatus('');
+async function loadPolicy(keepMsg) {
+  if (!keepMsg) showPlStatus('');
   let data;
   try {
     ({ data } = await adminApi('/v1/_admin/policy'));
@@ -527,17 +530,37 @@ async function loadPolicy() {
     return;
   }
   ADM.policy = data;
+  // 引用与内容文件的核对视图：它直接读磁盘，带 matches/drift/orphans 与每包的备份数。
+  // 这一步失败不拦整屏 —— 运行态那一半仍然要说得出口，只是发布/回滚那几列暂时空着。
+  try {
+    ADM.plb = (await adminApi('/v1/_admin/policy/bundles')).data;
+    ADM.plbErr = '';
+  } catch (e) {
+    ADM.plb = null;
+    ADM.plbErr = e.message;
+  }
   $('pl-rev').textContent = '配置修订 ' + num(data.revision) + ' · schema v' + num(data.config_schema_version);
   // 「配了但没生效」必须比任何统计都先看见：mode 写着 shadow、策略包却加载失败时，
   // 请求其实按旧路由静默运行，只报 mode 的界面会说谎。
   if (!data.running) {
+    // 两种 legacy 必须分开说：显式停在 legacy 的部署是「知道自己在干什么」，
+    // 还没有 policy 段的部署是「还没上 3.0」。把前者报成后者，运维会去补一个
+    // 本该由他决定的模式，而应急开关刚刚被人按下去过。
+    const noSection = !data.configured_mode || data.configured_mode === '-';
     const head = data.inactive_reason === 'policy_load_failed'
       ? '3.0 判定链路没有在跑：配置里启用了策略，但这一版加载失败，请求按旧路由静默运行。'
-      : '没启用 3.0：配置里没有 policy 段（config_schema_version=2 的缺省），整套按旧路由运行。';
+      : (noSection
+        ? '没启用 3.0：配置里还没有 policy 段（config_schema_version=2 的缺省），整套按旧路由运行。'
+        : '没启用 3.0：配置里 policy.mode = ' + data.configured_mode +
+          '，这是显式停在旧路由（legacy 就是那个应急开关）。要开始判定见下面「模式、生效包与版本发布」。');
     showPlStatus(head + (data.load_error ? '\n加载失败原因：' + data.load_error : ''), 'err');
+  } else if (ADM.plb && ADM.plb.drift_warning) {
+    // 「现在照旧在跑」与「下一次加载会整体失败」可以同时为真（热加载只看配置文件 mtime）。
+    showPlStatus(ADM.plb.drift_warning, 'err');
   }
   renderPolicyStats(data);
   renderPolicyBundles(data);
+  renderPolicyWrite();
   fillSimScopes();
 }
 
@@ -550,6 +573,11 @@ function renderPolicyStats(d) {
   const by = sh.by_verdict || {};
   const moved = (by.primary_moved || 0) + (by.policy_denied || 0)
     + (by.no_candidate || 0) + (by.decision_denied || 0);
+  // legacy 下生效分级只能是 unknown（没有 PolicyContext，服务端不许替配置猜一级），
+  // 但配置里那一行确实写着值。只报生效值，这一屏就会对已经声明了 internal 的部署
+  // 说「unknown」，于是运维以为还没配。
+  const declared = d.declared_data_level && d.declared_data_level !== '-'
+    && d.declared_data_level !== d.data_level ? d.declared_data_level : '';
   $('pl-stats').replaceChildren(
     stat('配置的模式', d.configured_mode + ' → ' + d.mode, 'sm',
       'configured_mode 是 YAML 里写的，mode 是归一后的实际口径'),
@@ -558,7 +586,9 @@ function renderPolicyStats(d) {
     stat('生效版本', d.policy_version || '—', 'sm'),
     stat('路由代', d.routing_epoch || '—', 'sm',
       'seed 由 (request_id, 版本, 代) 派生；代一变，同一 request_id 的 seed 也变'),
-    stat('数据分级', d.data_level, 'sm', '请求的分级高于某家上游上限时，那家不进 3.0 候选池'),
+    stat('数据分级', declared ? d.data_level + '（声明 ' + declared + '）' : d.data_level, 'sm',
+      '请求的分级高于某家上游上限时，那家不进 3.0 候选池'
+      + (declared ? '；括号里是 config.yaml 声明的那一级 —— ' + d.mode + ' 下它不参与判定' : '')),
     stat('回落旧路由', d.fallback_to_legacy ? '开' : '关', 'sm',
       '只对「3.0 算不出计划」生效；策略本身拒绝请求时不会被它绕过'),
     stat('影子已判定', num(sh.evaluated), 'sm'),
@@ -570,33 +600,369 @@ function renderPolicyStats(d) {
 // 声明的包与加载成功的包并排：只列一边就是让「引用改了、内容文件没改」这类事故
 // 只能从日志里读出来。
 function renderPolicyBundles(d) {
+  const box = $('pl-bundles');
+  const pb = ADM.plb;
+  if (!pb) return renderPolicyBundlesFromRuntime(box, d);
+  const refs = pb.refs || [];
+  const orphans = pb.orphans || [];
+  if (!refs.length && !orphans.length) {
+    box.replaceChildren(h('p', {
+      class: 'muted',
+      text: pb.bundle_dir_abs
+        ? '配置里没有引用任何策略包（包目录：' + pb.bundle_dir + '；磁盘上也没有可读的 <id>.yaml）。'
+        : '配置里没有引用任何策略包。',
+    }));
+    return;
+  }
+  const loaded = {};
+  (d.bundles || []).forEach((b) => { loaded[b.id] = b; });
+  const rows = refs.map((r) => policyRefRow(r, loaded[r.id], pb));
+  const orphanRows = orphans.map((o) => h('tr', null,
+    h('td', null, h('code', { class: 'k', text: (o.id || '—') + '.yaml' })),
+    h('td', { class: 'num', text: String(o.version == null ? '—' : o.version) }),
+    h('td', null, h('code', { class: 'k', text: o.scope || '—' })),
+    h('td', null, o.file_error
+      ? h('span', { class: 'tag err', text: '读不回来', title: o.file_error })
+      : h('span', { class: 'tag', text: '没被引用', title: '内容文件在磁盘上，但配置里没有任何引用指向它：它不参与任何判定。「引用它」会按这一版重新建立引用。' })),
+    h('td', { class: 'num', text: String(o.count == null ? '—' : o.count) }),
+    h('td', null, o.file_error ? '' : h('button', {
+      type: 'button', class: 'link', text: '引用它',
+      title: '按磁盘上这一版的 id/version/scope 补回配置引用（内容文件一个字不改）。条件值不经读侧下发，所以这里不重抄规则。',
+      onclick: () => referenceBundle(o),
+    }))));
+  box.replaceChildren(h('div', { class: 'tablewrap' },
+    h('table', null,
+      h('thead', null, h('tr', null,
+        h('th', { text: '策略包' }), h('th', { text: '引用版本' }), h('th', { text: '范围' }),
+        h('th', { text: '状态' }), h('th', { text: '规则数' }), h('th', { text: '操作' }))),
+      h('tbody', null, ...rows, ...orphanRows)),
+    // 规则明细来自核对视图（读磁盘），legacy 下运行态没有包也能看到内容。
+    ...refs.filter((r) => (r.rules || []).length).map((r) => bundleRules(r))));
+}
+
+// 核对视图（/policy/bundles，直接读磁盘）读不到时的降级画法：只按运行态那一半列，
+// 并且必须写明少了什么 —— 发布/回滚/撤下都靠核对视图点名，不能装作那几列还在。
+function renderPolicyBundlesFromRuntime(box, d) {
   const loaded = {};
   (d.bundles || []).forEach((b) => { loaded[b.id] = b; });
   const refs = d.declared_bundles || [];
-  const box = $('pl-bundles');
+  const note = h('p', { class: 'hint' },
+    '上面只按运行态画：引用与内容文件的核对视图这次读不到（' + (ADM.plbErr || '未知原因') +
+    '）。发布、回滚、撤下要先看清「磁盘上是哪一版」，所以那一侧恢复之前这一屏当作只读。');
   if (!refs.length && !(d.bundles || []).length) {
-    box.replaceChildren(h('p', { class: 'muted', text: '配置里没有引用任何策略包。' }));
+    box.replaceChildren(h('p', { class: 'muted', text: '配置里没有引用任何策略包。' }), note);
     return;
   }
-  const tb = h('tbody', null,
-    ...refs.map((r) => {
-      const b = loaded[r.id];
-      return h('tr', null,
-        h('td', null, h('code', { class: 'k', text: r.id + '.yaml' })),
-        h('td', { class: 'num', text: String(r.version) }),
-        h('td', null, h('code', { class: 'k', text: r.scope })),
-        h('td', null, b
-          ? h('span', { class: 'tag ok', text: '已加载 v' + b.version })
-          : h('span', { class: 'tag', text: '未加载' })),
-        h('td', { class: 'num', text: b ? String((b.rules || []).length) : '—' }));
-    }));
   box.replaceChildren(h('div', { class: 'tablewrap' },
     h('table', null,
       h('thead', null, h('tr', null,
         h('th', { text: '策略包' }), h('th', { text: '引用版本' }), h('th', { text: '范围' }),
         h('th', { text: '加载' }), h('th', { text: '规则数' }))),
-      tb),
-    ...refs.filter((r) => loaded[r.id]).map((r) => bundleRules(loaded[r.id]))));
+      h('tbody', null, ...refs.map((r) => {
+        const b = loaded[r.id];
+        return h('tr', null,
+          h('td', null, h('code', { class: 'k', text: r.id + '.yaml' }),
+            r.id === d.active_bundle ? h('span', { class: 'tag act', text: '生效包' }) : null),
+          h('td', { class: 'num', text: String(r.version) }),
+          h('td', null, h('code', { class: 'k', text: r.scope })),
+          h('td', null, b
+            ? h('span', { class: 'tag ok', text: '已加载 v' + b.version })
+            : h('span', { class: 'tag err', text: '未加载',
+              title: '配置引用了它，运行态却没加载成功 —— 请求此刻按旧路由走' })),
+          h('td', { class: 'num', text: b ? String((b.rules || []).length) : '—' }));
+      }))),
+    ...refs.filter((r) => loaded[r.id]).map((r) => bundleRules(loaded[r.id])),
+    note));
+}
+
+// policyRefRow 把「配置里的这一条引用」与「磁盘上的那个内容文件」并排成一行。
+// 状态列只回答一个问题：按现在两边重读，加载器会不会点头。
+function policyRefRow(r, live, pb) {
+  let status;
+  if (r.file_error) {
+    status = h('span', { class: 'tag err', text: r.file_exists ? '读不回来' : '路径不合法', title: r.file_error });
+  } else if (!r.file_exists) {
+    status = h('span', { class: 'tag err', text: '内容文件缺失', title: r.drift || '文件名必须是 <id>.yaml' });
+  } else if (!r.matches) {
+    status = h('span', { class: 'tag err', text: '引用与内容不一致', title: r.drift || '' });
+  } else if (live) {
+    status = h('span', { class: 'tag ok', text: '一致 · 已加载 v' + live.version });
+  } else {
+    status = h('span', { class: 'tag', text: '一致 · 未加载',
+      title: '两边对得上，但当前运行态没加载它（mode=legacy 时这是正常状态）' });
+  }
+  return h('tr', null,
+    h('td', null, h('code', { class: 'k', text: r.id + '.yaml' }),
+      r.active ? h('span', { class: 'tag act', text: '生效包' }) : null),
+    h('td', { class: 'num', text: String(r.version) }),
+    h('td', null, h('code', { class: 'k', text: r.scope })),
+    h('td', null, status),
+    h('td', { class: 'num', text: r.rules_count == null ? '—' : String(r.rules_count) }),
+    h('td', { class: 'row' },
+      r.active ? null : h('button', {
+        type: 'button', class: 'link', text: '设为生效',
+        title: '只换 policy.active_bundle：引用与内容文件都不动，切回上一版就是这么切',
+        onclick: () => plCall('POST', '/v1/_admin/policy/active', { bundle: r.id }),
+      }),
+      backupBox(r.id, r.backups),
+      h('button', {
+        type: 'button', class: 'link danger', text: '撤下',
+        title: '只删配置里的这条引用；内容文件留在磁盘上，那一行会变成「没被引用」，点「引用它」就原样回来。撤生效包时要指定接棒者。',
+        onclick: () => withdrawBundle(r, pb),
+      })));
+}
+
+// backupBox 展开时才去读备份列表：一屏可能有十几个包，逐个预取没必要。
+// toggle 只会在 <details> 上触发 —— 挂到内层 div 就等于「备份看得见但永远点不开」。
+function backupBox(id, count) {
+  const box = h('div', { class: 'muted', text: '展开后读取。' });
+  const det = h('details', { class: 'inline-backup' },
+    h('summary', { class: 'muted', text: '备份（' + num(count || 0) + '）' }), box);
+  let loaded = false;
+  det.addEventListener('toggle', async () => {
+    if (loaded || !det.open) return;
+    loaded = true;
+    try {
+      const { data } = await adminApi('/v1/_admin/policy/bundles/' + encodeURIComponent(id) + '/backups');
+      const list = data.backups || [];
+      box.replaceChildren(...(list.length ? list.map((b) => h('div', { class: 'row' },
+        h('span', { class: 'mono muted', text: b.name }),
+        h('span', { text: b.version ? 'v' + b.version : '—' }),
+        b.error ? h('span', { class: 'tag err', text: '读不回来', title: b.error }) : h('button', {
+          type: 'button', class: 'link', text: '回到这版',
+          title: '内容文件与引用一起回到那一版；当前内容先存成新备份，所以回滚本身也能回滚',
+          onclick: () => plCall('POST', '/v1/_admin/policy/bundles/' + encodeURIComponent(id) + '/rollback',
+            { backup: b.name }),
+        })))
+        : [h('span', { text: '这个包还没有历史内容：第一次替换时才会生成备份。' })]));
+    } catch (e) {
+      loaded = false;
+      box.replaceChildren(h('span', { class: 'err', text: '读备份失败：' + e.message }));
+    }
+  });
+  return det;
+}
+
+function withdrawBundle(r, pb) {
+  const others = (pb.refs || []).filter((x) => x.id !== r.id);
+  if (r.active && others.length === 0) {
+    return showPlStatus('这是唯一的策略包：停用 3.0 请在下面「模式」里选 legacy（应急开关，改一行即可），'
+      + '撤掉最后一条引用会让 shadow/enforce 加载失败。', 'err');
+  }
+  let path = '/v1/_admin/policy/bundles/' + encodeURIComponent(r.id);
+  if (r.active) {
+    const pick = prompt('要撤的正是生效包，接棒者的包 id：', others[0] ? others[0].id : '');
+    if (!pick) return showPlStatus('没给接棒者，已取消。', 'err');
+    path += '?active=' + encodeURIComponent(pick.trim());
+  } else if (!confirm('撤下对 ' + r.id + ' 的引用？内容文件会留在磁盘上（变成「没被引用」，随时能引回来）。')) {
+    return;
+  }
+  return plCall('DELETE', path);
+}
+
+// plCall 是写侧唯一的出口：做完一次写就整屏重读，让界面说的永远是加载器认过的那份。
+// 发布表单的草稿存在 ADM.plDraft 里，重读之后原样填回去 —— 校验失败时不该让人重抄规则。
+async function plCall(method, path, body) {
+  showPlStatus(method + ' ' + path + ' 处理中…');
+  let res;
+  try {
+    res = await adminApi(path, { method, body: body === undefined ? undefined : JSON.stringify(body) });
+  } catch (e) {
+    showPlStatus('失败：' + e.message, 'err');
+    // 失败时配置没动过（服务端每一步失败都还原），所以仍要把磁盘那一侧刷新一次。
+    await loadPolicy(true);
+    return null;
+  }
+  const d = res.data || {};
+  let msg = d.note || '已完成。';
+  if (d.backup) msg += '（配置备份 ' + d.backup + '）';
+  if (d.applied === false) msg += '\n⚠ 还在等热加载：下一次轮询才会装进运行态，可以先点刷新。';
+  if (d.strict_error) msg += '\n⚠ 文件写入了但服务加载它会失败：' + d.strict_error;
+  if ((d.warnings || []).length) msg += '\n提示：' + d.warnings.join('；');
+  showPlStatus(msg, d.strict_error || d.applied === false ? 'err' : '');
+  await loadPolicy(true);
+  return d;
+}
+
+// 引用它 = POST …/reference：把磁盘上那份内容重新写回配置引用。
+// 这里刻意不重发规则 —— 条件值不经读侧下发，界面手里本来就只有键名；
+// 让服务端读那份已经在受校验目录里的文件，才是这个动作的真实语义。
+function referenceBundle(o) {
+  if (!o.id) {
+    return showPlStatus('这个文件连 id 都读不出来（坏在文件里），要用 PUT 重新发布覆盖它。', 'err');
+  }
+  if (!confirm('按磁盘上的 ' + o.id + '.yaml（v' + o.version + '，scope=' + o.scope + '，'
+    + num(o.count || 0) + ' 条规则）重新建立引用，并设为生效包？')) return;
+  return plCall('POST', '/v1/_admin/policy/bundles/' + encodeURIComponent(o.id) + '/reference', {});
+}
+
+/* 写侧面板：模式、生效包、发布新版。三块都只把运维填进去的原文交给服务端，
+   界面不复算权限（§9H）：这里挡的只有 JSON 语法和必填项 ——
+   条件键、选择器形态、分级取值一律由服务端领域校验判，因为它才是真值来源。 */
+
+const LEVELS = ['public', 'internal', 'confidential', 'restricted'];
+
+// 规则示例只给形状与保留键名；条件值要由运维从自己的策略源文件带进来。
+// （上面那张表只回显键名，拿界面回显当原件发布会把条件值丢掉 —— 这不是提示，是接口契约。）
+const RULE_EXAMPLE = JSON.stringify([
+  { subject: 'role:teacher', resource: 'model:gpt-4o', action: 'use', effect: 'allow',
+    conditions: { 'max-data-level': 'internal' } },
+  { subject: '*', resource: 'model:secret-model', action: 'use', effect: 'deny',
+    expires_at: '2027-01-01T00:00:00Z' },
+], null, 2);
+
+// plDraft 让发布表单活得过整屏重读：校验失败时该看到的是自己刚写的那份，不是空框。
+function plDraft() {
+  if (!ADM.plDraft) {
+    ADM.plDraft = { id: '', version: '', scope: '', active: true, rules: '' };
+  }
+  return ADM.plDraft;
+}
+
+// 占位符不能是 RULE_EXAMPLE 本身：整段示例当水印会把「还没粘贴规则」的空框衬得像已经
+// 填好了，而空框发布出去就是一个零授权的包。
+const RULES_PLACEHOLDER = '在这里粘贴规则 JSON 数组（从你自己的策略源文件带进来）。\n'
+  + '不确定形状就先点「填入示例形状」。';
+
+function renderPolicyWrite() {
+  const box = $('pl-write');
+  const d = ADM.policy || {};
+  const refs = (ADM.plb && ADM.plb.refs) || [];
+  const draft = plDraft();
+
+  // ── 模式 ──
+  const mode = h('select', { style: 'max-width:300px' },
+    h('option', { value: 'legacy', text: 'legacy —— 3.0 不参与判定（应急开关）' }),
+    h('option', { value: 'shadow', text: 'shadow —— 只观察，不改路由' }),
+    h('option', { value: 'enforce', text: 'enforce —— 允许策略改路由' }));
+  // 预置的是 YAML 里写的那个值；'-' 表示这份部署还没有 policy 段。
+  mode.value = (d.configured_mode && d.configured_mode !== '-') ? d.configured_mode : 'legacy';
+
+  // 「不改」保住的是配置里声明的那一级，所以预置值必须取声明值：legacy 下生效值是
+  // unknown，用它当「当前」会把已经写了 internal 的部署显示成没配。
+  const levelCur = d.declared_data_level && d.declared_data_level !== '-'
+    ? d.declared_data_level : (d.data_level || '—');
+  const level = h('select', { style: 'max-width:220px' },
+    h('option', { value: '', text: '数据分级：不改（当前 ' + levelCur + '）' }),
+    ...LEVELS.map((v) => h('option', { value: v, text: '改为 ' + v })));
+
+  const fallback = h('select', { style: 'max-width:260px' },
+    h('option', { value: '', text: '回落旧路由：不改（当前 ' + (d.fallback_to_legacy ? '开' : '关') + '）' }),
+    h('option', { value: 'true', text: '开：3.0 算不出计划时回落旧路由' }),
+    h('option', { value: 'false', text: '关：算不出计划就不放行' }));
+
+  const activeSel = activeSelector(refs);
+
+  // ── 发布表单：草稿住在 ADM.plDraft，所以整屏重读之后填的内容还在 ──
+  const rulesBox = h('textarea', { class: 'pl-rules', rows: '10', spellcheck: 'false',
+    placeholder: RULES_PLACEHOLDER, oninput: (e) => { draft.rules = e.target.value; } });
+  rulesBox.value = draft.rules;
+  const activeCb = h('input', { type: 'checkbox' });
+  activeCb.checked = !!draft.active;
+  activeCb.addEventListener('change', () => { draft.active = activeCb.checked; });
+
+  box.replaceChildren(
+    h('div', { class: 'row' },
+      mode, level, fallback,
+      h('button', {
+        type: 'button', class: 'primary sm', text: '应用模式',
+        title: '只改 policy 段的 mode / data_level / fallback_to_legacy；段外内容与注释原样',
+        onclick: () => {
+          const body = { mode: mode.value };
+          if (level.value) body.data_level = level.value;
+          if (fallback.value) body.fallback_to_legacy = fallback.value === 'true';
+          return plCall('POST', '/v1/_admin/policy/mode', body);
+        },
+      })),
+    // 从 legacy 起步的部署只有一条诚实的启用序列，这里把它写出来，
+    // 而不是让人从三个 400 的原文里反推。
+    h('p', { class: 'hint', text: '新上 3.0 的顺序：先在下面发布策略包（模式仍是 legacy，发布不会开始判定）→'
+      + ' 再把模式切到 shadow 观察一致率 → 最后切 enforce。反过来做会被服务端拒掉并点名缺哪一步。' }),
+
+    h('div', { class: 'row' },
+      activeSel,
+      h('button', {
+        type: 'button', class: 'sm', text: '设为生效',
+        title: '只换 policy.active_bundle：引用与内容都不动，所以「切回上一版」就是这个动作',
+        onclick: () => {
+          if (!activeSel.value) {
+            return showPlStatus('还没有可切的包：先用下面的发布表单发一个策略包。', 'err');
+          }
+          return plCall('POST', '/v1/_admin/policy/active', { bundle: activeSel.value });
+        },
+      }),
+      h('span', { class: 'hint', text: '切生效包不改任何内容文件，是 A/B 与回退的最小动作。' })),
+
+    h('div', { class: 'pform' },
+      h('div', { class: 'pform-grid' },
+        h('div', null, h('label', { text: '策略包 id（会当文件名用）' }),
+          h('input', { type: 'text', class: 'mono', placeholder: 'cs-lab-open',
+            autocomplete: 'off', spellcheck: 'false', value: draft.id,
+            oninput: (e) => { draft.id = e.target.value; } })),
+        h('div', null, h('label', { text: '版本号（显式给，服务端不替你猜）' }),
+          h('input', { type: 'number', class: 'mono', min: '1', step: '1', placeholder: '2',
+            value: draft.version, oninput: (e) => { draft.version = e.target.value; } })),
+        h('div', { class: 'wide' }, h('label', { text: '范围 scope（kind:id）' }),
+          h('input', { type: 'text', class: 'mono', placeholder: 'system:gateway、project:cs-lab-7、organization:cs',
+            autocomplete: 'off', spellcheck: 'false', value: draft.scope,
+            oninput: (e) => { draft.scope = e.target.value; } })),
+        h('div', { class: 'wide' },
+          h('label', { class: 'inline' }, activeCb, '发布后立刻设为生效包'),
+          h('label', { text: '规则（JSON 数组，从你自己的策略源文件粘贴；条件值不经读侧下发）' }),
+          rulesBox,
+          h('div', { class: 'row' },
+            h('button', {
+              type: 'button', class: 'ghost sm', text: '填入示例形状',
+              title: '只给字段与保留键名，条件值仍要你从原件带进来',
+              onclick: () => {
+                draft.rules = RULE_EXAMPLE;
+                rulesBox.value = RULE_EXAMPLE;
+              },
+            }),
+            h('span', { class: 'grow' }),
+            h('button', {
+              type: 'button', class: 'primary', text: '发布这一版',
+              title: '一次调用同时改引用与 policy-bundles/<id>.yaml；任何一步校验不过就整笔还原',
+              onclick: () => publishDraft(draft),
+            }))))));
+}
+
+function activeSelector(refs) {
+  const sel = h('select', { style: 'max-width:300px' },
+    h('option', { value: '', text: refs.length ? '（选一个已引用的包）' : '还没有引用的策略包 —— 先在下面发布一个' }));
+  refs.forEach((r) => {
+    sel.append(h('option', { value: r.id, text: r.id + ' @v' + r.version + (r.active ? '（现行生效）' : '') }));
+  });
+  return sel;
+}
+
+// publishDraft 只做形状检查（必填 + JSON 语法）：条件的键与值是不是合法判定输入，
+// 是服务端领域校验的事 —— 前端算一套就会出现「界面说会过、线上拒了」的分叉。
+function publishDraft(draft) {
+  const id = (draft.id || '').trim();
+  if (!id) return showPlStatus('策略包 id 必填：它会当文件名用（<id>.yaml）。', 'err');
+  const version = Number(draft.version);
+  if (!draft.version || !Number.isInteger(version) || version < 1) {
+    return showPlStatus('version 要显式给且 ≥ 1：策略版本串是审计与回放的输入。', 'err');
+  }
+  const scope = (draft.scope || '').trim();
+  if (!scope) return showPlStatus('scope 必填，写成 kind:id（例如 system:gateway）。', 'err');
+  const raw = (draft.rules || '').trim();
+  // 空白 = 忘了粘贴，不是「要发一个零授权的包」。后者是合法意图，所以显式写 [] 就放行；
+  // 但服务端无从知道运维是不是想清楚了的，这一眼只能由下笔的人给。
+  if (!raw) {
+    return showPlStatus('规则正文是空的：那会发成一个零授权的包（enforce 下什么都放行不了）。'
+      + '忘了粘贴就点「填入示例形状」再改；确实要发空包就显式写 []。', 'err');
+  }
+  let rules;
+  try {
+    rules = JSON.parse(raw);
+  } catch (e) {
+    return showPlStatus('规则正文不是合法 JSON：' + e.message, 'err');
+  }
+  if (!Array.isArray(rules)) return showPlStatus('规则必须是一个 JSON 数组，每条一个授权对象。', 'err');
+  return plCall('PUT', '/v1/_admin/policy/bundles/' + encodeURIComponent(id),
+    { version, scope, active: !!draft.active, entitlements: rules });
 }
 
 // 规则只以选择器现身，条件只列键名：键名足以让人看出「这条规则要看分级」，值不外泄。

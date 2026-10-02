@@ -1263,7 +1263,8 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusNotFound, "invalid_request_error",
 			"可用路径：/v1/_admin/users[/{name}[/token|enable|disable|providers|models|usage]]、"+
 				"/v1/_admin/usage/export、/v1/_admin/providers[/{name}/discover]、"+
-				"/v1/_admin/config[/providers|/validate]、/v1/_admin/policy[/simulate|/trace]")
+				"/v1/_admin/config[/providers|/validate]、/v1/_admin/policy"+
+				"[/bundles[/{id}[/backups|/rollback|/reference]]|/active|/mode|/simulate|/trace]")
 	}
 }
 

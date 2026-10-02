@@ -25,30 +25,52 @@ import (
 	"github.com/mynet-club/net-tools/llmproxy/internal/routing"
 )
 
-// adminPolicyRoute 分发 /v1/_admin/policy[/simulate|/trace]。
+// adminPolicyRoute 分发 /v1/_admin/policy[/simulate|/trace|/bundles…|/active|/mode]。
+//
+// 读侧在本文件，写侧在 policypublish.go：两者共用同一套视图构造（bundleViews），
+// 所以「界面看到的」与「发布后能读回的」不会是两副面孔。
 func (s *Server) adminPolicyRoute(w http.ResponseWriter, r *http.Request, tail string) {
-	switch tail {
-	case "":
+	switch {
+	case tail == "":
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error", "只支持 GET")
+			writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error",
+				"只支持 GET；发布请用 PUT /v1/_admin/policy/bundles/{id}")
 			return
 		}
 		s.adminPolicyInspect(w)
-	case "simulate":
+	case tail == "simulate":
 		if r.Method != http.MethodPost {
 			writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error", "只支持 POST")
 			return
 		}
 		s.adminPolicySimulate(w, r)
-	case "trace":
+	case tail == "trace":
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error", "只支持 GET")
 			return
 		}
 		s.adminPolicyTrace(w, r)
+	case tail == "active":
+		if r.Method != http.MethodPost {
+			writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error",
+				"切换生效包只支持 POST /v1/_admin/policy/active")
+			return
+		}
+		s.adminPolicySetActive(w, r)
+	case tail == "mode":
+		if r.Method != http.MethodPost {
+			writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error",
+				"切换接线模式只支持 POST /v1/_admin/policy/mode（含应急切回 legacy）")
+			return
+		}
+		s.adminPolicySetMode(w, r)
+	case tail == "bundles" || strings.HasPrefix(tail, "bundles/"):
+		s.adminPolicyBundlesRoute(w, r, strings.TrimPrefix(tail, "bundles"))
 	default:
 		writeJSONError(w, http.StatusNotFound, "invalid_request_error",
-			"可用路径：/v1/_admin/policy、/v1/_admin/policy/simulate、/v1/_admin/policy/trace?request_id=")
+			"可用路径：/v1/_admin/policy、/v1/_admin/policy/simulate、"+
+				"/v1/_admin/policy/trace?request_id=、/v1/_admin/policy/bundles[/{id}[/backups|/rollback|/reference]]、"+
+				"/v1/_admin/policy/active、/v1/_admin/policy/mode")
 	}
 }
 
@@ -79,9 +101,14 @@ func (s *Server) adminPolicyInspect(w http.ResponseWriter) {
 		"bundle_dir":         bundleDir,
 		"fallback_to_legacy": pc.FallbackToLegacyEnabled(),
 		"data_level":         pc.DataLevelResolved().String(),
-		"declared_bundles":   bundleRefViews(pc.BundleRefs()),
-		"running":            rt != nil,
-		"shadow":             s.metrics.shadowSnapshot(),
+		// 声明值与生效值分开发：legacy 下 DataLevelResolved 是 LevelUnknown（判定根本没有
+		// PolicyContext，不许替它猜一级），但 config.yaml 里写的那一行仍然在那儿。
+		// 只报生效值，管理台会对一个已经写好 internal 的部署说「unknown」，
+		// 运维就会以为还没配。
+		"declared_data_level": orDash(pc.DataLevel),
+		"declared_bundles":    bundleRefViews(pc.BundleRefs()),
+		"running":             rt != nil,
+		"shadow":              s.metrics.shadowSnapshot(),
 	}
 	if rt == nil {
 		out["policy_version"] = ""
@@ -391,27 +418,38 @@ func bundleViews(set *policy.BundleSet) []map[string]any {
 	bundles := set.Bundles()
 	out := make([]map[string]any, 0, len(bundles))
 	for _, b := range bundles {
-		rules := make([]map[string]any, 0, len(b.Entitlements))
-		for _, e := range b.Entitlements {
-			rules = append(rules, map[string]any{
-				"subject":        e.Subject,
-				"resource":       e.Resource,
-				"action":         e.Action,
-				"effect":         string(e.Effect),
-				"scope":          orDash(e.Scope),
-				"source":         orDash(e.Source),
-				"version":        orDash(e.Version),
-				"condition_keys": conditionKeys(e),
-				"expires_at":     absoluteTime(e.ExpiresAt),
-			})
-		}
-		out = append(out, map[string]any{
-			"id": b.ID, "version": b.Version, "stamp": b.Stamp(),
-			"scope_kind": string(b.Scope.Kind), "scope_id": b.Scope.ID,
-			"rules": rules,
-		})
+		out = append(out, bundleView(b))
 	}
 	return out
+}
+
+// bundleView 是单个策略包的外显形态：只给标识与规则选择器，不给条件值。
+//
+// 读侧（已加载的集合）与写侧（磁盘上的内容文件）共用它，这样「界面看到的」和
+// 「发布后读回的」是同一副面孔 —— 而磁盘文件本来就带着 Conditions 的值，
+// 少一处收敛就多一个泄露面（§2.9 规则 6）。
+func bundleView(b policy.PolicyBundle) map[string]any {
+	rules := make([]map[string]any, 0, len(b.Entitlements))
+	for _, e := range b.Entitlements {
+		rules = append(rules, map[string]any{
+			"subject":        e.Subject,
+			"resource":       e.Resource,
+			"action":         e.Action,
+			"effect":         string(e.Effect),
+			"scope":          orDash(e.Scope),
+			"source":         orDash(e.Source),
+			"version":        orDash(e.Version),
+			"condition_keys": conditionKeys(e),
+			"expires_at":     absoluteTime(e.ExpiresAt),
+		})
+	}
+	return map[string]any{
+		"id": b.ID, "version": b.Version, "stamp": b.Stamp(),
+		"scope_kind": string(b.Scope.Kind), "scope_id": b.Scope.ID,
+		"scope": b.Scope.Display(),
+		"rules": rules,
+		"count": len(b.Entitlements),
+	}
 }
 
 // bundleRefViews 列出配置里的包引用（还没加载的那部分也要看得见 ——

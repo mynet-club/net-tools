@@ -155,6 +155,46 @@ func TestAdminPolicyInspectLegacy(t *testing.T) {
 	}
 }
 
+// 显式停在 legacy 与「根本没有 policy 段」是两件事，declared_data_level 就是用来
+// 把它们分开的：legacy 下参与判定的分级必然是 unknown（服务端不许替配置猜一级），
+// 但配置里那一行确实写着 internal。只报生效值，管理台会对已经决定过分级的部署
+// 说「unknown」，于是运维去重填一个本已定好的值。
+func TestAdminPolicyInspectDistinguishesTwoLegacyFlavors(t *testing.T) {
+	h := policyAdminHarnessBundles(t, "legacy", "t-open", "system:gateway", 1, policyBundleOpen)
+	code, body := adminJSON(t, h, "/v1/_admin/policy")
+	if code != http.StatusOK {
+		t.Fatalf("GET /policy = %d: %v", code, body)
+	}
+	if body["running"] != false || body["inactive_reason"] != "policy_mode_legacy" {
+		t.Fatalf("legacy 下不该在跑，实际 running=%v reason=%v",
+			body["running"], body["inactive_reason"])
+	}
+	if body["configured_mode"] != "legacy" {
+		t.Errorf("configured_mode = %v，want legacy（YAML 里写了这一行）", body["configured_mode"])
+	}
+	if body["data_level"] != "unknown" {
+		t.Errorf("data_level = %v，want unknown：legacy 没有判定输入，不许按声明值假装在分级",
+			body["data_level"])
+	}
+	if body["declared_data_level"] != "internal" {
+		t.Errorf("declared_data_level = %v，want internal：配置里声明的那一行要如实报出",
+			body["declared_data_level"])
+	}
+
+	// 核对视图与只读口同口径 —— 发布表单预置的「不改（当前 X）」读的就是这一份。
+	_, pb := adminJSON(t, h, "/v1/_admin/policy/bundles")
+	if pb["declared_data_level"] != "internal" {
+		t.Errorf("bundles 视图 declared_data_level = %v，want internal", pb["declared_data_level"])
+	}
+
+	// 真的没写 policy 段时声明值是 '-'：两种 legacy 必须能从字段上分得开。
+	_, none := adminJSON(t, policyAdminHarness(t, ""), "/v1/_admin/policy")
+	if none["declared_data_level"] != "-" || none["configured_mode"] != "-" {
+		t.Errorf("没有 policy 段的部署应两个字段都是 '-'，实际 %v / %v",
+			none["declared_data_level"], none["configured_mode"])
+	}
+}
+
 func TestAdminPolicyInspectShadow(t *testing.T) {
 	h := policyAdminHarness(t, "shadow")
 	code, body := adminJSON(t, h, "/v1/_admin/policy")
