@@ -99,7 +99,11 @@ func (r *Registry) Register(spec Spec, cfg *Config) error {
 	if _, err := factory(spec, cfg); err != nil {
 		// 工厂在注册期就跑一次：配置错误（非法正则、缺客户端、schema 越界）
 		// 必须在这里炸，而不是等第一条真实请求。
-		return Errorf(ErrRegistry, "%s: 构造失败: %v", spec.Name, err)
+		// 这里不用 Errorf：它把内层文案走 Sprintf，%w 在那儿不生效，
+		// 工厂哨兵就会在包装链上丢掉。接线方（管理 API）要按哨兵分流回答
+		// 「是哪道门拒的」（缺客户端 / 端点不在白名单 / 没注入授权判定器），
+		// 只留 ErrRegistry 等于强迫调用方去匹配错误文案。
+		return fmt.Errorf("%w: %s: 构造失败: %w", ErrRegistry, spec.Name, err)
 	}
 	next := registration{spec: spec, cfg: copyConfig(cfg)}
 	r.mu.Lock()
