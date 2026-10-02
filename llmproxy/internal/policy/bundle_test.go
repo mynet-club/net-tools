@@ -28,6 +28,40 @@ func TestBundleValidation(t *testing.T) {
 	}
 }
 
+// 条件的未知键必须在加载期拒绝：判定期它是 fail-closed（规则不生效），
+// 于是 `max_data_level` 这种下划线写法会让一条 deny 静默失效 —— 包照常加载、
+// 版本照常进审计，敏感流量却一路放行。
+func TestUnknownConditionKeyFailsAtLoad(t *testing.T) {
+	typo := bundle("typo-cond", 1, SystemScope, Entitlement{
+		Subject: "*", Resource: "model:secret", Action: "use", Effect: EffectDeny,
+		Conditions: map[string]string{"max_data_level": "internal"},
+	})
+	err := typo.Validate()
+	if err == nil {
+		t.Fatal("未知条件键必须让整包校验失败，而不是留到判定期静默不命中")
+	}
+	for _, want := range []string{"max_data_level", "max-data-level", "purpose", "auth-method"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("错误信息要同时点名写错的键并列出可用键，缺 %q: %v", want, err)
+		}
+	}
+
+	// 保留键一律放行；多个未知键要按固定顺序点名（错误信息也进排查记录）。
+	if err := bundle("ok-cond", 1, SystemScope, Entitlement{
+		Subject: "*", Resource: "model:*", Action: "use", Effect: EffectAllow,
+		Conditions: map[string]string{CondMaxDataLevel: "internal", CondPurpose: "chat"},
+	}).Validate(); err != nil {
+		t.Errorf("保留键不该被拒: %v", err)
+	}
+	multi := bundle("two-typo", 1, SystemScope, Entitlement{
+		Subject: "*", Resource: "model:*", Action: "use", Effect: EffectAllow,
+		Conditions: map[string]string{"zeta": "1", "alpha": "2"},
+	})
+	if err := multi.Validate(); err == nil || !strings.Contains(err.Error(), "alpha, zeta") {
+		t.Errorf("多个未知键要按固定顺序列出: %v", err)
+	}
+}
+
 // PolicyVersion 是审计与回放的输入，必须在任何构造顺序下逐位一致。
 func TestBundleSetVersionIsOrderIndependent(t *testing.T) {
 	bundles := []PolicyBundle{

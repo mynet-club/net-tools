@@ -30,7 +30,7 @@ var (
 	ErrSubjectSelector = errors.New("policy: subject 选择器格式错误")
 )
 
-// Conditions 保留键。其余键一律视为不满足（fail-closed）。
+// Conditions 保留键。其余键一律视为不满足（fail-closed），并且**加载期就拒绝**。
 //
 // 语义统一为**规则的前置条件**：所有键都成立，规则才生效；分级上界/下界是两个
 // 显式键，对 allow 和 deny 表现一致，不会出现「给 deny 写上界反而把禁令跳过」。
@@ -46,6 +46,40 @@ const (
 	CondGroup        = "group"
 	CondAuthMethod   = "auth-method"
 )
+
+// conditionKeys 列出全部保留键，顺序固定（错误信息要能逐字复现）。
+var conditionKeys = []string{
+	CondPurpose, CondOrganization, CondProject, CondSource, CondDataLevel,
+	CondMaxDataLevel, CondMinDataLevel, CondRole, CondGroup, CondAuthMethod,
+}
+
+// 未知键为什么必须在加载期拦住：判定期它是 fail-closed（规则不生效），
+// 于是 `max_data_level` 这种下划线写法会让一条 deny **静默失效** ——
+// 策略包照常加载、版本照常进审计，敏感流量却一路放行。
+// 「配了但没生效」正是 §3.0 要求在影子阶段之前排除掉的那类事故，
+// 让它以启动失败的形式出现，比在差异报告里多一行 no_candidate 便宜得多。
+func (e Entitlement) unknownConditionKeys() []string {
+	if len(e.Conditions) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(e.Conditions))
+	for key := range e.Conditions {
+		if !isConditionKey(key) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func isConditionKey(key string) bool {
+	for _, k := range conditionKeys {
+		if k == key {
+			return true
+		}
+	}
+	return false
+}
 
 // Validate 校验规则的必填项与选择器可解析性。
 //
@@ -76,6 +110,10 @@ func (e Entitlement) Validate() error {
 				return err
 			}
 		}
+	}
+	if unknown := e.unknownConditionKeys(); len(unknown) > 0 {
+		return fmt.Errorf("%w: 条件键 %q 不是保留键，这条规则永远不会命中（可用键：%s）",
+			ErrEntitlement, strings.Join(unknown, ", "), strings.Join(conditionKeys, ", "))
 	}
 	kind, value, err := parseSubjectSelector(e.Subject)
 	if err != nil {

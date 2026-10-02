@@ -208,7 +208,6 @@ func TestConditionMembershipAndUnknownKey(t *testing.T) {
 		{"用途不满足", map[string]string{CondPurpose: "batch"}, false},
 		{"组织满足", map[string]string{CondOrganization: "university"}, true},
 		{"来源满足", map[string]string{CondSource: "oidc:university"}, true},
-		{"未知键 fail-closed", map[string]string{"my-company-key": "x"}, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -219,6 +218,18 @@ func TestConditionMembershipAndUnknownKey(t *testing.T) {
 				t.Fatalf("期望 allowed=%v，实际 %+v", c.allow, d)
 			}
 		})
+	}
+	// 未知键在**判定期**也是 fail-closed，但这一层只是纵深防御：
+	// Entitlement.Validate 会在加载期先拒掉它（见 TestUnknownConditionKeyFailsAtLoad），
+	// 因为「规则静默不命中」对 deny 规则等于把禁令关掉。这里直接调 conditionsMet，
+	// 绕过 Validate 才能测到判定核自己的行为。
+	unknown := allowRule("alice", "model:gpt-5", "use")
+	unknown.Conditions = map[string]string{"my-company-key": "x"}
+	ctx := ctxOf(t, student(t, "alice", []string{"student"}, []string{"cs"}), "qa", LevelInternal)
+	if ok, reason := unknown.conditionsMet(ctx); ok {
+		t.Errorf("未知条件键不该让规则生效，实际原因 %q", reason)
+	} else if reason != ReasonConditionUnmet {
+		t.Errorf("未知条件键的原因应是 condition_unmet，实际 %q", reason)
 	}
 	// 多条键同时不成立时，原因码不能随 map 遍历顺序变化。
 	multi := allowRule("alice", "model:gpt-5", "use")

@@ -42,7 +42,10 @@ func (b PolicyBundle) Validate() error {
 	}
 	for i, e := range b.Entitlements {
 		if err := e.Validate(); err != nil {
-			return fmt.Errorf("%w: 第 %d 条规则（subject=%s）: %v", ErrBundle, i, e.Subject, err)
+			// 序号从 1 起，并带上 resource：一个包里的规则常常都是 subject=*，
+			// 只报主体等于没报，改配置的人得能在文本里认出自己写的那一条。
+			return fmt.Errorf("%w: 第 %d 条规则（subject=%s resource=%s）: %v",
+				ErrBundle, i+1, e.Subject, e.Resource, err)
 		}
 	}
 	return nil

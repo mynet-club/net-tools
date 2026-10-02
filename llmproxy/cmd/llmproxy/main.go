@@ -268,6 +268,15 @@ func cmdStart(paths config.Paths) error {
 		fmt.Fprintf(os.Stderr, "警告: %s\n", w)
 	}
 
+	// 启动期是唯一的严格窗口：此刻还没有流量要保护，而「策略包引用缺文件 / 条件键写错」
+	// 这类配置的真实后果是**一条规则都没加载**。这种网关照常应答、健康检查也正常，
+	// 唯独 enforce 的禁令全部不存在 —— 比拒之门外危险得多。
+	// 运行期故意相反：SIGHUP 热加载撞见坏配置按 legacy 继续服务并打 ERROR 日志，
+	// 一次改错配置不该把在跑的网关打挂。
+	if err := server.CheckPolicyRuntime(cfg); err != nil {
+		return fmt.Errorf("3.0 策略配置不可用，拒绝启动: %w", err)
+	}
+
 	db, err := openStore(cfg.Database)
 	if err != nil {
 		return err
