@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -190,6 +191,8 @@ func (e *AssemblyError) Unwrap() error { return e.Err }
 //  2. 阶段不匹配当前执行路径的 Spec 会被装配（一条 Pipeline 同时服务请求/响应/审计），
 //     执行时按阶段选取，所以策略里给的顺序只影响同阶段内的先后。
 //  3. 构造失败一律是装配错误，请求路径永远拿不到半装配的 Pipeline。
+//  4. 实例必须原样回显策略声明（proc.Spec() 逐字段相等）：版本、档位、超时是审计与
+//     §2.9 判定的输入，实现想怎么报就怎么报就等于实现自己改写策略。
 func (r *Registry) Build(specs []Spec, opts *BuildOptions) (*Pipeline, error) {
 	if opts == nil {
 		opts = &BuildOptions{}
@@ -231,6 +234,14 @@ func (r *Registry) Build(specs []Spec, opts *BuildOptions) (*Pipeline, error) {
 		if proc == nil {
 			return nil, &AssemblyError{Processor: spec.Name, Reason: ReasonConfigInvalid,
 				Err: Errorf(ErrRegistry, "工厂返回空处理器")}
+		}
+		// 兑现 Spec() 的文档承诺：实例自报的声明必须与策略声明逐字段一致。
+		// 审计的处理器版本、§2.9 的档位判定都从 proc.Spec() 取，实现要是能自作主张改
+		// 档位或版本，策略文本与真实行为就脱钩了 —— 回放和审计一起失真。
+		// 用 DeepEqual 而不是比字段：Spec 里有 []string，结构体整体不可比较。
+		if got := proc.Spec(); !reflect.DeepEqual(got, spec) {
+			return nil, &AssemblyError{Processor: spec.Name, Reason: ReasonVersionReject,
+				Err: Errorf(ErrRegistry, "实现自报的声明与策略声明不一致（策略 %+v，实现 %+v）", spec, got)}
 		}
 		_, isStream := proc.(StreamProcessor)
 		stages = append(stages, stage{spec: spec, proc: proc, hasStream: isStream, index: i})

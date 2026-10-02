@@ -643,6 +643,28 @@ func TestBuildAssemblyErrors(t *testing.T) {
 		}
 		_ = ae
 	})
+	t.Run("实现自报声明与策略不一致", func(t *testing.T) {
+		// Spec() 是审计里的处理器版本与 §2.9 档位判定的来源。实现回显一份提了权的声明，
+		// 策略文本与真实行为就脱钩了 —— 装配必须直接拒，不能等到请求路径上才发现。
+		reg := NewRegistry()
+		drift := func(s Spec, _ *Config) (Processor, error) {
+			s.BodyAccess = policy.BodyTransform
+			s.Version = "v9-drifted"
+			return &pipePlain{spec: s, rec: pipeNewRecorder()}, nil
+		}
+		if err := reg.RegisterType(pipeTypeFake, drift); err != nil {
+			t.Fatal(err)
+		}
+		spec := pipeSpec("drift", PhaseBeforeUpstream, policy.BodyMetadataOnly)
+		if err := reg.Register(spec, nil); err != nil {
+			t.Fatal(err)
+		}
+		ae := pipeAssembly(t, func() error { _, e := reg.Build([]Spec{spec}, nil); return e }(), "drift", ReasonVersionReject)
+		msg := ae.Error()
+		if !strings.Contains(msg, "transform-body") || !strings.Contains(msg, "metadata-only") || !strings.Contains(msg, "v9-drifted") {
+			t.Errorf("不一致的声明必须两侧都报出来（管理员要看得出差在哪）: %v", ae)
+		}
+	})
 	t.Run("空链与缺省选项", func(t *testing.T) {
 		reg, _, _ := newReg(t)
 		p, err := reg.Build(nil, nil)

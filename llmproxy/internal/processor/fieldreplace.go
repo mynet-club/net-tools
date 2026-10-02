@@ -266,8 +266,10 @@ func (f *fieldReplace) Process(ctx context.Context, in *Input) (*Output, error) 
 // 每条规则各自递归会把复杂度变成 O(规则数 × 节点数)，而一次遍历是 O(节点数 × 规则数)
 // 但共享遍历成本 —— 差别在于深文档 + 多规则时后者不会放大成拒绝服务面。
 func (f *fieldReplace) rewriteValue(value any, steps []observedStep, depth int, counts map[string]int) (any, int, error) {
+	// 不点名任何规则：嵌套超限是**这份请求正文**的形状问题，跟规则路径无关（遍历本身不看规则）。
+	// 带上规则名会把管理员引去改规则表，而真实原因是请求体，改了也没用。
 	if depth > MaxDocDepth {
-		return nil, 0, Errorf(ErrDepthTooDeep, "实例嵌套超过上限 %d（规则 %s 的路径无法定位）", MaxDocDepth, f.rules[0].path)
+		return nil, 0, Errorf(ErrDepthTooDeep, "请求正文的 JSON 嵌套超过上限 %d，字段替换不在超限文档上定位路径", MaxDocDepth)
 	}
 	switch typed := value.(type) {
 	case string:
