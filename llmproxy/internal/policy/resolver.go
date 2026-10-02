@@ -111,7 +111,7 @@ func (r *Resolver) Evaluate(ctx PolicyContext, chain ScopeChain, resource, actio
 		if !rule.matchesChain(chain) {
 			continue
 		}
-		precedence, ok := rule.matchSubject(ctx.Identity, ctx)
+		precedence, ok := rule.matchSubject(ctx, chain)
 		if !ok {
 			continue
 		}

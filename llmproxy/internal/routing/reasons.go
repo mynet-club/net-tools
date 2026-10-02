@@ -10,15 +10,15 @@ import (
 //
 // 原因码集合是**封闭注册表**：未注册的值会让 policy.RoutingPlan.Validate() 直接失败
 // （policy.ErrReasonUnknown），所以在 D 里写裸字符串等于产出一份不可审计的计划。
-// 本包不改 internal/policy，只把缺口记在这里 —— 主线补码后，改动就是换掉等号右边一行。
+// 本包不改 internal/policy，只在这里给每个码留一行「落地值 = 谁登记的」的追溯线索。
 var (
-	// ReasonCapabilityUnmatched 想表达的是「这家承接不了这个模型名 / 缺所需能力」。
+	// ReasonCapabilityUnmatched 表达「这家承接不了这个模型名 / 缺所需能力」。
 	//
-	// 注册表里目前没有 candidate_capability_unmatched（现有 candidate_* 只覆盖
-	// unhealthy / policy / region / level / cost 五个方向），先用 model_not_allowed 落地：
-	// 含义方向一致（这个模型对这家不可用），但它与策略侧「模型不在许可范围」共用一个码，
-	// 排查时看不出是技术不承接还是策略不授权。已在交付说明里列为需主线补的码。
-	ReasonCapabilityUnmatched = policy.ReasonModelNotAllowed
+	// 早期版本借用 model_not_allowed（注册表当时没有对应码），那会让排查方向出错：
+	// 运维看到 model_not_allowed 会去改策略，而这次是上游压根接不住这个模型名。
+	// 主线已在 internal/policy/decision.go 注册 candidate_capability_unmatched，
+	// 这里换成它 —— 与 candidate_unhealthy / candidate_region_excluded 同一档命名。
+	ReasonCapabilityUnmatched = policy.ReasonCandidateCapabilityUnmatched
 
 	// 关于「这家在冷却中」：D **不产生**冷却类排除（冷却只影响粘性与档内先后，见
 	// Offer.Healthy 的说明），因此这里不需要新码。一旦接线方要求「冷却即排除」，

@@ -77,10 +77,32 @@ func (e Entitlement) Validate() error {
 			}
 		}
 	}
-	if _, _, err := parseSubjectSelector(e.Subject); err != nil {
+	kind, value, err := parseSubjectSelector(e.Subject)
+	if err != nil {
 		return err
 	}
+	// project:/organization: 的取值必须是合法范围 ID：判定阶段是拿它去比范围链，
+	// 形态写错（含冒号、含空白、超长）的规则永远匹配不上，而「配了却不生效」正是
+	// 上面那句注释要排除的情形 —— 选择器能解析不代表取值能命中。
+	if scopeKind, isScope := selectorScopeKind(kind); isScope {
+		if _, err := NewScopeRef(scopeKind, value); err != nil {
+			return fmt.Errorf("%w: 主体选择器 %q 的取值不是合法的%s ID: %v",
+				ErrEntitlement, e.Subject, scopeKind, err)
+		}
+	}
 	return nil
+}
+
+// selectorScopeKind 把主体选择器类型映射到它比较的范围类型。
+// role/group 返回 false：那两类比的是 Identity 里的 claim 原值，不是结构化范围。
+func selectorScopeKind(kind selectorKind) (ScopeKind, bool) {
+	switch kind {
+	case selectorProject:
+		return ScopeProject, true
+	case selectorOrganization:
+		return ScopeOrganization, true
+	}
+	return "", false
 }
 
 // selectorKind 是 subject 选择器的类型。
@@ -137,7 +159,17 @@ func parseSubjectSelector(s string) (kind selectorKind, value string, err error)
 }
 
 // matchSubject 报告规则是否命中当前主体，并给出命中档位。
-func (e Entitlement) matchSubject(id Identity, ctx PolicyContext) (Precedence, bool) {
+//
+// 组织与项目一律走**结构化范围**（ctx 上的主归属 + 已解析出的范围链），不再看
+// Identity.Projects 这类 claim 原值。理由：范围链是 §2.7 之后唯一的归属口径，
+// 而 claim 原值是显示名 —— 把它当第二个关联键，就等于允许「IdP 里恰好叫
+// <别人项目 ID>」的组命中这条规则，而这正是链上判定要排除的形态。
+// 角色和组没有规范化过程（IdP 的角色名本身就是策略作者写的选择器取值），
+// 所以那两个分支继续读 Identity 的成员关系。
+//
+// 比较用的 ScopeRef 直接拼字段而不过 NewScopeRef：加载期已经校验过取值形态
+// （见 Validate），判定热路径上再做一次校验只会让一次求值多出 N 次字符串检查。
+func (e Entitlement) matchSubject(ctx PolicyContext, chain ScopeChain) (Precedence, bool) {
 	kind, value, err := parseSubjectSelector(e.Subject)
 	if err != nil {
 		return 0, false
@@ -146,27 +178,27 @@ func (e Entitlement) matchSubject(id Identity, ctx PolicyContext) (Precedence, b
 	case selectorAll:
 		return PrecedenceDefault, true
 	case selectorSelf:
-		if value == id.Subject {
+		if value == ctx.Identity.Subject {
 			return PrecedenceExplicitAllow, true
 		}
 		return 0, false
 	case selectorRole:
-		if id.HasRole(value) {
+		if ctx.Identity.HasRole(value) {
 			return PrecedenceGroupAllow, true
 		}
 		return 0, false
 	case selectorGroup:
-		if id.HasGroup(value) {
+		if ctx.Identity.HasGroup(value) {
 			return PrecedenceGroupAllow, true
 		}
 		return 0, false
 	case selectorProject:
-		if id.HasProject(value) || ctx.Project == value {
+		if ctx.Project == value || chain.Includes(ScopeRef{Kind: ScopeProject, ID: value}) {
 			return PrecedenceGroupAllow, true
 		}
 		return 0, false
 	case selectorOrganization:
-		if ctx.Organization == value {
+		if ctx.Organization == value || chain.Includes(ScopeRef{Kind: ScopeOrganization, ID: value}) {
 			return PrecedenceGroupAllow, true
 		}
 		return 0, false

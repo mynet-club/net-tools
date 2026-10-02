@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -432,4 +433,61 @@ func containsReason(list []Reason, want Reason) bool {
 		}
 	}
 	return false
+}
+
+// TestSubjectSelectorMatchesCanonicalScopes 钉住 §2.7 之后主体选择器的唯一归属口径：
+// project:/organization: 只比结构化范围（ctx 的主归属与范围链），不比 claim 原值。
+//
+// 差别在真实部署里才看得见：目录把「信息学部/计算机学院」规范成 cs 之后，IdP 里
+// 另一个恰好叫 "cs" 的组如果还能靠 Identity.Projects 命中 project:cs 的规则，
+// 权限就有了第二个判定入口 —— 而接线方只会维护和审计第一个（范围链）。
+func TestSubjectSelectorMatchesCanonicalScopes(t *testing.T) {
+	r := mustResolver(t, "core@1", allowRule("project:proj-lab-7", "model:gpt-mini", "use"))
+	idOnlyRaw := student(t, "alice", []string{"student"}, []string{"cs"})
+	ctxRaw := ctxOf(t, idOnlyRaw, "qa", LevelInternal)
+
+	// 只有 claim 原值、链上和 ctx 上都没有这个项目 → 不命中。
+	if d := r.Evaluate(ctxRaw, chain(MustScope(ScopeUser, "alice")), "model:gpt-mini", "use", baseNow); d.Allowed {
+		t.Fatalf("claim 原值不得成为授权键: %+v", d)
+	}
+
+	// 同一个身份，项目进了范围链 → 命中，且档位是组级放行。
+	d := r.Evaluate(ctxRaw, chainOf(t, "alice", "university", "proj-lab-7"), "model:gpt-mini", "use", baseNow)
+	if !d.Allowed || d.Reason != ReasonGroupAllow {
+		t.Fatalf("链上有该项目应组级放行: %+v", d)
+	}
+
+	// 接线方只填主归属的最小形态同样命中。
+	ctxPrimary := ctxRaw
+	ctxPrimary.Organization = "university"
+	ctxPrimary.Project = "proj-lab-7"
+	if d := r.Evaluate(ctxPrimary, chain(MustScope(ScopeUser, "alice")), "model:gpt-mini", "use", baseNow); !d.Allowed {
+		t.Fatalf("ctx.Project 是主归属，应命中: %+v", d)
+	}
+
+	// 组织选择器同样只认结构化范围。
+	org := mustResolver(t, "core@1", allowRule("organization:university", "model:gpt-mini", "use"))
+	if d := org.Evaluate(ctxRaw, chain(MustScope(ScopeUser, "alice")), "model:gpt-mini", "use", baseNow); d.Allowed {
+		t.Fatalf("链上没有该组织时不该命中: %+v", d)
+	}
+	if d := org.Evaluate(ctxRaw, chainOf(t, "alice", "university", ""), "model:gpt-mini", "use", baseNow); !d.Allowed {
+		t.Fatalf("链上有该组织应命中: %+v", d)
+	}
+}
+
+// TestEntitlementRejectsMalformedScopeSelector 证明写错的范围选择器在加载期就红：
+// 「配了但永远不命中」是最难排查的一类策略错误。
+func TestEntitlementRejectsMalformedScopeSelector(t *testing.T) {
+	oversized := strings.Repeat("x", 300)
+	for _, subject := range []string{"project:lab:7", "organization:" + oversized, "project:\x01x"} {
+		if err := (Entitlement{Subject: subject, Resource: "model:*", Action: "use", Effect: EffectAllow}).Validate(); err == nil {
+			t.Fatalf("%q 应当在加载期被拒", subject)
+		}
+	}
+	// 角色与组比的是 claim 原值，不受范围 ID 形态约束。
+	for _, subject := range []string{"role:realm:admin", "group:信息学部 计算机学院"} {
+		if err := (Entitlement{Subject: subject, Resource: "model:*", Action: "use", Effect: EffectAllow}).Validate(); err != nil {
+			t.Fatalf("%q 不该被范围 ID 规则拒: %v", subject, err)
+		}
+	}
 }

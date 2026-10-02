@@ -90,11 +90,14 @@ func (id Identity) Normalize() Identity {
 	return out
 }
 
-// HasRole / HasGroup / HasProject：成员关系判定。大小写敏感 —— 外部 IdP 的
+// HasRole / HasGroup：成员关系判定。大小写敏感 —— 外部 IdP 的
 // 组名常常区分大小写，这里做折叠会把两个不同的组当成一个，属于越权方向的风险。
-func (id Identity) HasRole(r string) bool    { return contains(id.Roles, r) }
-func (id Identity) HasGroup(g string) bool   { return contains(id.Groups, g) }
-func (id Identity) HasProject(p string) bool { return contains(id.Projects, p) }
+//
+// 项目**没有**对应的 HasProject：项目归属只认结构化范围（PolicyContext.Project 与
+// 范围链），不认 Identity.Projects 里的 claim 原值。那串原值是显示名，拿它当关联键
+// 就等于给同一份权限开了第二个判定入口（见 entitlement.go matchSubject 的注释）。
+func (id Identity) HasRole(r string) bool  { return contains(id.Roles, r) }
+func (id Identity) HasGroup(g string) bool { return contains(id.Groups, g) }
 func (id Identity) HasAuthMethod(m string) bool {
 	return contains(id.AuthMethods, m)
 }

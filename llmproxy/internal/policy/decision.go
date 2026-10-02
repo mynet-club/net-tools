@@ -42,13 +42,17 @@ const (
 	ReasonCandidateRegionExcluded Reason = "candidate_region_excluded"
 	ReasonCandidateLevelExcluded  Reason = "candidate_level_excluded"
 	ReasonCandidateCostUnknown    Reason = "candidate_cost_unknown"
-	ReasonAffinityHit             Reason = "affinity_hit"
-	ReasonWeightedChoice          Reason = "weighted_choice"
-	ReasonCheapestFirst           Reason = "cheapest_first"
-	ReasonFallbackUsed            Reason = "fallback_used"
-	ReasonRetryExhausted          Reason = "retry_exhausted"
-	ReasonPlanExpired             Reason = "plan_expired"
-	ReasonReplaySeedMissing       Reason = "replay_seed_missing"
+	// ReasonCandidateCapabilityUnmatched 是「这家上游承接不了这个模型名 / 缺所需能力」。
+	// 与 model_not_allowed 的区别是排查方向：那是策略不授权，这是技术不承接，
+	// 混用一个码会让运维去改策略而不是改模型映射（D 包 §3.D 申请追加）。
+	ReasonCandidateCapabilityUnmatched Reason = "candidate_capability_unmatched"
+	ReasonAffinityHit                  Reason = "affinity_hit"
+	ReasonWeightedChoice               Reason = "weighted_choice"
+	ReasonCheapestFirst                Reason = "cheapest_first"
+	ReasonFallbackUsed                 Reason = "fallback_used"
+	ReasonRetryExhausted               Reason = "retry_exhausted"
+	ReasonPlanExpired                  Reason = "plan_expired"
+	ReasonReplaySeedMissing            Reason = "replay_seed_missing"
 )
 
 var allReasons = map[Reason]bool{}
@@ -63,7 +67,8 @@ func init() {
 		ReasonRegionDenied, ReasonRawBodyGrantMissing, ReasonPolicyVersionMissing,
 		ReasonNoCandidate, ReasonCandidateUnhealthy, ReasonCandidatePolicyExcluded,
 		ReasonCandidateRegionExcluded, ReasonCandidateLevelExcluded,
-		ReasonCandidateCostUnknown, ReasonAffinityHit, ReasonWeightedChoice,
+		ReasonCandidateCostUnknown, ReasonCandidateCapabilityUnmatched,
+		ReasonAffinityHit, ReasonWeightedChoice,
 		ReasonCheapestFirst, ReasonFallbackUsed, ReasonRetryExhausted,
 		ReasonPlanExpired, ReasonReplaySeedMissing,
 	} {
