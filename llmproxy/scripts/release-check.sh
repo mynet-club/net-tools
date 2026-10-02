@@ -9,18 +9,19 @@
 # 退出码：0 = 可以发；非 0 = 哪一步失败看输出。
 # 给 CI 用：不需要任何额外依赖，有 Go 与 git 就能跑。
 #
-# 3.0 门禁的清单与容忍策略见 docs/3.0-verification.md：
-# 已合并包（policy/replay）任何一步红都拦停；在途包（identity/knowledge/processor/
-# routing/executor）编译不过只提示，因为它们是并行 agent 的地盘，不是发布阻塞项。
+# 3.0 门禁的清单与容忍策略见 docs/3.0-verification.md：七个领域包与高校示例都已合并，
+# 任何一步红都拦停。DOMAIN_INFLIGHT 现在是空的 —— 并行期口径必须随合并收掉，
+# 否则门禁等于对半数代码失效。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-# 3.0 领域包清单。分成两类是刻意的：并行期「别人的包编译不过」不能算在发布失败里，
-# 但也不能因此静默跳过 —— 输出里必须逐包标 OWNED / INFLIGHT。
-DOMAIN_OWNED="internal/policy internal/replay"
-DOMAIN_INFLIGHT="internal/identity internal/knowledge internal/processor internal/routing internal/executor"
+# 3.0 领域包清单。合并一个包就把名字从 INFLIGHT 移到 OWNED（两个脚本各自的名单），
+# 名单是唯一来源：脚本里另写一份硬编码 case，漏改的那处不报错，
+# 只会让该包继续享受「红也不拦」的待遇。
+DOMAIN_OWNED="internal/policy internal/replay internal/identity internal/knowledge internal/processor internal/routing internal/executor examples/university"
+DOMAIN_INFLIGHT=""
 
 QUICK=0
 ONLY3P0=0
@@ -63,6 +64,19 @@ has_src() {
   return 1
 }
 
+# domain_tag 给出一个包路径的归属标签。名单只有一处来源（DOMAIN_INFLIGHT）：
+# 脚本里另写一份硬编码 case，会让「把包升成 OWNED」需要改两个地方，而漏改的那处
+# 不报错，只会让该包继续享受「红也不拦」—— 门禁静默失效比没有门禁更危险。
+domain_tag() {
+  local target="${1#./}" inflight
+  for inflight in $DOMAIN_INFLIGHT; do
+    case "$target" in
+      "${inflight%/...}"/*|"$inflight"|"$inflight/...") echo INFLIGHT; return ;;
+    esac
+  done
+  echo OWNED
+}
+
 # gate_gofmt 检查 3.0 领域包的 gofmt。OWNED 未格式化即失败，INFLIGHT 只警告。
 gate_gofmt() {
   step "gofmt -l（3.0 领域包）"
@@ -86,6 +100,8 @@ gate_gofmt() {
       echo "  ✓  ${dir}（INFLIGHT）"
     fi
   done
+  # 空名单也要说出来：并行期口径收掉了却不在输出里留痕，读的人会以为还有包在途。
+  [ -n "$DOMAIN_INFLIGHT" ] || echo "  —  无在途包（名单已清空，任何红都拦停）"
 }
 
 # gate_tests_present 检查「3.0 关键领域包凡有源文件必须同时有 _test.go」。
@@ -131,10 +147,7 @@ run_pkg_checks() {
   vetlog=$(mktemp)
   testlog=$(mktemp)
   for target in "$@"; do
-    tag=OWNED
-    case "$target" in
-      ./internal/identity/*|./internal/knowledge/*|./internal/processor/*|./internal/routing/*|./internal/executor/*) tag=INFLIGHT ;;
-    esac
+    tag="$(domain_tag "$target")"
     step "按包检查 ${target}（${tag}）"
     ok=1
     bad=""

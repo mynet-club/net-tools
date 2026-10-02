@@ -8,17 +8,17 @@
 #   ./scripts/test-matrix.sh --pkg=./internal/replay/...   # 只跑指定包（可重复）
 #
 # 退出码：0 全绿；非 0 有失败（跳过不算失败）。
-# 3.0 在途包（identity/knowledge/processor/routing/executor）编译不过只提示不拦停，
-# 因为它们是并行 agent 的地盘；已合并包（policy/replay）任何红都是失败。清单见
-# docs/3.0-verification.md。
+# 3.0 的七个领域包与高校示例都已合并，任何一步红都拦停（并行期口径已收掉）。
+# 清单与理由见 docs/3.0-verification.md。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 # 3.0 领域包：OWNED 已合并并冻结，INFLIGHT 并行在途。
-DOMAIN_OWNED="./internal/policy/... ./internal/replay/..."
-DOMAIN_INFLIGHT="./internal/identity/... ./internal/knowledge/... ./internal/processor/... ./internal/routing/... ./internal/executor/..."
+# 合并一个包就把名字从 INFLIGHT 移到 OWNED，两个脚本都要改（名单各自唯一）。
+DOMAIN_OWNED="./internal/policy/... ./internal/replay/... ./internal/identity/... ./internal/knowledge/... ./internal/processor/... ./internal/routing/... ./internal/executor/... ./examples/university/..."
+DOMAIN_INFLIGHT=""
 
 MODE=sqlite
 ONLY3P0=0
