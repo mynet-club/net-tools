@@ -13,13 +13,14 @@ import (
 //   - users 表早先版本就有数据，只能加列（SQLite 的 ALTER TABLE ADD COLUMN 是安全的）；
 //   - usage_user_daily 的主键要从 (day,user,provider,model) 加上 system_paid，
 //     主键变了只能重建表再搬数据（与 provider_stats 加 scope 时同一套做法）。
+//
+// 这里只补 mode。**不补** quota_month_tokens / quota_month_cost / rpm / max_concurrent：
+// 那四列是 2.x 的配额存放处，3.0 的读写全在 scope_quota（§2.7 规则 2）。继续在这里补列，
+// 等于每次启动都给「第二份配额真相」补一次骨血 —— 老库里已经有的那几列由一次性迁移
+// 回填成配额行后删掉（scope_migration.go 的 retireUsersQuotaColumns），新库里它们压根不出现。
 func migrateConsumption(db *sql.DB, d Dialect) error {
 	if err := addColumnsIfMissing(db, d, "users", map[string]string{
-		"mode":               "TEXT NOT NULL DEFAULT 'byo'",
-		"quota_month_tokens": "INTEGER NOT NULL DEFAULT 0",
-		"quota_month_cost":   "REAL NOT NULL DEFAULT 0",
-		"rpm":                "INTEGER NOT NULL DEFAULT 0",
-		"max_concurrent":     "INTEGER NOT NULL DEFAULT 0",
+		"mode": "TEXT NOT NULL DEFAULT 'byo'",
 	}); err != nil {
 		return err
 	}

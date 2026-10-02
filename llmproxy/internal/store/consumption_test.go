@@ -200,6 +200,18 @@ INSERT INTO usage_user_daily VALUES ('2026-09-01','old','deepseek','deepseek-fla
 	if u.Mode != ModeBYO {
 		t.Fatalf("迁移后老用户应为 byo，实际 %q", u.Mode)
 	}
+	// 配额列**不再由这里补回来**（migrateConsumption 只补 mode）：3.0 的配额真源是 scope_quota，
+	// 在 users 上留四列等于给旧形状续命。
+	for _, col := range usersQuotaLegacyCols {
+		if has, err := columnExists(s.db, "users", col); err != nil || has {
+			t.Errorf("users.%s 不该出现在升级后的库里: has=%v err=%v", col, has, err)
+		}
+	}
+	// 这种库从来没有过配额列，回填没有旧值可搬，但配额行必须存在：
+	// buildRegistry 缺行时拒绝重建快照（不是按「不限」放行），漏补会让老账号上线就 401。
+	if q := mustQuota(t, s, policy.MustScope(policy.ScopeUser, "old")); q.QuotaMonthTokens != 0 || !q.Enabled {
+		t.Fatalf("无旧列的库也要补出「不限」的配额行: %+v", q)
+	}
 	// 老数据保留：条数、token 数不变
 	su, err := s.SystemUsageSince("old", time.Date(2026, 9, 1, 0, 0, 0, 0, time.Local))
 	if err != nil {

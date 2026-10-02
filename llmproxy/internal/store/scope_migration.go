@@ -25,8 +25,14 @@ import (
 //	provider_stats.scope  '<用户名>'       → (user, '<用户名>')
 //	user_prices.scope     'default'       → (system, 'global')
 //	user_prices.scope     'user:<用户名>'  → (user, '<用户名>')
-//	users 的配额列 quota_month_* / rpm / max_concurrent / enabled
-//	                     → scope_quota 的 (user, 名) 行
+//	users 的配额列 quota_month_tokens / quota_month_cost / rpm / max_concurrent
+//	                     → scope_quota 的 (user, 名) 行；enabled 一并作为该行的初值
+//	                       （一次性映射，不是镜像：账号可用性留在 users，见下）
+//	                     回填完成后那四列从 users 上**删掉**（§2.7 规则 8 的旧字段退役）
+//	users.enabled        → 留在 users（身份事实），同时作为配额行 enabled 的初值
+//	users 没有那四列（比消费模式更早的库）
+//	                     → 照样补出全 0（= 不限）的配额行：「每个 user 都有一行」是
+//	                       3.0 读路径的前提，不是旧库才有的负担
 //	usage_user_daily.user_name             → usage_scope_daily 的 scope_kind='user' + scope_id=名
 //	audit_log 既有行                       → (system, 'global')（2.x 只记管理员的全局操作）
 //	requests 既有行                        → **不回填**（见下）
@@ -137,6 +143,10 @@ type scopeSchemaState struct {
 	usageUserDaily      bool // 回填来源
 	scopeQuota          bool // 目标表已存在（可能是上一轮跑到一半留下的）
 	usageScopeDaily     bool
+	// usersQuotaLegacy 是 users 上还留着 2.x 那四列配额/限流列。它只决定**回填读哪份输入**
+	// （旧列的值 vs 全 0 初值），不参与 needsWork —— 「有没有配额列」不是 2.x 账单形状的
+	// 判据：比消费模式更早的库同样没有那四列，把它的行搬对靠的是收口校验而不是列探测。
+	usersQuotaLegacy bool
 }
 
 // needsWork 报告**既有表**是否还是 2.x 形状（要不要动数据/重建表）。
@@ -198,6 +208,11 @@ func loadScopeSchemaState(db *sql.DB, d Dialect) (scopeSchemaState, error) {
 	if st.usageUserDaily, err = d.HasTable(db, "usage_user_daily"); err != nil {
 		return st, err
 	}
+	// 只认 quota_month_tokens 一列代表整组：四列是同一个版本一起加的，
+	// 而 HasColumn 在表不存在时返回 false，新库与老库都问得出结果，不用先判表在不在。
+	if st.usersQuotaLegacy, err = d.HasColumn(db, "users", "quota_month_tokens"); err != nil {
+		return st, err
+	}
 	if st.scopeQuota, err = d.HasTable(db, "scope_quota"); err != nil {
 		return st, err
 	}
@@ -257,7 +272,14 @@ func migrateScopeSchema(db *sql.DB, d Dialect, pathOrDSN string) error {
 		if err := execScopeDerived(db, d); err != nil {
 			return fmt.Errorf("%w: 补建 scope 派生表失败: %w", ErrScopeMigration, err)
 		}
-		return execScopeIndexes(db, d)
+		if err := execScopeIndexes(db, d); err != nil {
+			return err
+		}
+		// 再补一次旧列退役：**上一版的二进制**迁完时还没有这一步，它的库里 users 仍带着
+		// 2.x 那四列配额列（3.0 不读它们，但形状没收干净）。删不动只打提示 ——
+		// 版本号已落、结构是完整的 3.0，不该为一句收尾的 DDL 把库锁在门外。
+		retireUsersQuotaColumnsQuietly(db, d)
+		return nil
 	}
 
 	st, err := loadScopeSchemaState(db, d)
@@ -272,12 +294,26 @@ func migrateScopeSchema(db *sql.DB, d Dialect, pathOrDSN string) error {
 		return fmt.Errorf("%w: 创建 scope 派生表失败: %w", ErrScopeMigration, err)
 	}
 	if !st.needsWork() {
-		// 既有表已经是 3.0 形状（新库由各表的 DDL 直接建好）：只有索引与版本号要落 ——
-		// 不动数据、不建备份。全新库第一次打开就走这条分支。
+		// 既有表已经是 3.0 形状（新库由各表的 DDL 直接建好）：不动数据、不建备份。
+		// 全新库第一次打开就走这条分支。
 		if err := execScopeIndexes(db, d); err != nil {
 			return fmt.Errorf("%w: 建 scope 索引失败: %w", ErrScopeMigration, err)
 		}
-		return stampScopeSchemaVersion(db, d, scopeBackup{}, time.Now())
+		// 配额行仍然要补齐：needsWork 说的是「没有 2.x 的表形状要搬」，不是「库里没有人」。
+		// 比多用户时代早的库升级上来时，各张表都是新建的 3.0 形状，users 里却已经有账号 ——
+		// 那种账号缺配额行会让 buildRegistry 拒绝重建快照（新账号上线直接 401 一片），
+		// 而这条分支下面就要对外宣称「这是 3.0 库」。
+		if err := writeScopeQuotaRows(db, d, st); err != nil {
+			return err
+		}
+		if err := stampScopeSchemaVersion(db, d, scopeBackup{}, time.Now()); err != nil {
+			return err
+		}
+		// 旧列在这一步退役：上一句已经按同一份输入选择把（可能存在的）旧列值搬进了配额行，
+		// 所以守卫在这里只是兜底，防的是「行还没落成就把唯一的真值删走」。
+		// 新库根本没有那四列（userSchema 已经不建），退役对它就是空转。
+		retireUsersQuotaColumnsQuietly(db, d)
+		return nil
 	}
 
 	// 1) 预检（**只读**）：映射是否封闭、有没有会撞桶的重复键、用户名能否当范围键。
@@ -646,10 +682,12 @@ func (p *scopeMigrationPlan) exec(q string, args ...any) error {
 //  4. 回填 scope_quota（users 的 1:1 镜像）
 //  5. 回填 usage_scope_daily（usage_user_daily 的镜像，原表一行不动）
 //  6. 收口校验：四项全过才允许继续
-//  7. 收尾：删掉 2.x 的旧列/旧索引/影子表，落版本号
+//  7. 收尾：删掉 2.x 的旧列/旧索引/影子表，落版本号，最后退役 users 上的四列配额列
 //
 // 4、5 排在 6 之前，因为校验查的就是它们的结果；7 排在 6 之后，
 // 因为「旧列」是唯一的退路 —— 校验没过就删掉它，等于失败时把退路也烧了。
+// users 的配额列排在**版本号之后**（见 finish）：它不是本次迁移的任何输入，
+// 而删到一半时回滚会把已经校验通过的 3.0 结构拆掉，不如留给下一次启动的幂等收尾。
 func (p *scopeMigrationPlan) runAll(st scopeSchemaState, rep *ScopeMigrationReport) error {
 	phases := []struct {
 		name string
@@ -921,21 +959,44 @@ func (p *scopeMigrationPlan) addScopeColumns(st scopeSchemaState, _ *ScopeMigrat
 	return nil
 }
 
-// backfillScopeQuota 从 users 回填 (user, 名) 的配额行。
+// writeScopeQuotaRows 落「每个 user 一行配额」这件事：先按旧列覆盖已有行，再补没有的键。
+//
+// 输入按 st.usersQuotaLegacy 二选一（见 backfillScopeQuota），两条语句都**不删行**，
+// 也不会碰非 user 范围的行。两家都不写成带冲突子句的 INSERT ... SELECT：
+// SQLite 的 upsert 只挂在 VALUES 形式上，那条写法在 SQLite 直接是语法错误
+// （MySQL / PostgreSQL 都允许，所以三家共用一份语句的前提就是不用它）。
+//
+// 这里不含补偿登记 —— 纯追加、可重入，失败时由调用方决定怎么收尾。
+func writeScopeQuotaRows(db *sql.DB, d Dialect, st scopeSchemaState) error {
+	src := scopeQuotaInitSQL
+	if st.usersQuotaLegacy {
+		src = scopeQuotaBackfillSQL
+		if _, err := db.Exec(d.Rebind(scopeQuotaSyncSQL)); err != nil {
+			return fmt.Errorf("%w: 同步 scope_quota 已有行失败: %w", ErrScopeMigration, err)
+		}
+	}
+	if _, err := db.Exec(d.Rebind(src)); err != nil {
+		return fmt.Errorf("%w: 回填 scope_quota 失败: %w", ErrScopeMigration, err)
+	}
+	return nil
+}
+
+// backfillScopeQuota 建出 (user, 名) 的配额行，并登记撤销它们的那一步。
+//
+// 输入有两份，按 st.usersQuotaLegacy 选：
+//
+//	旧列在 —— 搬 users 上的配额/限流值（2.x 库）。
+//	旧列不在 —— 全 0（= 不限）+ users.enabled 作初值（比消费模式更早的库）。
+//
+// 两份都必须落行：3.0 的读路径（buildRegistry）缺行就拒绝重建快照，
+// 收口校验也查「每个 user 一行」。漏了这一步，那种库升级上来第一次同步用户就会 401 一片。
 //
 // 键的两列在 SQL 里分别给出（常量 'user' 与 name 列），**没有拼接**（§2.7 规则 1）；
 // 用户名能否当 scope_id 已在预检里逐个查过。
-// created_at/updated_at 取 users 行上的时间戳：配额行的年龄跟着主体走，
-// 否则「早就设好的限额」会在报表里显示成迁移那一刻改的。
 func (p *scopeMigrationPlan) backfillScopeQuota(st scopeSchemaState, _ *ScopeMigrationReport) error {
 	createdHere := !st.scopeQuota
-	// 先覆盖已有键、再补没有的键：两条语句三家都能跑，且都不删行。
-	// 见 scopeQuotaBackfillSQL 上方的说明 —— 这里不能写成一条带冲突子句的 INSERT ... SELECT。
-	if err := p.exec(scopeQuotaSyncSQL); err != nil {
-		return fmt.Errorf("%w: 同步 scope_quota 已有行失败: %w", ErrScopeMigration, err)
-	}
-	if _, err := p.db.Exec(p.d.Rebind(scopeQuotaBackfillSQL)); err != nil {
-		return fmt.Errorf("%w: 回填 scope_quota 失败: %w", ErrScopeMigration, err)
+	if err := writeScopeQuotaRows(p.db, p.d, st); err != nil {
+		return err
 	}
 	if createdHere {
 		p.add("删掉本轮回填出来的 scope_quota", func() error {
@@ -971,6 +1032,24 @@ INSERT INTO scope_quota (
 )
 SELECT 'user', u.name, u.quota_month_tokens, u.quota_month_cost, u.rpm, u.max_concurrent,
        u.enabled, u.created_at, u.updated_at
+FROM users u
+WHERE NOT EXISTS (
+  SELECT 1 FROM scope_quota q WHERE q.scope_kind='user' AND q.scope_id = u.name
+)`
+
+// scopeQuotaInitSQL 给还没有配额行的 user 范围补一行「不限」。
+//
+// 走这条的是**没带过配额列**的库：比消费模式更早的 2.x 库（那时 users 上只有身份列）。
+// 那种库没有旧值可搬，但「每个 user 都有一行」是收口校验与 3.0 读路径共同的不变量，
+// 所以在这里补出来，而不是让那种库永远开不了。
+// 全 0 = 不限，跟 CreateUser 的初值同一口径；enabled 沿用账号的启用状态，
+// created_at/updated_at 跟主体走（配额行的年龄不等于迁移时刻）。
+const scopeQuotaInitSQL = `
+INSERT INTO scope_quota (
+  scope_kind, scope_id, quota_month_tokens, quota_month_cost, rpm, max_concurrent,
+  enabled, created_at, updated_at
+)
+SELECT 'user', u.name, 0, 0, 0, 0, u.enabled, u.created_at, u.updated_at
 FROM users u
 WHERE NOT EXISTS (
   SELECT 1 FROM scope_quota q WHERE q.scope_kind='user' AND q.scope_id = u.name
@@ -1387,8 +1466,8 @@ func absFloat(v float64) float64 {
 
 // ------------------------------------------------------------------ 收尾
 
-// dropLegacyStructures（在 finish 里）把 2.x 的字符串作用域结构彻底移除：
-// user_prices 的旧列与旧索引、provider_stats 的影子表。
+// dropLegacyStructures（在 finish 里）把 2.x 的遗留结构彻底移除：
+// user_prices 的旧列与旧索引、provider_stats 的影子表、users 上的四列配额/限流。
 //
 // 旧列与旧索引**三种方言都删** —— §2.7 规则 1 要求库里不再留着字符串 scope 列。
 // 影子表分两家：
@@ -1418,6 +1497,10 @@ func (p *scopeMigrationPlan) finish(st scopeSchemaState, _ *ScopeMigrationReport
 		return err
 	}
 	p.finished = true
+	// 退役 users 的配额列排在**落版本号之后**：这四列不是迁移的任何输入（回填早就跑完了），
+	// 删到一半失败也不该把刚校验通过的库回滚掉 —— 版本号已落，fail() 那时会直接返回原始错误，
+	// 残余的列交给下一次启动的幂等收尾。
+	retireUsersQuotaColumnsQuietly(p.db, p.d)
 	return nil
 }
 
@@ -1445,6 +1528,92 @@ func (p *scopeMigrationPlan) dropLegacyPriceScope() error {
 			ErrScopeMigration, err)
 	}
 	return nil
+}
+
+// usersQuotaLegacyCols 是 2.x 挤在 users 上的配额/限流列，迁移收尾时逐列退役。
+//
+// enabled 不在名单里：账号能不能用是**身份**事实，主体是用户本身，3.0 照旧读 users.enabled。
+// 配额行上那一列叫 enabled 说的是另一件事（这一行的限额生效与否），迁移只做一次性映射，
+// 之后两边不再互相镜像 —— 那正是规则 8 要删掉的双写。
+var usersQuotaLegacyCols = []string{"quota_month_tokens", "quota_month_cost", "rpm", "max_concurrent"}
+
+// retireUsersQuotaColumns 把 users 上那四列删掉：配额的真值已经在 scope_quota 里。
+//
+// 为什么**不**像 provider_stats 的影子表那样给 MySQL/PG 留一份：那几列不是备份，
+// 而是第二个能读写配额的真值来源。值已经搬完、收口校验刚比过行数，留着只会让
+// 「哪一列说了算」重新变成问题 —— 同一条理由适用于 user_prices.scope，
+// 那张的旧列也是三种方言都删（见 dropLegacyPriceScope）。
+//
+// 逐列先问在不在：上一轮删到一半留下的尾巴要靠幂等的后续调用收尾，
+// 而重复 DROP 在 MySQL / PG 上是错误而不是空操作。
+func retireUsersQuotaColumns(db *sql.DB, d Dialect) error {
+	for _, col := range usersQuotaLegacyCols {
+		has, err := d.HasColumn(db, "users", col)
+		if err != nil {
+			return err
+		}
+		if !has {
+			continue
+		}
+		if _, err := db.Exec(d.Rebind("ALTER TABLE users DROP COLUMN " + col)); err != nil {
+			return fmt.Errorf("删 users.%s 失败: %w", col, err)
+		}
+	}
+	return nil
+}
+
+// retireUsersQuotaColumnsQuietly 是「收尾顺便把旧列删干净」：删不动不许把库锁在门外。
+//
+// 三个调用点都在数据已经安全之后（2.x 路径是收口校验通过并落了版本号，另两个是幂等补齐），
+// 而 3.0 的读写路径压根不碰那几列（GetScopeQuota 缺行时返回 nil 而不回读 users，见 scope_store.go）。
+// 于是「列还在」只是形状没收干净：为一句 cosmetic 的 DDL 失败让 Open 一直报错，
+// 等于把一个能用的网关停在门口。
+//
+// 唯一必须停下来等的是**配额行还没配齐**：那种库里旧列是唯一剩下的配额真值，
+// 删了就等于销毁数据，而且 3.0 的读路径会立刻把缺行的用户当成「配额读不出来」。
+// 所以这里先数缺行的用户，非零就只打提示。
+func retireUsersQuotaColumnsQuietly(db *sql.DB, d Dialect) {
+	missing, err := usersWithoutQuotaRows(db, d)
+	if err != nil {
+		fmt.Fprintf(scopeMigrationOutput,
+			"[scope-migration] users 的 2.x 配额列没去检查（%v）—— 保持原样，不影响读写\n", err)
+		return
+	}
+	if missing > 0 {
+		fmt.Fprintf(scopeMigrationOutput,
+			"[scope-migration] 有 %d 个用户还没有 scope_quota 行，users 的 2.x 配额列因此**保留**："+
+				"那是它们唯一的配额真值。补齐配额行后重启即可自动退役\n", missing)
+		return
+	}
+	if err := retireUsersQuotaColumns(db, d); err != nil {
+		var hints []string
+		for _, col := range usersQuotaLegacyCols {
+			hints = append(hints, "ALTER TABLE users DROP COLUMN "+col+";")
+		}
+		fmt.Fprintf(scopeMigrationOutput,
+			"[scope-migration] users 的 2.x 配额列没能删干净（配额真源已经是 scope_quota，"+
+				"不影响读写）：%v。手工收尾：%s\n", err, strings.Join(hints, " "))
+	}
+}
+
+// usersWithoutQuotaRows 数出「users 里有行、scope_quota 里没有对应 (user,名) 行」的用户数。
+//
+// 收口校验查的是两边**同数**，这一句查的是「谁缺行」—— 退役旧列之前要的是后者，
+// 因为同数也可能一边是 alice/bob、另一边是 alice/carol（孤儿那一项另查）。
+// 任一张表缺席就返回错误：那时「查不出来」绝不能读成「没人缺行」，
+// 否则 scope_quota 还没建的库里，这一步会把唯一的配额真值删掉。
+func usersWithoutQuotaRows(db *sql.DB, d Dialect) (int64, error) {
+	for _, table := range []string{"users", "scope_quota"} {
+		ok, err := d.HasTable(db, table)
+		if err != nil {
+			return 0, err
+		}
+		if !ok {
+			return 0, fmt.Errorf("表 %s 不存在，查不了配额行覆盖", table)
+		}
+	}
+	return dbScalarInt(db, d, `SELECT COUNT(*) FROM users u WHERE NOT EXISTS (
+		SELECT 1 FROM scope_quota q WHERE q.scope_kind='user' AND q.scope_id = u.name)`)
 }
 
 // mysqlHasIndex 报告 MySQL 表上有没有这个索引名（information_schema）。

@@ -17,6 +17,9 @@ import (
 //   - 下游 token 只存 SHA-256，明文只在创建/轮换时返回一次给你
 //   - 上游 api_key 存 AES-GCM 密文（密钥在 master.key），库里没有明文
 //   - 用户用量单独一张表，不动已有的 usage_daily（避免改主键、避免迁移风险）
+//   - 配额与限流**不在这张表上**：那是按**范围**定的设置，真值只有 scope_quota 一行
+//     （§2.7 规则 2/8）。2.x 把它们挤在 users 上的那四列，由一次性迁移回填成
+//     (user, 名) 的配额行后再从 users 上删掉（scope_migration.go 的 retireUsersQuotaColumns）。
 const userSchema = `
 CREATE TABLE IF NOT EXISTS users (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -26,11 +29,7 @@ CREATE TABLE IF NOT EXISTS users (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   -- 下游模式：byo = 自带自己的上游；consumption = 允许消费系统上游（受白名单与配额约束）
-  mode               TEXT    NOT NULL DEFAULT 'byo',
-  quota_month_tokens INTEGER NOT NULL DEFAULT 0,  -- 0 = 不限
-  quota_month_cost   REAL    NOT NULL DEFAULT 0,  -- 0 = 不限
-  rpm                INTEGER NOT NULL DEFAULT 0,  -- 0 = 不限
-  max_concurrent     INTEGER NOT NULL DEFAULT 0   -- 0 = 不限
+  mode       TEXT    NOT NULL DEFAULT 'byo'
 );
 
 -- user_models 只对 consumption 用户有意义：既是「能不能用这个模型」的白名单，

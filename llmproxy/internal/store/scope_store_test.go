@@ -137,6 +137,10 @@ func TestScopeQuotaRejectsNegativeFields(t *testing.T) {
 //     一次性迁移会把旧列回填成配额行，收口校验查的正是每个 user 都有一行。
 //   - 「没行」与「限额为 0」必须可区分：nil = 从没配过，0 = 管理员显式给的「不限」。
 //     把 nil 当 0 显示，org / project 范围会一水儿显示成「额度为零」。
+//
+// 旧列由测试手工补回来（3.0 的 userSchema 已经不建它们，见 scope_migration_test.go）：
+// 要钉的是「读路径不碰它」，那与库里当前有没有这一列无关 —— 上一轮的库、
+// 或人工恢复回来的库都可能还带着它。
 func TestGetScopeQuotaHasNoUsersFallback(t *testing.T) {
 	s := openTestStore(t)
 	if err := s.CreateUser("alice", TokenHash("sk-alice")); err != nil {
@@ -148,6 +152,7 @@ func TestGetScopeQuotaHasNoUsersFallback(t *testing.T) {
 	if _, err := s.db.Exec(`DELETE FROM scope_quota WHERE scope_kind='user' AND scope_id='alice'`); err != nil {
 		t.Fatal(err)
 	}
+	ensureLegacyUsersQuotaCols(t, s.db)
 	if _, err := s.db.Exec(`UPDATE users SET quota_month_tokens=1000, quota_month_cost=50.5,
 		rpm=30, max_concurrent=3 WHERE name='alice'`); err != nil {
 		t.Fatal(err)

@@ -273,7 +273,8 @@ grep -q '"quota"' /tmp/adm.json && pass "列表里带配额与已用量" || fail
 curl -s -X PUT "$GW/v1/_admin/users/dave" -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
   -d '{"quota_month_tokens": 4242}' >/dev/null
 chk "改配额后模式保持 consumption" "$(sqlite3 "$H/data/llmproxy.db" "SELECT mode FROM users WHERE name='dave';")" "consumption"
-chk "配额已落库" "$(sqlite3 "$H/data/llmproxy.db" "SELECT quota_month_tokens FROM users WHERE name='dave';")" "4242"
+# 配额读 scope_quota：users 上那四列是 2.x 的形状，3.0 的迁移会把它回填进配额行再退役（§2.7 规则 2/8）
+chk "配额已落库" "$(sqlite3 "$H/data/llmproxy.db" "SELECT quota_month_tokens FROM scope_quota WHERE scope_kind='user' AND scope_id='dave';")" "4242"
 
 # 代用户配一条模型映射（模型名带 / 也要能加，所以走 body 不走路径）
 code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$GW/v1/_admin/users/dave/models" \
