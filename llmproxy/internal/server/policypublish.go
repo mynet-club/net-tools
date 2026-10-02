@@ -817,14 +817,21 @@ func (s *Server) editPolicySection(w http.ResponseWriter, r *http.Request, actio
 
 // ── 落盘通道 ───────────────────────────────────────────────
 
-// commitPolicyConfig 把新配置落到 path，走与 providers 写回同一条安全底线，
-// 并多做一步**按引用加载策略包**：那是「改完真的能加载」的唯一判据。
+// sectionGuard 是「新配置能加载」与「真的落盘」之间那一段特有的判据。
 //
-// undo 在这里被调用：临时文件校验不过时，已经写进线上目录的内容文件必须还原，
-// 否则磁盘上留下一份配置没引用的新内容 —— 下一次发布的「旧内容」就成了它。
+// 返回 failMsg 非空 = 放弃写入（原文件不动、undo 已经跑过）；
+// 返回 extra 会并进成功响应，让各段把自己的字段（比如 policy_version）带出去。
+// 为什么做成回调而不是各段自己复制一遍落盘代码：备份、chmod 0600、严格模式试读、
+// 审计与热加载确认这五件事缺任何一件都会留下「改坏了说不清」的现场，
+// 而复制两份迟早只改一份。
+type sectionGuard func(parsed *config.Config) (extra map[string]any, status int, code, failMsg string)
+
+// commitSectionConfig 把 newSrc 落到 path，走 providers 写回同一条安全底线：
+// 先临时文件校验、再备份、再原子改名，全程失败都不碰原文件。
+//
 // 返回的 resp 只到「写成功」为止，调用方补自己的字段后再 writeJSON。
-func (s *Server) commitPolicyConfig(w http.ResponseWriter, path string, src, newSrc []byte,
-	note string, undo func(), pa policyAudit) (map[string]any, bool) {
+func (s *Server) commitSectionConfig(w http.ResponseWriter, path string, src, newSrc []byte,
+	note string, undo func(), pa policyAudit, guard sectionGuard) (map[string]any, bool) {
 	fail := func(status int, code, msg string) (map[string]any, bool) {
 		if undo != nil {
 			undo()
@@ -844,13 +851,15 @@ func (s *Server) commitPolicyConfig(w http.ResponseWriter, path string, src, new
 		return fail(http.StatusBadRequest, "invalid_request_error",
 			"写回后的配置校验不通过，原文件未改动: "+err.Error())
 	}
-	// 引用与内容必须当场对得上。临时文件与原文件同目录，所以 BundleBaseDir 解析出的
-	// 就是刚写过内容文件的那个目录 —— 这一步失败说明两边又回到「两个真值来源」。
-	set, err := parsed.Policy.LoadBundles(parsed.BundleBaseDir())
-	if err != nil {
-		_ = os.Remove(tmp)
-		return fail(http.StatusConflict, "bundle_mismatch",
-			"配置能加载，但按引用读策略包内容失败（原文件未改动）: "+err.Error())
+	var extra map[string]any
+	if guard != nil {
+		var status int
+		var code, msg string
+		extra, status, code, msg = guard(parsed)
+		if msg != "" {
+			_ = os.Remove(tmp)
+			return fail(status, code, msg)
+		}
 	}
 	strictErr := ""
 	if _, err := config.LoadFile(tmp); err != nil {
@@ -869,30 +878,25 @@ func (s *Server) commitPolicyConfig(w http.ResponseWriter, path string, src, new
 	if err := os.Chmod(path, 0o600); err != nil {
 		s.log.Warnf("收紧配置文件权限失败: %v", err)
 	}
-	s.log.Warnf("管理员通过控制台改写了 policy 段：%s（配置备份 %s）", note, filepath.Base(backup))
-	// 审计与日志同一条落盘点：detail 就是那句 note（说了从哪版换到哪版、备份文件名在
-	// 响应里给），不含规则条件值。actor 固定 "admin" —— 这个端点只认 admin_token，
+	s.log.Warnf("管理员通过控制台改写了配置文件（%s）：%s（配置备份 %s）", pa.action, note, filepath.Base(backup))
+	// 审计与日志同一条落盘点：detail 就是那句 note（说了从哪版换到哪版、改了几条），
+	// 不含密钥也不含规则条件值。actor 固定 "admin" —— 这一族端点只认 admin_token，
 	// 目前不存在「哪个管理员」的身份，编一个名字比不写更糟。
 	s.auditAt(pa.scope, "admin", pa.action, pa.target, note)
 
-	version := ""
-	if set != nil {
-		if v, err := set.PolicyVersion(); err == nil {
-			version = v
-		}
-	}
 	resp := map[string]any{
-		"written":               true,
-		"applied":               s.waitForConfigApply(),
-		"revision":              s.cfgStore.Revision(),
-		"backup":                filepath.Base(backup),
-		"path":                  path,
-		"note":                  note,
-		"mode":                  parsed.Policy.ModeResolved().String(),
-		"configured_bundles":    bundleRefViews(parsed.Policy.BundleRefs()),
-		"policy_version":        version,
-		"declared_bundles":      bundleRefViews(parsed.Policy.BundleRefs()),
-		"policy_config_comment": "只替换了 policy 段，文件其余部分与注释保持原样",
+		"written":  true,
+		"applied":  s.waitForConfigApply(),
+		"revision": s.cfgStore.Revision(),
+		"backup":   filepath.Base(backup),
+		"path":     path,
+		"note":     note,
+	}
+	for k, v := range extra {
+		resp[k] = v
+	}
+	if !resp["applied"].(bool) {
+		resp["note"] = note + "；热加载尚未完成（最多 2 秒），稍后刷新看结果"
 	}
 	if strictErr != "" {
 		// 文件写得进去但服务加载不了：改动不会生效，必须说破。
@@ -906,6 +910,35 @@ func (s *Server) commitPolicyConfig(w http.ResponseWriter, path string, src, new
 		resp["warnings"] = parsed.Warnings
 	}
 	return resp, true
+}
+
+// commitPolicyConfig 落盘 policy 段，多做一步**按引用加载策略包**：
+// 那是「改完真的能加载」的唯一判据（引用与内容又回到两个真值来源时当场拒写）。
+//
+// undo 在这里被调用：临时文件校验不过时，已经写进线上目录的内容文件必须还原，
+// 否则磁盘上留下一份配置没引用的新内容 —— 下一次发布的「旧内容」就成了它。
+func (s *Server) commitPolicyConfig(w http.ResponseWriter, path string, src, newSrc []byte,
+	note string, undo func(), pa policyAudit) (map[string]any, bool) {
+	return s.commitSectionConfig(w, path, src, newSrc, note, undo, pa, func(parsed *config.Config) (map[string]any, int, string, string) {
+		set, err := parsed.Policy.LoadBundles(parsed.BundleBaseDir())
+		if err != nil {
+			return nil, http.StatusConflict, "bundle_mismatch",
+				"配置能加载，但按引用读策略包内容失败（原文件未改动）: " + err.Error()
+		}
+		version := ""
+		if set != nil {
+			if v, err := set.PolicyVersion(); err == nil {
+				version = v
+			}
+		}
+		return map[string]any{
+			"mode":                  parsed.Policy.ModeResolved().String(),
+			"configured_bundles":    bundleRefViews(parsed.Policy.BundleRefs()),
+			"policy_version":        version,
+			"declared_bundles":      bundleRefViews(parsed.Policy.BundleRefs()),
+			"policy_config_comment": "只替换了 policy 段，文件其余部分与注释保持原样",
+		}, 0, "", ""
+	})
 }
 
 // waitForConfigApply 等热加载轮询把新配置装进去，让界面能拿到确定答复。

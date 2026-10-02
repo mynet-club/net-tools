@@ -1,7 +1,8 @@
 'use strict';
 
 const ADM = { users: [], sys: [], cfg: { providers: [] }, cands: {}, editing: null, detail: null,
-  policy: null, plb: null, plbErr: '', plDraft: null };
+  policy: null, plb: null, plbErr: '', plDraft: null,
+  decl: null, declDraft: { p: '', kn: '' }, declDisk: { p: '', kn: '' }, declDirty: { p: false, kn: false } };
 
 // 管理台的请求都用 state.token（里面存的就是 admin_token），与公共 api() 是同一套
 const adminApi = (path, opts) => api(path, opts);
@@ -50,6 +51,11 @@ function adminLogout() {
   state.token = '';
   ADM.users = [];
   ADM.editing = null;
+  // 声明段的草稿是上一个部署的配置文本；留着它，下次登录会把旧内容当成待保存的编辑。
+  ADM.decl = null;
+  ADM.declDraft = { p: '', kn: '' };
+  ADM.declDisk = { p: '', kn: '' };
+  ADM.declDirty = { p: false, kn: false };
   $('admin').hidden = true;
   renderLogin('');
 }
@@ -564,6 +570,9 @@ async function loadPolicy(keepMsg) {
   renderPolicyBundles(data);
   renderPolicyWrite();
   fillSimScopes();
+  // 声明段的「参与/不参与请求」完全由 policy.mode 决定，所以模式一变就要跟着重读。
+  // 它失败不该挡住策略这一屏（两边是不同的段），自己会说明为什么读不到。
+  loadDeclarations(true).catch(() => {});
   // 策略写侧每次都落审计（policypublish.go 的落盘通道），所以这一屏刷新过之后
   // 审计列表也要跟着刷新：面板停在改动前的记录，等于把刚按下的按钮记的那条藏起来。
   fillAuditScopes();
@@ -1128,6 +1137,210 @@ async function runTrace() {
   }
 }
 
+/* ── 处理器与知识库声明（§3.H） ─────────────────────────────────────
+   这两段是 config.yaml 里的原文段，接口是整段读写，所以这一屏的形状就是
+   「把磁盘上那一段交给人改」。界面上只挡两件事：JSON 语法、顶层必须是数组。
+   条目里任何一条规则都不在这里判（阶段配了什么档位、上限之间怎么互相约束、
+   端点形态、知识库 ID）—— 那全是服务端领域校验的活，抄一份到前端就会在领域包
+   扩充那天变成「界面不让你填、配置其实能写」。 */
+
+const DECL = [
+  {
+    which: 'p', key: 'processors', path: '/v1/_admin/config/processors',
+    box: 'pc-p-json', err: 'pc-p-err', hint: 'pc-p-hint', save: 'pc-p-save',
+    example: 'pc-p-example', disk: 'pc-p-disk', noun: '处理器声明',
+  },
+  {
+    which: 'kn', key: 'knowledge_sources', path: '/v1/_admin/config/knowledge_sources',
+    box: 'pc-kn-json', err: 'pc-kn-err', hint: 'pc-kn-hint', save: 'pc-kn-save',
+    example: 'pc-kn-example', disk: 'pc-kn-disk', noun: '知识源委托入口',
+  },
+];
+
+// 最小示例只给形状：它用的是内置类型 pii-mask（合法组合：请求侧阶段 + transform-body）。
+// 换类型时按下面的取值域表改阶段与档位，最终判据仍以服务端为准。
+const DECL_EXAMPLE = {
+  p: [{
+    name: 'pii-request', type: 'pii-mask', phase: 'before-upstream', scope: '*',
+    timeout_ms: 5000, max_input_bytes: 1048576, max_output_bytes: 1048576,
+    fail_closed: true, body_access: 'transform-body', version: '1',
+  }],
+  kn: [{
+    name: 'campus-rag', endpoint: 'https://rag.internal.example/v1/retrieve',
+    knowledge_bases: ['course-materials'], timeout_ms: 3000, max_response_bytes: 1048576,
+  }],
+};
+
+const declSection = (which) => DECL.filter((s) => s.which === which)[0];
+
+function showPcStatus(msg, kind) {
+  const el = $('pc-status');
+  el.textContent = msg || '';
+  el.className = 'banner' + (kind === 'err' ? ' err-banner' : '');
+  el.hidden = !msg;
+}
+
+async function loadDeclarations(keepMsg) {
+  const got = {};
+  for (const s of DECL) {
+    try {
+      got[s.which] = (await adminApi(s.path)).data;
+    } catch (e) {
+      // 一侧读不到就整屏说明读不到：两段各自带 mode/applies，拼一半的显示更容易误导。
+      showPcStatus('读不到 ' + s.key + ' 段：' + e.message, 'err');
+      return;
+    }
+  }
+  ADM.decl = got;
+  for (const s of DECL) {
+    const disk = JSON.stringify(got[s.which][s.key] || [], null, 2);
+    ADM.declDisk[s.which] = disk;
+    // 编辑过的那一侧不覆盖：一次刷新抹掉刚填的声明，比多一个按钮糟得多。
+    if (!ADM.declDirty[s.which]) ADM.declDraft[s.which] = disk;
+  }
+  renderDeclarations(keepMsg);
+}
+
+function renderDeclarations(keepMsg) {
+  const d = ADM.decl || {};
+  const p = d.p || {};
+  const k = d.kn || {};
+  const v = p.vocabulary || k.vocabulary || {};
+  $('pc-rev').textContent = '配置修订 ' + num(p.revision) + ' · ' + (p.path || 'config.yaml');
+  $('pc-stats').replaceChildren(
+    // 「保存成功」与「正在生效」是两件事：§3.0 规则 2 只让 enforce 影响路由与处理器，
+    // 不把这一层写在最上面，脱敏就会在 legacy 下被当成已经上线。
+    stat('policy.mode', (p.mode || '—') + ' → ' + (p.applies ? '参与请求' : '暂不参与'), 'sm',
+      '只有 enforce 允许 3.0 影响路由与处理器。legacy / shadow 下这两段是提前备好的配置，不碰正文。'),
+    stat('处理器', num((p.processors || []).length) + ' 条', 'sm'),
+    stat('知识源', num((k.knowledge_sources || []).length) + ' 条', 'sm'),
+    stat('磁盘时间', p.mtime || '—', 'sm',
+      '文件大小 ' + num(p.size) + ' 字节 · 每次写回先备份再原子改名，段外内容与注释原样'),
+  );
+  DECL.forEach((s) => {
+    const one = (ADM.decl || {})[s.which] || {};
+    $(s.hint).textContent = num((one[s.key] || []).length) + ' 条在磁盘上 · '
+      + (ADM.declDirty[s.which] ? '编辑中（未保存）' : '与磁盘一致');
+    $(s.box).value = ADM.declDraft[s.which];
+  });
+  renderVocab(v);
+
+  const be = p.baseline_error || k.baseline_error || '';
+  if (be) {
+    // 基线坏了不能把 GET 变成 500：管理员要看清「磁盘上那条哪里不对」，
+    // 而列表显示的是服务当前加载着的那一份 —— 整段保存合法声明就能修好它。
+    showPcStatus('磁盘上的这一版读不回来：' + be
+      + '\n上面的条数列显示的是服务当前加载着的那一份。修好它的办法是整段保存一份合法声明 —— 在校验通过之前原文件一个字节都不会动。', 'err');
+  } else if (!keepMsg) {
+    const w = p.warnings || [];
+    showPcStatus(w.length ? '提示：' + w.join('；') : '');
+  }
+}
+
+// 取值域表：服务端下发什么就显示什么，界面不补一项、不减一项。
+function renderVocab(v) {
+  const box = $('pc-vocab');
+  if (!v || !v.processor_types) {
+    box.replaceChildren(h('p', { class: 'muted', text: '这次没拿到取值域（接口没回 vocabulary）。' }));
+    return;
+  }
+  const row = (k, list, note) => h('tr', null,
+    h('th', { text: k }),
+    h('td', null, h('code', { class: 'k', text: (list || []).join('、') || '—' }),
+      h('span', { class: 'hint', text: note || '' })));
+  const boundary = ((ADM.decl || {}).p || {}).boundary || '';
+  box.replaceChildren(
+    h('div', { class: 'tablewrap' }, h('table', null, h('tbody', null,
+      row('处理器类型', v.processor_types, '类型集合不封闭：自定义类型由部署在注册期 RegisterType 注入。写了没注入的类型会告警并在装配期失败。'),
+      row('阶段', v.phases, '闭集，执行次序固定：请求侧三个阶段 → after-upstream → audit。'),
+      row('正文档位', v.body_accesses, 'metadata-only（不读正文）< inspect-body（读，不改）< transform-body（可改写正文）。'),
+      row('范围写法', (v.scope_kinds || []).map((x) => x + ':id').concat(['*']), 'scope 必须显式写：* 是不限范围，kind:id 只对该范围生效。'),
+    ))),
+    h('p', { class: 'hint', text: '上限：timeout ≤ ' + num(v.max_timeout_ms) + ' ms；max_input_bytes ≤ '
+      + num(v.absolute_max_input_bytes) + '、max_output_bytes ≤ ' + num(v.absolute_max_output_bytes)
+      + ' 字节（且输出不得小于输入的 1/4）；name ≤ ' + num(v.max_name_len) + ' 字符；allowed_endpoints ≤ '
+      + num(v.max_allowed_endpoints) + ' 条；知识源预算默认 ' + num(v.default_budget_ms)
+      + ' ms、上限 ' + num(v.max_knowledge_budget_ms) + ' ms。' }),
+    h('p', { class: 'hint', text: boundary }),
+  );
+}
+
+// pcCall 是声明写侧唯一的出口：写完就整屏重读，让界面说的永远是加载器认过的那份。
+async function pcCall(method, path, body, s) {
+  showPcStatus(method + ' ' + path + ' 处理中…');
+  let res;
+  try {
+    res = await adminApi(path, { method, body: JSON.stringify(body) });
+  } catch (e) {
+    showPcStatus('失败：' + e.message + '\n原文件未改动（服务端在校验不过时整笔还原，也不留审计）。', 'err');
+    await loadDeclarations(true);
+    return null;
+  }
+  const d = res.data || {};
+  let msg = d.note || '已完成。';
+  if (d.backup) msg += '（配置备份 ' + d.backup + '）';
+  msg += d.applies
+    ? '\nmode=' + d.mode + '：这些声明现在参与请求。'
+    : '\n⚠ mode=' + d.mode + '：声明已写进配置，但现在还不参与请求（§3.0 规则 2）。要生效见「策略与路由」的模式。';
+  if (d.applied === false) msg += '\n⚠ 还在等热加载：下一次轮询才会装进运行态，可以先点刷新。';
+  if (d.strict_error) msg += '\n⚠ 文件写入了但服务加载它会失败：' + d.strict_error;
+  if ((d.warnings || []).length) msg += '\n提示：' + d.warnings.join('；');
+  showPcStatus(msg, d.strict_error || d.applied === false ? 'err' : '');
+  // 磁盘现在就是刚提交的这一份，所以编辑标记清掉；重读会把规范化后的文本填回框里
+  // （端点会去空白、条目按 name 排序）—— 那是加载器真正看到的形态，比原样留着更有用。
+  ADM.declDirty[s.which] = false;
+  ADM.declDraft[s.which] = '';
+  await loadDeclarations(true);
+  return d;
+}
+
+function saveDeclarations(s) {
+  showErr($(s.err), '');
+  let arr;
+  try {
+    arr = JSON.parse($(s.box).value.trim() || '[]');
+  } catch (e) {
+    return showErr($(s.err), 'JSON 语法不过：' + e.message);
+  }
+  if (!Array.isArray(arr)) {
+    return showErr($(s.err), '这一段是一个数组：顶层要写成 […]（清空请显式保存 []）');
+  }
+  const onDisk = (((ADM.decl || {})[s.which] || {})[s.key] || []).length;
+  // 整段替换意味着「保存空数组」= 删掉全部声明，而配置文件的段是整体写的，
+  // 事后逐条撤销做不到 —— 所以这一笔单独确认，其余条数变化直接落。
+  if (!arr.length && onDisk && !confirm('清空 ' + s.key + ' 段？磁盘上现在有 ' + onDisk
+    + ' 条。整段替换是一次写完的，撤销只能靠那次写的配置备份文件。')) return;
+  return pcCall('PUT', s.path, { [s.key]: arr }, s);
+}
+
+function fillDeclExample(which) {
+  const s = declSection(which);
+  showErr($(s.err), '');
+  ADM.declDirty[which] = true;
+  ADM.declDraft[which] = JSON.stringify(DECL_EXAMPLE[which], null, 2);
+  $(s.box).value = ADM.declDraft[which];
+  $(s.hint).textContent = '已填入示例（未保存）—— 名字、类型、端点都要改成你自己的。';
+}
+
+function rereadDeclDisk(which) {
+  const s = declSection(which);
+  showErr($(s.err), '');
+  ADM.declDirty[which] = false;
+  ADM.declDraft[which] = ADM.declDisk[which];
+  $(s.box).value = ADM.declDraft[which];
+  $(s.hint).textContent = '已读回磁盘上的那一份。';
+}
+
+// 编辑只动草稿。dirty 标记的作用是让「因为模式变了而重读」不抹掉没保存的内容 ——
+// 一次误刷新丢掉整段声明，代价是有人重新手抄一遍规则。
+function markDeclInput(which, text) {
+  ADM.declDirty[which] = true;
+  ADM.declDraft[which] = text;
+  const s = declSection(which);
+  $(s.hint).textContent = '编辑中（未保存）· 保存的是整段';
+  showErr($(s.err), '');
+}
+
 /* ── 操作审计 ────────────────────────────────────────────────────── */
 
 // 范围下拉只列这个网关真的会写出的归属：全局开关与上游价目（system:global）、
@@ -1641,6 +1854,15 @@ $('ud-new-upstream').addEventListener('keydown', (e) => { if (e.key === 'Enter')
 $('cfg-save').addEventListener('click', saveConfig);
 $('cfg-validate').addEventListener('click', validateConfig);
 $('pl-refresh').addEventListener('click', () => loadPolicy());
+$('pc-refresh').addEventListener('click', () => loadDeclarations());
+$('pc-p-save').addEventListener('click', () => saveDeclarations(declSection('p')));
+$('pc-p-example').addEventListener('click', () => fillDeclExample('p'));
+$('pc-p-disk').addEventListener('click', () => rereadDeclDisk('p'));
+$('pc-p-json').addEventListener('input', (e) => markDeclInput('p', e.target.value));
+$('pc-kn-save').addEventListener('click', () => saveDeclarations(declSection('kn')));
+$('pc-kn-example').addEventListener('click', () => fillDeclExample('kn'));
+$('pc-kn-disk').addEventListener('click', () => rereadDeclDisk('kn'));
+$('pc-kn-json').addEventListener('input', (e) => markDeclInput('kn', e.target.value));
 $('sim-run').addEventListener('click', runSimulate);
 $('sim-model').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); runSimulate(); } });
 $('sim-rid').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); runSimulate(); } });

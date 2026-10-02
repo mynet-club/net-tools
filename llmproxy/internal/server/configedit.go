@@ -35,7 +35,7 @@ func (s *Server) handleAdminConfig(w http.ResponseWriter, r *http.Request, rest 
 			s.adminShowConfig(w)
 		default:
 			writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error",
-				"配置文件用 GET 读、PUT 写（/v1/_admin/config/providers）")
+				"配置文件用 GET 读、PUT 写（/v1/_admin/config/providers|processors|knowledge_sources）")
 		}
 	case "providers":
 		switch r.Method {
@@ -45,6 +45,18 @@ func (s *Server) handleAdminConfig(w http.ResponseWriter, r *http.Request, rest 
 			writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error",
 				"只支持 PUT（要试算用 POST /v1/_admin/config/validate）")
 		}
+	case sectionProcessors, sectionKnowledge:
+		// 两段 3.0 声明表（§3.H）：GET 看当前形态与取值域，PUT 整段写回。
+		section := strings.Trim(rest, "/")
+		switch r.Method {
+		case http.MethodGet, http.MethodHead:
+			s.adminShowDeclarations(w, section)
+		case http.MethodPut, http.MethodPost:
+			s.adminSaveDeclarations(w, r, section)
+		default:
+			writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error",
+				"只支持 GET（读）与 PUT（整段写回）")
+		}
 	case "validate":
 		if r.Method != http.MethodPost {
 			writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error", "只支持 POST")
@@ -53,7 +65,9 @@ func (s *Server) handleAdminConfig(w http.ResponseWriter, r *http.Request, rest 
 		s.adminSaveProviders(w, r, true)
 	default:
 		writeJSONError(w, http.StatusNotFound, "invalid_request_error",
-			"可用路径：/v1/_admin/config、/v1/_admin/config/providers、/v1/_admin/config/validate")
+			"可用路径：/v1/_admin/config、/v1/_admin/config/providers、"+
+				"/v1/_admin/config/processors、/v1/_admin/config/knowledge_sources、"+
+				"/v1/_admin/config/validate")
 	}
 }
 

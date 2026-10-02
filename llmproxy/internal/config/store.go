@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/mynet-club/net-tools/llmproxy/internal/processor"
 )
 
 // Store 持有当前生效的配置快照，并在文件变化时原子替换。
@@ -163,6 +165,75 @@ func configEqual(a, b *Config) bool {
 	}
 	if !policyEqual(a.Policy, b.Policy) {
 		return false
+	}
+	if !processorsEqual(a.ProcessorSpecs, b.ProcessorSpecs) {
+		return false
+	}
+	if !knowledgeSourcesEqual(a.KnowledgeSources, b.KnowledgeSources) {
+		return false
+	}
+	return true
+}
+
+// processorsEqual 比较 processors 段的生效语义。
+//
+// 漏掉它的后果与 policyEqual 那段记的同一类，而且更隐蔽：只改处理器声明（加一条脱敏、
+// 把 fail_closed 从 false 翻成 true）会被判成「配置没变」→ revision 不推进 →
+// 重载回调直接 return → 管理台一直报「还在等热加载」，而运行时候选池里的 Spec
+// 到底是不是新那份，没人能从界面上看出来。一次「改了但 apparently 没生效」的误判，
+// 会让人把已经生效的配置再改回去。
+//
+// 比的是 normalize 之后的领域形态而不是 []ProcessorDef：后者带着 *bool 的 fail_closed，
+// 两次 Parse 各分配一个指针，直接 `!=` 会恒不等（同 databaseEqual 的坑），
+// 于是「一个字没改的配置」每次保存都被判成变了、白白丢掉上游连接池。
+// ProcessorSpecs 是加载期按 name 排序后的切片，两边同源，逐位比较即可。
+func processorsEqual(a, b []processor.Spec) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		x, y := a[i], b[i]
+		if x.Name != y.Name || x.Type != y.Type || x.Phase != y.Phase || x.Scope != y.Scope ||
+			x.Timeout != y.Timeout || x.MaxInputBytes != y.MaxInputBytes ||
+			x.MaxOutputBytes != y.MaxOutputBytes || x.FailClosed != y.FailClosed ||
+			x.BodyAccess != y.BodyAccess || x.AllowRawBody != y.AllowRawBody || x.Version != y.Version {
+			return false
+		}
+		// 白名单是逐条比较的集合：Spec 含切片字段时结构体整体 `!=` 不可编译，
+		// 而「少一个出网目标」正是最需要被当成变更的那类改动。
+		if len(x.AllowedEndpoints) != len(y.AllowedEndpoints) {
+			return false
+		}
+		for j := range x.AllowedEndpoints {
+			if x.AllowedEndpoints[j] != y.AllowedEndpoints[j] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// knowledgeSourcesEqual 比较 knowledge_sources 段（同一套比值不比指针、逐条比集合的理由）。
+//
+// 名字与端点按清理后的形态比：写回文件时端点已经归一化过，而「末尾多一个空格」
+// 不该被当成一次委托目标变更去重置连接池。
+func knowledgeSourcesEqual(a, b []KnowledgeSourceDef) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		x, y := a[i], b[i]
+		if strings.TrimSpace(x.Name) != strings.TrimSpace(y.Name) ||
+			strings.TrimSpace(x.Endpoint) != strings.TrimSpace(y.Endpoint) ||
+			x.TimeoutMs != y.TimeoutMs || x.MaxResponseBytes != y.MaxResponseBytes ||
+			len(x.KnowledgeBases) != len(y.KnowledgeBases) {
+			return false
+		}
+		for j := range x.KnowledgeBases {
+			if strings.TrimSpace(x.KnowledgeBases[j]) != strings.TrimSpace(y.KnowledgeBases[j]) {
+				return false
+			}
+		}
 	}
 	return true
 }

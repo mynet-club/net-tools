@@ -414,7 +414,10 @@ func TestOpenAPISpec(t *testing.T) {
 		t.Fatalf("openapi = %d %s", resp.StatusCode, raw)
 	}
 	text := string(raw)
-	for _, want := range []string{"openapi: 3", "paths:", "/v1/chat/completions", "/v1/_admin/usage/export"} {
+	// 声明段的两个端点必须在 spec 里点名：§3.H 的「H 只能调用服务端策略接口」要有
+	// 一份可对外的契约，而界面用的路径与契约不一致时，看 OpenAPI 的人会比界面更困惑。
+	for _, want := range []string{"openapi: 3", "paths:", "/v1/chat/completions", "/v1/_admin/usage/export",
+		"/v1/_admin/config/processors", "/v1/_admin/config/knowledge_sources", "processor.config.write"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("spec 缺 %q", want)
 		}

@@ -144,3 +144,54 @@ log:
 #     - id: university-default-v1
 #       version: 1                   # 从 1 起；0 分不清「没填」和「第 0 版」
 #       scope: organization:university   # 必须写成 kind:id（user|organization|project|system）
+
+# ============================ 处理器声明表（§2.6 / §3.H）============================
+# 这一段只声明**约束**：阶段、正文档位、大小与超时上限、失败策略、出网白名单。
+# 运行参数不在这里 —— 脱敏规则表、字段替换映射、JSON Schema、sidecar 的 HTTP 客户端
+# 与「原文出网」的授权判定器，都由部署在处理器注册期绑定（见 internal/processor
+# 的 Registry.Register 注释）：把那些塞进配置文件等于让配置变成第二个真值来源，
+# 而且 pseudonym key 这类密钥会跟着进文件。
+#
+# 只有 policy.mode=enforce 才允许这些声明参与判定（§3.0 规则 2）；
+# shadow / legacy 下声明了也不会跑，加载时会出一条 warning 说破这件事 ——
+# 「配了脱敏但原文照样出网」是这一屏最不能让人误解的事。
+#
+# processors:
+#   - name: pii-cn                   # 名字是注册表的键：字母数字与 -_.:/，≤128，不可重复
+#     type: pii-mask                 # 内置：pii-mask / field-replace / json-schema /
+#                                    # result-filter / http-sidecar；自定义类型要注册期注入
+#     phase: before-upstream         # 闭集五个值：before-classify / before-route /
+#                                    # before-upstream / after-upstream / audit
+#     scope: organization:university # **必填**：不限范围要写成 *，留空会被读成漏配
+#     version: "1"                   # **必填**：策略里点名哪一版，装配时逐字比对，不「取最新」
+#     body_access: transform-body    # **必填**：metadata-only / inspect-body / transform-body
+#                                    # 这一档决定处理器能不能读正文、能不能改写正文
+#     fail_closed: true              # **必填**：true = 出错就拒绝请求；false = 放行原文
+#     timeout_ms: 800                # 必须为正（禁止 0 = 不限），上限 120000
+#     max_input_bytes: 1048576       # 必须落在 (0, 33554432]
+#     max_output_bytes: 2097152      # 同上；且不得小于 max_input_bytes/4（脱敏后通常略长）
+#     # allow_raw_body / allowed_endpoints 只有 http-sidecar 这类真会把字节发出去的类型才用：
+#     # allow_raw_body: true 必须同时给出 allowed_endpoints（原文流向要可枚举、可审），
+#     # 且档位不能是 metadata-only。端点禁通配、禁 userinfo、只允许 http/https。
+#     # allowed_endpoints:
+#     #   - https://sidecar.internal/v1/rewrite
+
+# ============================ 知识检索委托入口（§3.C / §3.H）============================
+# 网关不做文档级权限判断（ACL 的事实只有知识源那一侧完整），这里只固定
+# 「哪个知识库由哪个入口回答」。transport 由接线方从出网策略（internal/dialer）注入，
+# 本段不含凭证 —— URL 里带 user:pass 会被直接拒绝，因为凭证进了 URL 就会出现在
+# 日志、错误信息和审计的端点字段里。
+#
+# 失败一律 fail_closed：超时、响应超限、协议字段缺失、非 2xx 都按「不可读」处理，
+# 绝不会退化成「放行」。这一条不是配置项，配不出一个 fail-open 的知识源。
+#
+# knowledge_sources:
+#   - name: campus-rag               # 字母数字与 -_.:/，≤128，不可重复（审计里区分多个入口）
+#     endpoint: https://rag.internal/retrieve   # 禁凭证、禁 query、禁 fragment
+#     knowledge_bases:               # 至少一个：不服务任何库的源是死配置，
+#       - campus-policy              # 但它仍然占着一个委托端点。库 ID 是稳定 ID，
+#       - course-outline             # 参与 policy 的 knowledge:<id> + read 判定。
+#                                    # 两个源不许声明同一个库（一次检索会打到两个入口，
+#                                    # 引用与审计分不清是哪一篇来的）
+#     timeout_ms: 1500               # 必须为正，上限 30000（超上限会把连接池拖住）
+#     max_response_bytes: 1048576    # 必须为正：0 不是「不限」

@@ -107,34 +107,7 @@ func EditPolicy(src []byte, p PolicyConfig) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	var root yaml.Node
-	if err := yaml.Unmarshal(src, &root); err != nil {
-		return nil, fmt.Errorf("原配置解析失败: %w", err)
-	}
-	keyNode, valNode := findTopLevelKey(&root, "policy")
-	if keyNode == nil {
-		out := append([]byte{}, src...)
-		if len(out) > 0 && out[len(out)-1] != '\n' {
-			out = append(out, '\n')
-		}
-		out = append(out, []byte("\npolicy:\n")...)
-		out = append(out, rendered...)
-		return out, nil
-	}
-
-	lines := strings.SplitAfter(string(src), "\n")
-	keyLine := keyNode.Line - 1
-	if keyLine < 0 || keyLine >= len(lines) {
-		return nil, fmt.Errorf("policy 的行号（%d）超出文件范围", keyNode.Line)
-	}
-	keyIndent := keyNode.Column - 1
-	end := sectionEnd(lines, keyLine, keyIndent)
-	if valNode != nil && valNode.Line-1 == keyLine {
-		// 流式写法（policy: {}）：连 key 那行一起替换。
-		return []byte(strings.Join(lines[:keyLine], "") + "policy:\n" + string(rendered) + strings.Join(lines[end:], "")), nil
-	}
-	return []byte(strings.Join(lines[:keyLine+1], "") + string(rendered) + strings.Join(lines[end:], "")), nil
+	return spliceSection(src, "policy", rendered)
 }
 
 // renderPolicy 渲染 policy 段正文（每行已带两格缩进）。

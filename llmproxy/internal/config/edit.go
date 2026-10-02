@@ -36,19 +36,28 @@ func EditProviders(src []byte, ps []ProviderRaw) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	return spliceSection(src, "providers", rendered)
+}
 
+// spliceSection 把顶层段 key 的正文替换成 rendered，段外字节一律不动。
+//
+// 为什么三个段（providers / policy / 两张声明表）共用一条通道：
+// 「只换段内、保留段外注释」这件事只要写两遍就会各漏各的 —— 一次是把段后的注释
+// 一起删掉，另一次是把流式写法（key: []）当成块写法，替换完留下半截旧正文。
+// 收在一处之后，新增一个可编辑段只需要给 rendered。
+func spliceSection(src []byte, key string, rendered []byte) ([]byte, error) {
 	var root yaml.Node
 	if err := yaml.Unmarshal(src, &root); err != nil {
 		return nil, fmt.Errorf("原配置解析失败: %w", err)
 	}
-	keyNode, valNode := findTopLevelKey(&root, "providers")
+	keyNode, valNode := findTopLevelKey(&root, key)
 	if keyNode == nil {
-		// 原文件里没有 providers 段：追加到末尾
+		// 原文件里没有这一段：追加到末尾（第一次启用与改已有配置走同一个接口）。
 		out := append([]byte{}, src...)
 		if len(out) > 0 && out[len(out)-1] != '\n' {
 			out = append(out, '\n')
 		}
-		out = append(out, []byte("\nproviders:\n")...)
+		out = append(out, []byte("\n"+key+":\n")...)
 		out = append(out, rendered...)
 		return out, nil
 	}
@@ -56,22 +65,17 @@ func EditProviders(src []byte, ps []ProviderRaw) ([]byte, error) {
 	lines := strings.SplitAfter(string(src), "\n")
 	keyLine := keyNode.Line - 1 // 1-based → 0-based
 	if keyLine < 0 || keyLine >= len(lines) {
-		return nil, fmt.Errorf("providers 的行号（%d）超出文件范围", keyNode.Line)
+		return nil, fmt.Errorf("%s 的行号（%d）超出文件范围", key, keyNode.Line)
 	}
 	keyIndent := keyNode.Column - 1
-
-	if valNode != nil && valNode.Line-1 == keyLine {
-		// 值就在 key 那一行（流式写法，如 providers: []）：连这一行一起替换
-		end := sectionEnd(lines, keyLine, keyIndent)
-		out := strings.Join(lines[:keyLine], "")
-		out += "providers:\n" + string(rendered) + strings.Join(lines[end:], "")
-		return []byte(out), nil
-	}
-
-	// 常见情形：值从下一行开始的分块写法，只替换正文，key 那行原样留着
 	end := sectionEnd(lines, keyLine, keyIndent)
-	out := strings.Join(lines[:keyLine+1], "") + string(rendered) + strings.Join(lines[end:], "")
-	return []byte(out), nil
+
+	head := strings.Join(lines[:keyLine+1], "")
+	if valNode != nil && valNode.Line-1 == keyLine {
+		// 值就在 key 那一行（流式写法，如 providers: []）：连这一行一起替换。
+		head = strings.Join(lines[:keyLine], "") + key + ":\n"
+	}
+	return []byte(head + string(rendered) + strings.Join(lines[end:], "")), nil
 }
 
 // sectionEnd 返回 providers 段正文结束的行号（不含）。

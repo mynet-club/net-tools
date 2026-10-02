@@ -112,6 +112,59 @@
       <div id="tr-out" hidden></div>
     </section>
 
+    <!-- 处理器与知识库（3.0 §3.H）：config.yaml 的 processors / knowledge_sources 两段声明，
+         整段读写。这一屏只做「把磁盘上那一段交给人改」，判据全在服务端领域校验。 -->
+    <section class="card" id="decl">
+      <div class="head">
+        <h2>处理器与知识库</h2>
+        <span class="mono muted" id="pc-rev"></span>
+        <span class="grow"></span>
+        <button type="button" id="pc-refresh" class="ghost sm">刷新</button>
+      </div>
+      <p class="sub">这里配的是<b>约束</b>（处理器挂在哪个范围、能读正文吗、失败时放行还是拒、
+        出网白名单、体积与超时上限；知识源委托给哪个入口、服务哪几个库）。
+        运行参数（规则表、JSON Schema、sidecar 客户端本身）在注册期绑定，不在这个文件里 ——
+        所有判据由服务端领域校验给出，界面不复算权限。</p>
+      <p class="banner" id="pc-status" hidden></p>
+      <div id="pc-stats" class="gridn"></div>
+
+      <h3 class="sub-h">处理器声明（<code>processors</code> 段）</h3>
+      <p class="sub">整段提交：改一条也要把整个数组发回来，服务端把这一段整体替换进
+        <code>config.yaml</code>（改前自动备份，段外内容与注释原样）。
+        <b>清空请显式保存 <code>[]</code></b> —— 少带字段不会被当成清空。
+        取值域见下方对照表，写坏的声明只会退回错误、磁盘不动。</p>
+      <textarea id="pc-p-json" class="pl-rules" rows="12" spellcheck="false"
+        placeholder="[{&quot;name&quot;:…}] —— 点「填入最小示例」拿形状"></textarea>
+      <div class="row">
+        <button type="button" id="pc-p-save" class="primary sm">整段保存</button>
+        <button type="button" id="pc-p-example" class="ghost sm">填入最小示例</button>
+        <button type="button" id="pc-p-disk" class="link">放弃修改，读回磁盘</button>
+        <span class="err" id="pc-p-err" hidden></span>
+        <span class="grow"></span>
+        <span class="muted" id="pc-p-hint"></span>
+      </div>
+
+      <h3 class="sub-h">知识源委托入口（<code>knowledge_sources</code> 段）</h3>
+      <p class="sub">网关不自己实现检索：这一段声明「哪个知识库 ID 交给哪个内部入口」，
+        请求侧只带知识库 ID，出网目标与预算由这里钉死。同一个库不能让两家入口同时服务
+        （否则「谁答的」在审计里就成了事后猜）。</p>
+      <textarea id="pc-kn-json" class="pl-rules" rows="10" spellcheck="false"
+        placeholder="[{&quot;name&quot;:…}] —— 点「填入最小示例」拿形状"></textarea>
+      <div class="row">
+        <button type="button" id="pc-kn-save" class="primary sm">整段保存</button>
+        <button type="button" id="pc-kn-example" class="ghost sm">填入最小示例</button>
+        <button type="button" id="pc-kn-disk" class="link">放弃修改，读回磁盘</button>
+        <span class="err" id="pc-kn-err" hidden></span>
+        <span class="grow"></span>
+        <span class="muted" id="pc-kn-hint"></span>
+      </div>
+
+      <h3 class="sub-h">取值域（服务端下发，不是这里手抄的表）</h3>
+      <p class="sub">这一屏能填什么，完全由服务端注册表与领域上限决定；这里只回显它报出来的那份。
+        界面不校验业务规则（阶段配对了什么档、上限之间怎么互相约束）—— 那是唯一真值来源的活。</p>
+      <div id="pc-vocab"></div>
+    </section>
+
     <!-- 用户列表 -->
     <section class="card">
       <div class="head">

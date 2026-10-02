@@ -223,6 +223,118 @@ paths:
       responses:
         '200': { description: 'written / applied / backup / strict_ok' }
         '400': { description: 校验不通过，原文件未改动 }
+  /v1/_admin/config/processors:
+    get:
+      tags: [admin]
+      summary: 读处理器声明段（processors）+ 取值域
+      description: |
+        视图从**配置文件原文**构建，不是加载后的结构：界面要看到的是磁盘上真写着的那份。
+        空段回 `processors: []` 而不是 null。
+        `vocabulary` 由服务端注册表与领域上限算出来（内置类型、五个阶段、三档正文访问、
+        范围种类、超时与体积上限、白名单条数上限）—— 前端不抄表，否则领域包扩充那天
+        界面就成了「配置能写但选不到」的那一侧。
+        `mode` + `applies` 回答「这些声明现在是否参与请求」：只有 enforce 为真（§3.0 规则 2）。
+        磁盘上那一版读不回来时 GET **仍然 200**，把错误原文放在 `baseline_error`，
+        列表退回显示服务当前加载着的那份 —— 管理员需要看清哪里坏了，而不是连读都被 500。
+      security: [{adminAuth: []}]
+      responses:
+        '200': { description: 'section / path / revision / mode / applies / vocabulary / warnings / processors[] / boundary' }
+    put:
+      tags: [admin]
+      summary: 整段保存处理器声明（只替换 processors 段，段外内容与注释原样）
+      description: |
+        请求体**需要且只需要** `processors` 字段，且必须是数组：缺字段不会被当成清空
+        （否则一个漏带键的请求就删掉整段声明，而那是最容易点错的一次写操作）。
+        清空请显式传 `[]`。未知键直接拒 —— 和配置加载同一条规则，
+        拼错的键在宽松解码下会变成「一条没有期限、没有条件的声明」被发布出去。
+        每条声明由 `processor.Spec.Validate()` 当场判（阶段闭集、档位与类型一致、
+        绝对上限、白名单形态、version 必填），判据不在这一层重抄。
+        落盘走与 providers / policy 同一条通道：临时文件宽松+严格两次试读 → 备份 → 原子改名 →
+        带范围的审计（`processor.config.write`，归属 `system:global`）。
+        任何一步不过都整笔还原，磁盘与审计都不留痕。
+        审计 detail 只写条数、名字与范围，**不含端点与阈值数值**：基线读不回来时
+        领域错误信息里可能带着含凭证的 URL，把它抄进审计库等于把凭证搬进另一个持久化位置。
+      security: [{adminAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [processors]
+              properties:
+                processors:
+                  type: array
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [name, type, phase, scope, timeout_ms, max_input_bytes, max_output_bytes, fail_closed, body_access, version]
+                    properties:
+                      name: { type: string, example: pii-request }
+                      type: { type: string, example: pii-mask, description: '内置类型不封闭：自定义类型由部署在注册期 RegisterType 注入；未注入的类型只告警不拦写，装配期才失败' }
+                      phase: { type: string, enum: [before-classify, before-route, before-upstream, after-upstream, audit] }
+                      scope: { type: string, example: '*', description: '必须显式写：* 或 kind:id' }
+                      timeout_ms: { type: integer, example: 5000, description: '必须为正，上限见 vocabulary.max_timeout_ms' }
+                      max_input_bytes: { type: integer, format: int64 }
+                      max_output_bytes: { type: integer, format: int64, description: '不得小于 max_input_bytes 的 1/4' }
+                      fail_closed: { type: boolean, description: '必须显式写：true = 处理器出错就拒绝请求' }
+                      body_access: { type: string, enum: [metadata-only, inspect-body, transform-body], description: '必须显式写：决定能否读正文/改写正文' }
+                      allow_raw_body: { type: boolean, description: '原文出网授权，必须同时给 allowed_endpoints' }
+                      allowed_endpoints:
+                        type: array
+                        items: { type: string, example: https://sidecar.internal/v1/scan }
+                        description: '出网白名单，必须可枚举（含通配、userinfo、非 http(s) 一律拒）'
+                      version: { type: string, example: '1' }
+      responses:
+        '200': { description: 'written / applied / backup / strict_ok / count / mode / applies / note' }
+        '400': { description: 请求体形状不对或声明不合法，原文件未改动 }
+  /v1/_admin/config/knowledge_sources:
+    get:
+      tags: [admin]
+      summary: 读知识源委托入口段（knowledge_sources）+ 取值域
+      description: 与 `/v1/_admin/config/processors` 同一条读侧通道（原文视图、空段回 `[]`、`baseline_error`、`mode`/`applies`）。
+      security: [{adminAuth: []}]
+      responses:
+        '200': { description: 'section / path / revision / mode / applies / vocabulary / warnings / knowledge_sources[]' }
+    put:
+      tags: [admin]
+      summary: 整段保存知识源委托入口
+      description: |
+        同一套「必须带本段字段 + 整段替换 + 校验不过不动磁盘」的规则，审计动作是
+        `knowledge.config.write`（归属 `system:global`）。
+        端点必须过委托协议那一关（http/https、无凭证、无 fragment），知识库 ID 过 A/C 那关，
+        而**两个源不许声明同一个库** —— 一次检索打到两家入口，引用与审计就分不清是哪一篇来的。
+        网关不在这里实现检索，也不接受检索服务的密钥：这一段只声明约束（谁能被委托、预算多少），
+        transport 由接线方从出网策略注入。
+      security: [{adminAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [knowledge_sources]
+              properties:
+                knowledge_sources:
+                  type: array
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [name, endpoint, knowledge_bases, timeout_ms, max_response_bytes]
+                    properties:
+                      name: { type: string, example: campus-rag, description: '不含空白与路径分隔符：它要进日志与审计字段' }
+                      endpoint: { type: string, example: https://rag.internal.example/v1/retrieve }
+                      knowledge_bases:
+                        type: array
+                        items: { type: string, example: course-materials }
+                        description: '不能为空（不服务任何库的源是死配置，却仍占着一个委托端点）'
+                      timeout_ms: { type: integer, example: 3000, description: '上限见 vocabulary.max_knowledge_budget_ms' }
+                      max_response_bytes: { type: integer, format: int64, description: '必须为正，0 不是不限' }
+      responses:
+        '200': { description: 'written / applied / backup / strict_ok / count / mode / applies / note' }
+        '400': { description: 请求体形状不对或声明不合法，原文件未改动 }
   /v1/_admin/config/validate:
     post:
       tags: [admin]

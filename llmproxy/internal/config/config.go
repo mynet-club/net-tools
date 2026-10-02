@@ -19,6 +19,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
+	"github.com/mynet-club/net-tools/llmproxy/internal/processor"
 )
 
 const ToolName = "llmproxy"
@@ -61,9 +62,21 @@ type Config struct {
 	// Alerts 是配额预警（webhook / 日志）。
 	Alerts AlertsConfig `yaml:"alerts"`
 
+	// Processors 是 3.0 的处理器**声明表**（§2.6 的 ProcessorSpec 字段集）。
+	// 这里只声明约束（阶段、档位、上限、失败策略、出网白名单），不含运行参数：
+	// 脱敏规则表、JSON Schema、sidecar 客户端与原文出网授权判定器都由注册期绑定，
+	// 理由见 procconf.go 的文件头与 processor.Registry.Register 的注释。
+	Processors []ProcessorDef `yaml:"processors"`
+	// KnowledgeSources 是知识检索的**委托入口**声明（协议见 docs/3.0-knowledge-delegation.md）。
+	// transport 不在这里：出网策略在 dialer 那一层，本段只固定「哪个库由哪个端点回答」。
+	KnowledgeSources []KnowledgeSourceDef `yaml:"knowledge_sources"`
+
 	// 下面是校验后的派生结构，供运行期直接使用
 	ProxyIndex map[string]ProxyDef `yaml:"-"`
 	Normalized []Provider          `yaml:"-"`
+	// ProcessorSpecs 是 Processors 逐条过 processor.Spec.Validate() 后的领域形态，
+	// 按名字排序（装配与回放都不该依赖配置文件里的书写次序）。
+	ProcessorSpecs []processor.Spec `yaml:"-"`
 }
 
 // APIKeyList 在解码阶段就给出可读的错误（否则 yaml 会报 "cannot unmarshal into []APIKey"）。
@@ -853,6 +866,15 @@ func (c *Config) normalize(opts LoadOptions) error {
 	if err := c.Policy.normalize(opts.KnownScopes, &c.Warnings); err != nil {
 		return err
 	}
+	// 3.0 的两张声明表（见 procconf.go）。校验放在 mode 之后：
+	// lintProcessorActivity 要知道「这次接线到底跑不跑处理器」。
+	if err := c.normalizeProcessors(); err != nil {
+		return err
+	}
+	if err := c.normalizeKnowledgeSources(); err != nil {
+		return err
+	}
+	c.lintProcessorActivity()
 	return c.checkProviderDataLevels()
 }
 

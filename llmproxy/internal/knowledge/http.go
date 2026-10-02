@@ -317,6 +317,13 @@ func drainAndClose(resp *http.Response, limit int64) {
 	_ = resp.Body.Close()
 }
 
+// ValidateEndpoint 暴露 validateEndpoint 给配置加载与控制台写入使用。
+//
+// 为什么要出口而不是让调用方自己判 URL：端点的合法形态（禁凭证、禁 query、禁 fragment、
+// 只允许 http/https）是委托协议的规则，配置层再抄一遍就会出现「配置认得而本包拒收」
+// 或反过来 —— 而两处判据一旦分叉，写进审计的端点和真正会打的地址不是同一个。
+func ValidateEndpoint(raw string) (string, error) { return validateEndpoint(raw) }
+
 // validateEndpoint 校验并归一化委托端点。
 //
 // 拒绝内嵌凭证（https://user:pass@host）：凭证进了 URL 就会出现在日志、
