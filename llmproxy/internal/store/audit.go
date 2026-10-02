@@ -1,11 +1,22 @@
 package store
 
-import "time"
+import (
+	"time"
 
-const auditSchema = `
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
+)
+
+// auditSchema 是 var：scope 两列的定义与老库 ALTER 共用 scope_schema.go 那一份。
+//
+// 按范围导审计（§2.7 规则 2：组织/项目管理员只看得到自己范围内的那些动作）的索引
+// idx_audit_scope **不在这里建**：老库的 audit_log 这时还没有 scope_kind 列，在这里建会撞
+// 「列不存在」而让 Open 失败。它由 migrateScopeSchema 在补完列之后按 scopeIndexDDL30 建 ——
+// 新库与老库共用那一条语句，幂等。
+var auditSchema = `
 CREATE TABLE IF NOT EXISTS audit_log (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   ts         INTEGER NOT NULL,
+` + scopeColsFragment(auditScopeCols30) + `,
   actor      TEXT    NOT NULL DEFAULT '',
   action     TEXT    NOT NULL,
   target     TEXT    NOT NULL DEFAULT '',
@@ -23,14 +34,15 @@ type AuditEntry struct {
 	Detail string    `json:"detail"`
 }
 
-// Audit 记一条管理操作。
+// Audit 记一条管理操作（2.x 的无范围接口）。
+//
+// 2.x 的 audit_log 只记管理员的全局操作，那些操作**本来就**属于 (system,'global')，
+// 所以这里固定落到系统范围是事实陈述，不是给缺省值猜一个桶。组织/项目内的操作
+// 必须改走 AuditScope，把真正的范围传进来。
+//
+// §2.7 规则 8：主线接线完成后删除，调用方改用 AuditScope。
 func (s *Store) Audit(actor, action, target, detail string) error {
-	if action == "" {
-		return nil
-	}
-	_, err := s.exec(`INSERT INTO audit_log (ts, actor, action, target, detail) VALUES (?,?,?,?,?)`,
-		time.Now().UnixMilli(), actor, action, target, detail)
-	return err
+	return s.AuditScope(policy.SystemScope, actor, action, target, detail)
 }
 
 // AuditRecent 返回最近 n 条审计（新的在前）。

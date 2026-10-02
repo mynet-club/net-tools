@@ -185,6 +185,10 @@ func TokenHash(token string) string {
 // ------------------------------------------------------------------ 用户
 
 // CreateUser 建一个用户。tokenHash 由调用方用 TokenHash 算好。
+//
+// 同一个事务里补一行 scope_quota（§2.7 规则 3）：3.0 的配额按**范围**读，
+// 「每个 user 范围都有一条配额行」是迁移的收口校验之一（count(scope_quota where kind=user)
+// == count(users)），新建用户不补就会破坏它。初值与 users 表的列默认值一致（全 0 = 不限、启用）。
 func (s *Store) CreateUser(name, tokenHash string) error {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -195,6 +199,12 @@ func (s *Store) CreateUser(name, tokenHash string) error {
 	}
 	if tokenHash == "" {
 		return errors.New("token 摘要不能为空")
+	}
+	// 用户名就是 (user, 名) 的范围键（§2.7 规则 3），所以它必须是合法的 scope ID：
+	// 在这里拦住，比让它进到库里、等一次性迁移报失败要友好得多。
+	scope, err := legacyUserScope(name)
+	if err != nil {
+		return fmt.Errorf("用户名 %q 不能用作范围键: %w", name, err)
 	}
 	now := time.Now().UnixMilli()
 
@@ -211,6 +221,12 @@ func (s *Store) CreateUser(name, tokenHash string) error {
 			return fmt.Errorf("用户 %q 已存在", name)
 		}
 		return fmt.Errorf("创建用户失败: %w", err)
+	}
+	if err := upsertScopeQuotaTx(tx, s.dialect, ScopeQuota{
+		Scope:   scope,
+		Enabled: true,
+	}); err != nil {
+		return fmt.Errorf("初始化用户 %q 的范围配额失败: %w", name, err)
 	}
 	if err := bumpRevision(tx, s.dialect); err != nil {
 		return err
@@ -278,12 +294,18 @@ func (s *Store) getUser(where string, arg any) (*User, error) {
 }
 
 // SetUserEnabled 启用/禁用一个用户。
+//
+// enabled 在 users 与 scope_quota 两张表里都有（3.0 的配额按范围读），
+// 所以这里同样走过渡期双写；§2.7 规则 8：接线完成后只留 scope_quota 那一份。
 func (s *Store) SetUserEnabled(name string, enabled bool) error {
 	v := 0
 	if enabled {
 		v = 1
 	}
-	return s.userUpdate("enabled = ?", []any{v}, name)
+	if err := s.userUpdate("enabled = ?", []any{v}, name); err != nil {
+		return err
+	}
+	return s.syncScopeQuotaFromUsers(name)
 }
 
 // SetUserToken 换 token（轮换）。旧 token 立即失效。
@@ -327,18 +349,27 @@ func (s *Store) userUpdate(setClause string, setArgs []any, name string) error {
 //   - `user_models`：消费模式的模型白名单与「下游名 → 上游模型」映射。不删的话，
 //     删掉 alice 再建一个 alice，新账号会**静默继承前任被授权的模型范围** ——
 //     管理员以为发出去的是个干净账号，实际它已经能调前任那些模型了。
-//   - `provider_stats`：按 (用户, 上游) 分桶的熔断状态。不删的话新账号继承前任的
+//   - `provider_stats`：按 (范围, 上游) 分桶的熔断状态（3.0 的桶键是
+//     scope_kind + scope_id + name）。不删的话新账号继承前任的
 //     连续失败计数；若前任是在冷却中被删的，新账号一上来就是「熔断中」。
 //     内存那一份由 admin.go 的 router.ForgetScope 清，但库里的行还在，
 //     重启后会被重新加载回来。
+//   - `scope_quota`：该用户范围那一行配额。同理，留着就是给同名新账号预设了限额。
 //
 // 刻意**保留**的两类：
 //
-//   - `usage_user_daily`：这是账单。钱已经花掉了，删掉等于销毁计量记录。
+//   - `usage_user_daily` / `usage_scope_daily`：这是账单。钱已经花掉了，删掉等于销毁计量记录。
+//     （§2.7 规则 5：历史明细的归属不因为删用户而改变。）
 //   - `user_prices`：历史价目行。请求行上的冻结金额（charge）已经写死、不依赖它，
 //     但 `price_downstream_id` 要指着它才能回溯「当时用的是哪一档价」。
 //     代价是新建同名用户会继承前任的分发价 —— 改价请显式插一条新行。
 func (s *Store) DeleteUser(name string) error {
+	scope, err := legacyUserScope(name)
+	if err != nil {
+		// 用户名当不了范围键 = 3.0 库里不可能有它的任何归属行；
+		// 旧库里的这种名字已经在一次性迁移那一步报出来了，不会静默走到这里。
+		return fmt.Errorf("用户名 %q 不能用作范围键: %w", name, err)
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -351,7 +382,12 @@ func (s *Store) DeleteUser(name string) error {
 	if _, err := txExec(tx, s.dialect, `DELETE FROM user_models WHERE user_name = ?`, name); err != nil {
 		return err
 	}
-	if _, err := txExec(tx, s.dialect, `DELETE FROM provider_stats WHERE scope = ?`, name); err != nil {
+	if _, err := txExec(tx, s.dialect, `DELETE FROM provider_stats WHERE scope_kind=? AND scope_id=?`,
+		scopeArgs(scope)...); err != nil {
+		return err
+	}
+	if _, err := txExec(tx, s.dialect, `DELETE FROM scope_quota WHERE scope_kind=? AND scope_id=?`,
+		scopeArgs(scope)...); err != nil {
 		return err
 	}
 	res, err := txExec(tx, s.dialect, `DELETE FROM users WHERE name = ?`, name)

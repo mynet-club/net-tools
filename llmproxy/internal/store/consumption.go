@@ -102,13 +102,63 @@ func (s *Store) SetUserMode(name, mode string) error {
 }
 
 // SetUserQuota 设置月度配额；0 表示不限。
+//
+// 过渡期是**双写**：users 的那两列仍是旧读路径（limits.go / 报表）的来源，
+// scope_quota 是 3.0 按范围读配额的地方。两边不同步就会算出两套账单，
+// 所以每次写 users 之后立刻用 users 的整行去覆盖 scope_quota（syncScopeQuotaFromUsers）。
+//
+// §2.7 规则 8：主线接线完成后 users 的配额列退休，这里只留 SetScopeQuota。
 func (s *Store) SetUserQuota(name string, tokens int64, cost float64) error {
-	return s.userUpdate("quota_month_tokens = ?, quota_month_cost = ?", []any{tokens, cost}, name)
+	if tokens < 0 || cost < 0 {
+		return fmt.Errorf("配额不能为负（0 表示不限）: tokens=%d cost=%v", tokens, cost)
+	}
+	if err := s.userUpdate("quota_month_tokens = ?, quota_month_cost = ?", []any{tokens, cost}, name); err != nil {
+		return err
+	}
+	return s.syncScopeQuotaFromUsers(name)
 }
 
-// SetUserLimits 设置 RPM 与并发上限；0 表示不限。
+// SetUserLimits 设置 RPM 与并发上限；0 表示不限。双写口径同 SetUserQuota。
+//
+// §2.7 规则 8：主线接线完成后删除，调用方改用 SetScopeQuota。
 func (s *Store) SetUserLimits(name string, rpm, maxConcurrent int) error {
-	return s.userUpdate("rpm = ?, max_concurrent = ?", []any{rpm, maxConcurrent}, name)
+	if rpm < 0 || maxConcurrent < 0 {
+		return fmt.Errorf("限流上限不能为负（0 表示不限）: rpm=%d concurrent=%d", rpm, maxConcurrent)
+	}
+	if err := s.userUpdate("rpm = ?, max_concurrent = ?", []any{rpm, maxConcurrent}, name); err != nil {
+		return err
+	}
+	return s.syncScopeQuotaFromUsers(name)
+}
+
+// syncScopeQuotaFromUsers 用 users 的整行覆盖该用户范围的 scope_quota 行（过渡期镜像）。
+//
+// 整行覆盖而不是只改动过的那几列：users 与 scope_quota 各自被不同旧接口写过一半，
+// 逐列同步迟早让两张表各持有一半真值。读一次 users、写一次 scope_quota，两边永远同形。
+//
+// §2.7 规则 8：主线接线完成后 users 的配额列退休，这个函数随之删除。
+func (s *Store) syncScopeQuotaFromUsers(name string) error {
+	scope, err := legacyUserScope(name)
+	if err != nil {
+		return err
+	}
+	u, err := s.GetUser(name)
+	if err != nil {
+		return fmt.Errorf("读取用户 %q 的配额失败: %w", name, err)
+	}
+	if u == nil {
+		// 用户不在了（并发的删除先落地）：范围配额行也跟着没了才算一致。
+		_, delErr := s.exec(`DELETE FROM scope_quota WHERE scope_kind=? AND scope_id=?`, scopeArgs(scope)...)
+		return delErr
+	}
+	return s.SetScopeQuota(ScopeQuota{
+		Scope:            scope,
+		QuotaMonthTokens: u.QuotaMonthTokens,
+		QuotaMonthCost:   u.QuotaMonthCost,
+		RPM:              u.RPM,
+		MaxConcurrent:    u.MaxConcurrent,
+		Enabled:          u.Enabled,
+	})
 }
 
 // ------------------------------------------------------------------ 模型映射

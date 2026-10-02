@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/config"
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 )
 
 // 计价与成本模型（设计见 docs/pricing-design.md）的存储层。
@@ -25,7 +26,13 @@ import (
 // 插入时把此前仍然有效（valid_to=0）的那条收口成 [旧行.valid_from, 新行.valid_from)。
 // 这样历史天然保留，账目可回溯 —— 这正是「记录历史计价」的落地方式。
 
-const pricingSchema = `
+// pricingSchema 是 var：user_prices 的范围两列与老库 ALTER 共用一份定义（见下面注释）。
+//
+// 分发价按范围键定之后，2.x 的 idx_user_prices_key（建在字符串 scope 上）由一次性迁移换掉：
+// 新索引 idx_user_prices_scope 也**不在这里建** —— 老库补列之前它会长在一个不存在的列上。
+// 两条（建新索引、删旧索引 + 旧列）都排在 scope_migration.go 的阶段里，顺序是
+// 「列 → 新索引 → 校验通过 → 删旧索引 → 删旧列」。
+var pricingSchema = `
 CREATE TABLE IF NOT EXISTS provider_prices (
   id                 INTEGER PRIMARY KEY AUTOINCREMENT,
   provider           TEXT    NOT NULL,
@@ -47,9 +54,18 @@ CREATE TABLE IF NOT EXISTS provider_prices (
 );
 CREATE INDEX IF NOT EXISTS idx_provider_prices_key ON provider_prices(provider, upstream_model, valid_from);
 
+-- 分发价按**范围**键定（3.0 §2.7 规则 1/2）：scope_kind + scope_id 两列，
+-- 不再有 2.x 那个 'default' / 'user:<名>' 的字符串前缀列。
+-- 表名沿用 user_prices 没改：改名只动得到 SQL 与文档，动不到 Go 侧的 UserPrice/ScopePrice 调用点，
+-- 而 README、docs/pricing-design.md、docs/OVERVIEW.md 都在本工作包的可改范围之外。
+-- 改名与否则归主线接线那一步统一处理（取舍见 scope_migration.go 顶部的说明）。
+--
+-- 两列的定义与老库 ALTER 用的那份是同一个（scope_schema.go 的 userPricesScopeCols30）：
+-- 新库建表带上、老库补齐并回填，两处永远逐列一致。DEFAULT '' 只是 ALTER 的语法要求
+-- （NOT NULL 列不能无默认地加在有数据的表上），迁移的收口校验会保证落库的行范围非空。
 CREATE TABLE IF NOT EXISTS user_prices (
   id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-  scope              TEXT    NOT NULL DEFAULT 'default',
+` + scopeColsFragment(userPricesScopeCols30) + `,
   model              TEXT    NOT NULL,
   currency           TEXT    NOT NULL DEFAULT 'CNY',
   in_miss            REAL    NOT NULL DEFAULT 0,
@@ -66,7 +82,6 @@ CREATE TABLE IF NOT EXISTS user_prices (
   note               TEXT    NOT NULL DEFAULT '',
   created_at         INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_user_prices_key ON user_prices(scope, model, valid_from);
 `
 
 // ProviderPrice 是一条**上游**价目行：供应商 × 上游模型 × 一段生效期。
@@ -93,8 +108,13 @@ type ProviderPrice struct {
 	CreatedAt    time.Time
 }
 
-// UserPrice 是一条**分发**价目行（我们向用户收多少）。
-// scope = "default"（全局默认）或 "user:<用户名>"（单用户覆盖），取价时最具体的那条生效。
+// UserPrice 是一条**分发**价目行的旧形状（我们向用户收多少）。
+//
+// Scope 是 2.x 的字符串前缀约定（"default" / "user:<用户名>"），表里已经没有这一列，
+// 读写都经过 scope.go 的编解码适配到 (scope_kind, scope_id)。
+//
+// §2.7 规则 8：主线接线完成后删除整个结构，调用方改用 ScopePrice
+// （字段同名，范围换成 policy.ScopeRef）。
 type UserPrice struct {
 	ID            int64
 	Scope         string
@@ -115,9 +135,10 @@ type UserPrice struct {
 	CreatedAt     time.Time
 }
 
-// ScopeDefault 是分发价的全局默认作用域；ScopeUser 拼出单用户作用域。
+// ScopeDefault 是分发价的全局默认作用域。§2.7 规则 8：主线接线完成后删除。
 const ScopeDefault = "default"
 
+// ScopeUser 拼出旧接口的单用户作用域串。§2.7 规则 8：主线接线完成后删除。
 func ScopeUser(userName string) string { return "user:" + userName }
 
 // onTheHour 报告时刻是否落在整点（按其自身 Location 的钟面表示：分/秒/纳秒全为 0）。
@@ -192,48 +213,29 @@ func (p *ProviderPrice) validate() error {
 	return validatePeak(p.PeakHours, p.OffPeakRatio, p.PeakTZ)
 }
 
-func (p *UserPrice) validate() error {
-	scope := strings.TrimSpace(p.Scope)
-	switch {
-	case scope == "":
+// legacyUserPriceToScope 把旧的字符串作用域行转成结构化行；范围串非法时返回旧接口的错误文案。
+//
+// 校验口径只有一份：ScopePrice.validate()。这里只负责「旧归一化 + 解码」——
+// 空 scope 仍然当 default 处理并写回调用方的结构体（旧行为，有测试钉住）。
+//
+// §2.7 规则 8：主线接线完成后删除。
+func legacyUserPriceToScope(p *UserPrice) (*ScopePrice, error) {
+	scopeStr := strings.TrimSpace(p.Scope)
+	if scopeStr == "" {
+		scopeStr = ScopeDefault
 		p.Scope = ScopeDefault
-	case scope == ScopeDefault || strings.HasPrefix(scope, "user:"):
-	default:
-		return fmt.Errorf("scope 需要是 %q 或 user:<用户名>，当前是 %q", ScopeDefault, p.Scope)
 	}
-	if strings.TrimSpace(p.Model) == "" {
-		return errors.New("model 不能为空")
+	scope, err := decodeLegacyPriceScope(scopeStr)
+	if err != nil {
+		return nil, err
 	}
-	if strings.TrimSpace(p.Currency) == "" {
-		p.Currency = "CNY"
-	}
-	if p.ValidFrom.IsZero() {
-		return errors.New("valid_from 不能为空")
-	}
-	if !onTheHour(p.ValidFrom) {
-		return fmt.Errorf("valid_from 必须是整点（价格只在整点生效），当前是 %s", p.ValidFrom.Format(time.RFC3339))
-	}
-	if !p.ValidTo.IsZero() {
-		if !onTheHour(p.ValidTo) {
-			return fmt.Errorf("valid_to 必须是整点，当前是 %s", p.ValidTo.Format(time.RFC3339))
-		}
-		if !p.ValidTo.After(p.ValidFrom) {
-			return fmt.Errorf("valid_to 需要晚于 valid_from，当前是 %s → %s",
-				p.ValidFrom.Format(time.RFC3339), p.ValidTo.Format(time.RFC3339))
-		}
-	}
-	for _, c := range []struct {
-		name string
-		v    float64
-	}{
-		{"in_miss", p.InMiss}, {"in_hit", p.InHit}, {"in_write", p.InWrite},
-		{"out", p.Out}, {"reasoning_out", p.ReasoningOut}, {"per_request_fee", p.PerRequestFee},
-	} {
-		if err := validateRate(c.name, c.v); err != nil {
-			return err
-		}
-	}
-	return validatePeak(p.PeakHours, p.OffPeakRatio, p.PeakTZ)
+	return &ScopePrice{
+		ID: p.ID, Scope: scope, Model: p.Model, Currency: p.Currency,
+		InMiss: p.InMiss, InHit: p.InHit, InWrite: p.InWrite, Out: p.Out,
+		ReasoningOut: p.ReasoningOut, PerRequestFee: p.PerRequestFee,
+		PeakHours: p.PeakHours, OffPeakRatio: p.OffPeakRatio, PeakTZ: p.PeakTZ,
+		ValidFrom: p.ValidFrom, ValidTo: p.ValidTo, Note: p.Note, CreatedAt: p.CreatedAt,
+	}, nil
 }
 
 func tsOf(t time.Time) int64 {
@@ -300,63 +302,36 @@ func (s *Store) InsertProviderPrice(p *ProviderPrice) error {
 	return tx.Commit()
 }
 
-// InsertUserPrice 插入一条分发价目行，语义与 InsertProviderPrice 一致
-// （整点校验、按时间只追加、插入时收口旧的有效行）。
+// InsertUserPrice 插入一条分发价目行（旧字符串作用域接口）。
+//
+// 实现已经整体委托给 InsertScopePrice —— 追加、收口、校验只有一份实现，
+// 避免「新旧两套口径算出不同金额」。
+//
+// §2.7 规则 8：主线接线完成后删除，调用方改用 InsertScopePrice。
 func (s *Store) InsertUserPrice(p *UserPrice) error {
 	if p == nil {
 		return errors.New("价目行为空")
 	}
-	if err := p.validate(); err != nil {
-		return err
-	}
-	tx, err := s.db.Begin()
+	sp, err := legacyUserPriceToScope(p)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = tx.Rollback() }()
-
-	var latest int64
-	err = txQueryRow(tx, s.dialect, `SELECT COALESCE(MAX(valid_from),0) FROM user_prices WHERE scope=? AND model=?`,
-		p.Scope, p.Model).Scan(&latest)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	if err := s.InsertScopePrice(sp); err != nil {
 		return err
 	}
-	if latest != 0 && p.ValidFrom.UnixMilli() <= latest {
-		return fmt.Errorf("价目按时间只追加：%s / %s 已有 valid_from=%s，新行不得早于或等于它",
-			p.Scope, p.Model, time.UnixMilli(latest).UTC().Format(time.RFC3339))
-	}
-
-	if _, err := txExec(tx, s.dialect, `UPDATE user_prices SET valid_to=? WHERE scope=? AND model=? AND valid_to=0`,
-		p.ValidFrom.UnixMilli(), p.Scope, p.Model); err != nil {
-		return err
-	}
-	now := time.Now().UTC()
-	if p.CreatedAt.IsZero() {
-		p.CreatedAt = now
-	}
-	id, err := insertID(tx, s.dialect, `INSERT INTO user_prices
-		(scope, model, currency, in_miss, in_hit, in_write, out, reasoning_out,
-		 per_request_fee, peak_hours, off_peak_ratio, peak_tz, valid_from, valid_to, note, created_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		p.Scope, p.Model, p.Currency, p.InMiss, p.InHit, p.InWrite, p.Out, p.ReasoningOut,
-		p.PerRequestFee, strings.Join(p.PeakHours, ","), p.OffPeakRatio, p.PeakTZ,
-		p.ValidFrom.UnixMilli(), tsOf(p.ValidTo), p.Note, p.CreatedAt.UnixMilli())
-	if err != nil {
-		return err
-	}
-	p.ID = id
-	return tx.Commit()
+	p.ID = sp.ID
+	return nil
 }
 
 const providerPriceCols = `id, provider, upstream_model, currency, in_miss, in_hit, in_write,
 	out, reasoning_out, per_request_fee, peak_hours, off_peak_ratio, peak_tz,
 	valid_from, valid_to, note, created_at`
 
-const userPriceCols = `id, scope, model, currency, in_miss, in_hit, in_write,
-	out, reasoning_out, per_request_fee, peak_hours, off_peak_ratio, peak_tz,
-	valid_from, valid_to, note, created_at`
+// 分发价的列与读取路径只有一份：scopePriceCols / scanScopePrice（见 scope_store.go）。
+// 旧接口的 UserPrice 由 ScopePrice.ToLegacy() 转换出来 —— 表里已没有 scope 字符串列，
+// 这里不再维护第二套列清单：两套 SELECT 不同步曾经让价目静默查不出来。
 
-// scanProviderPrice / scanUserPrice 是两张表各自**唯一**的读取路径。
+// scanProviderPrice 是该表的**唯一**读取路径。
 // 列与 Scan 必须一一对应，抽出来是为了让「加了列忘了改 Scan」这类错
 // 只可能发生在一个地方（曾经因为 SELECT 与 Scan 不同步而静默查不出数据）。
 func scanProviderPrice(row interface{ Scan(...any) error }) (*ProviderPrice, error) {
@@ -370,33 +345,6 @@ func scanProviderPrice(row interface{ Scan(...any) error }) (*ProviderPrice, err
 	)
 	if err := row.Scan(&p.ID, &p.Provider, &p.UpstreamModel, &p.Currency, &p.InMiss, &p.InHit,
 		&p.InWrite, &p.Out, &p.ReasoningOut, &p.PerRequestFee, &peak, &offPeak, &p.PeakTZ,
-		&validFrom, &validTo, &p.Note, &createdAt); err != nil {
-		return nil, err
-	}
-	if peak != "" {
-		p.PeakHours = strings.Split(peak, ",")
-	}
-	if offPeak.Valid {
-		v := offPeak.Float64
-		p.OffPeakRatio = &v
-	}
-	p.ValidFrom = timeOf(validFrom)
-	p.ValidTo = timeOf(validTo)
-	p.CreatedAt = timeOf(createdAt)
-	return &p, nil
-}
-
-func scanUserPrice(row interface{ Scan(...any) error }) (*UserPrice, error) {
-	var (
-		p         UserPrice
-		peak      string
-		offPeak   sql.NullFloat64
-		validFrom int64
-		validTo   int64
-		createdAt int64
-	)
-	if err := row.Scan(&p.ID, &p.Scope, &p.Model, &p.Currency, &p.InMiss, &p.InHit, &p.InWrite,
-		&p.Out, &p.ReasoningOut, &p.PerRequestFee, &peak, &offPeak, &p.PeakTZ,
 		&validFrom, &validTo, &p.Note, &createdAt); err != nil {
 		return nil, err
 	}
@@ -470,28 +418,31 @@ func (s *Store) ProviderPricesEffective(t time.Time) ([]ProviderPrice, error) {
 }
 
 // UserPriceAt 查某个时刻该用户对该**下游**模型的分发价：
-// 先找 scope=user:<名>，没有则回落 scope=default；都没有返回 nil。
+// 先找 (user, <名>)，没有则回落 (system, 'global')（旧 scope=default）；都没有返回 nil。
+//
+// 实现委托 ScopePriceAt，范围由 scope.go 的解码器集中给出 —— 旧的 'user:' 前缀解析
+// 在这一份代码里只出现一次。
+//
+// §2.7 规则 8：主线接线完成后删除，调用方改用 ScopePriceAt / ScopePriceAtChain。
 func (s *Store) UserPriceAt(userName, model string, t time.Time) (*UserPrice, error) {
 	if strings.TrimSpace(model) == "" {
 		return nil, errors.New("model 不能为空")
 	}
-	ts := t.UnixMilli()
-	scopes := []string{ScopeDefault}
-	if strings.TrimSpace(userName) != "" {
-		scopes = []string{ScopeUser(userName), ScopeDefault} // 最具体的那条生效
+	// 最具体的那条生效：用户名在前，全局兜底在后。
+	// 用户名非法（含冒号/控制字符）时旧接口同样查不到行（那种键插不进来），
+	// 所以这一腿直接跳过，行为与旧的「查不到就回落」等价。
+	legs := []policy.ScopeRef{policy.SystemScope}
+	if userScope, err := legacyUserScope(userName); err == nil {
+		legs = []policy.ScopeRef{userScope, policy.SystemScope}
 	}
-	for _, scope := range scopes {
-		row := s.queryRow(`SELECT `+userPriceCols+` FROM user_prices
-			WHERE scope=? AND model=? AND valid_from<=? AND (valid_to=0 OR valid_to>?)
-			ORDER BY valid_from DESC, id DESC LIMIT 1`, scope, model, ts, ts)
-		p, err := scanUserPrice(row)
-		if errors.Is(err, sql.ErrNoRows) {
-			continue
+	for _, scope := range legs {
+		p, err := s.ScopePriceAt(scope, model, t)
+		if err != nil || p != nil {
+			if p == nil {
+				return nil, err
+			}
+			return p.ToLegacy(), err
 		}
-		if err != nil {
-			return nil, err
-		}
-		return p, nil
 	}
 	return nil, nil
 }
@@ -501,45 +452,31 @@ func (s *Store) UserPriceAt(userName, model string, t time.Time) (*UserPrice, er
 // 用来回答「这个部署到底有没有在计价」。不能只看 config.yaml 的 legacy pricing 表 ——
 // 那张表已经退居为「没有价目行时的估算兜底」，真正的价目在库里。只报 legacy 表的话，
 // 明明录了价目、金额也确实在按请求冻结，接口却仍然回 priced:false，字面自相矛盾。
+//
+// §2.7 规则 8：主线接线完成后删除，调用方改用 HasEffectiveScopePrices。
 func (s *Store) HasEffectiveUserPrices(userName string, t time.Time) (bool, error) {
-	ts := t.UnixMilli()
-	scopes := []string{ScopeDefault}
-	if strings.TrimSpace(userName) != "" {
-		scopes = append(scopes, ScopeUser(userName))
+	scopes := []policy.ScopeRef{policy.SystemScope}
+	if userScope, err := legacyUserScope(userName); err == nil {
+		scopes = append(scopes, userScope)
 	}
-	var found int
-	err := s.queryRow(`SELECT 1 FROM user_prices
-		WHERE scope IN (?,?) AND valid_from<=? AND (valid_to=0 OR valid_to>?) LIMIT 1`,
-		scopes[0], scopes[len(scopes)-1], ts, ts).Scan(&found)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
+	return s.HasEffectiveScopePrices(t, scopes...)
 }
 
-// UserPricesEffective 返回在 t 时刻生效的全部分发价目行（跨 scope，含 default 与各 user:）。
-// 供 `llmproxy status` / `llmproxy price list` 展示价目覆盖情况用。
+// UserPricesEffective 给出在 t 时刻生效的全部分发价目行（跨范围，含全局默认与各用户覆盖）。
+// 旧的 scope 串由 ScopePrice.ToLegacy() 还原；组织/项目级的行还原不出来，
+// Scope 留空串 —— 旧接口本就没有那种范围，调用方（`llmproxy status`）只用来数条数。
+//
+// §2.7 规则 8：主线接线完成后删除，调用方改用 ListAllScopePrices。
 func (s *Store) UserPricesEffective(t time.Time) ([]UserPrice, error) {
-	ts := t.UnixMilli()
-	rows, err := s.query(`SELECT `+userPriceCols+` FROM user_prices
-		WHERE valid_from<=? AND (valid_to=0 OR valid_to>?)
-		ORDER BY scope, model`, ts, ts)
+	rows, err := s.ListAllScopePrices(t)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
-	out := []UserPrice{}
-	for rows.Next() {
-		p, err := scanUserPrice(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, *p)
+	out := make([]UserPrice, 0, len(rows))
+	for i := range rows {
+		out = append(out, *rows[i].ToLegacy())
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // ListProviderPrices 列出某个 (供应商, 上游模型) 的全部价目行（含历史），按 valid_from 升序。
@@ -562,23 +499,36 @@ func (s *Store) ListProviderPrices(provider, upstreamModel string) ([]ProviderPr
 	return out, rows.Err()
 }
 
-// ListUserPrices 列出某个 (scope, model) 的全部分发价目行（含历史），按 valid_from 升序。
+// ListUserPrices 列出某个 (旧 scope 串, 模型) 的全部分发价目行（含历史），按 valid_from 升序。
+//
+// 两处口径刻意与旧实现一致：
+//   - scope 串无法映射 → 返回空结果而不是报错。管理台允许任意串进来查询，映射不上
+//     等价于「那个范围一行都没有」；迁移已保证库里不存在映射不出来的行，所以这里没有
+//     静默丢数据的风险（服务端在 scope/model 为空时本就返回 400）。
+//   - model 为空 → 同样返回空。旧的 `WHERE scope=? AND model=?` 就是这个结果；
+//     要「某范围的全部模型」请用 ListScopePrices。
+//
+// §2.7 规则 8：主线接线完成后删除，调用方改用 ListScopePrices。
 func (s *Store) ListUserPrices(scope, model string) ([]UserPrice, error) {
-	rows, err := s.query(`SELECT `+userPriceCols+` FROM user_prices
-		WHERE scope=? AND model=? ORDER BY valid_from ASC`, scope, model)
+	ref, err := decodeLegacyPriceScope(strings.TrimSpace(scope))
+	if err != nil {
+		if errors.Is(err, ErrLegacyScope) {
+			return []UserPrice{}, nil
+		}
+		return nil, err
+	}
+	if strings.TrimSpace(model) == "" {
+		return []UserPrice{}, nil
+	}
+	rows, err := s.ListScopePrices(ref, model)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = rows.Close() }()
-	out := []UserPrice{}
-	for rows.Next() {
-		p, err := scanUserPrice(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, *p)
+	out := make([]UserPrice, 0, len(rows))
+	for i := range rows {
+		out = append(out, *rows[i].ToLegacy())
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // migratePricingColumns 给**已有**的库补上计价冻结相关列。

@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -61,10 +63,30 @@ type RequestRecord struct {
 	PriceDownstreamID int64
 	Charge            *float64
 	Currency          string
+
+	// Scope 是这次请求归属的**范围**（3.0 §2.7 规则 2）。零值 = 没有归属信息
+	// （静态 key、或未启用多用户），落 NULL 而不是猜一个。
+	//
+	// 过渡期口径：只给了 UserName 时按规则 3 落成 (user, <用户名>)，
+	// 解析集中在 resolveRequestScope 一处。
+	// §2.7 规则 8：主线接线完成后删掉那条 UserName 兜底 —— 届时调用方一律传 Scope。
+	Scope policy.ScopeRef
+
+	// 路由决策痕迹（§2.8：在线请求至少要记 routing_seed、候选集摘要、最终计划、policy_version）。
+	// 全是**摘要与版本号**，不含任何正文；空串落 NULL = 那条路径还没接入观测。
+	// 有 seed 才谈得上逐位复现，没 seed 只能做解释性回放。
+	PolicyVersion    string
+	RoutingEpoch     string
+	RoutingSeed      string
+	CandidatesDigest string
 }
 
-// ProviderStatus 是持久化的供应商运行期状态。
-// Scope 为空表示全局配置里的供应商，否则是某个用户名（多用户各自的上游）。
+// ProviderStatus 是持久化的供应商运行期状态（2.x 的旧形状）。
+//
+// Scope 是旧字符串约定：空串 = 全局配置里的供应商，否则是某个用户名（多用户各自的上游）。
+// 表里已经没有这一列 —— 读写都经 scope.go 的编解码落到 (scope_kind, scope_id, name)。
+//
+// §2.7 规则 8：主线接线完成后删除，调用方改用 ProviderBucketState（范围是 policy.ScopeRef）。
 type ProviderStatus struct {
 	Scope               string
 	Name                string
@@ -178,7 +200,11 @@ func insertID(tx *sql.Tx, d Dialect, q string, args ...any) (int64, error) {
 // schema 只放 DDL。连接级参数（busy_timeout / journal_mode / synchronous / _txlock）
 // 一律在 sqliteDSN() 里给 —— 它们必须对**每一条**连接生效，而 db.Exec(schema) 只作用于
 // 当时那一条。详见 dsn 的注释。
-const schema = `
+//
+// 刻意是 var 而不是 const：requests 的 scope/路由痕迹列与 provider_stats 的 3.0 形状
+// 都由 scope_schema.go 的单一定义生成 —— 新库的建表语句与老库的一次性迁移必须逐列一致，
+// 抄两遍就会出现「新库有列、老库补不上」或者反过来。
+var schema = `
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT    PRIMARY KEY,
   value INTEGER NOT NULL
@@ -214,25 +240,24 @@ CREATE TABLE IF NOT EXISTS requests (
   cost_upstream       REAL,
   price_downstream_id INTEGER NOT NULL DEFAULT 0,
   charge              REAL,
-  currency            TEXT    NOT NULL DEFAULT ''
+  currency            TEXT    NOT NULL DEFAULT '',
+  -- 3.0 §2.7 规则 2 + §2.8：归属范围与路由决策痕迹，全部可空 ——
+  -- 静态 key 的请求没有归属范围，2.x 的历史行也一律不回填（猜的归属会污染账单，规则 5）。
+  -- 这里同样**没有任何正文/提示词列**，列定义见 scope_schema.go。
+` + scopeColsFragment(requestsScopeCols30) + `
 );
 CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
 CREATE INDEX IF NOT EXISTS idx_requests_provider_ts ON requests(provider, ts);
 CREATE INDEX IF NOT EXISTS idx_requests_model_ts ON requests(model, ts);
+-- 范围桶索引 idx_requests_scope_bucket **不在这里建**：老库的 requests 此刻还没有 scope_kind
+-- 列（那一列由 §2.7 的一次性迁移补），在这里建会撞「列不存在」而让 Open 失败。
+-- 它统一由 migrateScopeSchema 在列齐了之后按 scope_schema.go 的那一份定义建，幂等。
 
+-- 路由桶 (scope, provider) 的熔断状态：主键 (scope_kind, scope_id, name) 正是
+-- §2.7 规则 4 的桶最终键。2.x 的单列 scope（裸用户名 / 空串）形状由 scope_migration.go
+-- 一次性搬过来，所以这里不再维护旧的 scope TEXT 定义。
 CREATE TABLE IF NOT EXISTS provider_stats (
-  scope                TEXT    NOT NULL DEFAULT '',
-  name                 TEXT    NOT NULL,
-  enabled              INTEGER NOT NULL DEFAULT 1,
-  consecutive_failures INTEGER NOT NULL DEFAULT 0,
-  unhealthy_until      INTEGER NOT NULL DEFAULT 0,
-  last_error           TEXT,
-  last_success_at      INTEGER,
-  last_failure_at      INTEGER,
-  total_requests       INTEGER NOT NULL DEFAULT 0,
-  total_failures       INTEGER NOT NULL DEFAULT 0,
-  updated_at           INTEGER NOT NULL,
-  PRIMARY KEY (scope, name)
+` + providerStatsBody30 + `
 );
 
 CREATE TABLE IF NOT EXISTS usage_daily (
@@ -340,6 +365,13 @@ func OpenDialect(driver, pathOrDSN string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("迁移计价冻结列失败: %w", err)
 	}
+	// §2.7 的一次性 scope 迁移：**必须排在所有 2.x 迁移之后**（它读 2.x 的最终形状），
+	// 并且失败就让整个 Open 失败 —— 半途而废的 scope 结构比不开库危险得多
+	// （账单会挂到错误的主体上）。细节与备份/回滚口径见 scope_migration.go。
+	if err := migrateScopeSchema(db, d, pathOrDSN); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("scope 结构迁移失败（数据库已回到迁移前，请修复后重试）: %w", err)
+	}
 	// SQLite：WAL 模式下会生成 -wal/-shm 文件，一并收紧权限
 	if d.Name() == "sqlite" {
 		for _, p := range []string{pathOrDSN, pathOrDSN + "-wal", pathOrDSN + "-shm"} {
@@ -399,13 +431,25 @@ func firstLine(s string) string {
 // migrateProviderStatsScope 把单用户时代的 provider_stats（主键只有 name）
 // 升级成 (scope, name)：已有行归入 scope=”，也就是「全局配置里的供应商」。
 //
-// SQLite 不能改主键，只能重建。用列是否存在来判断，重复调用无副作用。
+// 用列是否存在来判断，重复调用无副作用。
+//
+// 「有 scope 列」与「有 scope_kind 列」是两代形状，判据必须两条都看：
+// 3.0 的表**没有** scope 列（主键是 scope_kind + scope_id + name），
+// 只看「没有 scope 就重建」会把已经迁好的库再降回 2.x 的单列形状（数据不丢但形状倒退）。
+// 2.x→3.0 的那一步由 scope_migration.go 负责，这里只管「单用户→2.x」。
 func migrateProviderStatsScope(db *sql.DB, d Dialect) error {
 	has, err := d.HasColumn(db, "provider_stats", "scope")
 	if err != nil {
 		return err
 	}
 	if has {
+		return nil
+	}
+	has30, err := d.HasColumn(db, "provider_stats", "scope_kind")
+	if err != nil {
+		return err
+	}
+	if has30 {
 		return nil
 	}
 
@@ -490,11 +534,53 @@ func f64Val(p *float64) any {
 	return *p
 }
 
-// InsertRequest 写入一条请求明细，并同步更新 usage_daily 汇总。
+// emptyToNil 把空串落成 NULL：requests 的路由痕迹列「没有」与「是空串」是同一件事，
+// 用 NULL 表示就不必在读侧再造一个 is-not-empty 的特例。
+func emptyToNil(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// scopeCol / scopeIDCol 成对给出 requests 的范围两列（定不出归属就两列都 NULL）。
+func scopeCol(ok bool, kind policy.ScopeKind) any {
+	if !ok {
+		return nil
+	}
+	return string(kind)
+}
+
+func scopeIDCol(ok bool, id string) any {
+	if !ok {
+		return nil
+	}
+	return id
+}
+
+// InsertRequest 写入一条请求明细，并同步更新 usage_daily / usage_user_daily / usage_scope_daily。
+//
+// 三张聚合表的分工（§2.7 规则 5）：
+//
+//	usage_daily        全局按（日, 供应商, 模型）—— 2.x 就有，口径一字未动
+//	usage_user_daily   按（日, 用户名, ...）—— 2.x 的按用户账本，同样不动
+//	usage_scope_daily  按（日, 范围, ...）—— 3.0 新增的**叠加维度**
+//
+// 「叠加」的含义：老表的行含义不会因为新表而改变，历史明细的归属因此保持不变。
+// 一次请求能进 usage_scope_daily 的前提是它定得出范围（rec.Scope 或 rec.UserName）；
+// 定不出就只落前两张 —— 补一个默认范围等于凭空造归属。
 func (s *Store) InsertRequest(rec RequestRecord) error {
 	if rec.Ts.IsZero() {
 		rec.Ts = time.Now()
 	}
+	// 调用方给了非零 Scope 却非法（比如 ID 超长或带冒号）时必须失败，不能降级成
+	// 「按 UserName 归属」或「无归属」—— 那会让账单挂到错误的主体上。
+	if hasScope(rec.Scope) {
+		if err := rec.Scope.Validate(); err != nil {
+			return fmt.Errorf("写入 requests：%s 的 scope 非法: %w", rec.RequestID, err)
+		}
+	}
+	scope, scoped := resolveRequestScope(rec)
 	day := rec.Ts.Format("2006-01-02")
 	stream := 0
 	if rec.Stream {
@@ -526,8 +612,9 @@ INSERT INTO requests (
   status_code, ok, latency_ms, ttft_ms,
   prompt_tokens, completion_tokens, total_tokens,
   attempts, error_type, error_msg,
-  cache_write_tokens, price_upstream_id, cost_upstream, price_downstream_id, charge, currency
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+  cache_write_tokens, price_upstream_id, cost_upstream, price_downstream_id, charge, currency,
+  scope_kind, scope_id, policy_version, routing_epoch, routing_seed, candidates_digest
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		nowMs(rec.Ts), rec.RequestID, rec.ClientKeyHash, rec.ClientLabel, rec.ClientIP,
 		model, provider, rec.UpstreamModel, stream,
 		nullable(int64(rec.StatusCode)), map[bool]int{true: 1, false: 0}[rec.OK],
@@ -536,6 +623,11 @@ INSERT INTO requests (
 		rec.Attempts, rec.ErrorType, rec.ErrorMsg,
 		nullable(rec.CacheWriteTokens), rec.PriceUpstreamID, f64Val(rec.CostUpstream),
 		rec.PriceDownstreamID, f64Val(rec.Charge), rec.Currency,
+		// 范围两列成对出现：定得出范围就两列都有，定不出就两列都 NULL。
+		// 一半一半的形状会让「按范围查」把那条行同时算进「有归属」和「无归属」两边。
+		scopeCol(scoped, scope.Kind), scopeIDCol(scoped, scope.ID),
+		emptyToNil(rec.PolicyVersion), emptyToNil(rec.RoutingEpoch),
+		emptyToNil(rec.RoutingSeed), emptyToNil(rec.CandidatesDigest),
 	)
 	if err != nil {
 		return fmt.Errorf("写入 requests 失败: %w", err)
@@ -618,94 +710,98 @@ ON CONFLICT(day, user_name, provider, model, upstream_model, system_paid) DO UPD
 		}
 	}
 
+	// 3.0 的按范围聚合：与 usage_user_daily 同一套计数（同一事务、同一口径），
+	// 这样「按范围的合计」与「按用户的合计」可以对得上账。
+	if scoped {
+		upstream := rec.UpstreamModel
+		if upstream == "" {
+			upstream = model
+		}
+		toks := usageTokens{
+			prompt:     int64Val(rec.PromptTokens),
+			cacheHit:   rec.CacheHitTokens,
+			cacheMiss:  rec.CacheMissTokens,
+			completion: int64Val(rec.CompletionTokens),
+			total:      int64Val(rec.TotalTokens),
+			latencyMs:  rec.LatencyMs,
+			charge:     rec.Charge,
+		}
+		if err := s.upsertScopeUsage(tx, scope, day, provider, model, upstream,
+			rec.SystemPaid, rec.OK, !rec.OK, toks); err != nil {
+			return err
+		}
+	}
+
 	return tx.Commit()
 }
 
-// SaveProviderStatus 批量写入供应商运行期状态。
+// SaveProviderStatus 批量写入供应商运行期状态（2.x 的旧字符串作用域接口）。
+//
+// 实现整体委托 SaveProviderBucketStates：冲突键、列清单、写事务只有一份，
+// 「旧接口」在这里只剩一次字符串解码（scope.go 的 decodeLegacyProviderScope）。
+// 旧 scope 串映射不出来时（用户名里含 policy 禁止的字符）直接报错，不静默丢桶 ——
+// 丢一个桶等于那路上游的熔断计数凭空清零。
+//
+// §2.7 规则 8：主线接线完成后删除，调用方改用 SaveProviderBucketStates。
 func (s *Store) SaveProviderStatus(statuses []ProviderStatus) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	stmt, err := tx.Prepare(s.rebind(`
-INSERT INTO provider_stats (
-  scope, name, enabled, consecutive_failures, unhealthy_until,
-  last_error, last_success_at, last_failure_at,
-  total_requests, total_failures, updated_at
-) VALUES (?,?,?,?,?,?,?,?,?,?,?)
-ON CONFLICT(scope, name) DO UPDATE SET
-  enabled              = excluded.enabled,
-  consecutive_failures = excluded.consecutive_failures,
-  unhealthy_until      = excluded.unhealthy_until,
-  last_error           = excluded.last_error,
-  last_success_at      = excluded.last_success_at,
-  last_failure_at      = excluded.last_failure_at,
-  total_requests       = excluded.total_requests,
-  total_failures       = excluded.total_failures,
-  updated_at           = excluded.updated_at`))
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-
-	now := time.Now().UnixMilli()
+	states := make([]ProviderBucketState, 0, len(statuses))
 	for _, st := range statuses {
-		enabled := 0
-		if st.Enabled {
-			enabled = 1
+		scope, err := decodeLegacyProviderScope(st.Scope)
+		if err != nil {
+			return fmt.Errorf("provider_stats 的作用域 %q 无法映射到 3.0 范围: %w", st.Scope, err)
 		}
-		if _, err := stmt.Exec(
-			st.Scope, st.Name, enabled, st.ConsecutiveFailures, nowMs(st.UnhealthyUntil),
-			st.LastError, nowMs(st.LastSuccessAt), nowMs(st.LastFailureAt),
-			st.TotalRequests, st.TotalFailures, now,
-		); err != nil {
-			return fmt.Errorf("写入 provider_stats %s 失败: %w", st.Name, err)
-		}
+		states = append(states, ProviderBucketState{
+			Scope:               scope,
+			Name:                st.Name,
+			Enabled:             st.Enabled,
+			ConsecutiveFailures: st.ConsecutiveFailures,
+			UnhealthyUntil:      st.UnhealthyUntil,
+			LastError:           st.LastError,
+			LastSuccessAt:       st.LastSuccessAt,
+			LastFailureAt:       st.LastFailureAt,
+			TotalRequests:       st.TotalRequests,
+			TotalFailures:       st.TotalFailures,
+		})
 	}
-	return tx.Commit()
+	return s.SaveProviderBucketStates(states)
 }
 
 // LoadProviderStatus 读取全部供应商状态（含各用户自己的上游），重启后恢复熔断。
 //
 // 返回**切片**而不是 map：ProviderStatus 自带 Scope 与 Name，而把两者拼成复合键会丢信息 ——
 // 键 "alice/my-up" 既可能是「用户 alice 的上游 my-up」，也可能是一个名字里真带斜杠的
-// 全局供应商，恢复时无法还原（SplitScopeKey 只能猜）。ORDER BY 则让恢复结果不依赖
-// SQL 的返回顺序：同一份库两次读出来必须一样。
+// 全局供应商，恢复时无法还原。ORDER BY 由 LoadProviderBucketStates 给出
+// （scope_kind, scope_id, name），同一份库两次读出来必须一样。
+//
+// 读到的桶里出现旧接口表达不了的范围（组织级 / 项目级）时报错而不是跳过：
+// 那种桶一旦被静默忽略，重启后它的熔断冷却就消失了。
+//
+// §2.7 规则 8：主线接线完成后删除，调用方改用 LoadProviderBucketStates。
 func (s *Store) LoadProviderStatus() ([]ProviderStatus, error) {
-	rows, err := s.query(`
-SELECT COALESCE(scope,''), name, enabled, consecutive_failures, unhealthy_until,
-       COALESCE(last_error,''), COALESCE(last_success_at,0), COALESCE(last_failure_at,0),
-       total_requests, total_failures
-FROM provider_stats ORDER BY scope, name`)
+	states, err := s.LoadProviderBucketStates()
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	out := []ProviderStatus{}
-	for rows.Next() {
-		var st ProviderStatus
-		var enabled, unhealthyUntil, lastOK, lastFail int64
-		if err := rows.Scan(&st.Scope, &st.Name, &enabled, &st.ConsecutiveFailures, &unhealthyUntil,
-			&st.LastError, &lastOK, &lastFail,
-			&st.TotalRequests, &st.TotalFailures); err != nil {
-			return nil, err
+	out := make([]ProviderStatus, 0, len(states))
+	for _, st := range states {
+		legacy, err := encodeLegacyProviderScope(st.Scope)
+		if err != nil {
+			return nil, fmt.Errorf("恢复熔断状态时 %s: %w", st.bucketKey(), err)
 		}
-		st.Enabled = enabled != 0
-		if unhealthyUntil != 0 {
-			st.UnhealthyUntil = time.UnixMilli(unhealthyUntil)
-		}
-		if lastOK != 0 {
-			st.LastSuccessAt = time.UnixMilli(lastOK)
-		}
-		if lastFail != 0 {
-			st.LastFailureAt = time.UnixMilli(lastFail)
-		}
-		out = append(out, st)
+		out = append(out, ProviderStatus{
+			Scope:               legacy,
+			Name:                st.Name,
+			Enabled:             st.Enabled,
+			ConsecutiveFailures: st.ConsecutiveFailures,
+			UnhealthyUntil:      st.UnhealthyUntil,
+			LastError:           st.LastError,
+			LastSuccessAt:       st.LastSuccessAt,
+			LastFailureAt:       st.LastFailureAt,
+			TotalRequests:       st.TotalRequests,
+			TotalFailures:       st.TotalFailures,
+		})
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // Prune 删除 retainDays 天前的请求明细；usage_daily 保留（体积很小，且是长期消耗视图）。
