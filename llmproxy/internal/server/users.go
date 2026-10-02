@@ -710,11 +710,11 @@ func (s *Server) handleMeRouting(w http.ResponseWriter, r *http.Request, e *user
 		var price map[string]any
 		if p, err := s.db.UserPriceAt(e.Name, model, now); err == nil && p != nil {
 			price = map[string]any{
-				"currency":  p.Currency,
-				"in_miss":   p.InMiss,
-				"in_hit":    p.InHit,
-				"in_write":  p.InWrite,
-				"out":       p.Out,
+				"currency":   p.Currency,
+				"in_miss":    p.InMiss,
+				"in_hit":     p.InHit,
+				"in_write":   p.InWrite,
+				"out":        p.Out,
 				"valid_from": p.ValidFrom.Format(time.RFC3339),
 			}
 		}
