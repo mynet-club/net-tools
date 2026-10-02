@@ -302,6 +302,15 @@ func TestAdminPolicySimulateAllowAndDeny(t *testing.T) {
 	if blocked, _ := p2["blocked"].(string); blocked == "" {
 		t.Error("enforce 预览应给出会拒绝的理由")
 	}
+	// 被拒的请求没有候选次序，seed 也就没有可复现的对象：这里报一个，
+	// 同一个 request_id 就会在「路由模拟」里有 seed、在「决策痕迹」里没有 ——
+	// 而痕迹那一屏才是线上真正落库的口径（forwarder 只在计划跑过时写）。
+	if s, _ := denied["routing_seed"].(string); s != "" {
+		t.Errorf("被策略拒掉的模拟不该报 seed: %q", s)
+	}
+	if dg, _ := denied["digest"].(string); dg != "" {
+		t.Errorf("没有候选次序时不该报摘要: %q", dg)
+	}
 
 	after := shadowStats(t, h.harness)
 	if after["evaluated"] != before["evaluated"] {

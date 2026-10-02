@@ -39,7 +39,7 @@ async function enterAdmin() {
   $('login').hidden = true;
   $('admin').hidden = false;
   $('admin-base').textContent = state.base;
-  await Promise.all([loadSysProviders(), loadAdminUsers()]);
+  await Promise.all([loadSysProviders(), loadAdminUsers(), loadPolicy()]);
 }
 
 function adminLogout() {
@@ -114,6 +114,9 @@ async function ensureSaved() {
   });
   ADM.dirty = false;
   await loadSysProviders();
+  // 池子一变，「策略下有没有可用候选」就跟着变（分级门逐家收窄用的是同一批声明）。
+  // 读不到不该挡住保存结果本身，所以这里吞掉错误——那一屏自己会显示为什么读不到。
+  await loadPolicy().catch(() => {});
   return data;
 }
 
@@ -492,6 +495,267 @@ async function validateConfig() {
   }
 }
 
+/* ── 策略与路由（§3.H：只读可见性）──────────────────────────────
+   数据来源只有 /v1/_admin/policy[/simulate|/trace] 三个只读端点。
+   界面不参与任何判定：结论由接线层的判定核给出 —— 界面上说「会通过」而线上拒了，
+   这种误差会让人彻底放弃策略包。响应里也不会有条件值、上游地址或密钥。 */
+
+const VERDICT = {
+  agreed: ['与旧链路一致', 'ok'],
+  primary_moved: ['首选会变', ''],
+  policy_denied: ['策略会排除上游', ''],
+  no_candidate: ['策略下没有可用候选', ''],
+  decision_denied: ['策略会拒绝请求', ''],
+  policy_would_deny: ['策略会拒绝请求', ''],
+  not_evaluated: ['未判定（该范围按旧路由跑）', ''],
+};
+
+function showPlStatus(msg, kind) {
+  const el = $('pl-status');
+  el.textContent = msg || '';
+  el.className = 'banner' + (kind === 'err' ? ' err-banner' : '');
+  el.hidden = !msg;
+}
+
+async function loadPolicy() {
+  showPlStatus('');
+  let data;
+  try {
+    ({ data } = await adminApi('/v1/_admin/policy'));
+  } catch (e) {
+    showPlStatus('读不到策略状态：' + e.message, 'err');
+    return;
+  }
+  ADM.policy = data;
+  $('pl-rev').textContent = '配置修订 ' + num(data.revision) + ' · schema v' + num(data.config_schema_version);
+  // 「配了但没生效」必须比任何统计都先看见：mode 写着 shadow、策略包却加载失败时，
+  // 请求其实按旧路由静默运行，只报 mode 的界面会说谎。
+  if (!data.running) {
+    const head = data.inactive_reason === 'policy_load_failed'
+      ? '3.0 判定链路没有在跑：配置里启用了策略，但这一版加载失败，请求按旧路由静默运行。'
+      : '没启用 3.0：配置里没有 policy 段（config_schema_version=2 的缺省），整套按旧路由运行。';
+    showPlStatus(head + (data.load_error ? '\n加载失败原因：' + data.load_error : ''), 'err');
+  }
+  renderPolicyStats(data);
+  renderPolicyBundles(data);
+  fillSimScopes();
+}
+
+function renderPolicyStats(d) {
+  const sh = d.shadow || {};
+  // agree_percent 只在有影子流量时才有；缺字段也别让整屏崩掉——这一屏是推进
+  // shadow→enforce 的唯一依据，读不到时宁可显示「—」并保留其它统计。
+  const rate = sh.evaluated > 0 && typeof sh.agree_percent === 'number'
+    ? sh.agree_percent.toFixed(1) + '%' : '—';
+  const by = sh.by_verdict || {};
+  const moved = (by.primary_moved || 0) + (by.policy_denied || 0)
+    + (by.no_candidate || 0) + (by.decision_denied || 0);
+  $('pl-stats').replaceChildren(
+    stat('配置的模式', d.configured_mode + ' → ' + d.mode, 'sm',
+      'configured_mode 是 YAML 里写的，mode 是归一后的实际口径'),
+    stat('是否在跑', d.running ? '是' : '否', 'sm',
+      '「否」意味着请求按旧路由运行，哪怕 mode 写着 shadow；此时顶部横幅会连带给出加载失败原因'),
+    stat('生效版本', d.policy_version || '—', 'sm'),
+    stat('路由代', d.routing_epoch || '—', 'sm',
+      'seed 由 (request_id, 版本, 代) 派生；代一变，同一 request_id 的 seed 也变'),
+    stat('数据分级', d.data_level, 'sm', '请求的分级高于某家上游上限时，那家不进 3.0 候选池'),
+    stat('回落旧路由', d.fallback_to_legacy ? '开' : '关', 'sm',
+      '只对「3.0 算不出计划」生效；策略本身拒绝请求时不会被它绕过'),
+    stat('影子已判定', num(sh.evaluated), 'sm'),
+    stat('影子一致率', rate, 'sm',
+      sh.evaluated > 0 ? '分母是已判定次数；不一致 ' + num(moved) + ' 次' : '还没有影子流量'),
+  );
+}
+
+// 声明的包与加载成功的包并排：只列一边就是让「引用改了、内容文件没改」这类事故
+// 只能从日志里读出来。
+function renderPolicyBundles(d) {
+  const loaded = {};
+  (d.bundles || []).forEach((b) => { loaded[b.id] = b; });
+  const refs = d.declared_bundles || [];
+  const box = $('pl-bundles');
+  if (!refs.length && !(d.bundles || []).length) {
+    box.replaceChildren(h('p', { class: 'muted', text: '配置里没有引用任何策略包。' }));
+    return;
+  }
+  const tb = h('tbody', null,
+    ...refs.map((r) => {
+      const b = loaded[r.id];
+      return h('tr', null,
+        h('td', null, h('code', { class: 'k', text: r.id + '.yaml' })),
+        h('td', { class: 'num', text: String(r.version) }),
+        h('td', null, h('code', { class: 'k', text: r.scope })),
+        h('td', null, b
+          ? h('span', { class: 'tag ok', text: '已加载 v' + b.version })
+          : h('span', { class: 'tag', text: '未加载' })),
+        h('td', { class: 'num', text: b ? String((b.rules || []).length) : '—' }));
+    }));
+  box.replaceChildren(h('div', { class: 'tablewrap' },
+    h('table', null,
+      h('thead', null, h('tr', null,
+        h('th', { text: '策略包' }), h('th', { text: '引用版本' }), h('th', { text: '范围' }),
+        h('th', { text: '加载' }), h('th', { text: '规则数' }))),
+      tb),
+    ...refs.filter((r) => loaded[r.id]).map((r) => bundleRules(loaded[r.id]))));
+}
+
+// 规则只以选择器现身，条件只列键名：键名足以让人看出「这条规则要看分级」，值不外泄。
+function bundleRules(b) {
+  return h('details', { class: 'mt' },
+    h('summary', { class: 'muted', text: b.id + ' 的规则（' + (b.rules || []).length + ' 条）' }),
+    h('div', { class: 'tablewrap' }, h('table', null,
+      h('thead', null, h('tr', null,
+        h('th', { text: '主体' }), h('th', { text: '资源' }), h('th', { text: '动作' }),
+        h('th', { text: '效果' }), h('th', { text: '范围' }), h('th', { text: '条件键' }),
+        h('th', { text: '到期' }))),
+      h('tbody', null, ...(b.rules || []).map((e) => h('tr', null,
+        h('td', null, h('code', { class: 'k', text: e.subject })),
+        h('td', null, h('code', { class: 'k', text: e.resource })),
+        h('td', null, h('code', { class: 'k', text: e.action })),
+        h('td', null, h('span', { class: 'tag' + (e.effect === 'allow' ? ' ok' : ''), text: e.effect })),
+        h('td', null, h('code', { class: 'k', text: e.scope || '—' })),
+        h('td', null, (e.condition_keys || []).length
+          ? h('span', { class: 'chips' }, ...(e.condition_keys || []).map((k) => h('span', { class: 'chip', text: k })))
+          : h('span', { class: 'muted', text: '—' })),
+        h('td', { class: 'muted', text: e.expires_at || '不限' })))))));
+}
+
+// 模拟的范围下拉跟着用户表走：scope 留空就是网关自身（system 范围）。
+function fillSimScopes() {
+  const sel = $('sim-scope');
+  const cur = sel.value;
+  sel.replaceChildren(
+    h('option', { value: '', text: '网关自身（system 范围）' }),
+    ...(ADM.users || []).map((u) => h('option', {
+      value: u.name, text: u.name + '（' + u.mode + '）',
+    })));
+  sel.value = (cur && (ADM.users || []).some((u) => u.name === cur)) ? cur : '';
+}
+
+async function runSimulate() {
+  const model = $('sim-model').value.trim();
+  if (!model) return showErr($('sim-err'), '模型名必填（与客户端请求里写的一致）');
+  const btn = $('sim-run');
+  btn.disabled = true;
+  showErr($('sim-err'), '');
+  try {
+    const { data } = await adminApi('/v1/_admin/policy/simulate', {
+      method: 'POST',
+      body: JSON.stringify({
+        scope: $('sim-scope').value, model,
+        request_id: $('sim-rid').value.trim() || undefined,
+      }),
+    });
+    renderSimulate(data);
+  } catch (e) {
+    $('sim-out').hidden = true;
+    showErr($('sim-err'), e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderSimulate(d) {
+  const box = $('sim-out');
+  box.hidden = false;
+  const v = VERDICT[d.verdict] || [String(d.verdict || '—'), ''];
+  const kids = [];
+
+  kids.push(h('div', { class: 'row' },
+    h('span', { class: 'tag' + (v[1] ? ' ' + v[1] : ''), text: v[0] }),
+    h('span', { class: 'muted', text: d.mode + ' · ' + (d.policy_version || '无版本') + ' · ' + d.elapsed_ms + 'ms' }),
+    h('span', { class: 'muted mono', text: 'request_id ' + d.request_id }),
+    h('span', { class: 'grow' }),
+    d.sticky ? h('span', { class: 'muted', text: '粘性偏好：' + d.sticky }) : null));
+
+  // enforce 作用面单列一行：shadow 下线上不受影响，而运维要看的正是「明天切了会怎样」。
+  // 已经是 enforce 时这句要换成「真实作用」，否则读起来像是在说明一个假设。
+  const ep = d.enforce_preview || {};
+  kids.push(h('p', { class: 'sub' },
+    d.mode === 'enforce' ? '这条请求的真实作用：' : '如果切到 enforce：',
+    ep.blocked ? h('span', { class: 'tag', text: '会被拦截' })
+      : ep.applied ? h('span', { class: 'tag ok', text: '计划生效' })
+        : h('span', { class: 'tag', text: '不作用（回落旧路由）' }),
+    h('span', { class: 'muted', text: ep.blocked || ep.note || '' })));
+  if (d.note) kids.push(h('p', { class: 'sub', text: '判定说明：' + d.note }));
+
+  const dec = d.decision || {};
+  kids.push(h('div', { class: 'gridn' },
+    stat('授权', dec.allowed ? '允许' : '拒绝', 'sm'),
+    stat('结论', String(dec.reason || '—'), 'sm'),
+    stat('命中规则', String((dec.matched_rules || []).length)),
+    stat('候选数', String((d.candidates || []).length)),
+    stat('被策略排除', String((d.excluded || []).length))));
+  if (dec.explain) kids.push(h('p', { class: 'sub', text: dec.explain }));
+
+  const planOrder = d.plan_order || [];
+  if (planOrder.length) {
+    const seq = [];
+    planOrder.forEach((name, i) => {
+      if (i > 0) seq.push(h('span', { class: 'seq-arrow', text: '→' }));
+      seq.push(h('span', { class: 'chip', text: name }));
+    });
+    kids.push(h('p', { class: 'sub' }, '3.0 计划次序：', h('span', { class: 'seq' }, ...seq)));
+  } else if (d.plan_error) {
+    kids.push(h('p', { class: 'sub', text: '3.0 给不出计划：' + d.plan_error }));
+  }
+  const legacy = (d.legacy_first || []).map((n) => h('span', { class: 'chip', text: n }));
+  kids.push(h('p', { class: 'sub' },
+    '旧链路第一档本来会用：',
+    h('span', { class: 'chips' }, ...(legacy.length ? legacy : [h('span', { class: 'muted', text: '（空池）' })]))));
+
+  kids.push(h('div', { class: 'tablewrap' }, h('table', null,
+    h('thead', null, h('tr', null,
+      h('th', { text: '上游' }), h('th', { text: '上游模型名' }), h('th', { text: '档' }),
+      h('th', { text: '健康' }), h('th', { text: '权重' }), h('th', { text: '分级上限' }),
+      h('th', { text: '排除原因' }))),
+    h('tbody', null, ...(d.candidates || []).map((c) => {
+      const ex = (d.excluded || []).find((e) => e.provider === c.provider);
+      return h('tr', null,
+        h('td', null, h('code', { class: 'k', text: c.provider })),
+        h('td', null, h('code', { class: 'k', text: c.upstream_model })),
+        h('td', { class: 'num', text: String(c.tier) }),
+        h('td', null, h('span', { class: 'dot' + (c.healthy ? '' : ' off') }), c.healthy ? '可用' : '冷却'),
+        h('td', { class: 'num', text: String(c.weight) }),
+        h('td', null, h('span', { class: 'tag', text: c.max_data_level })),
+        h('td', null, ex ? h('span', { class: 'tag', text: ex.reason }) : h('span', { class: 'muted', text: '—' })));
+    })))));
+
+  // 有 seed 才谈得上逐位复现：计划没跑过就没有 seed（§2.8），空 seed 后面再写
+  // 「同 request_id 可复现」等于界面自己造了一个做不到的承诺。
+  kids.push(h('p', { class: 'sub mono' },
+    'routing_seed ' + (d.routing_seed || '—'),
+    d.digest ? ' · 候选摘要 ' + d.digest : '',
+    d.routing_seed ? ' · 同 request_id + 同版本 + 同代可复现' : ' · 本次没有计划，无逐位复现'));
+
+  box.replaceChildren(...kids.filter(Boolean));
+}
+
+async function runTrace() {
+  const rid = $('tr-rid').value.trim();
+  if (!rid) return showErr($('tr-err'), 'request_id 必填');
+  showErr($('tr-err'), '');
+  try {
+    const { data } = await adminApi('/v1/_admin/policy/trace?request_id=' + encodeURIComponent(rid));
+    const box = $('tr-out');
+    box.hidden = false;
+    box.replaceChildren(
+      h('div', { class: 'gridn' },
+        stat('范围', (data.scope_kind || '—') + ':' + (data.scope_id || '—'), 'sm'),
+        stat('策略版本', data.policy_version || '—', 'sm'),
+        stat('路由代', data.routing_epoch || '—', 'sm'),
+        stat('逐位可复现', data.exactly_replayable ? '是' : '否', 'sm')),
+      h('p', { class: 'sub mono' },
+        'seed ' + (data.routing_seed || '—'),
+        data.candidates_digest ? ' · 候选摘要 ' + data.candidates_digest : ''),
+      h('p', { class: 'sub', text: data.note || '' }),
+      h('p', { class: 'sub', text: data.scope_note || '' }));
+  } catch (e) {
+    $('tr-out').hidden = true;
+    showErr($('tr-err'), e.message);
+  }
+}
+
 /* ── 用户列表 ────────────────────────────────────────────────────── */
 
 function moneyShort(v) {
@@ -531,6 +795,9 @@ async function loadAdminUsers() {
     );
   }));
   $('u-empty').hidden = ADM.users.length > 0;
+  // 模拟的范围下拉要用这份名单；两处都调一次是因为进台时它们是并发加载的，
+  // 谁先回来都不能让下拉空着。
+  fillSimScopes();
 
   // 详情开着的话跟着刷新（改完设置要立刻看到新值）
   if (ADM.editing) await openUser(ADM.editing, true);
@@ -943,6 +1210,12 @@ $('ud-new-model').addEventListener('keydown', (e) => { if (e.key === 'Enter') { 
 $('ud-new-upstream').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addModel(); } });
 $('cfg-save').addEventListener('click', saveConfig);
 $('cfg-validate').addEventListener('click', validateConfig);
+$('pl-refresh').addEventListener('click', () => loadPolicy());
+$('sim-run').addEventListener('click', runSimulate);
+$('sim-model').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); runSimulate(); } });
+$('sim-rid').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); runSimulate(); } });
+$('tr-run').addEventListener('click', runTrace);
+$('tr-rid').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); runTrace(); } });
 $('pick-close').addEventListener('click', closePick);
 $('pick-ok').addEventListener('click', applyPick);
 $('pick-filter').addEventListener('input', renderPick);

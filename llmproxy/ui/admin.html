@@ -66,6 +66,46 @@
       </div>
     </section>
 
+    <!-- 策略与路由（3.0）：只读可见性 —— 现在到底生效了什么、切 enforce 会怎么判、当时判成了什么 -->
+    <section class="card" id="policy">
+      <div class="head">
+        <h2>策略与路由</h2>
+        <span class="mono muted" id="pl-rev"></span>
+        <span class="grow"></span>
+        <button type="button" id="pl-refresh" class="ghost sm">刷新</button>
+      </div>
+      <p class="sub">这一屏只读：改 <code>policy.mode</code>、发布与回滚策略包仍然是编辑
+        <code>config.yaml</code> 与包目录的事（改完网关按修订自动重载）。
+        这里回答的是推进 shadow→enforce 时唯一要看的那三件事。</p>
+      <p class="banner" id="pl-status" hidden></p>
+      <div id="pl-stats" class="gridn"></div>
+      <div id="pl-bundles"></div>
+
+      <h3 class="sub-h">路由模拟</h3>
+      <p class="sub">与线上请求走<b>同一个判定核</b>，所以「模拟通过」和「线上通过」是同一个答案。
+        它不写影子差异统计、不碰熔断/粘性/计量 —— 否则差异报告里的「一致率」就掺进了人为流量。
+        响应只有标识与结论：规则只列选择器与条件<b>键名</b>，不含条件值、上游地址与密钥。</p>
+      <div class="row">
+        <select id="sim-scope" style="max-width:220px"></select>
+        <input id="sim-model" class="mono" placeholder="模型名，如 gpt-4o-mini" autocomplete="off" style="flex:1;min-width:180px">
+        <input id="sim-rid" class="mono" placeholder="request_id（留空=每次新生成）" autocomplete="off" style="flex:1;min-width:200px">
+        <button type="button" id="sim-run" class="primary sm">模拟</button>
+        <span class="err" id="sim-err" hidden></span>
+      </div>
+      <div id="sim-out" hidden></div>
+
+      <h3 class="sub-h">决策痕迹</h3>
+      <p class="sub">按 <code>request_id</code> 回当时的策略版本、路由代、seed 与候选摘要。
+        只有 enforce 且计划真的作用到请求上才谈得上<b>逐位复现</b>；影子请求与回落旧路由的请求
+        只能做解释性回放，这里会照实写出来。</p>
+      <div class="row">
+        <input id="tr-rid" class="mono" placeholder="request_id" autocomplete="off" style="flex:1;min-width:240px">
+        <button type="button" id="tr-run" class="sm">查询</button>
+        <span class="err" id="tr-err" hidden></span>
+      </div>
+      <div id="tr-out" hidden></div>
+    </section>
+
     <!-- 用户列表 -->
     <section class="card">
       <div class="head">

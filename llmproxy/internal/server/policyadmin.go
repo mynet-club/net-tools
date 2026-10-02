@@ -63,18 +63,25 @@ func (s *Server) adminPolicyInspect(w http.ResponseWriter) {
 	rt := s.policyFor(cfg)
 	pc := &cfg.Policy
 
+	bundleDir := strings.TrimSpace(pc.BundleDir)
+	if bundleDir == "" {
+		bundleDir = config.DefaultBundleDir
+	}
+
 	out := map[string]any{
 		"config_schema_version": schemaVersionOf(cfg),
 		"revision":              s.cfgStore.Revision(),
 		"configured_mode":       orDash(pc.Mode),
 		"mode":                  pc.ModeResolved().String(),
 		"active_bundle":         orDash(pc.ActiveBundle),
-		"bundle_dir":            orDash(pc.BundleDir),
-		"fallback_to_legacy":    pc.FallbackToLegacyEnabled(),
-		"data_level":            pc.DataLevelResolved().String(),
-		"declared_bundles":      bundleRefViews(pc.BundleRefs()),
-		"running":               rt != nil,
-		"shadow":                s.metrics.shadowSnapshot(),
+		// 报**生效**目录而不是配置里的原值：留空时加载用的是默认目录，
+		// 显示成 "-" 会让人以为策略包根本没地方读。
+		"bundle_dir":         bundleDir,
+		"fallback_to_legacy": pc.FallbackToLegacyEnabled(),
+		"data_level":         pc.DataLevelResolved().String(),
+		"declared_bundles":   bundleRefViews(pc.BundleRefs()),
+		"running":            rt != nil,
+		"shadow":             s.metrics.shadowSnapshot(),
 	}
 	if rt == nil {
 		out["policy_version"] = ""
@@ -182,6 +189,14 @@ func (s *Server) adminPolicySimulate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	chain, chainErr := policyChainFor(scope)
+	// seed 只在计划真跑过时才报：§2.8 的逐位复现凭据是 (seed, 候选摘要) 一对，
+	// 被策略拒掉的请求压根没有候选次序可复现。线上记录同理（forwarder 只在
+	// Applied 时写）；模拟这里多报一个 seed，同一个 request_id 就会在
+	// 「路由模拟」和「决策痕迹」两屏给出两个答案。
+	seed := shot.Seed
+	if shot.CandidatesDigest == "" {
+		seed = ""
+	}
 	out := map[string]any{
 		"request_id":   requestID,
 		"scope":        scope,
@@ -207,7 +222,7 @@ func (s *Server) adminPolicySimulate(w http.ResponseWriter, r *http.Request) {
 		"legacy_first":   shot.LegacyFirst,
 		"plan_order":     shot.PlanOrder,
 		"excluded":       excludedView(shot.Excluded),
-		"routing_seed":   shot.Seed,
+		"routing_seed":   seed,
 		"digest":         shot.CandidatesDigest,
 		"policy_version": shot.Version,
 	}
