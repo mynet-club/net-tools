@@ -51,7 +51,11 @@ func (c *usageReportCache) Get(key usageReportKey) map[string]any {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e := c.entries[key]
-	if e == nil || c.now().After(e.expires) {
+	if e == nil {
+		return nil
+	}
+	if !c.now().Before(e.expires) {
+		delete(c.entries, key)
 		return nil
 	}
 	return e.payload
@@ -64,12 +68,26 @@ func (c *usageReportCache) Put(key usageReportKey, payload map[string]any) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.entries) >= c.max {
-		// 超限就整表清掉：条目都很小，没必要为 LRU 再维护一条链
-		c.entries = make(map[usageReportKey]*usageReportEntry)
+	now := c.now()
+	if _, exists := c.entries[key]; !exists && len(c.entries) >= c.max {
+		// 仅新增条目才淘汰；先清过期报表，仍满时只丢最早到期的一条。
+		var oldest usageReportKey
+		var earliest time.Time
+		for k, e := range c.entries {
+			if !now.Before(e.expires) {
+				delete(c.entries, k)
+				continue
+			}
+			if earliest.IsZero() || e.expires.Before(earliest) {
+				oldest, earliest = k, e.expires
+			}
+		}
+		if len(c.entries) >= c.max {
+			delete(c.entries, oldest)
+		}
 	}
 	c.entries[key] = &usageReportEntry{
-		expires: c.now().Add(c.ttl),
+		expires: now.Add(c.ttl),
 		payload: payload,
 	}
 }

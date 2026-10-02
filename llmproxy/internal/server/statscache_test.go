@@ -53,3 +53,19 @@ func TestUsageReportCacheTTLAndInvalidate(t *testing.T) {
 	nilCache.InvalidateUser("alice")
 	nilCache.Flush()
 }
+
+func TestUsageReportCacheUpdateDoesNotEvictOtherEntries(t *testing.T) {
+	c := newUsageReportCache()
+	c.max = 2
+	keyA := usageReportKey{scope: "a", days: 7}
+	keyB := usageReportKey{scope: "b", days: 7}
+	c.Put(keyA, map[string]any{"v": 1})
+	c.Put(keyB, map[string]any{"v": 2})
+	c.Put(keyA, map[string]any{"v": 3})
+	if got := c.Get(keyB); got == nil || got["v"] != 2 {
+		t.Fatalf("更新已有条目不应清掉其它条目，got=%v", got)
+	}
+	if got := c.Get(keyA); got == nil || got["v"] != 3 {
+		t.Fatalf("更新后的条目未生效，got=%v", got)
+	}
+}
