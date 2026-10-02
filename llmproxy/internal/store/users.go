@@ -100,6 +100,11 @@ const usageUserDailyDDL = `CREATE TABLE IF NOT EXISTS usage_user_daily (
 )`
 
 // User 是一个下游用户。库里只有 token 的摘要，没有明文。
+//
+// 这里**不再**有配额与限流字段（§2.7 规则 2/8）：那些设置按**范围**读，真值只有一处 ——
+// scope_quota 表（Store.GetScopeQuota / SetScopeQuota）。users 表上那几列是 2.x 的遗留形状，
+// 由 scope 迁移回填成 (user, 名) 的配额行后退役；把它们留在 User 上等于给旧列留一条
+// 「看起来还能用」的读路径，而两张表各持一半真值正是双写最难查的后果。
 type User struct {
 	Name      string
 	TokenHash string
@@ -109,11 +114,6 @@ type User struct {
 
 	// Mode 决定这个用户能不能用系统上游：byo（默认）或 consumption。
 	Mode string
-	// 配额与限流，0 一律表示「不限」。
-	QuotaMonthTokens int64
-	QuotaMonthCost   float64
-	RPM              int
-	MaxConcurrent    int
 }
 
 // IsConsumption 报告该用户是否为消费模式。
@@ -188,7 +188,8 @@ func TokenHash(token string) string {
 //
 // 同一个事务里补一行 scope_quota（§2.7 规则 3）：3.0 的配额按**范围**读，
 // 「每个 user 范围都有一条配额行」是迁移的收口校验之一（count(scope_quota where kind=user)
-// == count(users)），新建用户不补就会破坏它。初值与 users 表的列默认值一致（全 0 = 不限、启用）。
+// == count(users)），新建用户不补就会破坏它 —— 而 buildRegistry 缺行时是报错而不是按
+// 「不限」处理，漏补会让新账号直接 401。初值「全 0 = 不限、启用」与迁移回填的口径一致。
 func (s *Store) CreateUser(name, tokenHash string) error {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -235,14 +236,12 @@ func (s *Store) CreateUser(name, tokenHash string) error {
 }
 
 // userColumns 与 scanUser 成对维护：列顺序改一处必须改另一处。
-const userColumns = `name, token_hash, enabled, created_at, updated_at,
-       mode, quota_month_tokens, quota_month_cost, rpm, max_concurrent`
+const userColumns = `name, token_hash, enabled, created_at, updated_at, mode`
 
 func scanUser(sc interface{ Scan(...any) error }) (User, error) {
 	var u User
 	var enabled, created, updated int64
-	err := sc.Scan(&u.Name, &u.TokenHash, &enabled, &created, &updated,
-		&u.Mode, &u.QuotaMonthTokens, &u.QuotaMonthCost, &u.RPM, &u.MaxConcurrent)
+	err := sc.Scan(&u.Name, &u.TokenHash, &enabled, &created, &updated, &u.Mode)
 	if err != nil {
 		return u, err
 	}
@@ -295,17 +294,15 @@ func (s *Store) getUser(where string, arg any) (*User, error) {
 
 // SetUserEnabled 启用/禁用一个用户。
 //
-// enabled 在 users 与 scope_quota 两张表里都有（3.0 的配额按范围读），
-// 所以这里同样走过渡期双写；§2.7 规则 8：接线完成后只留 scope_quota 那一份。
+// 只写 users：账号是否可用是**身份**事实，主体就是用户，它不在 scope_quota 里有第二份真值。
+// 配额行上的 enabled 列说的是另一件事（这一行的限额是否生效），两边不该互相镜像 ——
+// §2.7 规则 8 删掉的就是那种「一次写两处、靠同步保持同形」的双写。
 func (s *Store) SetUserEnabled(name string, enabled bool) error {
 	v := 0
 	if enabled {
 		v = 1
 	}
-	if err := s.userUpdate("enabled = ?", []any{v}, name); err != nil {
-		return err
-	}
-	return s.syncScopeQuotaFromUsers(name)
+	return s.userUpdate("enabled = ?", []any{v}, name)
 }
 
 // SetUserToken 换 token（轮换）。旧 token 立即失效。

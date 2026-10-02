@@ -12,8 +12,8 @@ import (
 // 3.0 按范围键定的读写 API（§2.7）的行为钉死测试。
 //
 // 这里覆盖的是 scope_store.go 里配额与熔断桶的导出 API：
-// 每条都注明「为什么钉这个」—— 这些语义大多是过渡期的（users 兜底、双写），
-// 接线完成后要删的分支最容易在重构时悄悄改了行为。
+// 每条都注明「为什么钉这个」—— 配额行是花钱的闸门，读错方向（多算/少算、
+// 把「没配过」当成「不限」）在报表上看不出来，只在超支发生那天才暴露。
 // 迁移本体不在这里测（scope_migration_test.go 负责）。
 
 // mustQuota 读一条必然存在的配额，省掉每个用例重复三段 err 处理。
@@ -81,7 +81,7 @@ func TestScopeQuotaRoundtripPerKind(t *testing.T) {
 			t.Errorf("%s: cost/enabled 没原样存取: want %v/%v got %v/%v",
 				c.name, q.QuotaMonthCost, q.Enabled, got.QuotaMonthCost, got.Enabled)
 		}
-		// 时间戳只给 scope_quota 行（users 兜底那条没有），为零说明写侧漏了列
+		// 时间戳由写侧落列，为零说明 SetScopeQuota 漏了 created_at/updated_at
 		if got.CreatedAt.IsZero() || got.UpdatedAt.IsZero() {
 			t.Errorf("%s: created_at/updated_at 没落库: %+v", c.name, got)
 		}
@@ -128,66 +128,111 @@ func TestScopeQuotaRejectsNegativeFields(t *testing.T) {
 	}
 }
 
-// ------------------------------------------------------------------ 过渡期兜底
+// ------------------------------------------------------------------ 缺行与补丁
 
-// 钉死 GetScopeQuota 文档里的过渡期兜底，两个方向都要：
-//  1. user 范围没有 scope_quota 行 → 回读 users 表那几列（迁移前的老库只有它）；
-//     回读行没有 created/updated 列，UpdatedAt 必须是零值——这是「来自 users」的指纹。
-//  2. 一旦 scope_quota 有了行就它说了算，哪怕 users 还留着旧值。
-//     两边并存时「谁赢」如果不钉，双写路径一改就会静默改变生效配额。
+// §2.7 规则 8：users 表上的配额列不再是读路径。这里钉的是「删掉兜底之后」的行为：
 //
-// 另外钉「没行」与「零配额」的区分：非 user 范围无行返回 (nil, nil)，
-// 调用方据此走默认策略；把 nil 当 0 会让「未配置」变成「额度为零」。
-func TestGetScopeQuotaLegacyUsersFallback(t *testing.T) {
+//   - user 范围没有 scope_quota 行 = (nil, nil)，绝不回读 users 的旧列。
+//     留着那条兜底，两张表各持一半真值时没人报错，而配额决定的是「还花不花得起系统池的钱」；
+//     一次性迁移会把旧列回填成配额行，收口校验查的正是每个 user 都有一行。
+//   - 「没行」与「限额为 0」必须可区分：nil = 从没配过，0 = 管理员显式给的「不限」。
+//     把 nil 当 0 显示，org / project 范围会一水儿显示成「额度为零」。
+func TestGetScopeQuotaHasNoUsersFallback(t *testing.T) {
 	s := openTestStore(t)
 	if err := s.CreateUser("alice", TokenHash("sk-alice")); err != nil {
 		t.Fatalf("CreateUser: %v", err)
 	}
 	alice := policy.MustScope(policy.ScopeUser, "alice")
 
-	// 造出「迁移前」的形状：删掉 scope_quota 行，只留 users 上的配额列。
+	// 造出「迁移前」的形状：删掉配额行，users 上留着旧列的值。
 	if _, err := s.db.Exec(`DELETE FROM scope_quota WHERE scope_kind='user' AND scope_id='alice'`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.db.Exec(`UPDATE users SET quota_month_tokens=1000, quota_month_cost=50.5,
-		rpm=30, max_concurrent=3, enabled=0 WHERE name='alice'`); err != nil {
+		rpm=30, max_concurrent=3 WHERE name='alice'`); err != nil {
 		t.Fatal(err)
 	}
-
-	got := mustQuota(t, s, alice)
-	if got.QuotaMonthTokens != 1000 || got.QuotaMonthCost != 50.5 || got.RPM != 30 || got.MaxConcurrent != 3 {
-		t.Errorf("应从 users 兜底读出旧配额，实际: %+v", got)
+	q, err := s.GetScopeQuota(alice)
+	if err != nil {
+		t.Fatalf("GetScopeQuota: %v", err)
 	}
-	if got.Enabled {
-		t.Error("users.enabled=0 被读成了启用")
-	}
-	if !got.UpdatedAt.IsZero() {
-		t.Errorf("users 兜底行不该有 UpdatedAt（那是 scope_quota 才有的列）: %v", got.UpdatedAt)
+	if q != nil {
+		t.Errorf("配额行缺失时应返回 (nil,nil)，不该回读 users 旧列，实际: %+v", q)
 	}
 
-	// 写一行 scope_quota（token 改成 7，其余为 0=不限）：读取必须切到 scope_quota，
-	// users 的旧值 1000 原样不动——证明「有行即它赢」而不是两边取大取小。
+	// 补一行之后它说了算，users 的旧值不参与、也不被回写。
 	if err := s.SetScopeQuota(ScopeQuota{Scope: alice, QuotaMonthTokens: 7, Enabled: true}); err != nil {
 		t.Fatalf("SetScopeQuota: %v", err)
 	}
-	got = mustQuota(t, s, alice)
-	if got.QuotaMonthTokens != 7 || got.RPM != 0 || !got.Enabled {
-		t.Errorf("scope_quota 行应当压过 users 兜底，实际: %+v", got)
+	if got := mustQuota(t, s, alice); got.QuotaMonthTokens != 7 || got.RPM != 0 || !got.Enabled {
+		t.Errorf("scope_quota 行是唯一真源，实际: %+v", got)
 	}
 	var legacy int64
 	if err := s.db.QueryRow(`SELECT quota_month_tokens FROM users WHERE name='alice'`).Scan(&legacy); err != nil {
 		t.Fatal(err)
 	}
 	if legacy != 1000 {
-		t.Errorf("SetScopeQuota 不该回写 users（那是旧写路径的职责），users 列变成了 %d", legacy)
+		t.Errorf("SetScopeQuota 不该回写 users 旧列（那是双写时代的职责），现在 %d", legacy)
 	}
 
-	// 「没行」的两个形态：组织范围无行、用户名两边都无 → 都是 (nil, nil)，不是报错也不是零值。
+	// 非 user 范围无行同样是 (nil, nil)：org / project 从没配过限额是常态。
 	if q, err := s.GetScopeQuota(policy.MustScope(policy.ScopeOrganization, "ghost")); err != nil || q != nil {
 		t.Errorf("组织范围无行应返回 (nil,nil)，实际 q=%v err=%v", q, err)
 	}
-	if q, err := s.GetScopeQuota(policy.MustScope(policy.ScopeUser, "nobody")); err != nil || q != nil {
-		t.Errorf("users 也没有该用户时应返回 (nil,nil)，实际 q=%v err=%v", q, err)
+}
+
+// PatchScopeQuota 的契约是「只改给到的那几项」。
+//
+// 三个写侧（管理界面 PATCH、CLI 改配额、CLI 改限流）都只带自己那两项，
+// 如果「没给到的项」落成零值，管理员点一下改 token 上限就顺手清了同一个人的金额上限 ——
+// 静默放开额度是这套 API 最贵的一种错，所以 nil 保持原值与零值表示「不限」要分开钉。
+func TestPatchScopeQuotaKeepsUnsetFields(t *testing.T) {
+	s := openTestStore(t)
+	scope := policy.MustScope(policy.ScopeUser, "alice")
+	two, zero := int64(2), 0.0
+	if err := s.SetScopeQuota(ScopeQuota{
+		Scope: scope, QuotaMonthTokens: 5_000_000, QuotaMonthCost: 199.5, RPM: 60, MaxConcurrent: 4, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.PatchScopeQuota(scope, QuotaPatch{Tokens: &two}); err != nil {
+		t.Fatalf("PatchScopeQuota: %v", err)
+	}
+	got := mustQuota(t, s, scope)
+	if got.QuotaMonthTokens != 2 {
+		t.Errorf("给了的那项该改：tokens=%d", got.QuotaMonthTokens)
+	}
+	if got.QuotaMonthCost != 199.5 || got.RPM != 60 || got.MaxConcurrent != 4 || !got.Enabled {
+		t.Errorf("没给的项该原样保留（清零等于放开额度）: %+v", got)
+	}
+
+	// 显式 0 = 不限，和「没给」是两件事。
+	if err := s.PatchScopeQuota(scope, QuotaPatch{Cost: &zero}); err != nil {
+		t.Fatalf("PatchScopeQuota(cost=0): %v", err)
+	}
+	got = mustQuota(t, s, scope)
+	if got.QuotaMonthCost != 0 || got.QuotaMonthTokens != 2 {
+		t.Errorf("cost 应被显式改成不限而 tokens 不动: %+v", got)
+	}
+
+	// 负值在写侧拦住（进库的负配额会让「已用 - 限额」恒为正，等于静默封死主体）。
+	neg := int64(-1)
+	if err := s.PatchScopeQuota(scope, QuotaPatch{Tokens: &neg}); err == nil ||
+		!strings.Contains(err.Error(), "不能为负") {
+		t.Errorf("负值应报「不能为负」，实际: %v", err)
+	}
+
+	// 缺行时按「全 0 = 不限、启用」起步：org / project 第一次设限走的就是这条路，
+	// 要求调用方先插空行只会让三个写侧各写一遍起步逻辑。
+	proj := policy.MustScope(policy.ScopeProject, "proj-lab-7")
+	rpmTwo := 2
+	if err := s.PatchScopeQuota(proj, QuotaPatch{RPM: &rpmTwo}); err != nil {
+		t.Fatalf("缺行时 PatchScopeQuota: %v", err)
+	}
+	got = mustQuota(t, s, proj)
+	if got.RPM != 2 || !got.Enabled || got.QuotaMonthTokens != 0 {
+		t.Errorf("缺行应从「不限、启用」起步且只改给到的项: %+v", got)
 	}
 }
 

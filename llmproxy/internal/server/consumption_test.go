@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 	"github.com/mynet-club/net-tools/llmproxy/internal/secrets"
 	"github.com/mynet-club/net-tools/llmproxy/internal/store"
 )
@@ -190,6 +191,24 @@ func setConsumption(t *testing.T, h *muHarness, user, model, upstream string) {
 	}
 }
 
+// setQuota 写某个用户的配额与限流。
+//
+// 真值在 scope_quota 那一行（§2.7 规则 2）：users 行上已经没有额度列，所以测试也是
+// 整行写，而不是像 2.x 那样「配额一次、限流一次」—— 两次写正是双写会漏的那一半。
+func setQuota(t *testing.T, h *muHarness, user string, tokens int64, cost float64, rpm, conc int) {
+	t.Helper()
+	if err := h.db.SetScopeQuota(store.ScopeQuota{
+		Scope:            policy.MustScope(policy.ScopeUser, user),
+		QuotaMonthTokens: tokens,
+		QuotaMonthCost:   cost,
+		RPM:              rpm,
+		MaxConcurrent:    conc,
+		Enabled:          true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // 消费用户走系统池：请求要真的打到系统上游，且按上游模型名计费。
 func TestConsumptionUsesSystemPoolAndMeters(t *testing.T) {
 	stub := newUsageStub(t, 0)
@@ -273,9 +292,7 @@ func TestConsumptionQuotaExceeded(t *testing.T) {
 	setConsumption(t, h, "carol", "fast", "sys-model")
 
 	// 配额 1000 token，而一次请求就要 1500 —— 第一条放行，第二条就必须挡住
-	if err := h.db.SetUserQuota("carol", 1000, 0); err != nil {
-		t.Fatal(err)
-	}
+	setQuota(t, h, "carol", 1000, 0, 0, 0)
 	if err := h.srv.SyncUsers(); err != nil {
 		t.Fatal(err)
 	}
@@ -309,9 +326,7 @@ func TestConsumptionRateLimit(t *testing.T) {
 	setConsumption(t, h, "carol", "fast", "sys-model")
 
 	// rpm=6 → 桶容量 1、每秒补 0.1，连发必然被挡
-	if err := h.db.SetUserLimits("carol", 6, 0); err != nil {
-		t.Fatal(err)
-	}
+	setQuota(t, h, "carol", 0, 0, 6, 0)
 	if err := h.srv.SyncUsers(); err != nil {
 		t.Fatal(err)
 	}
@@ -336,9 +351,7 @@ func TestConsumptionConcurrencyLimit(t *testing.T) {
 	h := newConsumptionHarness(t, stub, testPricing)
 	token := h.addUser(t, "carol")
 	setConsumption(t, h, "carol", "fast", "sys-model")
-	if err := h.db.SetUserLimits("carol", 0, 1); err != nil {
-		t.Fatal(err)
-	}
+	setQuota(t, h, "carol", 0, 0, 0, 1)
 	if err := h.srv.SyncUsers(); err != nil {
 		t.Fatal(err)
 	}

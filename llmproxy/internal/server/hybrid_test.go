@@ -116,9 +116,7 @@ func TestHybridQuotaDoesNotBlockOwnUpstream(t *testing.T) {
 	token := h.addUser(t, "arthur")
 	setConsumption(t, h, "arthur", "fast", "sys-model")
 	// 配额 1 个 token，并先垫一笔系统付费的用量把它撑满
-	if err := h.db.SetUserQuota("arthur", 1, 0); err != nil {
-		t.Fatal(err)
-	}
+	setQuota(t, h, "arthur", 1, 0, 0, 0)
 	if err := h.srv.SyncUsers(); err != nil {
 		t.Fatal(err)
 	}

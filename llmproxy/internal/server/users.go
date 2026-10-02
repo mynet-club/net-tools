@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/config"
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 	"github.com/mynet-club/net-tools/llmproxy/internal/secrets"
 	"github.com/mynet-club/net-tools/llmproxy/internal/store"
 )
@@ -143,15 +144,34 @@ func (s *Server) buildRegistry() (*userRegistry, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 配额与限流按**范围**读（§2.7 规则 2）：一次 ListScopeQuotas 而不是每用户一问，
+	// 快照刷新走的是同一条「少查询」路径，而且缺哪一行都要能立刻说清是谁缺。
+	quotas, err := s.db.ListScopeQuotas()
+	if err != nil {
+		return nil, err
+	}
+	byUser := map[string]store.ScopeQuota{}
+	for _, q := range quotas {
+		if q.Scope.Kind == policy.ScopeUser {
+			byUser[q.Scope.ID] = q
+		}
+	}
 	for _, u := range users {
+		q, hasQuota := byUser[u.Name]
+		if !hasQuota {
+			// 一次性迁移的收口校验要求「每个 user 范围都恰好有一行配额」，缺行只可能是
+			// 有人绕过 API 直接往 users 表插了数据。这里失败而不是按「不限」处理：
+			// 配额是花钱的闸门，把「读不到」解释成「没限额」等于对这个人打开系统池。
+			return nil, fmt.Errorf("用户 %s 没有 scope_quota 行，配额与限流读不出来（请用 CLI 给他设一次配额，或补一行 scope_quota）", u.Name)
+		}
 		e := &userEntry{
 			Name:             u.Name,
 			Enabled:          u.Enabled,
 			Consumption:      u.IsConsumption(),
-			QuotaMonthTokens: u.QuotaMonthTokens,
-			QuotaMonthCost:   u.QuotaMonthCost,
-			RPM:              u.RPM,
-			MaxConcurrent:    u.MaxConcurrent,
+			QuotaMonthTokens: q.QuotaMonthTokens,
+			QuotaMonthCost:   q.QuotaMonthCost,
+			RPM:              q.RPM,
+			MaxConcurrent:    q.MaxConcurrent,
 		}
 		for _, um := range models[u.Name] {
 			if um.Enabled {

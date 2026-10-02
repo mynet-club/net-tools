@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 	"github.com/mynet-club/net-tools/llmproxy/internal/store"
 )
 
@@ -133,22 +134,25 @@ func (s *Server) adminUsersRoute(w http.ResponseWriter, r *http.Request, tail st
 
 // userSummary 是列表与详情共用的用户快照。
 func (s *Server) userSummary(name string) (map[string]any, error) {
-	reg := s.usersSnapshot()
-	e := reg.byName[name]
-	var u *store.User
-	if e == nil {
-		// 快照里没有（比如刚建还没同步）时退回库里查
-		var err error
-		if u, err = s.db.GetUser(name); err != nil || u == nil {
-			return nil, fmt.Errorf("用户 %q 不存在", name)
-		}
-	} else {
-		// 快照是运行期视图，配额/限流这类设置得看库里的权威值
-		var err error
-		if u, err = s.db.GetUser(name); err != nil || u == nil {
-			return nil, fmt.Errorf("用户 %q 不存在", name)
-		}
+	u, err := s.db.GetUser(name)
+	if err != nil || u == nil {
+		return nil, fmt.Errorf("用户 %q 不存在", name)
 	}
+	// 快照只给「哪些上游可用 / 模型范围」这类运行期视图，配额与限流一律读库里的
+	// 权威行（scope_quota，§2.7 规则 2）：users 行上已经没有这些列。
+	scope, err := policy.NewScopeRef(policy.ScopeUser, name)
+	if err != nil {
+		return nil, fmt.Errorf("用户 %q 的名字当不了范围键: %w", name, err)
+	}
+	q, err := s.db.GetScopeQuota(scope)
+	if err != nil {
+		return nil, err
+	}
+	if q == nil {
+		// 没有配额行 = 没配过限额，各项按「不限」（0）显示。
+		q = &store.ScopeQuota{Scope: scope}
+	}
+	e := s.usersSnapshot().byName[name]
 
 	// 本月「系统付费」用量：只有这部分进配额与金额
 	usedTokens, usedCost := s.meters.Snapshot(name)
@@ -163,15 +167,15 @@ func (s *Server) userSummary(name string) (map[string]any, error) {
 		"mode":       userMode(u),
 		"created_at": u.CreatedAt.Format(time.RFC3339),
 		"quota": map[string]any{
-			"month_tokens": u.QuotaMonthTokens,
-			"month_cost":   u.QuotaMonthCost,
+			"month_tokens": q.QuotaMonthTokens,
+			"month_cost":   q.QuotaMonthCost,
 			"used_tokens":  usedTokens,
 			"used_cost":    usedCost,
 			"currency":     s.pricingCurrency(),
 		},
 		"limits": map[string]any{
-			"rpm":            u.RPM,
-			"max_concurrent": u.MaxConcurrent,
+			"rpm":            q.RPM,
+			"max_concurrent": q.MaxConcurrent,
 		},
 		"usage_all": map[string]any{ // 全部流量（含用户自己上游的，不计配额）
 			"requests":     all.Requests,
@@ -265,44 +269,39 @@ func (s *Server) adminUpdateUser(w http.ResponseWriter, r *http.Request, name st
 			return
 		}
 	}
-	if req.QuotaMonthTokens != nil || req.QuotaMonthCost != nil {
-		tokens, cost := u.QuotaMonthTokens, u.QuotaMonthCost
-		if req.QuotaMonthTokens != nil {
-			if *req.QuotaMonthTokens < 0 {
-				writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "配额不能为负（0 = 不限）")
-				return
-			}
-			tokens = *req.QuotaMonthTokens
-		}
-		if req.QuotaMonthCost != nil {
-			if *req.QuotaMonthCost < 0 {
-				writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "金额配额不能为负（0 = 不限）")
-				return
-			}
-			cost = *req.QuotaMonthCost
-		}
-		if err := s.db.SetUserQuota(name, tokens, cost); err != nil {
-			writeJSONError(w, http.StatusInternalServerError, "internal", err.Error())
+	// 配额与限流都落在**范围配额行**上（§2.7 规则 2）：一次 PATCH 只交给 PatchScopeQuota，
+	// 避免「token 改了、金额被顺手清零」这种各写一半的事故。
+	if req.QuotaMonthTokens != nil || req.QuotaMonthCost != nil || req.RPM != nil || req.MaxConcurrent != nil {
+		// NewScopeRef 而不是 MustScope：老库里可能有改规则之前建的、当不了范围键的名字，
+		// 那种情况下要回 400 说清名字有问题，而不是 panic 掉这个请求。
+		scope, err := policy.NewScopeRef(policy.ScopeUser, name)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
+				fmt.Sprintf("用户 %q 的名字当不了范围键: %v", name, err))
 			return
 		}
-	}
-	if req.RPM != nil || req.MaxConcurrent != nil {
-		rpm, conc := u.RPM, u.MaxConcurrent
-		if req.RPM != nil {
-			if *req.RPM < 0 {
-				writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "rpm 不能为负（0 = 不限）")
+		patch := store.QuotaPatch{
+			Tokens:        req.QuotaMonthTokens,
+			Cost:          req.QuotaMonthCost,
+			RPM:           req.RPM,
+			MaxConcurrent: req.MaxConcurrent,
+		}
+		for _, item := range []struct {
+			label string
+			bad   bool
+		}{
+			{"配额", req.QuotaMonthTokens != nil && *req.QuotaMonthTokens < 0},
+			{"金额配额", req.QuotaMonthCost != nil && *req.QuotaMonthCost < 0},
+			{"rpm", req.RPM != nil && *req.RPM < 0},
+			{"并发上限", req.MaxConcurrent != nil && *req.MaxConcurrent < 0},
+		} {
+			if item.bad {
+				writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
+					item.label+"不能为负（0 = 不限）")
 				return
 			}
-			rpm = *req.RPM
 		}
-		if req.MaxConcurrent != nil {
-			if *req.MaxConcurrent < 0 {
-				writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "并发上限不能为负（0 = 不限）")
-				return
-			}
-			conc = *req.MaxConcurrent
-		}
-		if err := s.db.SetUserLimits(name, rpm, conc); err != nil {
+		if err := s.db.PatchScopeQuota(scope, patch); err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "internal", err.Error())
 			return
 		}

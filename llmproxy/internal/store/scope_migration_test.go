@@ -15,10 +15,10 @@ import (
 // 这两条都是回归测试：前一条曾经用 INSERT ... SELECT ... ON CONFLICT 写，
 // 在 SQLite 上是语法错误；后一条曾经只打印一句提示就继续改表。
 
-// seedUserQuotaRow 直接写 users 行，而不走 CreateUser / SetUserQuota。
+// seedUserQuotaRow 直接写 users 行，而不走 CreateUser。
 //
-// 回填读的输入是 users 表的裸列，走配额接口会顺手把 scope_quota 也写好（过渡期双写），
-// 那样就测不到「回填到底灌了哪几列」。
+// 回填读的输入是 users 表的裸列；CreateUser 会在同一事务里顺手补一行全 0 的 scope_quota，
+// 那样就测不到「回填到底灌了哪几列」—— 而回填把旧列的值搬错一格，只有在迁移结果里才看得见。
 func seedUserQuotaRow(t *testing.T, s *Store, name string, tokens int64, cost float64, at time.Time) {
 	t.Helper()
 	if _, err := s.db.Exec(`INSERT INTO users

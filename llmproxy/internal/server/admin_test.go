@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 	"github.com/mynet-club/net-tools/llmproxy/internal/store"
 )
 
@@ -25,12 +26,7 @@ func TestAdminListUsersShowsModeQuotaAndUsage(t *testing.T) {
 	h := newConsumptionHarness(t, stub, testPricing)
 	token := h.addUser(t, "carol")
 	setConsumption(t, h, "carol", "fast", "sys-model")
-	if err := h.db.SetUserQuota("carol", 1_000_000, 10); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.db.SetUserLimits("carol", 60, 4); err != nil {
-		t.Fatal(err)
-	}
+	setQuota(t, h, "carol", 1_000_000, 10, 60, 4)
 	if err := h.srv.SyncUsers(); err != nil {
 		t.Fatal(err)
 	}
@@ -111,12 +107,7 @@ func TestAdminListUsersShowsModeQuotaAndUsage(t *testing.T) {
 func TestAdminUpdateUserIsPartial(t *testing.T) {
 	h := newConsumptionHarness(t, newUsageStub(t, 0), testPricing)
 	h.addUser(t, "carol")
-	if err := h.db.SetUserQuota("carol", 500, 5); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.db.SetUserLimits("carol", 30, 2); err != nil {
-		t.Fatal(err)
-	}
+	setQuota(t, h, "carol", 500, 5, 30, 2)
 	if err := h.srv.SyncUsers(); err != nil {
 		t.Fatal(err)
 	}
@@ -139,11 +130,16 @@ func TestAdminUpdateUserIsPartial(t *testing.T) {
 	if !u.IsConsumption() {
 		t.Error("改配额不该把模式重置回 byo")
 	}
-	if u.QuotaMonthTokens != 42 || u.QuotaMonthCost != 5 {
-		t.Errorf("配额应只改 token 那一项: tokens=%d cost=%v", u.QuotaMonthTokens, u.QuotaMonthCost)
+	// 配额与限流读 scope_quota（§2.7 规则 2）：users 行上已经没有这些列。
+	q, err := h.db.GetScopeQuota(policy.MustScope(policy.ScopeUser, "carol"))
+	if err != nil || q == nil {
+		t.Fatalf("GetScopeQuota: %v", err)
 	}
-	if u.RPM != 30 || u.MaxConcurrent != 2 {
-		t.Errorf("限流不该被动到: rpm=%d conc=%d", u.RPM, u.MaxConcurrent)
+	if q.QuotaMonthTokens != 42 || q.QuotaMonthCost != 5 {
+		t.Errorf("配额应只改 token 那一项: tokens=%d cost=%v", q.QuotaMonthTokens, q.QuotaMonthCost)
+	}
+	if q.RPM != 30 || q.MaxConcurrent != 2 {
+		t.Errorf("限流不该被动到: rpm=%d conc=%d", q.RPM, q.MaxConcurrent)
 	}
 
 	// 非法输入要挡住

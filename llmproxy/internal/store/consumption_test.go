@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 )
 
 // 消费模式：设置项、模型映射、系统付费用量。
@@ -22,23 +24,28 @@ func TestConsumptionSettingsAndModels(t *testing.T) {
 	if u.Mode != ModeBYO {
 		t.Fatalf("新用户默认模式应为 byo，实际 %q", u.Mode)
 	}
-	if u.QuotaMonthTokens != 0 || u.QuotaMonthCost != 0 || u.RPM != 0 || u.MaxConcurrent != 0 {
-		t.Fatalf("新用户的配额与限流应为「不限」: %+v", u)
+	// 配额在 scope_quota（§2.7 规则 2）：CreateUser 同一事务里补的行，初值全 0 = 不限。
+	carol := policy.MustScope(policy.ScopeUser, "carol")
+	q := mustQuota(t, s, carol)
+	if q.QuotaMonthTokens != 0 || q.QuotaMonthCost != 0 || q.RPM != 0 || q.MaxConcurrent != 0 {
+		t.Fatalf("新用户的配额与限流应为「不限」: %+v", q)
 	}
 
 	if err := s.SetUserMode("carol", ModeConsumption); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetUserQuota("carol", 5_000_000, 12.5); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.SetUserLimits("carol", 30, 4); err != nil {
+	if err := s.SetScopeQuota(ScopeQuota{
+		Scope: carol, QuotaMonthTokens: 5_000_000, QuotaMonthCost: 12.5, RPM: 30, MaxConcurrent: 4, Enabled: true,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	u, _ = s.GetUser("carol")
-	if u.Mode != ModeConsumption || u.QuotaMonthTokens != 5_000_000 || u.QuotaMonthCost != 12.5 ||
-		u.RPM != 30 || u.MaxConcurrent != 4 {
-		t.Fatalf("设置没落库: %+v", u)
+	if u.Mode != ModeConsumption {
+		t.Fatalf("模式没落库: %+v", u)
+	}
+	if got := mustQuota(t, s, carol); got.QuotaMonthTokens != 5_000_000 || got.QuotaMonthCost != 12.5 ||
+		got.RPM != 30 || got.MaxConcurrent != 4 {
+		t.Fatalf("配额没落库: %+v", got)
 	}
 	if !u.IsConsumption() {
 		t.Fatal("IsConsumption 应为 true")

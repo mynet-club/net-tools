@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/config"
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 	"github.com/mynet-club/net-tools/llmproxy/internal/store"
 )
 
@@ -46,6 +47,54 @@ func userMode(paths config.Paths, rest []string) error {
 
 // ------------------------------------------------------------------ 配额与限流
 
+// userScopeOf 把用户名折成 (user, 名) 范围（§2.7 规则 3）。
+//
+// 用 NewScopeRef 而不是 MustScope：CLI 的输入来自命令行，名字里可能有非法字符，
+// 这里要给出「用户名的错」而不是 panic。CreateUser 建号时已经拦过一轮，
+// 但老库里可能存在改规则之前建的名字，报错信息得说清是这个名字当不了范围键。
+func userScopeOf(name string) (policy.ScopeRef, error) {
+	scope, err := policy.NewScopeRef(policy.ScopeUser, name)
+	if err != nil {
+		return policy.ScopeRef{}, fmt.Errorf("用户名 %q 不能用作范围键: %w", name, err)
+	}
+	return scope, nil
+}
+
+// quotaOfUser 读一个用户的配额与限流行。
+//
+// 缺行报错而不是按「不限」显示：store.Open 里的 scope 迁移保证每个用户都有一行，
+// 读不到说明库还没迁到 3.0。把这种状态显示成「没有额度限制」，
+// 管理员看到的就是一个假的「一切正常」。
+func quotaOfUser(db *store.Store, name string) (store.ScopeQuota, error) {
+	scope, err := userScopeOf(name)
+	if err != nil {
+		return store.ScopeQuota{}, err
+	}
+	q, err := db.GetScopeQuota(scope)
+	if err != nil {
+		return store.ScopeQuota{}, err
+	}
+	if q == nil {
+		return store.ScopeQuota{}, fmt.Errorf("用户 %s 没有 scope_quota 配额行（scope 迁移未完成）", name)
+	}
+	return *q, nil
+}
+
+// requireUser 确认用户存在。写配额之前必须先查这一步：
+// 配额行是按范围键 upsert 的，名字打错时 PatchScopeQuota 会照样给一个不存在的用户
+// 建出一行孤儿配额，而「每个 user 范围恰好一行配额」是收口校验要查的不变量 ——
+// 报错要在管理员面前报，不要把库改坏留到下次体检。
+func requireUser(db *store.Store, name string) error {
+	u, err := db.GetUser(name)
+	if err != nil {
+		return err
+	}
+	if u == nil {
+		return fmt.Errorf("用户 %q 不存在", name)
+	}
+	return nil
+}
+
 func userQuota(paths config.Paths, rest []string) error {
 	fs := flag.NewFlagSet("user quota", flag.ContinueOnError)
 	tokens := fs.Int64("tokens", -1, "每月 token 上限（0 = 不限）")
@@ -66,24 +115,30 @@ func userQuota(paths config.Paths, rest []string) error {
 	}
 	defer db.Close()
 
-	u, err := db.GetUser(name)
+	if err := requireUser(db, name); err != nil {
+		return err
+	}
+	scope, err := userScopeOf(name)
 	if err != nil {
 		return err
 	}
-	if u == nil {
-		return fmt.Errorf("用户 %q 不存在", name)
-	}
-	t, c := u.QuotaMonthTokens, u.QuotaMonthCost
+	// 只把「这次给到的那一项」交给 PatchScopeQuota：没给的项保持原值，
+	// 所以改 token 上限不会顺手把金额上限清零（那等于给用户放开额度）。
+	patch := store.QuotaPatch{}
 	if *tokens >= 0 {
-		t = *tokens
+		patch.Tokens = tokens
 	}
 	if *cost >= 0 {
-		c = *cost
+		patch.Cost = cost
 	}
-	if err := db.SetUserQuota(name, t, c); err != nil {
+	if err := db.PatchScopeQuota(scope, patch); err != nil {
 		return err
 	}
-	fmt.Printf("用户 %s 的月度配额：token %s，金额 %s\n", name, limitText(t), costText(c))
+	q, err := quotaOfUser(db, name)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("用户 %s 的月度配额：token %s，金额 %s\n", name, limitText(q.QuotaMonthTokens), costText(q.QuotaMonthCost))
 	fmt.Println("说明：配额只统计「走系统上游」的消耗；用户用自己的上游时不占额度。")
 	fmt.Println("      判定在请求之前做，属于软限额 —— 并发请求最多可能超出同时在飞的那几条。")
 	runningHint()
@@ -110,24 +165,28 @@ func userLimits(paths config.Paths, rest []string) error {
 	}
 	defer db.Close()
 
-	u, err := db.GetUser(name)
+	if err := requireUser(db, name); err != nil {
+		return err
+	}
+	scope, err := userScopeOf(name)
 	if err != nil {
 		return err
 	}
-	if u == nil {
-		return fmt.Errorf("用户 %q 不存在", name)
-	}
-	r, c := u.RPM, u.MaxConcurrent
+	patch := store.QuotaPatch{}
 	if *rpm >= 0 {
-		r = *rpm
+		patch.RPM = rpm
 	}
 	if *conc >= 0 {
-		c = *conc
+		patch.MaxConcurrent = conc
 	}
-	if err := db.SetUserLimits(name, r, c); err != nil {
+	if err := db.PatchScopeQuota(scope, patch); err != nil {
 		return err
 	}
-	fmt.Printf("用户 %s 的限流：%d 次/分钟，并发 %d\n", name, r, c)
+	q, err := quotaOfUser(db, name)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("用户 %s 的限流：%d 次/分钟，并发 %d\n", name, q.RPM, q.MaxConcurrent)
 	runningHint()
 	return nil
 }
@@ -266,10 +325,18 @@ func costText(v float64) string {
 }
 
 // printUserMode 打印模式、配额、限流与系统付费用量，供 user show 复用。
+//
+// 模式读 users 行（身份事实），配额与限流读 scope_quota 行（范围事实）——
+// §2.7 规则 2：这两件事各自只有一处真值，这里不能再去 users 的旧列里找。
 func printUserMode(db *store.Store, cfg *config.Config, u *store.User) {
 	fmt.Printf("  模式      %s\n", map[bool]string{true: "consumption（消费系统上游）", false: "byo（自带上游）"}[u.IsConsumption()])
-	fmt.Printf("  月度配额  token %s / 金额 %s\n", limitText(u.QuotaMonthTokens), costText(u.QuotaMonthCost))
-	fmt.Printf("  限流      %d 次/分钟，并发 %d\n", u.RPM, u.MaxConcurrent)
+	q, err := quotaOfUser(db, u.Name)
+	if err != nil {
+		fmt.Printf("  配额      %v\n", err)
+		return
+	}
+	fmt.Printf("  月度配额  token %s / 金额 %s\n", limitText(q.QuotaMonthTokens), costText(q.QuotaMonthCost))
+	fmt.Printf("  限流      %d 次/分钟，并发 %d\n", q.RPM, q.MaxConcurrent)
 
 	su, err := db.SystemUsageSince(u.Name, store.MonthStart(time.Now()))
 	if err != nil {

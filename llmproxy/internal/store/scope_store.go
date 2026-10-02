@@ -461,8 +461,8 @@ func scanScopeQuota(row interface{ Scan(...any) error }) (ScopeQuota, error) {
 
 // upsertScopeQuotaTx 在事务里按范围写入配额（0 = 不限，enabled 由调用方给）。
 //
-// 单独成函数是因为有两个写侧要用同一份 SQL：SetScopeQuota（3.0 主路径）与
-// CreateUser / 旧的用户配额写路径（过渡期镜像）。两处各写一遍就会有一处漏列。
+// 单独成函数是因为有两个写侧要用同一份 SQL：SetScopeQuota（唯一的配额写入口）与
+// CreateUser（建号同一事务里补的那一行）。两处各写一遍就会有一处漏列。
 func upsertScopeQuotaTx(tx *sql.Tx, d Dialect, q ScopeQuota) error {
 	if err := checkScope("写入 scope_quota", q.Scope); err != nil {
 		return err
@@ -511,48 +511,78 @@ func (s *Store) SetScopeQuota(q ScopeQuota) error {
 
 // GetScopeQuota 查某个范围的配额；没有行返回 (nil, nil)。
 //
-// 过渡期兜底：user 范围在 scope_quota 里没有行时，回读 users 表的那几列
-// （users 是 2.x 的唯一配额来源，迁移之前的老库只有它）。有了行就以 scope_quota 为准 ——
-// 两边同时存在却不一致时不猜，让写侧（SetUserQuota / SetScopeQuota 的双写）负责同步。
+// 「没行」与「限额为 0」是两件事，调用方必须区分：0 是管理员显式给的「不限」，
+// 而 nil 是这一行的配额从来没被配置过（org / project 范围尤其常见）。把 nil 当 0，
+// 等于让「未配置」在报表里显示成「额度为零」，反过来也一样糟。
 //
-// §2.7 规则 8：主线接线完成后，users 的配额列退休，这段兜底随之删除。
+// §2.7 规则 2/8：users 表的配额列不再是读路径 —— 一次性迁移会把它们回填进这张表，
+// 收口校验查的正是「每个 user 范围都有一行」。这里刻意**不留**回读 users 的兜底：
+// 兜底意味着两张表可以各持一半真值而没人报错，而配额决定的是「还花不花得起钱」。
 func (s *Store) GetScopeQuota(scope policy.ScopeRef) (*ScopeQuota, error) {
 	if err := checkScope("GetScopeQuota", scope); err != nil {
 		return nil, err
 	}
 	q, err := scanScopeQuota(s.queryRow(`SELECT `+scopeQuotaCols+` FROM scope_quota
 		WHERE scope_kind=? AND scope_id=?`, scopeArgs(scope)...))
-	if err == nil {
-		return &q, nil
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
+	if err != nil {
 		return nil, err
 	}
-	if scope.Kind != policy.ScopeUser {
-		return nil, nil
+	return &q, nil
+}
+
+// QuotaPatch 是「只改给到的那几项」的配额补丁：nil = 保持原值，0 = 不限。
+type QuotaPatch struct {
+	Tokens        *int64
+	Cost          *float64
+	RPM           *int
+	MaxConcurrent *int
+	Enabled       *bool
+}
+
+// PatchScopeQuota 读-改-写一个范围的配额与限流。
+//
+// 单独一个方法而不是让调用方自己 Get + Set：三个写侧（管理界面 PATCH、CLI 改配额、
+// CLI 改限流）都会各写一遍「缺行时从哪起步」，漏掉任何一遍都会把「这次没改的那一项」
+// 写成 0 = 不限 —— 管理员点一下改 token 上限，顺手清了同一个人的金额上限。
+//
+// 缺行按「全 0 = 不限、启用」起步：org / project 范围第一次设限走的就是这条路径，
+// 而 user 范围的行在一次性迁移与 CreateUser 里都会有，缺行属于异常，
+// 这里按「未配置」处理而不是报错，是为了让新范围的第一次配置不必先插空行。
+func (s *Store) PatchScopeQuota(scope policy.ScopeRef, p QuotaPatch) error {
+	if err := checkScope("PatchScopeQuota", scope); err != nil {
+		return err
 	}
-	var (
-		tokens           int64
-		cost             float64
-		rpm, concurrency int
-		enabled          int64
-	)
-	rowErr := s.queryRow(`SELECT quota_month_tokens, quota_month_cost, rpm, max_concurrent, enabled
-		FROM users WHERE name=?`, scope.ID).Scan(&tokens, &cost, &rpm, &concurrency, &enabled)
-	if errors.Is(rowErr, sql.ErrNoRows) {
-		return nil, nil
+	cur, err := s.GetScopeQuota(scope)
+	if err != nil {
+		return err
 	}
-	if rowErr != nil {
-		return nil, rowErr
+	if cur == nil {
+		cur = &ScopeQuota{Scope: scope, Enabled: true}
 	}
-	return &ScopeQuota{
-		Scope:            scope,
-		QuotaMonthTokens: tokens,
-		QuotaMonthCost:   cost,
-		RPM:              rpm,
-		MaxConcurrent:    concurrency,
-		Enabled:          enabled != 0,
-	}, nil
+	if p.Tokens != nil {
+		cur.QuotaMonthTokens = *p.Tokens
+	}
+	if p.Cost != nil {
+		cur.QuotaMonthCost = *p.Cost
+	}
+	if p.RPM != nil {
+		cur.RPM = *p.RPM
+	}
+	if p.MaxConcurrent != nil {
+		cur.MaxConcurrent = *p.MaxConcurrent
+	}
+	if p.Enabled != nil {
+		cur.Enabled = *p.Enabled
+	}
+	if cur.QuotaMonthTokens < 0 || cur.QuotaMonthCost < 0 || cur.RPM < 0 || cur.MaxConcurrent < 0 {
+		return fmt.Errorf("配额与限流不能为负（0 表示不限）: tokens=%d cost=%v rpm=%d concurrent=%d",
+			cur.QuotaMonthTokens, cur.QuotaMonthCost, cur.RPM, cur.MaxConcurrent)
+	}
+	cur.Scope = scope
+	return s.SetScopeQuota(*cur)
 }
 
 // ListScopeQuotas 按（类型, ID）稳定顺序返回全部范围配额。

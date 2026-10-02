@@ -25,8 +25,6 @@ type DB interface {
 	ListUsers() ([]User, error)
 	SetUserEnabled(name string, enabled bool) error
 	SetUserMode(name, mode string) error
-	SetUserQuota(name string, tokens int64, cost float64) error
-	SetUserLimits(name string, rpm, maxConcurrent int) error
 	SetUserToken(name, tokenHash string) error
 	DeleteUser(name string) error
 	Revision() (int64, error)
@@ -62,8 +60,10 @@ type DB interface {
 	// UserPrice 结构一起删除，调用方改用下面那组 ScopePrice*。
 	// SaveProviderStatus / LoadProviderStatus 与 ProviderStatus.Scope 同理
 	// （换成 ProviderBucketState），审计的 Audit/AuditRecent 换成 AuditScope/AuditRecentByScope，
-	// 配额侧的 SetUserQuota/SetUserLimits 换成 SetScopeQuota，
 	// 用量侧的 UsageByUser/TotalByUser/SystemUsageSince/SystemUsageRowsSince 换成 Scope* 那组。
+	//
+	// 配额侧已经没有遗留项可删了：2.x 的 SetUserQuota/SetUserLimits 与「读不到配额行就
+	// 回读 users 额度列」的兜底随规则 8 一起删掉，写侧只剩 SetScopeQuota/PatchScopeQuota。
 	InsertProviderPrice(p *ProviderPrice) error
 	ProviderPriceAt(provider, upstreamModel string, t time.Time) (*ProviderPrice, error)
 	ProviderPricesEffective(t time.Time) ([]ProviderPrice, error)
@@ -95,6 +95,7 @@ type DB interface {
 
 	// 配额与限流：按范围
 	SetScopeQuota(q ScopeQuota) error
+	PatchScopeQuota(scope policy.ScopeRef, p QuotaPatch) error
 	GetScopeQuota(scope policy.ScopeRef) (*ScopeQuota, error)
 	ListScopeQuotas() ([]ScopeQuota, error)
 	DeleteScopeQuota(scope policy.ScopeRef) (bool, error)

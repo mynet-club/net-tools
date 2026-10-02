@@ -732,15 +732,23 @@ func printUsageAndQuota(db *store.Store, now time.Time, pricing *config.PricingC
 		}
 		fmt.Printf("  %-12s %-26s token %s  金额 ¥%s\n",
 			u.Name, mode, humanCount(tokens), humanMoney(cost))
+		// 配额读 scope_quota（§2.7 规则 2）：users 行上已经没有额度列了。
+		// 读不出来就明说读不出来 —— 这行是给管理员判断「还放不放得出量」用的，
+		// 把缺行显示成「不限」是最糟的一种安静失败。
+		q, err := quotaOfUser(db, u.Name)
+		if err != nil {
+			fmt.Printf("             配额: %v\n", err)
+			continue
+		}
 		qt := "token 不限"
-		if u.QuotaMonthTokens > 0 {
-			qt = fmt.Sprintf("token 上限 %s（剩 %s）", humanCount(u.QuotaMonthTokens),
-				humanCount(u.QuotaMonthTokens-tokens))
+		if q.QuotaMonthTokens > 0 {
+			qt = fmt.Sprintf("token 上限 %s（剩 %s）", humanCount(q.QuotaMonthTokens),
+				humanCount(q.QuotaMonthTokens-tokens))
 		}
 		qc := "金额 不限"
-		if u.QuotaMonthCost > 0 {
-			qc = fmt.Sprintf("金额上限 ¥%s（剩 ¥%s）", humanMoney(u.QuotaMonthCost),
-				humanMoney(u.QuotaMonthCost-cost))
+		if q.QuotaMonthCost > 0 {
+			qc = fmt.Sprintf("金额上限 ¥%s（剩 ¥%s）", humanMoney(q.QuotaMonthCost),
+				humanMoney(q.QuotaMonthCost-cost))
 		}
 		fmt.Printf("             配额: %s  %s\n", qt, qc)
 	}
