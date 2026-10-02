@@ -40,6 +40,13 @@ type Config struct {
 	ConfigPath string   `yaml:"-"`
 	Warnings   []string `yaml:"-"`
 
+	// SchemaVersion 是**配置文件结构**版本（§3.0），与策略内容版本
+	// （policy bundle 的 id@version）是两码事：前者只管加载与迁移校验，
+	// 后者才进路由决策、审计和回放。缺省按 2 处理，现存配置一行都不用改。
+	SchemaVersion *int `yaml:"config_schema_version"`
+	// Policy 是 3.0 接线块（shadow/enforce/legacy + 生效的策略包引用）。
+	Policy PolicyConfig `yaml:"policy"`
+
 	Server    ServerConfig   `yaml:"server"`
 	Routing   RoutingConfig  `yaml:"routing"`
 	Proxies   []ProxyDef     `yaml:"proxies"`
@@ -507,6 +514,10 @@ type LoadOptions struct {
 	// start / service 安装必须用严格模式；status / providers / stats / logs 等只读命令
 	// 用宽松模式，否则没 export 环境变量就连状态都看不了。
 	Strict bool
+	// KnownScopes 是目录提供的「已知规范范围」集合，用来 lint policy.bundles 的
+	// 范围值（organization:/project: 拼错会让那条策略永不生效，而审计看不出来）。
+	// 留 nil 表示本次加载没有目录可对照 —— 只跳过 lint，不降级任何校验。
+	KnownScopes KnownScopes
 }
 
 func LoadFile(path string) (*Config, error) {
@@ -795,7 +806,34 @@ func (c *Config) normalize(opts LoadOptions) error {
 		c.Log.Keep = 5
 	}
 
-	return nil
+	// 配置结构版本 + 3.0 接线块（见 policy30.go）。
+	if err := c.normalizeSchemaVersion(); err != nil {
+		return err
+	}
+	return c.Policy.normalize(opts.KnownScopes, &c.Warnings)
+}
+
+// normalizeSchemaVersion 校验 config_schema_version 并定下缺省值。
+//
+// 只接受 2 与 3：比二进制新的结构版本必须拒绝加载，而不是「不认识的就忽略」——
+// 忽略未知字段在 KnownFields(true) 下已经不可能，但版本号写在前面，
+// 让「升级顺序错了」（先改配置后升二进制）这件事在启动第一行就炸掉。
+func (c *Config) normalizeSchemaVersion() error {
+	if c.SchemaVersion == nil {
+		v := SchemaVersionLegacy
+		c.SchemaVersion = &v
+		return nil
+	}
+	switch *c.SchemaVersion {
+	case SchemaVersionLegacy, SchemaVersion3:
+		return nil
+	}
+	if *c.SchemaVersion < SchemaVersionLegacy {
+		return fmt.Errorf("config_schema_version 需要是 %d 或 %d，当前是 %d（1 之前的配置没有结构版本，请按 v2.5 的示例配置重写）",
+			SchemaVersionLegacy, SchemaVersion3, *c.SchemaVersion)
+	}
+	return fmt.Errorf("config_schema_version=%d 比本二进制支持的 %d 更新，先升级 llmproxy 再改配置",
+		*c.SchemaVersion, SchemaVersion3)
 }
 
 func normalizeProxyRef(raw string, index map[string]ProxyDef, where string) (ProxyRef, error) {

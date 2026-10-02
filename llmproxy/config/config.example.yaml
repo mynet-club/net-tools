@@ -104,3 +104,35 @@ log:
   level: info          # debug | info | warn | error
   max_mb: 10           # 单个日志文件上限
   keep: 5              # 轮转保留份数
+
+# ============================ 3.0 接线（§3.0）============================
+# 下面这一段全部注释掉 = 3.0 不参与，请求走原有的 provider 路由（legacy）。
+# 升级二进制不需要动配置文件：整段缺省就是 legacy，行为与 2.x 完全一致。
+#
+# config_schema_version 是**配置文件结构**版本（只用于加载与迁移校验，
+# 现在支持 2 与 3）；它和策略内容版本（bundle 的 id@version）是两码事 ——
+# 后者才进路由决策、审计和回放。写一个比本二进制更高的结构版本会直接拒绝启动，
+# 这是刻意的：先升程序再改配置，反过来会让新字段被静默忽略。
+# config_schema_version: 3
+# policy:
+#   # shadow = 旁路影子运行：解析身份、策略与候选计划，记录差异和耗时，
+#   #          但**不改变**实际 provider、不读正文、不碰计量/熔断/粘性/供应商状态。
+#   #          影子模式同样产出 policy version，否则事后没法复现「当时算出了什么」。
+#   # enforce = 允许新策略影响路由与处理器。
+#   # legacy = 完全沿用现有 provider 路由。
+#   mode: shadow
+#   # 3.0 算不出可用计划时是否回落旧路由。缺省 true —— §3.0 要求
+#   # 「任何新路径都必须可以按 scope 回滚到 legacy」。
+#   # 显式 false 是 fail-closed 决定：新路径没计划就直接失败。
+#   # 注意 shadow 下这个开关没有作用点（影子本来就不改路由），写了会报错。
+#   fallback_to_legacy: true
+#   # 生效的是哪一版策略。审计与回放里的 policy_version 就是这里的 id@version，
+#   # 唯一来源是实际加载的 bundle，不允许 handler 临时拼。
+#   active_bundle: university-default-v1
+#   # bundles 只是**引用**（生效范围 + 版本号）；授权内容（entitlements）
+#   # 由管理面（策略发布/回滚）持有。两边都写内容就会出现两个真值来源，
+#   # 回滚时互相打脸。
+#   bundles:
+#     - id: university-default-v1
+#       version: 1                   # 从 1 起；0 分不清「没填」和「第 0 版」
+#       scope: organization:university   # 必须写成 kind:id（user|organization|project|system）
