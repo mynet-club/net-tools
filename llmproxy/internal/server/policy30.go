@@ -473,7 +473,7 @@ func (g policyGate) Allows(ctx policy.PolicyContext, chain policy.ScopeChain,
 // 它和真实选路共用同一份 bucketize/priorityTiers 分类，抄一份档序表就会出现
 // 「影子算的次序和线上走的次序不是一回事」这种根本没法解读的差异报告。
 func (s *Server) policyOffers(scope string, providers []config.Provider, model string, now time.Time) (routing.Offers, error) {
-	tiers := s.router.PlanFor(scope, providers, model)
+	tiers := s.router.PlanFor(userBucket(scope), providers, model)
 	byName := make(map[string]providerFacts, len(providers))
 	for i := range providers {
 		p := &providers[i]
@@ -484,7 +484,7 @@ func (s *Server) policyOffers(scope string, providers []config.Provider, model s
 		byName[p.Name] = providerFacts{upstream: up, weight: p.Weight,
 			declared: p.Declares(model), maxLevel: p.DataLevelCeiling()}
 	}
-	states := s.router.SnapshotFor(scope)
+	states := s.router.SnapshotFor(userBucket(scope))
 
 	seen := map[string]bool{}
 	offers := make(routing.Offers, 0, len(providers))
@@ -642,7 +642,7 @@ func namesOf(providers []config.Provider) string {
 //
 // 档内按权重随机，所以首选是**一组**而不是一个 —— 拿单个随机结果去比会天天「不一致」。
 func (s *Server) legacyFirstTier(scope string, providers []config.Provider, model string) []string {
-	for _, group := range s.router.PlanFor(scope, providers, model) {
+	for _, group := range s.router.PlanFor(userBucket(scope), providers, model) {
 		if len(group.Providers) == 0 {
 			continue
 		}

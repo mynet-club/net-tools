@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/config"
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 )
 
 // State 是单个供应商的运行期状态，跨配置热重载按 name 保留。
@@ -24,21 +25,26 @@ type State struct {
 
 // Router 持有当前配置的供应商列表与各自的运行期状态。
 //
-// 状态按「作用域」分桶：全局作用域（""）对应配置文件里的供应商，
-// 每个用户名是一个独立作用域，对应用户自带的上游。这样熔断天然隔离 ——
+// 状态按「作用域」分桶：全局作用域（system:global）对应配置文件里的供应商，
+// 每个用户范围是一个独立作用域，对应用户自带的上游。这样熔断天然隔离 ——
 // 一个用户把自己的上游打成 429，不会摘掉别人的同名上游。
+//
+// 桶键就是 §2.7 规则 4 的那个三元组的前两元（scope_kind, scope_id）+ 供应商名，
+// 与 provider_stats 的列一一对应，中间没有「拼成字符串再解析回来」那一步。
 type Router struct {
 	mu        sync.Mutex
 	routing   config.RoutingConfig
 	providers []config.Provider
-	scoped    map[string]map[string]*State // 作用域 → 供应商名 → 状态
+	scoped    map[policy.ScopeRef]map[string]*State // 作用域 → 供应商名 → 状态
 	rnd       *rand.Rand
 	now       func() time.Time
 }
 
 // ScopedState 是一条带作用域的状态，用于在 Router 与持久化之间搬运。
+//
+// 字段与 store.ProviderBucketState 同形：搬运是逐字段赋值，不是编解码。
 type ScopedState struct {
-	Scope string
+	Scope policy.ScopeRef
 	Name  string
 	State State
 }
@@ -47,18 +53,18 @@ func New(routing config.RoutingConfig, providers []config.Provider) *Router {
 	r := &Router{
 		routing:   routing,
 		providers: append([]config.Provider(nil), providers...),
-		scoped:    map[string]map[string]*State{"": {}},
+		scoped:    map[policy.ScopeRef]map[string]*State{policy.SystemScope: {}},
 		rnd:       rand.New(rand.NewSource(time.Now().UnixNano())),
 		now:       time.Now,
 	}
 	for _, p := range providers {
-		r.scoped[""][p.Name] = &State{}
+		r.scoped[policy.SystemScope][p.Name] = &State{}
 	}
 	return r
 }
 
 // stateLocked 取某个作用域下某供应商的状态；不存在则创建一个。调用方须持锁。
-func (r *Router) stateLocked(scope, name string) *State {
+func (r *Router) stateLocked(scope policy.ScopeRef, name string) *State {
 	m, ok := r.scoped[scope]
 	if !ok {
 		m = map[string]*State{}
@@ -73,8 +79,8 @@ func (r *Router) stateLocked(scope, name string) *State {
 }
 
 // ForgetScope 丢弃某个作用域的全部状态（用户被删或不再有上游时调用）。
-func (r *Router) ForgetScope(scope string) {
-	if scope == "" {
+func (r *Router) ForgetScope(scope policy.ScopeRef) {
+	if scope == policy.SystemScope {
 		return // 全局作用域由 ApplyConfig 管理
 	}
 	r.mu.Lock()
@@ -89,7 +95,7 @@ func (r *Router) ApplyConfig(routing config.RoutingConfig, providers []config.Pr
 	defer r.mu.Unlock()
 	r.routing = routing
 	r.providers = append([]config.Provider(nil), providers...)
-	prev := r.scoped[""]
+	prev := r.scoped[policy.SystemScope]
 	next := make(map[string]*State, len(providers))
 	for _, p := range providers {
 		if s, ok := prev[p.Name]; ok {
@@ -98,7 +104,7 @@ func (r *Router) ApplyConfig(routing config.RoutingConfig, providers []config.Pr
 			next[p.Name] = &State{}
 		}
 	}
-	r.scoped[""] = next
+	r.scoped[policy.SystemScope] = next
 }
 
 // Providers 返回当前供应商列表的副本。
@@ -147,7 +153,7 @@ func (r *Router) Pick(model string, exclude map[string]bool) (*Candidate, error)
 	r.mu.Lock()
 	providers := append([]config.Provider(nil), r.providers...)
 	r.mu.Unlock()
-	return r.PickFrom("", providers, model, exclude)
+	return r.PickFrom(policy.SystemScope, providers, model, exclude)
 }
 
 // PickFrom 按权重随机挑选一个承接 model 的供应商，排除 exclude 中的名字。
@@ -159,7 +165,7 @@ func (r *Router) Pick(model string, exclude map[string]bool) (*Candidate, error)
 //   - 连续失败达到 threshold 后，该供应商被摘除 cooldownSeconds
 //   - 优先在"健康"供应商中按权重随机
 //   - 若一个健康供应商都没有，则在全部候选中按权重随机（宁可重试也不要硬失败）
-func (r *Router) PickFrom(scope string, candidates []config.Provider, model string, exclude map[string]bool) (*Candidate, error) {
+func (r *Router) PickFrom(scope policy.ScopeRef, candidates []config.Provider, model string, exclude map[string]bool) (*Candidate, error) {
 	return r.PickFromPreferring(scope, candidates, model, exclude, "")
 }
 
@@ -193,7 +199,7 @@ type buckets struct{ explHealthy, explAll, fbHealthy, fbAll []scored }
 // 选路（PickFromPreferring）与界面展示（PlanFor）共用这一份分类，两边的次序不会走偏 ——
 // 「界面上写的顺序」就是「真实会走的顺序」，这是这个函数存在的全部理由。
 // exclude 传 nil 表示不做排除（展示场景）。
-func (r *Router) bucketize(scope string, candidates []config.Provider, model string, exclude map[string]bool) (own, sys buckets) {
+func (r *Router) bucketize(scope policy.ScopeRef, candidates []config.Provider, model string, exclude map[string]bool) (own, sys buckets) {
 	now := r.now()
 	// 先看这个模型有没有**启用中**的点名映射（exclude 也算：重试排除的那家
 	// 映射还在，不该因此放万能匹配进来）。有就只走映射，没有才用通配。
@@ -323,7 +329,7 @@ func priorityOrder(own, sys buckets) [][]scored {
 // 给界面用：「我的模型」里要能看清这个模型先走哪家、再走哪家。档序取自
 // priorityTiers（与真实选路同一份定义），所以界面上看到的次序就是实际会走的次序。
 // 同一档内部的成员是**按权重随机 + 会话粘性**，不分先后，所以档内不再排序。
-func (r *Router) PlanFor(scope string, candidates []config.Provider, model string) []Tier {
+func (r *Router) PlanFor(scope policy.ScopeRef, candidates []config.Provider, model string) []Tier {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -383,7 +389,7 @@ type PlanEntry struct {
 	Healthy       bool
 }
 
-func (r *Router) PickFromPreferring(scope string, candidates []config.Provider, model string, exclude map[string]bool, prefer string) (*Candidate, error) {
+func (r *Router) PickFromPreferring(scope policy.ScopeRef, candidates []config.Provider, model string, exclude map[string]bool, prefer string) (*Candidate, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -436,7 +442,7 @@ func (r *Router) PickFromPreferring(scope string, candidates []config.Provider, 
 //
 // 只读、不创建状态 —— 规则 B 的路由排序要用它跳过正在冷却的家，
 // 而"看一眼"不该给没跑过的供应商建一条记录。
-func (r *Router) Cooling(scope, name string) bool {
+func (r *Router) Cooling(scope policy.ScopeRef, name string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	m, ok := r.scoped[scope]
@@ -455,7 +461,7 @@ func (r *Router) Cooling(scope, name string) bool {
 // 给 402 / 429 这类**明确的额度或限流信号**用：它们不需要攒够次数，
 // 一次就该让这家让位（次便宜的顶上），否则规则 B 会一遍遍把请求送到已经没额度的家。
 // 冷却只延长不缩短：已有更晚的恢复时间就保留。
-func (r *Router) CoolFor(scope, name string, d time.Duration) {
+func (r *Router) CoolFor(scope policy.ScopeRef, name string, d time.Duration) {
 	if d <= 0 {
 		return
 	}
@@ -469,10 +475,10 @@ func (r *Router) CoolFor(scope, name string, d time.Duration) {
 }
 
 // ReportSuccess 是 ReportSuccessFor 在全局作用域上的快捷方式。
-func (r *Router) ReportSuccess(name string) { r.ReportSuccessFor("", name) }
+func (r *Router) ReportSuccess(name string) { r.ReportSuccessFor(policy.SystemScope, name) }
 
 // ReportSuccessFor 重置连续失败计数并解除熔断。
-func (r *Router) ReportSuccessFor(scope, name string) {
+func (r *Router) ReportSuccessFor(scope policy.ScopeRef, name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	st := r.stateLocked(scope, name)
@@ -484,11 +490,13 @@ func (r *Router) ReportSuccessFor(scope, name string) {
 }
 
 // ReportFailure 是 ReportFailureFor 在全局作用域上的快捷方式。
-func (r *Router) ReportFailure(name string, err error) { r.ReportFailureFor("", name, err) }
+func (r *Router) ReportFailure(name string, err error) {
+	r.ReportFailureFor(policy.SystemScope, name, err)
+}
 
 // ReportFailureFor 累加连续失败；达到阈值后进入冷却。
 // 返回值表示「这一次失败刚刚把该供应商压进冷却」—— 观测指标用它数熔断次数。
-func (r *Router) ReportFailureFor(scope, name string, err error) (enteredCooldown bool) {
+func (r *Router) ReportFailureFor(scope policy.ScopeRef, name string, err error) (enteredCooldown bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	st := r.stateLocked(scope, name)
@@ -512,10 +520,10 @@ func (r *Router) ReportFailureFor(scope, name string, err error) (enteredCooldow
 }
 
 // Snapshot 是 SnapshotFor 在全局作用域上的快捷方式。
-func (r *Router) Snapshot() map[string]State { return r.SnapshotFor("") }
+func (r *Router) Snapshot() map[string]State { return r.SnapshotFor(policy.SystemScope) }
 
 // SnapshotFor 返回某个作用域下全部供应商状态的副本。
-func (r *Router) SnapshotFor(scope string) map[string]State {
+func (r *Router) SnapshotFor(scope policy.ScopeRef) map[string]State {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	out := make(map[string]State)
@@ -541,10 +549,10 @@ func (r *Router) SnapshotAll() []ScopedState {
 // RestoreScoped 从持久化恢复全部作用域的状态（重启后继续熔断）。
 // 已存在的作用域按名字覆盖，新作用域按需创建。
 //
-// 这是**唯一**的恢复入口：状态是按 (作用域, 供应商) 分桶的，全局池是 ""、
-// 每个用户自己的上游是用户名。曾经还有一个只写全局作用域的 RestoreState，
-// 生产代码调了它，于是用户级熔断重启即丢、还在库里长出名叫 "alice/my-up"
-// 的幽灵条目 —— 那个 API 已经删掉，让编译器杜绝重犯。
+// 这是**唯一**的恢复入口：状态是按 (作用域, 供应商) 分桶的，全局池是
+// system:global、每个用户自己的上游是 user:<用户名>。曾经还有一个只写全局作用域的
+// RestoreState，生产代码调了它，于是用户级熔断重启即丢、还在库里长出名叫
+// "alice/my-up" 的幽灵条目 —— 那个 API 已经删掉，让编译器杜绝重犯。
 func (r *Router) RestoreScoped(list []ScopedState) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

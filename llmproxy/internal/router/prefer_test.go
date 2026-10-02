@@ -18,7 +18,7 @@ func TestPreferringHonorsNamedProvider(t *testing.T) {
 		mapped("beta", 1, map[string]string{"m": "beta-up"}),
 	})
 	for i := 0; i < 300; i++ {
-		c, err := r.PickFromPreferring("", r.providers, "m", nil, "beta")
+		c, err := r.PickFromPreferring(scopeGlobal, r.providers, "m", nil, "beta")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -40,7 +40,7 @@ func TestPreferringEmptyIsPlainPick(t *testing.T) {
 	})
 	seen := map[string]int{}
 	for i := 0; i < 200; i++ {
-		c, err := r.PickFromPreferring("", r.providers, "m", nil, "")
+		c, err := r.PickFromPreferring(scopeGlobal, r.providers, "m", nil, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -61,7 +61,7 @@ func TestPreferringIgnoredWhenUnavailable(t *testing.T) {
 		disabled,
 	})
 	for i := 0; i < 50; i++ {
-		c, err := r.PickFromPreferring("", r.providers, "m", nil, "beta")
+		c, err := r.PickFromPreferring(scopeGlobal, r.providers, "m", nil, "beta")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -75,7 +75,7 @@ func TestPreferringIgnoredWhenUnavailable(t *testing.T) {
 		mapped("alpha", 1, map[string]string{"m": "m"}),
 		mapped("beta", 1, map[string]string{"other": "other"}),
 	})
-	c, err := r2.PickFromPreferring("", r2.providers, "m", nil, "beta")
+	c, err := r2.PickFromPreferring(scopeGlobal, r2.providers, "m", nil, "beta")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +90,7 @@ func TestPreferringIgnoredWhenExcluded(t *testing.T) {
 		mapped("alpha", 1, map[string]string{"m": "m"}),
 		mapped("beta", 1, map[string]string{"m": "m"}),
 	})
-	c, err := r.PickFromPreferring("", r.providers, "m", map[string]bool{"beta": true}, "beta")
+	c, err := r.PickFromPreferring(scopeGlobal, r.providers, "m", map[string]bool{"beta": true}, "beta")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +112,7 @@ func TestPreferringDriftsWhenPreferredIsCooling(t *testing.T) {
 	r.ReportFailure("beta", errors.New("boom")) // 把点名的那家打进冷却
 
 	for i := 0; i < 50; i++ {
-		c, err := r.PickFromPreferring("", r.providers, "m", nil, "beta")
+		c, err := r.PickFromPreferring(scopeGlobal, r.providers, "m", nil, "beta")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -133,7 +133,7 @@ func TestPreferringDoesNotBypassDeclaredPriority(t *testing.T) {
 		passthrough("beta", 1),
 	})
 	for i := 0; i < 200; i++ {
-		c, err := r.PickFromPreferring("", r.providers, "m", nil, "beta")
+		c, err := r.PickFromPreferring(scopeGlobal, r.providers, "m", nil, "beta")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -150,7 +150,7 @@ func TestPreferringWorksWithinFallbackPool(t *testing.T) {
 		passthrough("gamma", 1),
 	})
 	for i := 0; i < 100; i++ {
-		c, err := r.PickFromPreferring("", r.providers, "没人声明过的名字", nil, "gamma")
+		c, err := r.PickFromPreferring(scopeGlobal, r.providers, "没人声明过的名字", nil, "gamma")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -177,7 +177,7 @@ func TestPreferringDoesNotStickWhenInPoolButUnhealthy(t *testing.T) {
 
 	seen := map[string]int{}
 	for i := 0; i < 300; i++ {
-		c, err := r.PickFromPreferring("", r.providers, "m", nil, "beta")
+		c, err := r.PickFromPreferring(scopeGlobal, r.providers, "m", nil, "beta")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -197,21 +197,21 @@ func TestCoolForAndCooling(t *testing.T) {
 		passthrough("a", 1),
 		passthrough("b", 1),
 	})
-	if r.Cooling("", "a") {
+	if r.Cooling(scopeGlobal, "a") {
 		t.Fatal("初始不该在冷却")
 	}
-	r.CoolFor("", "a", 5*time.Minute)
-	if !r.Cooling("", "a") {
+	r.CoolFor(scopeGlobal, "a", 5*time.Minute)
+	if !r.Cooling(scopeGlobal, "a") {
 		t.Fatal("CoolFor 之后应当在冷却")
 	}
 	// 只延长不缩短：再用一个更短的，恢复时间不能被拉前
-	before := r.SnapshotFor("")["a"].UnhealthyUntil
-	r.CoolFor("", "a", time.Second)
-	if got := r.SnapshotFor("")["a"].UnhealthyUntil; !got.Equal(before) {
+	before := r.SnapshotFor(scopeGlobal)["a"].UnhealthyUntil
+	r.CoolFor(scopeGlobal, "a", time.Second)
+	if got := r.SnapshotFor(scopeGlobal)["a"].UnhealthyUntil; !got.Equal(before) {
 		t.Errorf("更短的冷却不该把恢复时间拉前：%s → %s", before, got)
 	}
 	// 作用域隔离：别的 scope 不受影响
-	if r.Cooling("other", "a") {
+	if r.Cooling(scopeOther, "a") {
 		t.Error("别的 scope 不该被牵连")
 	}
 	// 冷却中的 a 会被选路跳过
@@ -225,8 +225,8 @@ func TestCoolForAndCooling(t *testing.T) {
 		}
 	}
 	// 冷却时长为 0 或负数 = 什么都不做
-	r.CoolFor("", "b", 0)
-	if r.Cooling("", "b") {
+	r.CoolFor(scopeGlobal, "b", 0)
+	if r.Cooling(scopeGlobal, "b") {
 		t.Error("CoolFor(0) 不该压冷却")
 	}
 }

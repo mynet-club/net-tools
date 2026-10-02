@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 )
 
 // 连接级参数必须对**每一条**连接生效，而不只是对跑过 schema 的那一条。
@@ -60,8 +62,8 @@ func TestOpenHandlesAwkwardPaths(t *testing.T) {
 				t.Errorf("数据库文件没落在 %q: %v", path, err)
 			}
 			// 并且确实可写
-			if err := s.SaveProviderStatus([]ProviderStatus{
-				{Name: "p", Enabled: true, TotalRequests: 1},
+			if err := s.SaveProviderBucketStates([]ProviderBucketState{
+				{Scope: policy.SystemScope, Name: "p", Enabled: true, TotalRequests: 1},
 			}); err != nil {
 				t.Errorf("写不进去: %v", err)
 			}

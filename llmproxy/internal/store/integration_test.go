@@ -18,6 +18,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 )
 
 // integrationCase 是一组「换任何驱动都必须成立」的操作。
@@ -106,18 +108,19 @@ func runIntegrationSuite(t *testing.T, driver, pathOrDSN string) {
 	}
 
 	// 熔断状态
-	if err := s.SaveProviderStatus([]ProviderStatus{
-		{Scope: uid, Name: "up", Enabled: true, ConsecutiveFailures: 2},
+	uidScope := policy.MustScope(policy.ScopeUser, uid)
+	if err := s.SaveProviderBucketStates([]ProviderBucketState{
+		{Scope: uidScope, Name: "up", Enabled: true, ConsecutiveFailures: 2},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	sts, err := s.LoadProviderStatus()
+	sts, err := s.LoadProviderBucketStates()
 	if err != nil {
 		t.Fatal(err)
 	}
 	found := false
 	for _, st := range sts {
-		if st.Scope == uid && st.Name == "up" && st.ConsecutiveFailures == 2 {
+		if st.Scope == uidScope && st.Name == "up" && st.ConsecutiveFailures == 2 {
 			found = true
 		}
 	}

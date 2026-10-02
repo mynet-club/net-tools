@@ -58,10 +58,12 @@ type DB interface {
 	// HasEffectiveUserPrices，以及 ScopeDefault / ScopeUser 两个常量）
 	// 是 2.x 的 'default' / 'user:<名>' 前缀适配层，主线接线完成后连同
 	// UserPrice 结构一起删除，调用方改用下面那组 ScopePrice*。
-	// SaveProviderStatus / LoadProviderStatus 与 ProviderStatus.Scope 同理
-	// （换成 ProviderBucketState）。审计侧已经收干净了：无范围的 Audit/AuditRecent
-	// 已删除，写侧只剩 AuditScope，读侧三条都返回带范围的条目。
 	// 用量侧的 UsageByUser/TotalByUser/SystemUsageSince/SystemUsageRowsSince 换成 Scope* 那组。
+	//
+	// 已经收干净的两块：审计（无范围的 Audit/AuditRecent 已删，写侧只剩 AuditScope，
+	// 读侧三条都返回带范围的条目）；熔断（ProviderStatus/SaveProviderStatus/
+	// LoadProviderStatus 随规则 8 删除，桶状态只有 ProviderBucketState 一种形状，
+	// 键就是 (scope_kind, scope_id, provider)）。
 	//
 	// 配额侧已经没有遗留项可删了：2.x 的 SetUserQuota/SetUserLimits 与「读不到配额行就
 	// 回读 users 额度列」的兜底随规则 8 一起删掉，写侧只剩 SetScopeQuota/PatchScopeQuota。
@@ -74,10 +76,6 @@ type DB interface {
 	UserPricesEffective(t time.Time) ([]UserPrice, error)
 	ListUserPrices(scope, model string) ([]UserPrice, error)
 	HasEffectiveUserPrices(userName string, t time.Time) (bool, error)
-
-	// ── 熔断状态 ───────────────────────────────────────────────
-	SaveProviderStatus(statuses []ProviderStatus) error
-	LoadProviderStatus() ([]ProviderStatus, error)
 
 	// ── 3.0 结构化 scope API（§2.7：新增的唯一入口，一律收 policy.ScopeRef/ScopeChain）──
 	// 路由桶 (scope_kind, scope_id, provider) 的熔断状态

@@ -72,7 +72,7 @@ func (s *Server) adminUsersRoute(w http.ResponseWriter, r *http.Request, tail st
 				writeJSONError(w, http.StatusNotFound, "not_found", err.Error())
 				return
 			}
-			s.router.ForgetScope(name)
+			s.router.ForgetScope(userBucket(name))
 			if s.meters != nil {
 				s.meters.Forget(name)
 			}
@@ -482,7 +482,7 @@ func (s *Server) adminListSystemProviders(w http.ResponseWriter, r *http.Request
 		writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error", "只支持 GET")
 		return
 	}
-	snap := s.router.SnapshotFor("")
+	snap := s.router.SnapshotFor(policy.SystemScope)
 	cfg := s.cfgStore.Current()
 	out := make([]map[string]any, 0, len(cfg.Normalized))
 	for _, p := range cfg.Normalized {

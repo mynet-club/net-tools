@@ -81,25 +81,6 @@ type RequestRecord struct {
 	CandidatesDigest string
 }
 
-// ProviderStatus 是持久化的供应商运行期状态（2.x 的旧形状）。
-//
-// Scope 是旧字符串约定：空串 = 全局配置里的供应商，否则是某个用户名（多用户各自的上游）。
-// 表里已经没有这一列 —— 读写都经 scope.go 的编解码落到 (scope_kind, scope_id, name)。
-//
-// §2.7 规则 8：主线接线完成后删除，调用方改用 ProviderBucketState（范围是 policy.ScopeRef）。
-type ProviderStatus struct {
-	Scope               string
-	Name                string
-	Enabled             bool
-	ConsecutiveFailures int
-	UnhealthyUntil      time.Time
-	LastError           string
-	LastSuccessAt       time.Time
-	LastFailureAt       time.Time
-	TotalRequests       int64
-	TotalFailures       int64
-}
-
 // UsageRow 是统计查询的一行结果。
 type UsageRow struct {
 	Day              string
@@ -733,75 +714,6 @@ ON CONFLICT(day, user_name, provider, model, upstream_model, system_paid) DO UPD
 	}
 
 	return tx.Commit()
-}
-
-// SaveProviderStatus 批量写入供应商运行期状态（2.x 的旧字符串作用域接口）。
-//
-// 实现整体委托 SaveProviderBucketStates：冲突键、列清单、写事务只有一份，
-// 「旧接口」在这里只剩一次字符串解码（scope.go 的 decodeLegacyProviderScope）。
-// 旧 scope 串映射不出来时（用户名里含 policy 禁止的字符）直接报错，不静默丢桶 ——
-// 丢一个桶等于那路上游的熔断计数凭空清零。
-//
-// §2.7 规则 8：主线接线完成后删除，调用方改用 SaveProviderBucketStates。
-func (s *Store) SaveProviderStatus(statuses []ProviderStatus) error {
-	states := make([]ProviderBucketState, 0, len(statuses))
-	for _, st := range statuses {
-		scope, err := decodeLegacyProviderScope(st.Scope)
-		if err != nil {
-			return fmt.Errorf("provider_stats 的作用域 %q 无法映射到 3.0 范围: %w", st.Scope, err)
-		}
-		states = append(states, ProviderBucketState{
-			Scope:               scope,
-			Name:                st.Name,
-			Enabled:             st.Enabled,
-			ConsecutiveFailures: st.ConsecutiveFailures,
-			UnhealthyUntil:      st.UnhealthyUntil,
-			LastError:           st.LastError,
-			LastSuccessAt:       st.LastSuccessAt,
-			LastFailureAt:       st.LastFailureAt,
-			TotalRequests:       st.TotalRequests,
-			TotalFailures:       st.TotalFailures,
-		})
-	}
-	return s.SaveProviderBucketStates(states)
-}
-
-// LoadProviderStatus 读取全部供应商状态（含各用户自己的上游），重启后恢复熔断。
-//
-// 返回**切片**而不是 map：ProviderStatus 自带 Scope 与 Name，而把两者拼成复合键会丢信息 ——
-// 键 "alice/my-up" 既可能是「用户 alice 的上游 my-up」，也可能是一个名字里真带斜杠的
-// 全局供应商，恢复时无法还原。ORDER BY 由 LoadProviderBucketStates 给出
-// （scope_kind, scope_id, name），同一份库两次读出来必须一样。
-//
-// 读到的桶里出现旧接口表达不了的范围（组织级 / 项目级）时报错而不是跳过：
-// 那种桶一旦被静默忽略，重启后它的熔断冷却就消失了。
-//
-// §2.7 规则 8：主线接线完成后删除，调用方改用 LoadProviderBucketStates。
-func (s *Store) LoadProviderStatus() ([]ProviderStatus, error) {
-	states, err := s.LoadProviderBucketStates()
-	if err != nil {
-		return nil, err
-	}
-	out := make([]ProviderStatus, 0, len(states))
-	for _, st := range states {
-		legacy, err := encodeLegacyProviderScope(st.Scope)
-		if err != nil {
-			return nil, fmt.Errorf("恢复熔断状态时 %s: %w", st.bucketKey(), err)
-		}
-		out = append(out, ProviderStatus{
-			Scope:               legacy,
-			Name:                st.Name,
-			Enabled:             st.Enabled,
-			ConsecutiveFailures: st.ConsecutiveFailures,
-			UnhealthyUntil:      st.UnhealthyUntil,
-			LastError:           st.LastError,
-			LastSuccessAt:       st.LastSuccessAt,
-			LastFailureAt:       st.LastFailureAt,
-			TotalRequests:       st.TotalRequests,
-			TotalFailures:       st.TotalFailures,
-		})
-	}
-	return out, nil
 }
 
 // Prune 删除 retainDays 天前的请求明细；usage_daily 保留（体积很小，且是长期消耗视图）。

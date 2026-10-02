@@ -24,6 +24,7 @@ import (
 	"github.com/mynet-club/net-tools/llmproxy/internal/config"
 	"github.com/mynet-club/net-tools/llmproxy/internal/dialer"
 	"github.com/mynet-club/net-tools/llmproxy/internal/logx"
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 	"github.com/mynet-club/net-tools/llmproxy/internal/router"
 	"github.com/mynet-club/net-tools/llmproxy/internal/secrets"
 	"github.com/mynet-club/net-tools/llmproxy/internal/store"
@@ -329,16 +330,38 @@ func (s *Server) Shutdown(timeout time.Duration) {
 
 // authResult 是一次鉴权的结果。
 //
-// 多用户模式下 UserName/Scope 会被填上：Scope 决定这次请求能用哪组上游
-// （用户自己的，或回退到全局配置），也决定熔断状态落在哪个桶里。
+// 只有两个维度要分清，所以只有两个字段：
+//   - UserName 是「谁」——按名字索引的子系统（模型白名单、会话粘性、策略主体）
+//     都拿它当键；静态 key 与匿名本机请求为空，表示「没有归属用户」。
+//   - Bucket 是「熔断/路由桶落在哪个范围」——§2.7 规则 4 的 (scope_kind, scope_id)，
+//     与 provider_stats 的列同形，中间没有拼成字符串再解析回来那一步。
+//
+// 2.x 还有一个和 UserName 恒等的 Scope 字符串字段（空串 = 全局），它把「同一个事实」
+// 写成两种形状，随规则 8 一起删掉。
 type authResult struct {
 	KeyHash  string
 	Label    string
 	ClientIP string
 	OK       bool
 	UserName string // DB 用户的名字；静态 key 为空
-	Scope    string // 路由作用域，等于 UserName 或空串
-	Disabled bool   // 凭证有效但账号已停用
+	// Bucket 是熔断/路由桶的结构化范围：静态 key 与匿名本机请求都是 system:global，
+	// DB 用户是 user:<名>。零值只可能来自库里旁路写进来的坏名字。
+	Bucket   policy.ScopeRef
+	Disabled bool // 凭证有效但账号已停用
+}
+
+// userBucket 把一个 DB 用户落成熔断桶范围。
+//
+// 名字合法性在建用户时就按 validName（^[A-Za-z0-9._-]{1,64}$）校过，那是 policy
+// 允许的 scope ID 的子集，所以正常数据恒成功。真失败说明这行是绕过接口写进库的
+// 脏数据：退化成「没有归属范围」（零值桶），绝不并进全局桶 —— 那会让一个坏名字
+// 的失败拖掉所有人的同名上游。
+func userBucket(name string) policy.ScopeRef {
+	b, err := policy.NewScopeRef(policy.ScopeUser, name)
+	if err != nil {
+		return policy.ScopeRef{}
+	}
+	return b
 }
 
 func keyMatches(got, want string) bool {
@@ -364,7 +387,7 @@ func extractToken(r *http.Request) string {
 func (s *Server) authenticate(r *http.Request) authResult {
 	cfg := s.cfgStore.Current()
 	ip := clientIP(r)
-	res := authResult{ClientIP: ip}
+	res := authResult{ClientIP: ip, Bucket: policy.SystemScope}
 	presented := extractToken(r)
 	reg := s.usersSnapshot()
 
@@ -374,7 +397,7 @@ func (s *Server) authenticate(r *http.Request) authResult {
 			res.KeyHash = store.KeyHash(presented)
 			res.Label = e.Name
 			res.UserName = e.Name
-			res.Scope = e.Name
+			res.Bucket = userBucket(e.Name)
 			if !e.Enabled {
 				res.Disabled = true
 				return res // OK 保持 false
@@ -480,7 +503,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	data := []modelCard{}
 	// 消费用户能调哪些模型：没配映射就是继承系统池声明的全部（方案 A），配了就是他那份收窄列表。
 	// 直接列有效清单，别让用户从系统池里猜。
-	if e := s.usersSnapshot().byName[auth.Scope]; e != nil && e.Consumption {
+	if e := s.usersSnapshot().byName[auth.UserName]; e != nil && e.Consumption {
 		names, _, _ := s.effectiveModels(e)
 		for _, m := range names {
 			if seen[m] {
@@ -490,7 +513,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			data = append(data, modelCard{ID: m, Object: "model", OwnedBy: "llmproxy"})
 		}
 	}
-	list, _ := s.providersFor(auth.Scope, "")
+	list, _ := s.providersFor(auth.UserName, "")
 	for _, p := range list {
 		if !p.Enabled || p.Models.Passthrough {
 			continue
@@ -538,18 +561,18 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request) {
 	// （上游错误响应体的前 300 字节）。用户台压根不调这个接口（它用的是 /v1/_me 的
 	// broken_providers），所以拒掉不损失任何功能，却一次堵住两条泄漏。
 	//
-	// BYO 用户照旧放行：他们看到的是**自己**那些上游的状态（下面按 auth.Scope 收窄过），
+	// BYO 用户照旧放行：他们看到的是**自己**那些上游的状态（下面按 auth.UserName 收窄过），
 	// base_url 与错误正文本来就是他们自己的东西 ——「我配的上游为什么在冷却」是正当需求，
 	// 而且有测试钉住（TestCircuitBreakerIsolatedByUser）。静态 key 是运营者自己，也照旧。
-	if e := s.usersSnapshot().byName[auth.Scope]; e != nil && e.Consumption {
+	if e := s.usersSnapshot().byName[auth.UserName]; e != nil && e.Consumption {
 		writeJSONError(w, http.StatusForbidden, "invalid_request_error",
 			"消费模式用户没有自己的上游，这里不展示系统池；用量请看 /v1/_me/usage")
 		return
 	}
 	// 走到这里只剩静态 key（全局作用域）与 BYO 用户（自己的上游），
-	// 两者都按 auth.Scope 收窄即可 —— 消费模式已经在上面被拒了。
-	providers, _ := s.providersFor(auth.Scope, "")
-	snap := s.router.SnapshotFor(auth.Scope)
+	// 两者都按 auth.UserName 收窄即可 —— 消费模式已经在上面被拒了。
+	providers, _ := s.providersFor(auth.UserName, "")
+	snap := s.router.SnapshotFor(auth.Bucket)
 
 	type liveProvider struct {
 		Name                string   `json:"name"`
@@ -615,7 +638,7 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"revision":  s.cfgStore.Revision(),
 		"routing":   cfg.Routing,
-		"scope":     auth.Scope, // 空 = 全局配置；否则是某个用户自己的上游
+		"scope":     auth.UserName, // 空 = 全局配置；否则是某个用户自己的上游
 		"providers": out,
 	})
 }

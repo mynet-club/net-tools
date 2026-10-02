@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 )
 
 func TestUserLifecycle(t *testing.T) {
@@ -210,46 +212,56 @@ func TestInsertRequestPerUserUsage(t *testing.T) {
 
 func TestProviderStatusScopeIsolation(t *testing.T) {
 	s := openTestStore(t)
-	if err := s.SaveProviderStatus([]ProviderStatus{
-		{Scope: "", Name: "shared", Enabled: true, ConsecutiveFailures: 1, TotalRequests: 10},
-		{Scope: "alice", Name: "shared", Enabled: true, ConsecutiveFailures: 9, TotalRequests: 90},
-		{Scope: "bob", Name: "shared", Enabled: true, ConsecutiveFailures: 2, TotalRequests: 20},
+	alice := policy.MustScope(policy.ScopeUser, "alice")
+	bob := policy.MustScope(policy.ScopeUser, "bob")
+	if err := s.SaveProviderBucketStates([]ProviderBucketState{
+		{Scope: policy.SystemScope, Name: "shared", Enabled: true, ConsecutiveFailures: 1, TotalRequests: 10},
+		{Scope: alice, Name: "shared", Enabled: true, ConsecutiveFailures: 9, TotalRequests: 90},
+		{Scope: bob, Name: "shared", Enabled: true, ConsecutiveFailures: 2, TotalRequests: 20},
 	}); err != nil {
-		t.Fatalf("SaveProviderStatus: %v", err)
+		t.Fatalf("SaveProviderBucketStates: %v", err)
 	}
 
-	got, err := s.LoadProviderStatus()
+	got, err := s.LoadProviderBucketStates()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 3 {
 		t.Fatalf("应有 3 条，实际 %d: %v", len(got), got)
 	}
-	if st, ok := statusOf(got, "", "shared"); !ok || st.ConsecutiveFailures != 1 {
+	if st, ok := statusOf(got, policy.SystemScope, "shared"); !ok || st.ConsecutiveFailures != 1 {
 		t.Errorf("全局作用域取错了: %+v", st)
 	}
-	if st, ok := statusOf(got, "alice", "shared"); !ok || st.ConsecutiveFailures != 9 {
+	if st, ok := statusOf(got, alice, "shared"); !ok || st.ConsecutiveFailures != 9 {
 		t.Errorf("alice 作用域取错了: %+v", st)
 	}
-	if st, ok := statusOf(got, "bob", "shared"); !ok || st.ConsecutiveFailures != 2 {
+	if st, ok := statusOf(got, bob, "shared"); !ok || st.ConsecutiveFailures != 2 {
 		t.Errorf("bob 作用域取错了: %+v", st)
 	}
 
 	// 同名不同作用域必须互不覆盖
-	if err := s.SaveProviderStatus([]ProviderStatus{
-		{Scope: "alice", Name: "shared", Enabled: true, ConsecutiveFailures: 0, TotalRequests: 91},
+	if err := s.SaveProviderBucketStates([]ProviderBucketState{
+		{Scope: alice, Name: "shared", Enabled: true, ConsecutiveFailures: 0, TotalRequests: 91},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	got, _ = s.LoadProviderStatus()
-	if st, _ := statusOf(got, "", "shared"); st.TotalRequests != 10 {
+	got, _ = s.LoadProviderBucketStates()
+	if st, _ := statusOf(got, policy.SystemScope, "shared"); st.TotalRequests != 10 {
 		t.Error("写 alice 的作用域污染了全局记录")
 	}
-	if st, _ := statusOf(got, "bob", "shared"); st.TotalRequests != 20 {
+	if st, _ := statusOf(got, bob, "shared"); st.TotalRequests != 20 {
 		t.Error("写 alice 的作用域污染了 bob 的记录")
 	}
-	if st, _ := statusOf(got, "alice", "shared"); st.TotalRequests != 91 {
+	if st, _ := statusOf(got, alice, "shared"); st.TotalRequests != 91 {
 		t.Error("alice 的记录没更新")
+	}
+
+	// 零范围必须拒写：熔断开销落在「谁的桶」上是有语义的，
+	// 让零值悄悄落库等于把无归属的计数并进某个真实主体。
+	if err := s.SaveProviderBucketStates([]ProviderBucketState{
+		{Name: "orphan", Enabled: true},
+	}); err == nil {
+		t.Error("零范围的熔断状态应当被拒绝写入")
 	}
 }
 
@@ -293,12 +305,12 @@ CREATE TABLE provider_stats (
 	}
 	defer s.Close()
 
-	got, err := s.LoadProviderStatus()
+	got, err := s.LoadProviderBucketStates()
 	if err != nil {
 		t.Fatal(err)
 	}
 	// statusOf 按 (作用域, 名字) 匹配，所以找到即证明老数据归入了全局作用域
-	st, ok := statusOf(got, "", "legacy-prov")
+	st, ok := statusOf(got, policy.SystemScope, "legacy-prov")
 	if !ok {
 		t.Fatalf("迁移后老数据丢了（或没归入全局作用域）: %v", got)
 	}
@@ -307,13 +319,13 @@ CREATE TABLE provider_stats (
 	}
 
 	// 迁移后按作用域写入应当正常
-	if err := s.SaveProviderStatus([]ProviderStatus{
-		{Scope: "alice", Name: "my-up", Enabled: true, TotalRequests: 1},
+	if err := s.SaveProviderBucketStates([]ProviderBucketState{
+		{Scope: policy.MustScope(policy.ScopeUser, "alice"), Name: "my-up", Enabled: true, TotalRequests: 1},
 	}); err != nil {
 		t.Fatalf("迁移后写入失败: %v", err)
 	}
-	got2, _ := s.LoadProviderStatus()
-	if _, ok := statusOf(got2, "alice", "my-up"); !ok {
+	got2, _ := s.LoadProviderBucketStates()
+	if _, ok := statusOf(got2, policy.MustScope(policy.ScopeUser, "alice"), "my-up"); !ok {
 		t.Errorf("迁移后作用域写入不可用: %v", got2)
 	}
 
@@ -324,32 +336,43 @@ CREATE TABLE provider_stats (
 		t.Fatalf("二次打开失败: %v", err)
 	}
 	defer s2.Close()
-	got3, _ := s2.LoadProviderStatus()
+	got3, _ := s2.LoadProviderBucketStates()
 	if len(got3) != len(got2) {
 		t.Errorf("二次迁移改变了数据: %v → %v", got2, got3)
 	}
 }
 
-// LoadProviderStatus 的顺序必须稳定：恢复结果不该依赖 SQL 的返回顺序。
+// LoadProviderBucketStates 的顺序必须稳定：恢复结果不该依赖 SQL 的返回顺序。
 //
-// 曾经它返回一个按 "scope/name" 折叠的 map，于是 ("alice","my-up") 与
-// ("", "alice/my-up") 会撞成同一个键，谁覆盖谁取决于返回顺序 ——
-// 多次重启之间恢复出来的计数会不确定地跳变。现在返回切片并按 (scope, name) 排序。
-func TestLoadProviderStatusDeterministicOrder(t *testing.T) {
+// 曾经它返回一个按 "scope/name" 折叠的 map，于是 (user:alice, "my-up") 与
+// (system:global, "alice/my-up") 会撞成同一个键，谁覆盖谁取决于返回顺序 ——
+// 多次重启之间恢复出来的计数会不确定地跳变。现在返回切片并按三元组排序。
+func TestLoadProviderBucketsDeterministicOrder(t *testing.T) {
 	s := openTestStore(t)
-	if err := s.SaveProviderStatus([]ProviderStatus{
-		{Scope: "bob", Name: "z-up", Enabled: true, TotalRequests: 3},
-		{Scope: "", Name: "shared", Enabled: true, TotalRequests: 1},
-		{Scope: "alice", Name: "my-up", Enabled: true, TotalRequests: 2},
-		{Scope: "", Name: "aaa", Enabled: true, TotalRequests: 4},
+	alice := policy.MustScope(policy.ScopeUser, "alice")
+	bob := policy.MustScope(policy.ScopeUser, "bob")
+	if err := s.SaveProviderBucketStates([]ProviderBucketState{
+		{Scope: bob, Name: "z-up", Enabled: true, TotalRequests: 3},
+		{Scope: policy.SystemScope, Name: "shared", Enabled: true, TotalRequests: 1},
+		{Scope: alice, Name: "my-up", Enabled: true, TotalRequests: 2},
+		{Scope: policy.SystemScope, Name: "aaa", Enabled: true, TotalRequests: 4},
 	}); err != nil {
-		t.Fatalf("SaveProviderStatus: %v", err)
+		t.Fatalf("SaveProviderBucketStates: %v", err)
 	}
-	want := [][2]string{{"", "aaa"}, {"", "shared"}, {"alice", "my-up"}, {"bob", "z-up"}}
+	// 排序键是 (scope_kind, scope_id, name)：'system' < 'user'，所以全局那两条在前
+	want := []struct {
+		scope policy.ScopeRef
+		name  string
+	}{
+		{policy.SystemScope, "aaa"},
+		{policy.SystemScope, "shared"},
+		{alice, "my-up"},
+		{bob, "z-up"},
+	}
 
 	// 读两次：顺序与内容都必须一致
 	for round := 1; round <= 2; round++ {
-		got, err := s.LoadProviderStatus()
+		got, err := s.LoadProviderBucketStates()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -357,9 +380,9 @@ func TestLoadProviderStatusDeterministicOrder(t *testing.T) {
 			t.Fatalf("第 %d 次读：应有 %d 条，实际 %d: %v", round, len(want), len(got), got)
 		}
 		for i, w := range want {
-			if got[i].Scope != w[0] || got[i].Name != w[1] {
-				t.Errorf("第 %d 次读第 %d 条 = (%q,%q)，期望 (%q,%q)",
-					round, i, got[i].Scope, got[i].Name, w[0], w[1])
+			if got[i].Scope != w.scope || got[i].Name != w.name {
+				t.Errorf("第 %d 次读第 %d 条 = (%s,%q)，期望 (%s,%q)",
+					round, i, got[i].Scope.Display(), got[i].Name, w.scope.Display(), w.name)
 			}
 		}
 	}
@@ -387,9 +410,9 @@ func TestDeleteUserCascadesModelsAndProviderStats(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// bob 自己上游的熔断状态（作用域 = 用户名）
-	if err := s.SaveProviderStatus([]ProviderStatus{
-		{Scope: "bob", Name: "up", Enabled: true, ConsecutiveFailures: 5, TotalRequests: 9},
+	// bob 自己上游的熔断状态（作用域 = (user, bob)）
+	if err := s.SaveProviderBucketStates([]ProviderBucketState{
+		{Scope: policy.MustScope(policy.ScopeUser, "bob"), Name: "up", Enabled: true, ConsecutiveFailures: 5, TotalRequests: 9},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -419,11 +442,11 @@ func TestDeleteUserCascadesModelsAndProviderStats(t *testing.T) {
 	if len(provs) != 0 {
 		t.Errorf("user_providers 应当被级联删除，实际残留 %d 条", len(provs))
 	}
-	stats, err := s.LoadProviderStatus()
+	stats, err := s.LoadProviderBucketStates()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st, ok := statusOf(stats, "bob", "up"); ok {
+	if st, ok := statusOf(stats, policy.MustScope(policy.ScopeUser, "bob"), "up"); ok {
 		t.Errorf("bob 作用域的熔断状态应当被级联删除，实际残留: %+v", st)
 	}
 	// 刻意保留：用量是账单，不是配置
@@ -446,8 +469,8 @@ func TestDeleteUserCascadesModelsAndProviderStats(t *testing.T) {
 	if len(models) != 0 {
 		t.Errorf("同名重建后不该继承前任的模型授权，实际拿到 %d 条: %+v", len(models), models)
 	}
-	stats, _ = s.LoadProviderStatus()
-	if st, ok := statusOf(stats, "bob", "up"); ok {
+	stats, _ = s.LoadProviderBucketStates()
+	if st, ok := statusOf(stats, policy.MustScope(policy.ScopeUser, "bob"), "up"); ok {
 		t.Errorf("同名重建后不该继承前任的熔断状态，实际拿到 %+v", st)
 	}
 }

@@ -21,6 +21,7 @@ import (
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/config"
 	"github.com/mynet-club/net-tools/llmproxy/internal/logx"
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 	"github.com/mynet-club/net-tools/llmproxy/internal/router"
 	"github.com/mynet-club/net-tools/llmproxy/internal/secrets"
 	"github.com/mynet-club/net-tools/llmproxy/internal/server"
@@ -284,11 +285,12 @@ func cmdStart(paths config.Paths) error {
 	defer db.Close()
 
 	r := router.New(cfg.Routing, cfg.Normalized)
-	if persisted, err := db.LoadProviderStatus(); err == nil && len(persisted) > 0 {
-		// 必须按作用域恢复：熔断状态是**分桶**的（全局池是 ""，每个用户自己的上游是用户名）。
-		// 只写全局作用域的话，用户级熔断会被当成一个名叫 "alice/my-up" 的全局供应商恢复 ——
-		// 既永远匹配不到真实供应商（重启即丢用户级熔断），又会被 30 秒后的
-		// PersistProviderStatus 写回库，在 provider_stats 里长出幽灵行。
+	// 必须按桶恢复：熔断状态是 (scope_kind, scope_id, provider) 三元组分桶的（§2.7 规则 4），
+	// 全局池是 system:global、每个用户自己的上游是 user:<名>。
+	// 只写全局作用域的话，用户级熔断会被当成一个名叫 "alice/my-up" 的全局供应商恢复 ——
+	// 既永远匹配不到真实供应商（重启即丢用户级熔断），又会被 30 秒后的
+	// PersistProviderBuckets 写回库，在 provider_stats 里长出幽灵行。
+	if persisted, err := db.LoadProviderBucketStates(); err == nil && len(persisted) > 0 {
 		scoped := make([]router.ScopedState, 0, len(persisted))
 		for _, st := range persisted {
 			scoped = append(scoped, router.ScopedState{
@@ -389,7 +391,7 @@ func cmdStart(paths config.Paths) error {
 				// 用户/上游是由 CLI 或管理接口写进库的，这里按修订号增量刷新
 				srv.SyncUsersIfChanged()
 			case <-slow.C:
-				if err := srv.PersistProviderStatus(); err != nil {
+				if err := srv.PersistProviderBuckets(); err != nil {
 					lg.Warnf("保存供应商状态失败: %v", err)
 				}
 				// 走 storeCfg.Current()（atomic.Value）而不是闭包捕获的 cfg：
@@ -460,7 +462,7 @@ func cmdStart(paths config.Paths) error {
 	}
 
 	close(stopHousekeep)
-	if err := srv.PersistProviderStatus(); err != nil {
+	if err := srv.PersistProviderBuckets(); err != nil {
 		lg.Warnf("保存供应商状态失败: %v", err)
 	}
 	srv.Shutdown(10 * time.Second)
@@ -878,14 +880,12 @@ func cmdProviders(paths config.Paths) error {
 	}
 	defer db.Close()
 
-	// 这张表列的是 config.yaml 里的系统池，所以只取全局作用域（scope == ""）的状态；
-	// 各用户自己上游的熔断按用户名分桶，不属于这里。
-	global := map[string]store.ProviderStatus{}
-	if loaded, err := db.LoadProviderStatus(); err == nil {
+	// 这张表列的是 config.yaml 里的系统池，所以只取 system:global 那一桶的状态；
+	// 各用户自己上游的熔断在 user:<名> 桶里，不属于这里。
+	global := map[string]store.ProviderBucketState{}
+	if loaded, err := db.LoadProviderBucketsForScope(policy.SystemScope); err == nil {
 		for _, st := range loaded {
-			if st.Scope == "" {
-				global[st.Name] = st
-			}
+			global[st.Name] = st
 		}
 	}
 

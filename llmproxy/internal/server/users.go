@@ -455,27 +455,38 @@ func (s *Server) globalProviders() []config.Provider {
 	return cfg.Normalized
 }
 
-// PersistProviderStatus 把所有作用域的熔断状态落库（重启后继续熔断）。
-func (s *Server) PersistProviderStatus() error {
+// PersistProviderBuckets 把所有作用域的熔断状态落库（重启后继续熔断）。
+func (s *Server) PersistProviderBuckets() error {
 	if s.db == nil {
 		return nil
 	}
-	enabled := map[string]bool{}
+	// 「这家现在该不该在清单里」按 (范围, 供应商名) 查，用结构体键而不是拼接键 ——
+	// 拼出来的串既可能来自用户名也可能来自供应商名，反解不唯一（§2.7 规则 1）。
+	type bucketKey struct {
+		scope policy.ScopeRef
+		name  string
+	}
+	enabled := map[bucketKey]bool{}
 	for _, p := range s.globalProviders() {
-		enabled["\x00"+p.Name] = p.Enabled
+		enabled[bucketKey{policy.SystemScope, p.Name}] = p.Enabled
 	}
 	for _, e := range s.usersSnapshot().byName {
 		for _, p := range e.Providers {
-			enabled[e.Name+"\x00"+p.Name] = p.Enabled
+			enabled[bucketKey{userBucket(e.Name), p.Name}] = p.Enabled
 		}
 	}
 
-	list := []store.ProviderStatus{}
+	list := make([]store.ProviderBucketState, 0, len(s.router.SnapshotAll()))
 	for _, item := range s.router.SnapshotAll() {
-		list = append(list, store.ProviderStatus{
+		if item.Scope == (policy.ScopeRef{}) {
+			// 零值桶只来自库里旁路写进来的坏用户名（见 userBucket）。这种状态无处归属，
+			// 落库也会被整批拒收 —— 跳过它，不让一个人的坏数据挡住所有人重启后继续熔断。
+			continue
+		}
+		list = append(list, store.ProviderBucketState{
 			Scope:               item.Scope,
 			Name:                item.Name,
-			Enabled:             enabled[item.Scope+"\x00"+item.Name],
+			Enabled:             enabled[bucketKey{item.Scope, item.Name}],
 			ConsecutiveFailures: item.State.ConsecutiveFailures,
 			UnhealthyUntil:      item.State.UnhealthyUntil,
 			LastError:           item.State.LastError,
@@ -485,7 +496,7 @@ func (s *Server) PersistProviderStatus() error {
 			TotalFailures:       item.State.TotalFailures,
 		})
 	}
-	return s.db.SaveProviderStatus(list)
+	return s.db.SaveProviderBucketStates(list)
 }
 
 // UserCount 返回已加载的用户数（供启动日志用）。
@@ -725,7 +736,7 @@ func (s *Server) handleMeRouting(w http.ResponseWriter, r *http.Request, e *user
 	now := time.Now()
 	for _, model := range all {
 		providers, _ := s.providersFor(e.Name, model)
-		tiers := s.router.PlanFor(e.Name, providers, model)
+		tiers := s.router.PlanFor(userBucket(e.Name), providers, model)
 		// 分发价（向用户收多少）：有 DB 价目就报出来，界面做模型目录用
 		var price map[string]any
 		if p, err := s.db.UserPriceAt(e.Name, model, now); err == nil && p != nil {

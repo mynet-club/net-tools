@@ -7,6 +7,16 @@ import (
 	"time"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/config"
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
+)
+
+// 测试用的桶键：全局池与三个用户桶。写成常量形状是为了让断言里不出现
+// 「字符串作用域」—— 那是 §2.7 规则 8 要清掉的东西。
+var (
+	scopeGlobal = policy.SystemScope
+	scopeAlice  = policy.MustScope(policy.ScopeUser, "alice")
+	scopeBob    = policy.MustScope(policy.ScopeUser, "bob")
+	scopeOther  = policy.MustScope(policy.ScopeUser, "other")
 )
 
 func mkProvider(name string, weight float64, models config.ModelSpec) config.Provider {
@@ -236,9 +246,9 @@ func TestRestoreScopedRecoversCooldown(t *testing.T) {
 	})
 	future := time.Now().Add(30 * time.Second)
 	r.RestoreScoped([]ScopedState{
-		{Scope: "", Name: "a", State: State{
+		{Scope: scopeGlobal, Name: "a", State: State{
 			ConsecutiveFailures: 3, UnhealthyUntil: future, TotalRequests: 10, TotalFailures: 3}},
-		{Scope: "alice", Name: "my-up", State: State{
+		{Scope: scopeAlice, Name: "my-up", State: State{
 			ConsecutiveFailures: 7, UnhealthyUntil: future, TotalRequests: 50, TotalFailures: 7}},
 	})
 
@@ -250,7 +260,7 @@ func TestRestoreScopedRecoversCooldown(t *testing.T) {
 		t.Errorf("全局冷却时间未恢复: %v, want %v", snap["a"].UnhealthyUntil, future)
 	}
 
-	alice := r.SnapshotFor("alice")
+	alice := r.SnapshotFor(scopeAlice)
 	if alice["my-up"].ConsecutiveFailures != 7 || alice["my-up"].TotalRequests != 50 {
 		t.Errorf("alice 的状态未恢复到自己的作用域: %+v", alice)
 	}
@@ -325,30 +335,30 @@ func TestScopeIsolationInCircuitBreaker(t *testing.T) {
 	bob := []config.Provider{passthrough("upstream", 1)}
 
 	for i := 0; i < 3; i++ {
-		r.ReportFailureFor("alice", "upstream", fmt.Errorf("boom"))
+		r.ReportFailureFor(scopeAlice, "upstream", fmt.Errorf("boom"))
 	}
 
 	// alice 的已熔断
-	if got := r.SnapshotFor("alice")["upstream"].ConsecutiveFailures; got != 3 {
+	if got := r.SnapshotFor(scopeAlice)["upstream"].ConsecutiveFailures; got != 3 {
 		t.Errorf("alice 连续失败应为 3，实际 %d", got)
 	}
-	if !r.SnapshotFor("alice")["upstream"].UnhealthyUntil.After(now) {
+	if !r.SnapshotFor(scopeAlice)["upstream"].UnhealthyUntil.After(now) {
 		t.Error("alice 的上游应处于熔断")
 	}
 	// bob 的不受影响
-	if m := r.SnapshotFor("bob"); len(m) != 0 {
+	if m := r.SnapshotFor(scopeBob); len(m) != 0 {
 		t.Errorf("bob 不该有状态，实际 %v", m)
 	}
-	if c, err := r.PickFrom("bob", bob, "m", nil); err != nil || c.Provider.Name != "upstream" {
+	if c, err := r.PickFrom(scopeBob, bob, "m", nil); err != nil || c.Provider.Name != "upstream" {
 		t.Errorf("bob 应能正常选到自己的上游: %v %v", c, err)
 	}
 	// 全局的更不受影响
-	if got := r.SnapshotFor(""); len(got) != 1 || got["shared"].ConsecutiveFailures != 0 {
+	if got := r.SnapshotFor(scopeGlobal); len(got) != 1 || got["shared"].ConsecutiveFailures != 0 {
 		t.Errorf("全局状态被污染: %v", got)
 	}
 
 	// alice 熔断期间，即使只有这一个候选，也仍然返回它（宁可重试不硬失败）
-	c, err := r.PickFrom("alice", alice, "m", nil)
+	c, err := r.PickFrom(scopeAlice, alice, "m", nil)
 	if err != nil {
 		t.Fatalf("全部不健康时仍应返回候选: %v", err)
 	}
@@ -364,7 +374,7 @@ func TestPickFromUsesOnlyGivenCandidates(t *testing.T) {
 	// 全局有 global-only，但 alice 只带了自己那个；不应选到全局的
 	alice := []config.Provider{passthrough("alice-up", 1)}
 	for i := 0; i < 20; i++ {
-		c, err := r.PickFrom("alice", alice, "m", nil)
+		c, err := r.PickFrom(scopeAlice, alice, "m", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -373,7 +383,7 @@ func TestPickFromUsesOnlyGivenCandidates(t *testing.T) {
 		}
 	}
 	// 候选为空 → 报错
-	if _, err := r.PickFrom("alice", nil, "m", nil); err == nil {
+	if _, err := r.PickFrom(scopeAlice, nil, "m", nil); err == nil {
 		t.Error("候选为空时应当报错")
 	}
 }
@@ -382,8 +392,8 @@ func TestSnapshotAllAndRestoreScoped(t *testing.T) {
 	r := New(config.RoutingConfig{FailureThreshold: 3, CooldownSeconds: 60}, []config.Provider{
 		passthrough("g", 1),
 	})
-	r.ReportFailureFor("alice", "a1", fmt.Errorf("x"))
-	r.ReportSuccessFor("bob", "b1")
+	r.ReportFailureFor(scopeAlice, "a1", fmt.Errorf("x"))
+	r.ReportSuccessFor(scopeBob, "b1")
 
 	all := r.SnapshotAll()
 	if len(all) != 3 {
@@ -391,9 +401,9 @@ func TestSnapshotAllAndRestoreScoped(t *testing.T) {
 	}
 	seen := map[string]bool{}
 	for _, s := range all {
-		seen[s.Scope+"/"+s.Name] = true
+		seen[s.Scope.Display()+"/"+s.Name] = true
 	}
-	for _, want := range []string{"/g", "alice/a1", "bob/b1"} {
+	for _, want := range []string{"system:global/g", "user:alice/a1", "user:bob/b1"} {
 		if !seen[want] {
 			t.Errorf("缺少作用域条目 %s", want)
 		}
@@ -404,28 +414,28 @@ func TestSnapshotAllAndRestoreScoped(t *testing.T) {
 		passthrough("g", 1),
 	})
 	r2.RestoreScoped(all)
-	if got := r2.SnapshotFor("alice")["a1"].TotalFailures; got != 1 {
+	if got := r2.SnapshotFor(scopeAlice)["a1"].TotalFailures; got != 1 {
 		t.Errorf("恢复后 alice/a1 失败数应为 1，实际 %d", got)
 	}
-	if got := r2.SnapshotFor("bob")["b1"].TotalRequests; got != 1 {
+	if got := r2.SnapshotFor(scopeBob)["b1"].TotalRequests; got != 1 {
 		t.Errorf("恢复后 bob/b1 请求数应为 1，实际 %d", got)
 	}
 }
 
 func TestForgetScope(t *testing.T) {
 	r := New(config.RoutingConfig{FailureThreshold: 3}, []config.Provider{passthrough("g", 1)})
-	r.ReportFailureFor("alice", "a1", fmt.Errorf("x"))
-	if len(r.SnapshotFor("alice")) != 1 {
+	r.ReportFailureFor(scopeAlice, "a1", fmt.Errorf("x"))
+	if len(r.SnapshotFor(scopeAlice)) != 1 {
 		t.Fatal("alice 状态未建立")
 	}
-	r.ForgetScope("alice")
-	if len(r.SnapshotFor("alice")) != 0 {
+	r.ForgetScope(scopeAlice)
+	if len(r.SnapshotFor(scopeAlice)) != 0 {
 		t.Error("ForgetScope 未清掉作用域")
 	}
 	// 全局作用域不允许被清掉
-	r.ForgetScope("")
-	if len(r.SnapshotFor("")) != 1 {
-		t.Error("ForgetScope(\"\") 不应清空全局作用域")
+	r.ForgetScope(scopeGlobal)
+	if len(r.SnapshotFor(scopeGlobal)) != 1 {
+		t.Error("ForgetScope(全局范围) 不应清空全局作用域")
 	}
 }
 
@@ -433,19 +443,19 @@ func TestApplyConfigKeepsUserScopes(t *testing.T) {
 	r := New(config.RoutingConfig{FailureThreshold: 3, CooldownSeconds: 60}, []config.Provider{
 		passthrough("g", 1),
 	})
-	r.ReportFailureFor("alice", "a1", fmt.Errorf("x"))
+	r.ReportFailureFor(scopeAlice, "a1", fmt.Errorf("x"))
 
 	// 热重载：全局换了一个供应商
 	r.ApplyConfig(config.RoutingConfig{FailureThreshold: 3, CooldownSeconds: 60}, []config.Provider{
 		passthrough("g2", 1),
 	})
-	if len(r.SnapshotFor("")) != 1 {
-		t.Errorf("全局作用域应只剩新供应商: %v", r.SnapshotFor(""))
+	if len(r.SnapshotFor(scopeGlobal)) != 1 {
+		t.Errorf("全局作用域应只剩新供应商: %v", r.SnapshotFor(scopeGlobal))
 	}
-	if _, ok := r.SnapshotFor("")["g2"]; !ok {
+	if _, ok := r.SnapshotFor(scopeGlobal)["g2"]; !ok {
 		t.Error("新供应商状态未建立")
 	}
-	if got := r.SnapshotFor("alice")["a1"].ConsecutiveFailures; got != 1 {
+	if got := r.SnapshotFor(scopeAlice)["a1"].ConsecutiveFailures; got != 1 {
 		t.Errorf("热重载不应影响用户作用域，实际 %d", got)
 	}
 }

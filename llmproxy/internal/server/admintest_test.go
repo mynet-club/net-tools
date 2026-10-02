@@ -82,7 +82,7 @@ func TestAdminTestDoesNotAccountOrTripBreaker(t *testing.T) {
 	if err := h2.srv.SyncUsers(); err != nil {
 		t.Fatal(err)
 	}
-	before2 := h2.srv.router.SnapshotFor("dave")
+	before2 := h2.srv.router.SnapshotFor(userBucket("dave"))
 	resp, raw2 := h2.post(t, "/v1/_admin/users/dave/test", adminToken, map[string]any{"model": "sys-model"})
 	if resp.StatusCode != 200 {
 		t.Fatalf("测试应 200，实际 %d: %s", resp.StatusCode, raw2)
@@ -90,7 +90,7 @@ func TestAdminTestDoesNotAccountOrTripBreaker(t *testing.T) {
 	if out := testOutcomeOf(t, raw2); out.OK {
 		t.Errorf("上游 500 时应当报 ok=false: %+v", out)
 	}
-	after2 := h2.srv.router.SnapshotFor("dave")
+	after2 := h2.srv.router.SnapshotFor(userBucket("dave"))
 	if len(before2) != len(after2) {
 		t.Fatalf("快照大小变了: %d → %d", len(before2), len(after2))
 	}

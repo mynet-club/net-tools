@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 )
 
 // 探活：活着的上游记成功，挂掉的记失败（进熔断计数）。
@@ -30,13 +32,13 @@ func TestActiveProbeRound(t *testing.T) {
 	// 把两个假上游塞进 globalProviders 不容易；改为测 one() 的成败路径
 	p := newActiveProbe(time.Second)
 	p.one(h.srv, "good", good.URL, "")
-	st := h.srv.router.SnapshotFor("")
+	st := h.srv.router.SnapshotFor(policy.SystemScope)
 	if g := st["good"]; g.TotalRequests == 0 {
 		// ReportSuccessFor 会 +TotalRequests
 		t.Errorf("good 应记一次成功: %+v", g)
 	}
 	p.one(h.srv, "bad", bad.URL, "")
-	st = h.srv.router.SnapshotFor("")
+	st = h.srv.router.SnapshotFor(policy.SystemScope)
 	if b := st["bad"]; b.ConsecutiveFailures == 0 {
 		t.Errorf("bad 应记一次失败: %+v", b)
 	}

@@ -30,7 +30,7 @@ func TestPlanForTierOrder(t *testing.T) {
 		system("sys-named", declares(map[string]string{"m": "m"})),
 		owned("own-named", declares(map[string]string{"m": "m"})),
 	}
-	plan := r.PlanFor("", cands, "m")
+	plan := r.PlanFor(scopeGlobal, cands, "m")
 	if len(plan) != 2 {
 		t.Fatalf("有点名映射时通配应出局，应当 2 档，实际 %d: %+v", len(plan), plan)
 	}
@@ -54,7 +54,7 @@ func TestPlanForDropsWildcardWhenNamedExists(t *testing.T) {
 		owned("named", declares(map[string]string{"m": "m"})),
 		owned("wild", config.ModelSpec{Passthrough: true}),
 	}
-	plan := r.PlanFor("", cands, "m")
+	plan := r.PlanFor(scopeGlobal, cands, "m")
 	if len(plan) != 1 {
 		t.Fatalf("应当只留点名 1 档，实际 %d: %+v", len(plan), plan)
 	}
@@ -73,7 +73,7 @@ func TestPlanForKeepsWildcardWhenNobodyDeclares(t *testing.T) {
 		owned("own-wild", config.ModelSpec{Passthrough: true}),
 		system("sys-wild", config.ModelSpec{Passthrough: true}),
 	}
-	plan := r.PlanFor("", cands, "m")
+	plan := r.PlanFor(scopeGlobal, cands, "m")
 	if len(plan) != 2 {
 		t.Fatalf("应当 2 档，实际 %d: %+v", len(plan), plan)
 	}
@@ -89,7 +89,7 @@ func TestPlanForSkipsNonServing(t *testing.T) {
 		owned("other", declares(map[string]string{"别的模型": "x"})),
 		owned("mine", declares(map[string]string{"m": "m"})),
 	}
-	plan := r.PlanFor("", cands, "m")
+	plan := r.PlanFor(scopeGlobal, cands, "m")
 	total := 0
 	for _, tier := range plan {
 		total += len(tier.Providers)
@@ -109,8 +109,8 @@ func TestPlanForMarksCoolingLast(t *testing.T) {
 		owned("cooling", declares(map[string]string{"m": "m"})),
 		owned("warm", declares(map[string]string{"m": "m"})),
 	}
-	r.CoolFor("", "cooling", 60_000_000_000) // 60s
-	plan := r.PlanFor("", cands, "m")
+	r.CoolFor(scopeGlobal, "cooling", 60_000_000_000) // 60s
+	plan := r.PlanFor(scopeGlobal, cands, "m")
 	if len(plan) != 1 {
 		t.Fatalf("应当合成 1 档，实际 %d", len(plan))
 	}

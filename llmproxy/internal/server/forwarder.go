@@ -118,8 +118,10 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 
 	// 这次请求该用哪组上游由「用户的模式 + 模型名」共同决定，而模型名在请求体里，
 	// 所以上游池要等读完 body 再解析（见下面的 providersFor 调用）。
-	// 作用域同时决定熔断状态落在哪个桶里 —— 用户之间互不影响。
-	scope := auth.Scope
+	// scope 是**用户名**这一维：模型白名单、会话粘性、策略主体都按名字索引。
+	// 熔断桶是另一回事，看下面那个结构化的 bucket。
+	scope := auth.UserName
+	bucket := auth.Bucket // 熔断状态落哪个桶（结构化范围，见 authResult.Bucket）
 
 	// 用户级限流与配额：限流不依赖请求体，先判，省得白读一遍 body。
 	// 限流对两种模式都生效（单个用户打满网关跟模式无关）。
@@ -283,7 +285,7 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 	prefer := s.routingPrefer(scope, probe.Model, affinityPrefer, shot, providers)
 
 	for i := 0; i < maxAttempts; i++ {
-		cand, err := s.router.PickFromPreferring(scope, providers, probe.Model, exclude, prefer)
+		cand, err := s.router.PickFromPreferring(bucket, providers, probe.Model, exclude, prefer)
 		if err != nil {
 			if lastErr == nil {
 				lastErr = fmt.Errorf("%w（当前可用模型：%s）", err, describeModels(providers))
@@ -415,7 +417,7 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 				err = fmt.Errorf("供应商 %s 请求超时（%s）", cand.Provider.Name, timeout)
 			}
 			s.log.Warnf("供应商 %s 请求失败: %v", cand.Provider.Name, err)
-			s.router.ReportFailureFor(scope, cand.Provider.Name, err)
+			s.router.ReportFailureFor(bucket, cand.Provider.Name, err)
 			lastErr = err
 			lastProvider = cand.Provider.Name
 			lastUpstreamM = cand.UpstreamModel
@@ -431,13 +433,13 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 			if resp.StatusCode == http.StatusPaymentRequired || resp.StatusCode == http.StatusTooManyRequests {
 				// 额度不足 / 被限流：这是**明确**的信号，一次就该让这家让位 ——
 				// 攒够失败次数再冷却太慢，规则 B 会一遍遍把请求送到已经没额度的家。
-				s.router.CoolFor(scope, cand.Provider.Name, ruleBQuotaCooldown)
+				s.router.CoolFor(bucket, cand.Provider.Name, ruleBQuotaCooldown)
 				s.metrics.noteCircuitCool()
 				s.log.Warnf("供应商 %s 返回 %d，压 %s 冷却（规则 B 下次改用次便宜的）",
 					cand.Provider.Name, resp.StatusCode, ruleBQuotaCooldown)
 			}
 			s.log.Warnf("供应商 %s 返回 %d: %s", cand.Provider.Name, resp.StatusCode, snippet)
-			s.router.ReportFailureFor(scope, cand.Provider.Name, fmt.Errorf("上游返回 %d: %s", resp.StatusCode, snippet))
+			s.router.ReportFailureFor(bucket, cand.Provider.Name, fmt.Errorf("上游返回 %d: %s", resp.StatusCode, snippet))
 			lastErr = fmt.Errorf("供应商 %s 返回 %d", cand.Provider.Name, resp.StatusCode)
 			lastStatus = resp.StatusCode
 			lastProvider = cand.Provider.Name
@@ -461,13 +463,13 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 		// 正是空闲看门狗专门为它设计的那种故障。在读到 body 之前就报成功的话，
 		// 它会被永久判为健康 —— 看门狗掐掉它、库里记成 upstream_idle，router 却毫不知情。
 		if outcome == relayOK {
-			s.router.ReportSuccessFor(scope, cand.Provider.Name)
+			s.router.ReportSuccessFor(bucket, cand.Provider.Name)
 		} else if outcome == relayUpstreamFailed {
-			if entered := s.router.ReportFailureFor(scope, cand.Provider.Name,
+			if entered := s.router.ReportFailureFor(bucket, cand.Provider.Name,
 				fmt.Errorf("上游在响应中途失败：%s", rec.ErrorMsg)); entered {
 				s.metrics.noteCircuitCool()
 				s.Emit("circuit.open", map[string]any{
-					"scope": scope, "provider": cand.Provider.Name, "model": rec.Model,
+					"scope": bucket.Display(), "provider": cand.Provider.Name, "model": rec.Model,
 				})
 			}
 		}

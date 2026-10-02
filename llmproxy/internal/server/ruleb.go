@@ -63,7 +63,7 @@ func (s *Server) cheapestProvider(scope string, providers []config.Provider, mod
 		if !ok {
 			continue
 		}
-		if s.router.Cooling(scope, p.Name) {
+		if s.router.Cooling(userBucket(scope), p.Name) {
 			continue
 		}
 		price, ok := byKey[key{p.Name, up}]

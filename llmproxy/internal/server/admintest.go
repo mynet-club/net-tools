@@ -44,7 +44,7 @@ func (s *Server) runUpstreamTest(ctx context.Context, scope string, providers []
 	if strings.TrimSpace(model) == "" {
 		return testOutcome{Error: "没有指定要测的模型"}
 	}
-	cand, err := s.router.PickFrom(scope, providers, model, map[string]bool{})
+	cand, err := s.router.PickFrom(userBucket(scope), providers, model, map[string]bool{})
 	if err != nil {
 		// 选不出候选：把原因说清楚（收窄？池子里没有？上游都不可用？）
 		msg := err.Error()

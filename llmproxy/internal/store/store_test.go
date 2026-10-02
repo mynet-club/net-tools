@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 )
 
 func openTestStore(t *testing.T) *Store {
@@ -134,38 +136,38 @@ func contains(s, sub string) bool {
 	})()
 }
 
-// statusOf 在 LoadProviderStatus 的切片里按 (作用域, 名字) 找一条。
-// 作用域必须一起匹配：熔断状态是按 (用户, 上游) 分桶的，
+// statusOf 在桶状态切片里按 (范围, 名字) 找一条。
+// 范围必须一起匹配：熔断状态是按 (scope_kind, scope_id, provider) 分桶的，
 // 只按名字找会把「alice 的 up」和「全局的 up」混为一谈 —— 那正是曾经的 bug。
-func statusOf(list []ProviderStatus, scope, name string) (ProviderStatus, bool) {
+func statusOf(list []ProviderBucketState, scope policy.ScopeRef, name string) (ProviderBucketState, bool) {
 	for _, st := range list {
 		if st.Scope == scope && st.Name == name {
 			return st, true
 		}
 	}
-	return ProviderStatus{}, false
+	return ProviderBucketState{}, false
 }
 
 func TestProviderStatusPersistence(t *testing.T) {
 	s := openTestStore(t)
 	until := time.Now().Add(60 * time.Second).Truncate(time.Second)
-	statuses := []ProviderStatus{
-		{Name: "p1", Enabled: true, ConsecutiveFailures: 3, UnhealthyUntil: until,
+	statuses := []ProviderBucketState{
+		{Scope: policy.SystemScope, Name: "p1", Enabled: true, ConsecutiveFailures: 3, UnhealthyUntil: until,
 			LastError: "上游返回 500", TotalRequests: 10, TotalFailures: 3,
 			LastSuccessAt: time.Now().Add(-time.Minute), LastFailureAt: time.Now()},
-		{Name: "p2", Enabled: true, TotalRequests: 5},
+		{Scope: policy.SystemScope, Name: "p2", Enabled: true, TotalRequests: 5},
 	}
-	if err := s.SaveProviderStatus(statuses); err != nil {
-		t.Fatalf("SaveProviderStatus: %v", err)
+	if err := s.SaveProviderBucketStates(statuses); err != nil {
+		t.Fatalf("SaveProviderBucketStates: %v", err)
 	}
-	got, err := s.LoadProviderStatus()
+	got, err := s.LoadProviderBucketStates()
 	if err != nil {
-		t.Fatalf("LoadProviderStatus: %v", err)
+		t.Fatalf("LoadProviderBucketStates: %v", err)
 	}
 	if len(got) != 2 {
 		t.Fatalf("got %d statuses", len(got))
 	}
-	p1, ok := statusOf(got, "", "p1")
+	p1, ok := statusOf(got, policy.SystemScope, "p1")
 	if !ok {
 		t.Fatalf("没有找到 p1 的状态: %+v", got)
 	}
@@ -184,11 +186,11 @@ func TestProviderStatusPersistence(t *testing.T) {
 	statuses[0].ConsecutiveFailures = 0
 	statuses[0].UnhealthyUntil = time.Time{}
 	statuses[0].LastError = ""
-	if err := s.SaveProviderStatus(statuses); err != nil {
+	if err := s.SaveProviderBucketStates(statuses); err != nil {
 		t.Fatal(err)
 	}
-	got, _ = s.LoadProviderStatus()
-	if p1, _ = statusOf(got, "", "p1"); p1.ConsecutiveFailures != 0 || !p1.UnhealthyUntil.IsZero() {
+	got, _ = s.LoadProviderBucketStates()
+	if p1, _ = statusOf(got, policy.SystemScope, "p1"); p1.ConsecutiveFailures != 0 || !p1.UnhealthyUntil.IsZero() {
 		t.Errorf("覆盖更新失败: %+v", p1)
 	}
 }

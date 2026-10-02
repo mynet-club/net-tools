@@ -143,7 +143,7 @@ func TestQuotaExhaustedProviderIsCooled(t *testing.T) {
 	if got := resp.Header.Get("X-LLMProxy-Provider"); got != "beta" {
 		t.Errorf("应当换到 beta，实际 %q", got)
 	}
-	if !h.srv.router.Cooling("carol", "alpha") {
+	if !h.srv.router.Cooling(userBucket("carol"), "alpha") {
 		t.Fatal("402 之后应当给 alpha 压冷却")
 	}
 	// 第二次：alpha 在冷却中 → 直接走 beta

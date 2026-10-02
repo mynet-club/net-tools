@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 )
 
 // activeProbe 定时探活系统池上游：只发一次极轻的 GET /models，
@@ -91,16 +93,16 @@ func (p *activeProbe) one(s *Server, name, baseURL, apiKey string) {
 	}
 	resp, err := p.client.Do(req)
 	if err != nil {
-		s.router.ReportFailureFor("", name, err)
+		s.router.ReportFailureFor(policy.SystemScope, name, err)
 		return
 	}
 	_ = resp.Body.Close()
 	if resp.StatusCode >= 500 {
-		s.router.ReportFailureFor("", name, errHTTP(resp.StatusCode))
+		s.router.ReportFailureFor(policy.SystemScope, name, errHTTP(resp.StatusCode))
 		return
 	}
 	// 401/403/404 也算「活着」：服务在应答，只是这个探针姿势不对
-	s.router.ReportSuccessFor("", name)
+	s.router.ReportSuccessFor(policy.SystemScope, name)
 }
 
 type errHTTP int

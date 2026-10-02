@@ -76,12 +76,16 @@ func isSystemScope(scope policy.ScopeRef) bool { return scope.Is(policy.SystemSc
 func isScopeParam(kind, id string) bool { return kind != "" && id != "" }
 
 // ------------------------------------------------------------------ 旧约定编解码
+//
+// 这一节只剩**升级迁移**要用的解码：运行时读写一律走 (scope_kind, scope_id)，
+// 旧字符串只在「读一份 2.x 的表」时出现。反向编码随旧 API 一起删掉了。
 
 // decodeLegacyProviderScope 把 provider_stats 的旧 scope 串映射成结构化范围：
 //
 //	''          → (system, 'global')     全局配置里的供应商
 //	'<用户名>'   → (user, '<用户名>')      该用户自有的上游
 //
+// 只有迁移（scope_migration.go）用它：老库那一列还在的时候，取值就这两种形状。
 // 用户名必须本身就是一个合法的 scope ID（policy 禁冒号/控制字符）。老库里若存在含冒号的
 // 用户名，这里必须报错而不是清洗 —— 清洗等于把两个不同的主体并成一个桶。
 func decodeLegacyProviderScope(s string) (policy.ScopeRef, error) {
@@ -102,22 +106,6 @@ func legacyUserScope(userName string) (policy.ScopeRef, error) {
 		return policy.ScopeRef{}, fmt.Errorf("%w: 用户名为空，无归属范围", ErrScopeRequired)
 	}
 	return policy.NewScopeRef(policy.ScopeUser, name)
-}
-
-// encodeLegacyProviderScope 是反向映射，只服务旧 API 的 ProviderStatus.Scope 裸串字段。
-//
-// §2.7 规则 8：主线接线完成后删除（连带旧字段与旧调用点）。
-// 编出来的串必须能被旧调用方原样比回去，所以非 user/system 范围直接报错而不是塞假字符串。
-func encodeLegacyProviderScope(scope policy.ScopeRef) (string, error) {
-	switch {
-	case isSystemScope(scope):
-		return legacyProviderScopeGlobal, nil
-	case scope.Kind == policy.ScopeUser:
-		return scope.ID, nil
-	default:
-		return "", fmt.Errorf("%w: 旧接口无法表达 %s（旧只有全局与用户两种范围）",
-			ErrLegacyScope, scope.Display())
-	}
 }
 
 // DecodeLegacyPriceScope 把 user_prices 的旧 scope 串映射成结构化范围：

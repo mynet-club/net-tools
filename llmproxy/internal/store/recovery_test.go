@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 )
 
 // 重启恢复：关掉再打开，用户、价目、冻结金额、熔断状态都必须原样回来，
@@ -67,8 +69,8 @@ func TestReopenRestoresUsersPricesFrozenAndStatus(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SaveProviderStatus([]ProviderStatus{
-		{Scope: "alice", Name: "up", Enabled: true, ConsecutiveFailures: 3, TotalRequests: 9, UnhealthyUntil: time.Now().Add(time.Minute)},
+	if err := s.SaveProviderBucketStates([]ProviderBucketState{
+		{Scope: policy.MustScope(policy.ScopeUser, "alice"), Name: "up", Enabled: true, ConsecutiveFailures: 3, TotalRequests: 9, UnhealthyUntil: time.Now().Add(time.Minute)},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -133,18 +135,18 @@ func TestReopenRestoresUsersPricesFrozenAndStatus(t *testing.T) {
 	}
 
 	// 熔断状态（含冷却截止时间）恢复
-	pstats, err := s2.LoadProviderStatus()
+	pstats, err := s2.LoadProviderBucketStates()
 	if err != nil {
 		t.Fatal(err)
 	}
-	pst, ok := statusOf(pstats, "alice", "up")
+	pst, ok := statusOf(pstats, policy.MustScope(policy.ScopeUser, "alice"), "up")
 	if !ok {
 		t.Fatalf("alice/up 的熔断状态应当恢复，实际 %+v", pstats)
 	}
 	if pst.ConsecutiveFailures != 3 || pst.TotalRequests != 9 || pst.UnhealthyUntil.IsZero() {
 		t.Errorf("熔断状态不完整: %+v", pst)
 	}
-	if _, ok := statusOf(pstats, "bob", "up"); ok {
+	if _, ok := statusOf(pstats, policy.MustScope(policy.ScopeUser, "bob"), "up"); ok {
 		t.Error("bob 不该看到 alice 的熔断状态")
 	}
 
