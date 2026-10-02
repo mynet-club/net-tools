@@ -82,7 +82,10 @@ func (p *PolicyConfig) LoadBundles(baseDir string) (*policy.BundleSet, error) {
 	set := make([]policy.PolicyBundle, 0, len(refs))
 	for _, ref := range refs {
 		id := strings.TrimSpace(ref.ID)
-		path := filepath.Join(dir, id+".yaml")
+		path, err := BundleFilePath(dir, id)
+		if err != nil {
+			return nil, fmt.Errorf("%w: policy.bundles 里有不能当文件名用的 id: %v", ErrPolicyBundle, err)
+		}
 		b, err := p.loadOneBundle(id, path, ref)
 		if err != nil {
 			return nil, err
@@ -101,19 +104,9 @@ const DefaultBundleDir = "policy-bundles"
 
 // loadOneBundle 读一个内容文件并核对它与引用一致。
 func (p *PolicyConfig) loadOneBundle(id, path string, ref PolicyBundleRef) (policy.PolicyBundle, error) {
-	raw, err := os.ReadFile(path)
+	wire, err := readBundleWire(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return policy.PolicyBundle{}, fmt.Errorf(
-				"%w: 策略包 %s 的内容文件不存在：%s（policy.bundles 里的每个引用都要有对应文件；%s）",
-				ErrPolicyBundle, id, path, "文件名必须是 <id>.yaml")
-		}
-		return policy.PolicyBundle{}, fmt.Errorf("%w: 读取 %s 失败: %v", ErrPolicyBundle, path, err)
-	}
-
-	var wire bundleFileWire
-	if err := decodeYAMLStrict(raw, &wire); err != nil {
-		return policy.PolicyBundle{}, fmt.Errorf("%w: %s: %v", ErrPolicyBundle, path, err)
+		return policy.PolicyBundle{}, err
 	}
 
 	// 内容与引用逐字段核对。**以引用为准**：配置里那一条才是运维明确生效的版本，
@@ -153,6 +146,27 @@ func bundleMismatch(path, field, want, got string) error {
 	return fmt.Errorf("%w: %s 的 %s 与 policy.bundles 引用不一致（引用=%s，内容=%s）："+
 		"发新版要同时改引用与内容文件，只改一边等于两个真值来源",
 		ErrPolicyBundle, filepath.Base(path), field, want, got)
+}
+
+// readBundleWire 读并严格解析一个内容文件，只到磁盘形态（不核对引用、不建领域对象）。
+//
+// 加载器（loadOneBundle）与写侧（ReadBundleFile / 发布后的回读校验）共用它：
+// 「磁盘上什么算合法」只能有一份定义，否则会出现写得出来却加载不了的包。
+func readBundleWire(path string) (bundleFileWire, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return bundleFileWire{}, fmt.Errorf(
+				"%w: 内容文件不存在：%s（policy.bundles 里的每个引用都要有对应文件；%s）",
+				ErrPolicyBundle, path, "文件名必须是 <id>.yaml")
+		}
+		return bundleFileWire{}, fmt.Errorf("%w: 读取 %s 失败: %v", ErrPolicyBundle, path, err)
+	}
+	var wire bundleFileWire
+	if err := decodeYAMLStrict(raw, &wire); err != nil {
+		return bundleFileWire{}, fmt.Errorf("%w: %s: %v", ErrPolicyBundle, path, err)
+	}
+	return wire, nil
 }
 
 // decodeYAMLStrict 把 YAML 解进目标结构：未知键一律报错。
