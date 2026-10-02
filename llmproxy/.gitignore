@@ -2,6 +2,8 @@
 # 注意必须写「/llmproxy」而不是「llmproxy」——裸名会匹配任意层级的同名文件或目录，
 # 那样连 cmd/llmproxy/ 这个**源码目录**也会被一起忽略掉。
 /llmproxy
+# 压测工具的本地构建产物：同样必须写「/llmpbench」，裸名会把 cmd/llmpbench 源码目录一起忽略掉
+/llmpbench
 dist/
 
 # 实际配置含上游密钥与网关访问密钥，不入库；模板见 config/config.example.yaml
