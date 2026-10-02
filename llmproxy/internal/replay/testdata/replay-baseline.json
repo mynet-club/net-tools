@@ -1,0 +1,357 @@
+{
+  "schema_version": 1,
+  "decisions": [
+    {
+      "request_id": "req-allow-gpt5",
+      "recorded_at": "2026-03-01T12:00:00Z",
+      "policy_version": "university-default@3|system-default@1",
+      "scope_chain": [
+        {
+          "kind": "organization",
+          "id": "university"
+        },
+        {
+          "kind": "user",
+          "id": "alice"
+        }
+      ],
+      "subject": {
+        "subject": "alice",
+        "source": "oidc:university",
+        "roles": [
+          "student"
+        ],
+        "groups": [
+          "cs"
+        ],
+        "auth_methods": [
+          "mfa",
+          "password"
+        ],
+        "issued_at": "2026-03-01T11:00:00Z",
+        "expires_at": "2026-03-01T20:00:00Z"
+      },
+      "context": {
+        "purpose": "qa",
+        "organization": "university",
+        "data_level": "internal",
+        "wiring_mode": "shadow"
+      },
+      "resource": "model:gpt-5",
+      "action": "use",
+      "effect": "allow",
+      "reason": "explicit_allow",
+      "reasons": [
+        "explicit_allow"
+      ],
+      "winner": {
+        "subject": "alice",
+        "resource": "model:gpt-5",
+        "action": "use",
+        "effect": "allow",
+        "precedence": "explicit_allow",
+        "sort_key": "alice|model:gpt-5|use|",
+        "expires_at": "2026-03-02T12:00:00Z"
+      },
+      "matched": [
+        {
+          "subject": "alice",
+          "resource": "model:gpt-5",
+          "action": "use",
+          "effect": "allow",
+          "precedence": "explicit_allow",
+          "sort_key": "alice|model:gpt-5|use|",
+          "expires_at": "2026-03-02T12:00:00Z"
+        }
+      ],
+      "expires_at": "2026-03-01T20:00:00Z",
+      "external_plaintext_allowed": false
+    },
+    {
+      "request_id": "req-allow-mini",
+      "recorded_at": "2026-03-01T12:00:00Z",
+      "policy_version": "university-default@3|system-default@1",
+      "scope_chain": [
+        {
+          "kind": "organization",
+          "id": "university"
+        },
+        {
+          "kind": "user",
+          "id": "alice"
+        }
+      ],
+      "subject": {
+        "subject": "alice",
+        "source": "oidc:university",
+        "roles": [
+          "student"
+        ],
+        "groups": [
+          "cs"
+        ],
+        "auth_methods": [
+          "mfa",
+          "password"
+        ],
+        "issued_at": "2026-03-01T11:00:00Z",
+        "expires_at": "2026-03-01T20:00:00Z"
+      },
+      "context": {
+        "purpose": "qa",
+        "organization": "university",
+        "data_level": "internal",
+        "wiring_mode": "shadow"
+      },
+      "resource": "model:gpt-mini",
+      "action": "use",
+      "effect": "allow",
+      "reason": "group_allow",
+      "reasons": [
+        "group_allow"
+      ],
+      "winner": {
+        "subject": "role:student",
+        "resource": "model:gpt-mini",
+        "action": "use",
+        "effect": "allow",
+        "precedence": "group_allow",
+        "sort_key": "role:student|model:gpt-mini|use|"
+      },
+      "matched": [
+        {
+          "subject": "role:student",
+          "resource": "model:gpt-mini",
+          "action": "use",
+          "effect": "allow",
+          "precedence": "group_allow",
+          "sort_key": "role:student|model:gpt-mini|use|"
+        }
+      ],
+      "expires_at": "2026-03-01T20:00:00Z",
+      "external_plaintext_allowed": false
+    },
+    {
+      "request_id": "req-deny-gptmax",
+      "recorded_at": "2026-03-01T12:00:00Z",
+      "policy_version": "university-default@3|system-default@1",
+      "scope_chain": [
+        {
+          "kind": "organization",
+          "id": "university"
+        },
+        {
+          "kind": "user",
+          "id": "alice"
+        }
+      ],
+      "subject": {
+        "subject": "alice",
+        "source": "oidc:university",
+        "roles": [
+          "student"
+        ],
+        "groups": [
+          "cs"
+        ],
+        "auth_methods": [
+          "mfa",
+          "password"
+        ],
+        "issued_at": "2026-03-01T11:00:00Z",
+        "expires_at": "2026-03-01T20:00:00Z"
+      },
+      "context": {
+        "purpose": "qa",
+        "organization": "university",
+        "data_level": "internal",
+        "wiring_mode": "shadow"
+      },
+      "resource": "model:gpt-max",
+      "action": "use",
+      "effect": "deny",
+      "reason": "model_not_allowed",
+      "reasons": [
+        "deny_rule",
+        "model_not_allowed"
+      ],
+      "winner": {
+        "subject": "role:student",
+        "resource": "model:gpt-max",
+        "action": "use",
+        "effect": "deny",
+        "precedence": "deny",
+        "sort_key": "role:student|model:gpt-max|use|"
+      },
+      "matched": [
+        {
+          "subject": "role:student",
+          "resource": "model:gpt-max",
+          "action": "use",
+          "effect": "deny",
+          "precedence": "deny",
+          "sort_key": "role:student|model:gpt-max|use|"
+        },
+        {
+          "subject": "alice",
+          "scope": "organization:university",
+          "resource": "model:gpt-max",
+          "action": "use",
+          "effect": "allow",
+          "precedence": "explicit_allow",
+          "sort_key": "alice|model:gpt-max|use|"
+        }
+      ],
+      "expires_at": "2026-03-01T20:00:00Z",
+      "external_plaintext_allowed": false
+    },
+    {
+      "request_id": "req-allow-mri",
+      "recorded_at": "2026-03-01T12:00:00Z",
+      "policy_version": "hospital-a-default@2|system-default@1",
+      "scope_chain": [
+        {
+          "kind": "organization",
+          "id": "hospital-a"
+        },
+        {
+          "kind": "user",
+          "id": "bob"
+        }
+      ],
+      "subject": {
+        "subject": "bob",
+        "source": "oidc:university",
+        "roles": [
+          "doctor"
+        ],
+        "groups": [
+          "radiology"
+        ],
+        "auth_methods": [
+          "mfa",
+          "password"
+        ],
+        "issued_at": "2026-03-01T11:00:00Z",
+        "expires_at": "2026-03-01T20:00:00Z"
+      },
+      "context": {
+        "purpose": "qa",
+        "organization": "hospital-a",
+        "data_level": "confidential",
+        "wiring_mode": "shadow"
+      },
+      "resource": "model:private-mri",
+      "action": "use",
+      "effect": "allow",
+      "reason": "group_allow",
+      "reasons": [
+        "group_allow"
+      ],
+      "winner": {
+        "subject": "role:doctor",
+        "resource": "model:private-mri",
+        "action": "use",
+        "effect": "allow",
+        "precedence": "group_allow",
+        "sort_key": "role:doctor|model:private-mri|use|"
+      },
+      "matched": [
+        {
+          "subject": "role:doctor",
+          "resource": "model:private-mri",
+          "action": "use",
+          "effect": "allow",
+          "precedence": "group_allow",
+          "sort_key": "role:doctor|model:private-mri|use|"
+        }
+      ],
+      "expires_at": "2026-03-01T20:00:00Z",
+      "external_plaintext_allowed": false
+    }
+  ],
+  "routing": [
+    {
+      "request_id": "req-allow-mini",
+      "recorded_at": "2026-03-01T12:00:00Z",
+      "policy_version": "university-default@3|system-default@1",
+      "routing_seed": "ef0b981649de2ec349802a85b3fc3ff3cb0cfa905f88cd349b7127878cb9fb1a",
+      "routing_epoch": "epoch-7",
+      "sampling_algo": "replay-sampling-v1",
+      "candidates_digest": "a9b84932c066037547c27a6ec00e9225f114e1c0cdfac335a4948c2bba2b1a31",
+      "candidates": [
+        {
+          "executor": "openai-http",
+          "provider": "p-demo",
+          "model": "public-demo",
+          "upstream_model": "public-demo",
+          "weight": 1,
+          "region": "cn-north",
+          "max_data_level": 3
+        },
+        {
+          "executor": "openai-http",
+          "provider": "p-gpt5",
+          "model": "gpt-5",
+          "upstream_model": "gpt-5",
+          "weight": 3,
+          "region": "cn-north",
+          "max_data_level": 3
+        },
+        {
+          "executor": "openai-http",
+          "provider": "p-mini",
+          "model": "gpt-mini",
+          "upstream_model": "gpt-mini",
+          "weight": 1,
+          "region": "cn-north",
+          "max_data_level": 3
+        }
+      ],
+      "plan": {
+        "executor": "openai-http",
+        "model": "gpt-5",
+        "upstream_model": "gpt-5",
+        "fallbacks": [
+          {
+            "executor": "openai-http",
+            "provider": "p-gpt5",
+            "model": "gpt-5",
+            "upstream_model": "gpt-5",
+            "weight": 3,
+            "region": "cn-north",
+            "max_data_level": 3
+          },
+          {
+            "executor": "openai-http",
+            "provider": "p-mini",
+            "model": "gpt-mini",
+            "upstream_model": "gpt-mini",
+            "weight": 1,
+            "region": "cn-north",
+            "max_data_level": 3
+          }
+        ],
+        "max_retries": 1,
+        "reason_codes": [
+          "weighted_choice"
+        ],
+        "policy_version": "university-default@3|system-default@1",
+        "expires_at": "2026-03-01T13:00:00Z",
+        "routing_seed": "ef0b981649de2ec349802a85b3fc3ff3cb0cfa905f88cd349b7127878cb9fb1a",
+        "rejections": [
+          {
+            "provider": "p-demo",
+            "reason": "candidate_level_excluded"
+          }
+        ]
+      },
+      "rejections": [
+        {
+          "provider": "p-demo",
+          "reason": "candidate_level_excluded"
+        }
+      ]
+    }
+  ]
+}
