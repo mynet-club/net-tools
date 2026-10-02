@@ -133,7 +133,8 @@ func TestSystemUsageOnlyCountsSystemPaid(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	su, err := s.SystemUsageSince("carol", MonthStart(day))
+	carolScope := policy.MustScope(policy.ScopeUser, "carol")
+	su, err := s.ScopeSystemUsage(carolScope, MonthStart(day))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +146,7 @@ func TestSystemUsageOnlyCountsSystemPaid(t *testing.T) {
 	}
 
 	// 全量口径仍然是两条
-	all, err := s.TotalByUser(MonthStart(day), "carol")
+	all, err := s.ScopeUsageTotals([]policy.ScopeRef{carolScope}, MonthStart(day), time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,15 +213,17 @@ INSERT INTO usage_user_daily VALUES ('2026-09-01','old','deepseek','deepseek-fla
 	if q := mustQuota(t, s, policy.MustScope(policy.ScopeUser, "old")); q.QuotaMonthTokens != 0 || !q.Enabled {
 		t.Fatalf("无旧列的库也要补出「不限」的配额行: %+v", q)
 	}
-	// 老数据保留：条数、token 数不变
-	su, err := s.SystemUsageSince("old", time.Date(2026, 9, 1, 0, 0, 0, 0, time.Local))
+	// 老数据保留：条数、token 数不变。读的是 usage_scope_daily —— 一次性迁移把
+	// usage_user_daily 的旧行按 (user, 名) 回填过去，老账这才还在。
+	oldScope := policy.MustScope(policy.ScopeUser, "old")
+	su, err := s.ScopeSystemUsage(oldScope, time.Date(2026, 9, 1, 0, 0, 0, 0, time.Local))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if su.Requests != 0 {
 		t.Fatalf("老数据不该被算成系统付费: %+v", su)
 	}
-	all, err := s.TotalByUser(time.Time{}, "old")
+	all, err := s.ScopeUsageTotals([]policy.ScopeRef{oldScope}, time.Time{}, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +237,7 @@ INSERT INTO usage_user_daily VALUES ('2026-09-01','old','deepseek','deepseek-fla
 		t.Fatalf("二次打开失败（迁移不幂等）: %v", err)
 	}
 	defer s2.Close()
-	if all2, _ := s2.TotalByUser(time.Time{}, "old"); all2.Requests != 3 {
+	if all2, _ := s2.ScopeUsageTotals([]policy.ScopeRef{oldScope}, time.Time{}, time.Time{}); all2.Requests != 3 {
 		t.Fatalf("二次迁移后数据变了: %+v", all2)
 	}
 }

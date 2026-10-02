@@ -146,7 +146,8 @@ func costFromRates(inHit, inMiss, inWrite, out, perReq float64, rec *store.Reque
 // freezeDownstreamCharge 按**分发价**（user_prices）冻结"向这个用户收多少钱"。
 //
 // 与上游成本一样按请求开始时刻取价、一样只在成功且有 usage 时冻结。
-// 取价顺序由 store 保证：user:<用户名> 优先，没有则回落 default。
+// 取价链条是「这个请求自己的范围 → 全局默认 (system, global)」，由 store 按具体度排；
+// 少一腿就会只配了全局默认价的部署算不出钱。
 // 只有系统付费的消耗才谈得上收费 —— BYO 用户用自己的上游，网关不掏钱也不向他收钱，
 // 那部分只有上游成本要算（而且属于他自己），分发金额保持未冻结。
 func (s *Server) freezeDownstreamCharge(rec *store.RequestRecord, started time.Time) {
@@ -156,9 +157,21 @@ func (s *Server) freezeDownstreamCharge(rec *store.RequestRecord, started time.T
 	if !rec.OK || rec.PromptTokens == nil {
 		return
 	}
-	price, err := s.db.UserPriceAt(rec.UserName, rec.Model, started)
+	scope := rec.Scope
+	if err := scope.Validate(); err != nil {
+		scope = userBucket(rec.UserName) // 与熔断桶同一个落点，不在这里再立一套「用户名怎么变成范围」
+	}
+	if err := scope.Validate(); err != nil {
+		return // 归属都定不下来，谈不上按哪个范围取价
+	}
+	chain, err := priceScopeChain(scope)
 	if err != nil {
-		s.log.Warnf("查分发价目失败（%s/%s）: %v", rec.UserName, rec.Model, err)
+		s.log.Warnf("取分发价目的范围链失败（%s）: %v", scope.Display(), err)
+		return
+	}
+	price, err := s.db.ScopePriceAtChain(chain, rec.Model, started)
+	if err != nil {
+		s.log.Warnf("查分发价目失败（%s/%s）: %v", scope.Display(), rec.Model, err)
 		return
 	}
 	if price == nil {

@@ -279,7 +279,9 @@ func migrateScopeSchema(db *sql.DB, d Dialect, pathOrDSN string) error {
 		// 2.x 那四列配额列（3.0 不读它们，但形状没收干净）。删不动只打提示 ——
 		// 版本号已落、结构是完整的 3.0，不该为一句收尾的 DDL 把库锁在门外。
 		retireUsersQuotaColumnsQuietly(db, d)
-		return nil
+		// 老账单的镜像也在这条分支补：上一版二进制盖版本号时还没有「读源只剩
+		// usage_scope_daily」这件事，那种库结构全对、镜像却是空的。
+		return mirrorUsageScopeDailyIfEmpty(db, d)
 	}
 
 	st, err := loadScopeSchemaState(db, d)
@@ -306,11 +308,17 @@ func migrateScopeSchema(db *sql.DB, d Dialect, pathOrDSN string) error {
 		if err := writeScopeQuotaRows(db, d, st); err != nil {
 			return err
 		}
+		// needsWork() 说的是「四张表的形状不用搬」，不是「库里没有老账单」：比消费模式还早的库
+		// 可能只有 users + usage_user_daily，走的就是这条分支。镜像必须排在版本号之前 ——
+		// 版本号一落，下次的早退分支虽然也会补，但那一轮的收口校验已经不再管这批账了。
+		if err := mirrorUsageScopeDailyIfEmpty(db, d); err != nil {
+			return err
+		}
 		if err := stampScopeSchemaVersion(db, d, scopeBackup{}, time.Now()); err != nil {
 			return err
 		}
-		// 旧列在这一步退役：上一句已经按同一份输入选择把（可能存在的）旧列值搬进了配额行，
-		// 所以守卫在这里只是兜底，防的是「行还没落成就把唯一的真值删走」。
+		// 旧列在这一步退役：writeScopeQuotaRows 已经按同一份输入把（可能存在的）旧列值搬进了
+		// 配额行，所以守卫在这里只是兜底，防的是「行还没落成就把唯一的真值删走」。
 		// 新库根本没有那四列（userSchema 已经不建），退役对它就是空转。
 		retireUsersQuotaColumnsQuietly(db, d)
 		return nil
@@ -1074,6 +1082,22 @@ UPDATE scope_quota SET
 WHERE scope_kind='user'
   AND EXISTS (SELECT 1 FROM users u WHERE u.name = scope_quota.scope_id)`
 
+// usageScopeMirrorSQL 把 usage_user_daily 整表按 (user, 名) 复制进 usage_scope_daily。
+//
+// 两个调用点共用同一句：回填阶段（真正的一次性迁移）与「结构已是 3.0 但镜像还空着」的补齐
+// （见 mirrorUsageScopeDailyIfEmpty）。分两处写就会漂移 —— 一处补了列、另一处忘了。
+// 不带 ON CONFLICT：目标表灌之前必然是空的。
+const usageScopeMirrorSQL = `
+INSERT INTO usage_scope_daily (
+  day, scope_kind, scope_id, provider, model, upstream_model, system_paid,
+  requests, ok, failed, prompt_tokens, cache_hit_tokens, cache_miss_tokens,
+  completion_tokens, total_tokens, latency_sum_ms, charge, frozen_charges
+)
+SELECT day, 'user', user_name, provider, model, upstream_model, system_paid,
+       requests, ok, failed, prompt_tokens, cache_hit_tokens, cache_miss_tokens,
+       completion_tokens, total_tokens, latency_sum_ms, charge, frozen_charges
+FROM usage_user_daily`
+
 // backfillUsageScopeDaily 从 usage_user_daily 回填按范围的日聚合。
 //
 // 「历史明细的归属不改变」（§2.7 规则 5）在这里的具体含义：
@@ -1095,16 +1119,7 @@ func (p *scopeMigrationPlan) backfillUsageScopeDaily(st scopeSchemaState, _ *Sco
 			return err
 		}
 	}
-	if _, err := p.db.Exec(p.d.Rebind(`
-INSERT INTO usage_scope_daily (
-  day, scope_kind, scope_id, provider, model, upstream_model, system_paid,
-  requests, ok, failed, prompt_tokens, cache_hit_tokens, cache_miss_tokens,
-  completion_tokens, total_tokens, latency_sum_ms, charge, frozen_charges
-)
-SELECT day, 'user', user_name, provider, model, upstream_model, system_paid,
-       requests, ok, failed, prompt_tokens, cache_hit_tokens, cache_miss_tokens,
-       completion_tokens, total_tokens, latency_sum_ms, charge, frozen_charges
-FROM usage_user_daily`)); err != nil {
+	if _, err := p.db.Exec(p.d.Rebind(usageScopeMirrorSQL)); err != nil {
 		return fmt.Errorf("%w: 回填 usage_scope_daily 失败: %w", ErrScopeMigration, err)
 	}
 	if createdHere {
@@ -1118,6 +1133,37 @@ FROM usage_user_daily`)); err != nil {
 			return p.exec(`DELETE FROM usage_scope_daily WHERE scope_kind='user'`)
 		})
 	}
+	return nil
+}
+
+// mirrorUsageScopeDailyIfEmpty 给「结构已经是 3.0、但老账还没镜像过来」的库补一次回填。
+//
+// 为什么单独要有这一句：3.0 的用量**只有 usage_scope_daily 一个读源**（规则 8 之后
+// usage_user_daily 既不写也不读了）。而 needsWork() 只看四张表的形状 —— 一张表形状齐了、
+// 老 usage_user_daily 里却还留着账单的库（比消费模式还早、又从没建过 provider_stats 的库，
+// 或被上一版二进制提前盖上版本号的库）会直接走「不动数据」分支，版本号一落，
+// 那批账单就再也没有读路径能看见：**账单凭空变成 0**，而这正是最贵的那种静默失败。
+//
+// 只在目标表为空时动手：那时不可能重复计数，也不可能在真跑过 3.0 的库上盖掉实时行。
+// 目标表有行就说明镜像已经发生（或者 3.0 正在记账），这里一律不碰。
+func mirrorUsageScopeDailyIfEmpty(db *sql.DB, d Dialect) error {
+	userRows, hasLegacy, err := tableRowCount(db, d, "usage_user_daily")
+	if err != nil || !hasLegacy || userRows == 0 {
+		return err
+	}
+	scopeRows, _, err := tableRowCount(db, d, "usage_scope_daily")
+	if err != nil {
+		return err
+	}
+	if scopeRows > 0 {
+		return nil
+	}
+	if _, err := db.Exec(d.Rebind(usageScopeMirrorSQL)); err != nil {
+		return fmt.Errorf("%w: 补镜像 usage_scope_daily 失败: %w", ErrScopeMigration, err)
+	}
+	fmt.Fprintf(scopeMigrationOutput,
+		"[scope-migration] 结构已是 3.0 但 usage_scope_daily 是空的：已把 usage_user_daily 的 %d 行老账单补镜像过来\n",
+		userRows)
 	return nil
 }
 

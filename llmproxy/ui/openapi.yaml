@@ -169,8 +169,11 @@ paths:
       tags: [admin]
       summary: 用量 CSV 导出
       security: [{adminAuth: []}]
+      description: |
+        范围用精确选择器 kind:id（§2.7 规则 1）；缺省 = 全部范围。CSV 里两列成对出现：
+        `day,scope_kind,scope_id,amount,currency,charge_frozen`，不给折叠成一个串的 scope。
       parameters:
-        - { name: user, in: query, schema: { type: string } }
+        - { name: scope, in: query, schema: { type: string, example: user:alice } }
         - { name: since, in: query, schema: { type: string, format: date } }
         - { name: until, in: query, schema: { type: string, format: date } }
         - { name: monthly, in: query, schema: { type: boolean } }
@@ -180,6 +183,7 @@ paths:
           content:
             text/csv:
               schema: { type: string }
+        '400': { description: scope 不是精确的 kind:id（裸用户名、通配、未知类型都拒） }
   /v1/_admin/audit:
     get:
       tags: [admin]
@@ -493,9 +497,26 @@ paths:
     put:
       tags: [admin]
       summary: 录一条分发价目
+      description: |
+        分发价按**范围**定：body 里的 scope 是精确选择器 kind:id（user:alice、
+        project:cs-lab、organization:university），全局兜底价写 system:global。
+        2.x 的 `default` / `user:<名>` 前缀串不再受理 —— 读侧只认结构化范围，
+        响应里也永远成对给 scope_kind + scope_id（§2.7 规则 1）。
+        价目只在整点生效、按时间只追加，币种必须等于基准币。
       security: [{adminAuth: []}]
       responses:
-        '200': { description: OK }
+        '200': { description: 'inserted: {scope_kind, scope_id, model, …}' }
+        '400': { description: scope 非精确 kind:id / valid_from 非整点 / 往回插价 / 混币种 }
+    get:
+      tags: [admin]
+      summary: 查某个 (范围, 模型) 的分发价历史
+      security: [{adminAuth: []}]
+      parameters:
+        - { name: scope, in: query, required: true, schema: { type: string, example: user:alice } }
+        - { name: model, in: query, required: true, schema: { type: string } }
+      responses:
+        '200': { description: 'scope_kind + scope_id + prices[]，按 valid_from 升序，含历史' }
+        '400': { description: scope 不是精确的 kind:id，或缺 model }
   /healthz:
     get:
       tags: [openai]

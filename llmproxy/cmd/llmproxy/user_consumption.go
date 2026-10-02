@@ -60,6 +60,18 @@ func userScopeOf(name string) (policy.ScopeRef, error) {
 	return scope, nil
 }
 
+// userTotals 读一个用户名的累计用量。
+//
+// §2.7 规则 8 之后用量只有 scope 形状的阅读口，所以「按用户名查累计」这一句
+// 在 CLI 里出现三处（列表、详情、usage），收在这儿而不是各写一遍范围拼装。
+func userTotals(db *store.Store, name string, since, until time.Time) (store.UsageTotals, error) {
+	scope, err := userScopeOf(name)
+	if err != nil {
+		return store.UsageTotals{}, err
+	}
+	return db.ScopeUsageTotals([]policy.ScopeRef{scope}, since, until)
+}
+
 // quotaOfUser 读一个用户的配额与限流行。
 //
 // 缺行报错而不是按「不限」显示：store.Open 里的 scope 迁移保证每个用户都有一行，
@@ -338,11 +350,17 @@ func printUserMode(db *store.Store, cfg *config.Config, u *store.User) {
 	fmt.Printf("  月度配额  token %s / 金额 %s\n", limitText(q.QuotaMonthTokens), costText(q.QuotaMonthCost))
 	fmt.Printf("  限流      %d 次/分钟，并发 %d\n", q.RPM, q.MaxConcurrent)
 
-	su, err := db.SystemUsageSince(u.Name, store.MonthStart(time.Now()))
+	// 系统付费用量按范围读（§2.7 规则 8：usage_user_daily 已经不再写，读侧只留 scope 形状）
+	scope, err := userScopeOf(u.Name)
+	if err != nil {
+		fmt.Printf("  用量      %v\n", err)
+		return
+	}
+	su, err := db.ScopeSystemUsage(scope, store.MonthStart(time.Now()))
 	if err != nil {
 		return
 	}
-	rows, err := db.SystemUsageRowsSince(u.Name, store.MonthStart(time.Now()))
+	rows, err := db.ScopeSystemUsageRows(scope, store.MonthStart(time.Now()))
 	if err != nil {
 		return
 	}

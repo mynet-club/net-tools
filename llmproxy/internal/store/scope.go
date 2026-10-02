@@ -68,9 +68,6 @@ func hasScope(scope policy.ScopeRef) bool { return scope.Kind != "" || scope.ID 
 // 只有这一处负责列序，避免各查询各写一遍写反。
 func scopeArgs(scope policy.ScopeRef) []any { return []any{string(scope.Kind), scope.ID} }
 
-// isSystemScope 报告是否是那个唯一的系统范围（等价于 policy.SystemScope）。
-func isSystemScope(scope policy.ScopeRef) bool { return scope.Is(policy.SystemScope) }
-
 // isScopeParam 报告一个 SQL 读回来的 scope 列是否可用。
 // requests 的可空列在 3.0 之前是 NULL（= 无归属信息），扫进来就是空串。
 func isScopeParam(kind, id string) bool { return kind != "" && id != "" }
@@ -113,10 +110,9 @@ func legacyUserScope(userName string) (policy.ScopeRef, error) {
 //	'default'      → (system, 'global')
 //	'user:<名>'    → (user, '<名>')
 //
-// 导出它的唯一理由：分发价的管理接口收到的还是旧串，而写审计必须有范围 ——
-// 让 server 自己再解析一遍 'default' / 'user:' 前缀就是跨包复制业务规则。
-//
-// §2.7 规则 8：随旧分发价接口一起删除（调用方改用结构化 ScopePrice 后无人需要解析旧串）。
+// 现在只剩一个使用者：§2.7 的一次性迁移（预检 + 回填读的是 2.x 库里那列 scope 串）。
+// 运行时的读写一律走 ScopePrice 的结构化范围，接口与 CLI 都不再收旧串 ——
+// 兼容层只在这条搬家路径上存在，搬完就没有第二个解析点。
 func DecodeLegacyPriceScope(s string) (policy.ScopeRef, error) {
 	switch {
 	case s == legacyPriceScopeDefault:
@@ -126,20 +122,6 @@ func DecodeLegacyPriceScope(s string) (policy.ScopeRef, error) {
 	default:
 		return policy.ScopeRef{}, fmt.Errorf("%w: %q（旧约定只认 %q 与 %q<用户名>）",
 			ErrLegacyScope, s, legacyPriceScopeDefault, legacyPriceScopeUserPfx)
-	}
-}
-
-// encodeLegacyPriceScope 是反向映射，只服务旧 API 的 UserPrice.Scope 裸串字段。
-//
-// §2.7 规则 8：主线接线完成后删除。
-func encodeLegacyPriceScope(scope policy.ScopeRef) (string, error) {
-	switch {
-	case isSystemScope(scope):
-		return legacyPriceScopeDefault, nil
-	case scope.Kind == policy.ScopeUser:
-		return legacyPriceScopeUserPfx + scope.ID, nil
-	default:
-		return "", fmt.Errorf("%w: 旧分发价接口无法表达 %s", ErrLegacyScope, scope.Display())
 	}
 }
 
@@ -185,10 +167,10 @@ func (b ProviderBucketState) bucketKey() string {
 	return b.Scope.Display() + "/" + b.Name
 }
 
-// ScopePrice 是一条**按范围键定**的分发价目行（3.0 形态）。
+// ScopePrice 是一条**按范围键定**的分发价目行。
 //
-// 与旧的 UserPrice 的区别只有范围：旧的那份用 'default' / 'user:<名>' 字符串前缀约定，
-// 这一份直接带 policy.ScopeRef，因此组织级、项目级分发价在存储层第一次有了表达形式。
+// 范围是 policy.ScopeRef，不是 2.x 的 'default' / 'user:<名>' 字符串前缀约定：
+// 组织级、项目级分发价因此有了表达形式，全局兜底就是 (system, 'global')。
 // 价目行仍按时间只追加、整点生效（口径与 2.x 一致，见 docs/pricing-design.md）。
 type ScopePrice struct {
 	ID            int64
@@ -208,25 +190,6 @@ type ScopePrice struct {
 	ValidTo       time.Time // 零值 = 一直有效
 	Note          string
 	CreatedAt     time.Time
-}
-
-// ToLegacy 把结构化行摊回旧的 UserPrice，只给旧读路径用。
-//
-// §2.7 规则 8：主线接线完成后删除。
-func (p *ScopePrice) ToLegacy() *UserPrice {
-	scope, err := encodeLegacyPriceScope(p.Scope)
-	if err != nil {
-		// 组织/项目级的行在旧接口里没有对应字面量：留空串，旧调用方按「未知作用域」处理，
-		// 不会被误当成 default（default 会被旧取价逻辑当成全局兜底而错用报价）。
-		scope = ""
-	}
-	return &UserPrice{
-		ID: p.ID, Scope: scope, Model: p.Model, Currency: p.Currency,
-		InMiss: p.InMiss, InHit: p.InHit, InWrite: p.InWrite, Out: p.Out,
-		ReasoningOut: p.ReasoningOut, PerRequestFee: p.PerRequestFee,
-		PeakHours: p.PeakHours, OffPeakRatio: p.OffPeakRatio, PeakTZ: p.PeakTZ,
-		ValidFrom: p.ValidFrom, ValidTo: p.ValidTo, Note: p.Note, CreatedAt: p.CreatedAt,
-	}
 }
 
 // ScopeQuota 是一个范围的月度配额与限流设置。0 一律表示「不限」（沿用 2.x 口径）。

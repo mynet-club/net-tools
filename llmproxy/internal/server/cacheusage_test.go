@@ -104,10 +104,7 @@ func TestOpenAIStyleCacheTokensRecorded(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("应 200，实际 %d: %s", resp.StatusCode, raw)
 	}
-	su, err := h.db.SystemUsageSince("carol", store.MonthStart(time.Now()))
-	if err != nil {
-		t.Fatal(err)
-	}
+	su := mustSystemUsage(t, h.db, "carol", store.MonthStart(time.Now()))
 	if su.CacheHitTokens != 800 || su.CacheMissTokens != 200 {
 		t.Fatalf("OpenAI 形状的 cached_tokens 没被算成命中：hit=%d miss=%d（应当是 800/200）",
 			su.CacheHitTokens, su.CacheMissTokens)
@@ -138,10 +135,7 @@ func TestOpenAIStyleCacheTokensRecordedOnStream(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("应 200，实际 %d: %s", resp.StatusCode, raw)
 	}
-	su, err := h.db.SystemUsageSince("carol", store.MonthStart(time.Now()))
-	if err != nil {
-		t.Fatal(err)
-	}
+	su := mustSystemUsage(t, h.db, "carol", store.MonthStart(time.Now()))
 	if su.CacheHitTokens != 800 || su.CacheMissTokens != 200 {
 		t.Fatalf("流式下的 cached_tokens 没被算成命中：hit=%d miss=%d", su.CacheHitTokens, su.CacheMissTokens)
 	}

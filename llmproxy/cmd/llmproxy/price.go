@@ -14,9 +14,9 @@ const priceUsage = `llmproxy price — 录入与查看价目（provider_prices /
 
   llmproxy price list                                 当前生效的全部价目
   llmproxy price list -provider P -upstream-model M   该 (供应商,模型) 的全部历史
-  llmproxy price list -scope S -model M               该 (scope,模型) 的全部历史
+  llmproxy price list -scope kind:id -model M         该 (范围,模型) 的全部历史
   llmproxy price set provider <供应商> <上游模型> [选项]    录一条上游价
-  llmproxy price set user <scope> <模型> [选项]            录一条分发价
+  llmproxy price set user <kind:id> <模型> [选项]         录一条分发价
 
 选项（单价单位都是「每百万 token」，CNY）:
   -in-miss X        未命中缓存的输入（必填）
@@ -36,7 +36,9 @@ const priceUsage = `llmproxy price — 录入与查看价目（provider_prices /
     历史不会被改写，可以随时回溯「这一笔当时用的是哪一档」。
   * 币种必须与基准币（config.yaml 的 pricing.currency，缺省 CNY）一致 ——
     目前不做汇率换算，混币种会让规则 B 比错价（能差好几倍）。
-  * scope 只能是 default 或 user:<用户名>。
+  * 分发价的键是一个**范围**，写成 kind:id（user:alice、project:cs-lab、organization:xxx）。
+    取价按「最具体的范围优先、全局兜底」链条走，兜底那一档就是 system:global ——
+    2.x 的 default 前缀串不再受理。
 `
 
 // priceFlags 是 provider 与 user 两种录价共用的一套参数。
@@ -128,7 +130,7 @@ func priceList(paths config.Paths, args []string) error {
 	fs := flag.NewFlagSet("price list", flag.ContinueOnError)
 	provider := fs.String("provider", "", "供应商名")
 	upstream := fs.String("upstream-model", "", "上游模型名")
-	scope := fs.String("scope", "", "default 或 user:<名>")
+	scope := fs.String("scope", "", "精确范围键 kind:id")
 	model := fs.String("model", "", "下游模型名")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -158,11 +160,15 @@ func priceList(paths config.Paths, args []string) error {
 		return nil
 	}
 	if *scope != "" && *model != "" {
-		rows, err := db.ListUserPrices(*scope, *model)
+		ref, err := parseExactScope(*scope)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("分发价 %s/%s 的全部历史（%d 条）\n", *scope, *model, len(rows))
+		rows, err := db.ListScopePrices(ref, *model)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("分发价 %s/%s 的全部历史（%d 条）\n", ref.Display(), *model, len(rows))
 		for _, r := range rows {
 			fmt.Printf("  id=%-3d %s → %s  hit=%g miss=%g write=%g out=%g fee=%g %s\n",
 				r.ID, fmtTime(r.ValidFrom), fmtTime(r.ValidTo),
@@ -178,7 +184,7 @@ func priceList(paths config.Paths, args []string) error {
 	if err != nil {
 		return err
 	}
-	us, err := db.UserPricesEffective(now)
+	us, err := db.ListAllScopePrices(now)
 	if err != nil {
 		return err
 	}
@@ -198,7 +204,7 @@ func priceList(paths config.Paths, args []string) error {
 		fmt.Println("分发价（user_prices）")
 		for _, r := range us {
 			fmt.Printf("  %-22s %-16s hit=%-8g miss=%-8g write=%-8g out=%-8g %s\n",
-				r.Scope, r.Model, r.InHit, r.InMiss, r.InWrite, r.Out,
+				r.Scope.Display(), r.Model, r.InHit, r.InMiss, r.InWrite, r.Out,
 				peakSuffix(r.PeakHours, r.OffPeakRatio, r.PeakTZ))
 		}
 	}
@@ -208,7 +214,7 @@ func priceList(paths config.Paths, args []string) error {
 func priceSet(paths config.Paths, args []string) error {
 	if len(args) < 3 {
 		return fmt.Errorf("用法: llmproxy price set provider <供应商> <上游模型> [选项]\n" +
-			"      llmproxy price set user <scope> <模型> [选项]\n\n" + priceUsage)
+			"      llmproxy price set user <kind:id> <模型> [选项]\n\n" + priceUsage)
 	}
 	kind, a, b := args[0], args[1], args[2]
 	if kind != "provider" && kind != "user" {
@@ -278,8 +284,12 @@ func priceSet(paths config.Paths, args []string) error {
 		if p.inMiss <= 0 && p.out <= 0 {
 			return fmt.Errorf("至少给一个 -in-miss 或 -out（单位：每百万 token）")
 		}
-		rec := &store.UserPrice{
-			Scope: a, Model: b, Currency: currency,
+		ref, err := parseExactScope(a)
+		if err != nil {
+			return err
+		}
+		rec := &store.ScopePrice{
+			Scope: ref, Model: b, Currency: currency,
 			InMiss: p.inMiss, InHit: p.inHit, Out: p.out, PerRequestFee: p.fee,
 			PeakHours: p.peakHoursList(), OffPeakRatio: out, PeakTZ: p.peakTZ,
 			ValidFrom: validFrom, Note: note,
@@ -287,11 +297,11 @@ func priceSet(paths config.Paths, args []string) error {
 		if p.hasInWrite {
 			rec.InWrite = p.inWrite
 		}
-		if err := db.InsertUserPrice(rec); err != nil {
+		if err := db.InsertScopePrice(rec); err != nil {
 			return err
 		}
 		fmt.Printf("已录分发价 %s/%s\n  valid_from %s  hit=%g miss=%g write=%g out=%g fee=%g\n",
-			a, b, validFrom.Format(time.RFC3339), rec.InHit, rec.InMiss, rec.InWrite, rec.Out, rec.PerRequestFee)
+			ref.Display(), b, validFrom.Format(time.RFC3339), rec.InHit, rec.InMiss, rec.InWrite, rec.Out, rec.PerRequestFee)
 	}
 	if hs := p.peakHoursList(); len(hs) > 0 {
 		fmt.Printf("  峰谷: %s ×%g @ %s（空闲时段系数；0 表示回落全局）\n",

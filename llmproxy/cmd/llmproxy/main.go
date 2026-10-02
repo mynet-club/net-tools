@@ -52,7 +52,7 @@ const usageText = `llmproxy %s — 自用 LLM 转发网关
   user usage <名字>    看某个用户的按日消耗
   user rm <名字>       删除用户及其全部上游
   stats [-days N] [-recent N]   查看消耗统计
-  export [-user U] [-since D] [-until D] [-monthly] [-out f.csv]  导出用量 CSV
+  export [-scope kind:id] [-since D] [-until D] [-monthly] [-out f.csv]  导出用量 CSV
   logs [-n N] [-f]    查看日志
   test [-model M] [-stream]     通过本机网关发一条测试请求
   admin token         打印管理凭证（管理台 /admin/ 用）
@@ -731,10 +731,14 @@ func printUsageAndQuota(db *store.Store, now time.Time, pricing *config.PricingC
 	for _, u := range users {
 		var tokens int64
 		var cost float64
-		if rows, err := db.SystemUsageRowsSince(u.Name, store.MonthStart(now)); err == nil {
-			for _, r := range rows {
-				tokens += r.PromptTokens + r.CompletionTokens
-				cost += rowChargeOf(r, pricing, now)
+		// 用量按范围读（§2.7 规则 8）：usage_user_daily 已经不再写，老读取方法随之退役。
+		// 名字成不了范围键就显示成读不出来，而不是按全局范围估一份。
+		if scope, err := userScopeOf(u.Name); err == nil {
+			if rows, err := db.ScopeSystemUsageRows(scope, store.MonthStart(now)); err == nil {
+				for _, r := range rows {
+					tokens += r.PromptTokens + r.CompletionTokens
+					cost += rowChargeOf(r, pricing, now)
+				}
 			}
 		}
 		mode := "byo 自带上游"
@@ -771,7 +775,7 @@ func printPriceCoverage(db *store.Store, now time.Time) {
 	if err != nil {
 		return
 	}
-	us, _ := db.UserPricesEffective(now)
+	us, _ := db.ListAllScopePrices(now)
 	fmt.Println("价目（当前生效）")
 	if len(ps) == 0 {
 		fmt.Printf("  上游价   无 —— 成本报表只能是估算段\n")
@@ -787,7 +791,7 @@ func printPriceCoverage(db *store.Store, now time.Time) {
 	} else {
 		var keys []string
 		for _, u := range us {
-			keys = append(keys, u.Scope+"/"+u.Model)
+			keys = append(keys, u.Scope.Display()+"/"+u.Model)
 		}
 		fmt.Printf("  分发价   %d 条: %s\n", len(us), strings.Join(keys, "、"))
 	}

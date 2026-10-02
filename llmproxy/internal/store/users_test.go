@@ -155,7 +155,7 @@ func TestUserProviderCRUDAndCascade(t *testing.T) {
 	}
 }
 
-func TestInsertRequestPerUserUsage(t *testing.T) {
+func TestInsertRequestScopeAttribution(t *testing.T) {
 	s := openTestStore(t)
 	now := time.Now()
 	pt, ct, tt := int64(100), int64(20), int64(120)
@@ -175,18 +175,19 @@ func TestInsertRequestPerUserUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rows, err := s.UsageByUser(time.Time{}, "alice")
+	alice := policy.MustScope(policy.ScopeUser, "alice")
+	rows, err := s.UsageByScope(alice, time.Time{}, time.Time{})
 	if err != nil {
-		t.Fatalf("UsageByUser: %v", err)
+		t.Fatalf("UsageByScope: %v", err)
 	}
 	if len(rows) != 1 {
-		t.Fatalf("用户维度行数应为 1，实际 %d", len(rows))
+		t.Fatalf("范围维度行数应为 1，实际 %d", len(rows))
 	}
 	if rows[0].TotalTokens != 120 || rows[0].Requests != 1 || rows[0].OK != 1 {
-		t.Errorf("用户维度统计不对: %+v", rows[0])
+		t.Errorf("范围维度统计不对: %+v", rows[0])
 	}
 
-	tot, err := s.TotalByUser(time.Time{}, "alice")
+	tot, err := s.ScopeUsageTotals([]policy.ScopeRef{alice}, time.Time{}, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,8 +198,14 @@ func TestInsertRequestPerUserUsage(t *testing.T) {
 		t.Errorf("LastDay 不对: %q", tot.LastDay)
 	}
 
-	if other, _ := s.UsageByUser(time.Time{}, "bob"); len(other) != 0 {
+	bob := policy.MustScope(policy.ScopeUser, "bob")
+	if other, _ := s.UsageByScope(bob, time.Time{}, time.Time{}); len(other) != 0 {
 		t.Errorf("别的用户不应查到数据: %v", other)
+	}
+	// 无归属的那条不落进任何范围：全表就只有 alice 这一行。
+	// 「静态 key 的请求按全局范围记账」会把所有人的消耗并进同一个主体，是最糟的一种安静失败。
+	if all, _ := s.AllScopesUsageExportRows(time.Time{}, time.Time{}); len(all) != 1 {
+		t.Errorf("静态 key 的请求不该有归属: %+v", all)
 	}
 	// 全局维度不受影响：两条都在
 	st, err := s.Stats(time.Time{}, 0)
@@ -450,12 +457,12 @@ func TestDeleteUserCascadesModelsAndProviderStats(t *testing.T) {
 		t.Errorf("bob 作用域的熔断状态应当被级联删除，实际残留: %+v", st)
 	}
 	// 刻意保留：用量是账单，不是配置
-	usage, err := s.SystemUsageRowsSince("bob", time.Now().AddDate(0, 0, -1))
+	usage, err := s.ScopeSystemUsageRows(policy.MustScope(policy.ScopeUser, "bob"), time.Now().AddDate(0, 0, -1))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(usage) == 0 {
-		t.Error("usage_user_daily 应当保留（那是账单，删用户不等于销毁计量记录）")
+		t.Error("usage_scope_daily 应当保留（那是账单，删用户不等于销毁计量记录）")
 	}
 
 	// 关键场景：删掉之后建一个**同名**用户，它必须是干净的
@@ -518,7 +525,7 @@ func TestRevisionBumpsOnUserChanges(t *testing.T) {
 
 // 累计里要带上输入缓存的命中/未命中：用量界面的「命中率」全靠这两个字段，
 // 漏了它用户只能看到 0% 或者一片空白，看不出缓存到底有没有生效。
-func TestTotalByUserCarriesCacheSplit(t *testing.T) {
+func TestScopeUsageTotalsCarriesCacheSplit(t *testing.T) {
 	s := openTestStore(t)
 	now := time.Now()
 	pt, ct, tt := int64(1000), int64(50), int64(1050)
@@ -531,7 +538,8 @@ func TestTotalByUserCarriesCacheSplit(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	tot, err := s.TotalByUser(MonthStart(now), "carol")
+	tot, err := s.ScopeUsageTotals([]policy.ScopeRef{policy.MustScope(policy.ScopeUser, "carol")},
+		MonthStart(now), time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -43,27 +43,30 @@ type DB interface {
 	// ── 请求账本与用量 ─────────────────────────────────────────
 	InsertRequest(rec RequestRecord) error
 	Stats(since time.Time, recentLimit int) (*Stats, error)
-	UsageByUser(since time.Time, userName string) ([]UsageRow, error)
-	TotalByUser(since time.Time, userName string) (UserTotals, error)
-	SystemUsageSince(userName string, since time.Time) (SystemUsage, error)
-	SystemUsageRowsSince(userName string, since time.Time) ([]UsageRow, error)
-	UsageExportRows(f UsageExportFilter) ([]UsageExportRow, error)
-	MonthlyRollup(since, until time.Time, userName string) ([]MonthlyRollupRow, error)
 	Prune(retainDays int) (int64, error)
 
 	// ── 价目（上游成本 / 分发价，都带历史） ────────────────────
 	//
-	// §2.7 规则 8：下面这几条**按分发范围**取旧字符串约定的方法
-	// （InsertUserPrice / UserPriceAt / UserPricesEffective / ListUserPrices /
-	// HasEffectiveUserPrices，以及 ScopeDefault / ScopeUser 两个常量）
-	// 是 2.x 的 'default' / 'user:<名>' 前缀适配层，主线接线完成后连同
-	// UserPrice 结构一起删除，调用方改用下面那组 ScopePrice*。
-	// 用量侧的 UsageByUser/TotalByUser/SystemUsageSince/SystemUsageRowsSince 换成 Scope* 那组。
+	// §2.7 规则 8 在这一块已经收干净：分发价只有 ScopePrice 一种形状、只有下面那组
+	// ScopePrice* 方法一个入口。2.x 的 'default' / 'user:<名>' 前缀适配层
+	// （UserPrice 结构、InsertUserPrice / UserPriceAt / UserPricesEffective /
+	// ListUserPrices / HasEffectiveUserPrices，以及 ScopeDefault / ScopeUser 两个常量）
+	// 全部删除 —— 取价的「本人范围 → 全局默认」回落现在由 ScopePriceAtChain 按
+	// specificity 链条给出，全局兜底就是 (system, 'global')。
 	//
-	// 已经收干净的两块：审计（无范围的 Audit/AuditRecent 已删，写侧只剩 AuditScope，
-	// 读侧三条都返回带范围的条目）；熔断（ProviderStatus/SaveProviderStatus/
-	// LoadProviderStatus 随规则 8 删除，桶状态只有 ProviderBucketState 一种形状，
-	// 键就是 (scope_kind, scope_id, provider)）。
+	// 还剩两处**刻意保留**的旧约定，都不在运行时的读写主线上：
+	//   - DecodeLegacyPriceScope：只服务一次性迁移（读 2.x 库里那列 scope 串）。
+	//   - resolveRequestScope 里 UserName → (user, 名)：§2.7 规则 3 的归属口径，
+	//     是在线调用方没带 Scope 时唯一允许的推导点，集中在这一处。
+	//
+	// 其余三块的收口状态：
+	//   - 审计：无范围的 Audit/AuditRecent 已删，写侧只剩 AuditScope，读侧三条都返回带范围的条目。
+	//   - 熔断：ProviderStatus/SaveProviderStatus/LoadProviderStatus 已删，桶状态只有
+	//     ProviderBucketState 一种形状，键就是 (scope_kind, scope_id, provider)。
+	//   - 用量：按 user_name 读 usage_user_daily 的那五条（UsageByUser / TotalByUser /
+	//     SystemUsageSince / SystemUsageRowsSince / UsageExportRows + MonthlyRollup）已删。
+	//     用量只有 usage_scope_daily 一个读源，「某个人的账」就是 (user, 名) 那一桶；
+	//     InsertRequest 也不再双写老表。
 	//
 	// 配额侧已经没有遗留项可删了：2.x 的 SetUserQuota/SetUserLimits 与「读不到配额行就
 	// 回读 users 额度列」的兜底随规则 8 一起删掉，写侧只剩 SetScopeQuota/PatchScopeQuota。
@@ -71,11 +74,6 @@ type DB interface {
 	ProviderPriceAt(provider, upstreamModel string, t time.Time) (*ProviderPrice, error)
 	ProviderPricesEffective(t time.Time) ([]ProviderPrice, error)
 	ListProviderPrices(provider, upstreamModel string) ([]ProviderPrice, error)
-	InsertUserPrice(p *UserPrice) error
-	UserPriceAt(userName, model string, t time.Time) (*UserPrice, error)
-	UserPricesEffective(t time.Time) ([]UserPrice, error)
-	ListUserPrices(scope, model string) ([]UserPrice, error)
-	HasEffectiveUserPrices(userName string, t time.Time) (bool, error)
 
 	// ── 3.0 结构化 scope API（§2.7：新增的唯一入口，一律收 policy.ScopeRef/ScopeChain）──
 	// 路由桶 (scope_kind, scope_id, provider) 的熔断状态
@@ -102,10 +100,14 @@ type DB interface {
 	// 用量：按范围的明细、汇总与导出
 	UsageByScope(scope policy.ScopeRef, since, until time.Time) ([]ScopeUsageRow, error)
 	AggregateScopeUsage(scopes []policy.ScopeRef, since, until time.Time) ([]UsageRow, error)
-	ScopeUsageTotals(scopes []policy.ScopeRef, since, until time.Time) (UserTotals, error)
+	ScopeUsageTotals(scopes []policy.ScopeRef, since, until time.Time) (UsageTotals, error)
 	ScopeSystemUsage(scope policy.ScopeRef, since time.Time) (SystemUsage, error)
+	ScopeSystemUsageRows(scope policy.ScopeRef, since time.Time) ([]UsageRow, error)
 	ScopeChargeTotal(scope policy.ScopeRef, since, until time.Time, cost CostFunc) (float64, error)
 	ScopeUsageExportRows(scope policy.ScopeRef, since, until time.Time) ([]ScopeUsageRow, error)
+	AllScopesUsageExportRows(since, until time.Time) ([]ScopeUsageRow, error)
+	ScopeMonthlyRollup(scope policy.ScopeRef, since, until time.Time) ([]ScopeMonthlyRollupRow, error)
+	AllScopesMonthlyRollup(since, until time.Time) ([]ScopeMonthlyRollupRow, error)
 
 	// 审计：写侧一律带范围；读侧全量那条也返回带范围的条目
 	AuditScope(scope policy.ScopeRef, actor, action, target, detail string) error

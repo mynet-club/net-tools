@@ -52,10 +52,7 @@ func TestAdminTestDoesNotAccountOrTripBreaker(t *testing.T) {
 	h.addUser(t, "carol")
 	setConsumption(t, h, "carol", "fast", "sys-model")
 
-	before, err := h.db.TotalByUser(time.Time{}, "carol")
-	if err != nil {
-		t.Fatal(err)
-	}
+	before := mustScopeTotals(t, h.db, "carol", time.Time{}, time.Time{})
 	code, raw := adminGet(t, h, "/v1/_admin/users/carol") // 只为确认存在
 	if code != 200 {
 		t.Fatal(string(raw))
@@ -64,10 +61,7 @@ func TestAdminTestDoesNotAccountOrTripBreaker(t *testing.T) {
 	if resp, raw := h.post(t, "/v1/_admin/users/carol/test", adminToken, map[string]any{"model": "fast"}); resp.StatusCode != 200 {
 		t.Fatalf("测试失败 %d: %s", resp.StatusCode, raw)
 	}
-	after, err := h.db.TotalByUser(time.Time{}, "carol")
-	if err != nil {
-		t.Fatal(err)
-	}
+	after := mustScopeTotals(t, h.db, "carol", time.Time{}, time.Time{})
 	if after.Requests != before.Requests || after.TotalTokens != before.TotalTokens {
 		t.Errorf("探测不该写记账：前 %+v 后 %+v", before, after)
 	}

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 	"github.com/mynet-club/net-tools/llmproxy/internal/store"
 )
 
@@ -87,8 +88,8 @@ func TestFreezeUnsetPeakRatioIsNotFree(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.db.InsertUserPrice(&store.UserPrice{
-		Scope: store.ScopeDefault, Model: "m", ValidFrom: from,
+	if err := h.db.InsertScopePrice(&store.ScopePrice{
+		Scope: policy.SystemScope, Model: "m", ValidFrom: from,
 		InHit: 4, InMiss: 4, Out: 4, Currency: "CNY",
 		PeakHours: []string{"09:00-12:00"}, PeakTZ: "+08:00",
 	}); err != nil {
@@ -99,7 +100,7 @@ func TestFreezeUnsetPeakRatioIsNotFree(t *testing.T) {
 	newRec := func() *store.RequestRecord {
 		return &store.RequestRecord{
 			OK: true, Provider: "sys-a", UpstreamModel: "m", SystemPaid: true,
-			UserName: "carol", Model: "m",
+			Scope: policy.MustScope(policy.ScopeUser, "carol"), UserName: "carol", Model: "m",
 			PromptTokens: &prompt, CompletionTokens: &completion,
 			CacheHitTokens: stubHit, CacheMissTokens: stubMiss,
 		}
@@ -133,8 +134,8 @@ func TestFreezeDownstreamChargeAppliesPeakRatio(t *testing.T) {
 
 	peak := atWeekday(time.Wednesday, 10, 0)
 	off := atWeekday(time.Wednesday, 13, 0)
-	if err := h.db.InsertUserPrice(&store.UserPrice{
-		Scope: store.ScopeDefault, Model: "m", ValidFrom: hourFloor(off.Add(-13 * time.Hour)),
+	if err := h.db.InsertScopePrice(&store.ScopePrice{
+		Scope: policy.SystemScope, Model: "m", ValidFrom: hourFloor(off.Add(-13 * time.Hour)),
 		InHit: 4, InMiss: 4, Out: 4, Currency: "CNY",
 		PeakHours:    []string{"09:00-12:00"},
 		OffPeakRatio: ratioPtr(0.5), PeakTZ: "+08:00",
@@ -145,7 +146,8 @@ func TestFreezeDownstreamChargeAppliesPeakRatio(t *testing.T) {
 	charge := func(at time.Time) float64 {
 		prompt, completion := int64(stubPrompt), int64(stubOut)
 		rec := &store.RequestRecord{
-			OK: true, SystemPaid: true, UserName: "carol", Model: "m",
+			OK: true, SystemPaid: true, Scope: policy.MustScope(policy.ScopeUser, "carol"),
+			UserName: "carol", Model: "m",
 			PromptTokens: &prompt, CompletionTokens: &completion,
 			CacheHitTokens: stubHit, CacheMissTokens: stubMiss,
 		}
@@ -302,14 +304,14 @@ func TestAdminPricePeakFieldsRoundTrip(t *testing.T) {
 
 	// 分发价一侧同样能带峰谷
 	ub := map[string]any{
-		"scope": "default", "model": "fast", "valid_from": base.Format(time.RFC3339),
+		"scope": "system:global", "model": "fast", "valid_from": base.Format(time.RFC3339),
 		"in_hit": 0.02, "in_miss": 1.0, "out": 4.0,
 		"peak_hours": []string{"09:00-12:00"}, "off_peak_ratio": 0.5, "peak_tz": "+08:00",
 	}
 	if resp, raw := h.put(t, "/v1/_admin/prices/user", adminToken, ub); resp.StatusCode != http.StatusOK {
 		t.Fatalf("写带峰谷的分发价应 200，实际 %d: %s", resp.StatusCode, raw)
 	}
-	resp, raw = h.get(t, "/v1/_admin/prices/user?scope=default&model=fast", adminToken)
+	resp, raw = h.get(t, "/v1/_admin/prices/user?scope=system%3Aglobal&model=fast", adminToken)
 	if resp.StatusCode != http.StatusOK || !containsAll(string(raw), `"peak_tz":"+08:00"`, `"off_peak_ratio":0.5`) {
 		t.Errorf("分发价的峰谷字段应当能读回: %d %s", resp.StatusCode, raw)
 	}

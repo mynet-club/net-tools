@@ -64,10 +64,7 @@ func TestHybridPrefersOwnUpstream(t *testing.T) {
 	}
 
 	// 账：自有上游的那笔**不算**系统付费，配额不涨
-	su, err := h.db.SystemUsageSince("arthur", store.MonthStart(time.Now()))
-	if err != nil {
-		t.Fatal(err)
-	}
+	su := mustSystemUsage(t, h.db, "arthur", store.MonthStart(time.Now()))
 	if su.Requests != 0 {
 		t.Errorf("走自有上游不该计入系统付费用量，实际 %d 条", su.Requests)
 	}
@@ -98,10 +95,7 @@ func TestHybridFallsBackToSystemPool(t *testing.T) {
 		t.Errorf("回落时应当走 sys-a，实际 %q", got)
 	}
 	// 回落到系统池的这一笔要计网关的账
-	su, err := h.db.SystemUsageSince("arthur", store.MonthStart(time.Now()))
-	if err != nil {
-		t.Fatal(err)
-	}
+	su := mustSystemUsage(t, h.db, "arthur", store.MonthStart(time.Now()))
 	if su.Requests != 1 {
 		t.Errorf("回落系统池的那笔应计入系统付费用量，实际 %d", su.Requests)
 	}

@@ -3,20 +3,24 @@ package server
 import (
 	"sync"
 	"time"
+
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 )
 
 // usageReportTTL 是用量报表的缓存有效期。
 //
-// 用量接口是界面轮询的热点：每次打开页面/切标签都会打一遍 UsageByUser +
-// TotalByUser + SystemUsageRowsSince，再对每一行做 rowCharge。这些查询抢的是
+// 用量接口是界面轮询的热点：每次打开页面/切标签都会打一遍 UsageByScope +
+// ScopeUsageTotals + ScopeSystemUsageRows，再对每一行做 rowCharge。这些查询抢的是
 // store 那条唯一 SQLite 连接，轮询一密就把转发路径的落库也堵在后面。
 //
 // 5 秒的陈旧度对「看今天花了多少」完全够用；配额判断**不走这份缓存**
 // （那是 meters 的实时计数），所以不会因为缓存而少扣或多扣。
 const usageReportTTL = 5 * time.Second
 
+// 缓存键用 policy.ScopeRef 而不是 Display() 串：范围是复合键，落成串再当 map key
+// 就是 §2.7 规则 1 禁止的那种形式（§2.7 规则 8）。结构体可比较，能直接做 map 键。
 type usageReportKey struct {
-	scope string
+	scope policy.ScopeRef
 	days  int
 }
 
@@ -25,7 +29,7 @@ type usageReportEntry struct {
 	payload map[string]any
 }
 
-// usageReportCache 按 (用户, 天数) 缓存拼好的用量报表。
+// usageReportCache 按 (范围, 天数) 缓存拼好的用量报表。
 type usageReportCache struct {
 	mu      sync.Mutex
 	ttl     time.Duration
@@ -92,9 +96,12 @@ func (c *usageReportCache) Put(key usageReportKey, payload map[string]any) {
 	}
 }
 
-// InvalidateUser 丢掉某用户的全部缓存（删用户时调用）。
-func (c *usageReportCache) InvalidateUser(scope string) {
-	if c == nil {
+// InvalidateScope 丢掉某个范围的全部缓存报表（删用户时调用）。
+//
+// 零范围直接返回：它匹配不上任何写入过的条目（报表一律带有效范围），
+// 而按零值去遍历等于给「归属不明」开了一条清理路径。
+func (c *usageReportCache) InvalidateScope(scope policy.ScopeRef) {
+	if c == nil || scope == (policy.ScopeRef{}) {
 		return
 	}
 	c.mu.Lock()

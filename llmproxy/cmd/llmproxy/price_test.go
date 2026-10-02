@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/config"
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 	"github.com/mynet-club/net-tools/llmproxy/internal/store"
 )
 
@@ -82,12 +83,12 @@ func TestPriceSetUser(t *testing.T) {
 	paths, db := priceHarness(t)
 	vf := nextHour().Format(time.RFC3339)
 	if err := priceSet(paths, []string{
-		"user", "default", "deepseek-flash",
+		"user", "system:global", "deepseek-flash",
 		"-in-miss", "0.052", "-in-write", "0.1", "-out", "2.6", "-valid-from", vf,
 	}); err != nil {
 		t.Fatalf("price set user 失败: %v", err)
 	}
-	rows, err := db.ListUserPrices("default", "deepseek-flash")
+	rows, err := db.ListScopePrices(policy.SystemScope, "deepseek-flash")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,11 +99,21 @@ func TestPriceSetUser(t *testing.T) {
 		t.Errorf("显式 -in-write 应当生效，实际 %g", rows[0].InWrite)
 	}
 
-	// 非法 scope 拒掉
-	if err := priceSet(paths, []string{
-		"user", "not-a-scope", "m", "-in-miss", "1", "-out", "1", "-valid-from", vf,
-	}); err == nil {
-		t.Error("scope 不是 default 或 user: 前缀时应当被拒")
+	// 非法 scope 拒掉：旧的 'default' 串、裸名字、通配都不再是合法选择器
+	for _, bad := range []string{"not-a-scope", "default", "arthur", "*", "user:*"} {
+		if err := priceSet(paths, []string{
+			"user", bad, "m", "-in-miss", "1", "-out", "1", "-valid-from", vf,
+		}); err == nil {
+			t.Errorf("scope %q 应当被拒（要写成 kind:id 的精确范围）", bad)
+		}
+	}
+	// 组织/项目范围也能录价 —— 3.0 的新能力，旧的字符串约定放不下它们
+	for _, good := range []string{"user:arthur", "organization:campus", "project:proj-lab-7"} {
+		if err := priceSet(paths, []string{
+			"user", good, "m", "-in-miss", "1", "-out", "1", "-valid-from", vf,
+		}); err != nil {
+			t.Errorf("scope %q 应当能录价: %v", good, err)
+		}
 	}
 }
 
@@ -254,9 +265,13 @@ func TestPriceList(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := priceSet(paths, []string{
-		"user", "default", "m", "-in-miss", "1.3", "-out", "1.1", "-valid-from", t1.Format(time.RFC3339),
+		"user", "system:global", "m", "-in-miss", "1.3", "-out", "1.1", "-valid-from", t1.Format(time.RFC3339),
 	}); err != nil {
 		t.Fatal(err)
+	}
+	// 旧的 default 串不再受理：读侧同样只认 kind:id
+	if err := priceList(paths, []string{"-scope", "default", "-model", "m"}); err == nil {
+		t.Error(`price list -scope default 应当被拒（改用 -scope system:global）`)
 	}
 	if err := priceList(paths, nil); err != nil {
 		t.Fatalf("price list 失败: %v", err)
@@ -265,12 +280,12 @@ func TestPriceList(t *testing.T) {
 	if err := priceList(paths, []string{"-provider", "p", "-upstream-model", "m"}); err != nil {
 		t.Fatalf("历史查询失败: %v", err)
 	}
-	if err := priceList(paths, []string{"-scope", "default", "-model", "m"}); err != nil {
+	if err := priceList(paths, []string{"-scope", "system:global", "-model", "m"}); err != nil {
 		t.Fatalf("分发价历史查询失败: %v", err)
 	}
 	// db 再次确认两层价都在
 	ps, _ := db.ProviderPricesEffective(time.Now())
-	us, _ := db.UserPricesEffective(time.Now())
+	us, _ := db.ListAllScopePrices(time.Now())
 	// valid_from 是下一个整点，现在还没生效，所以 effective 可能是空 —— 这是正确行为
 	_ = ps
 	_ = us
@@ -280,22 +295,28 @@ func TestPriceList(t *testing.T) {
 	}
 }
 
-// UserPricesEffective：没到 valid_from 时不生效；到了才生效。
-func TestUserPricesEffective(t *testing.T) {
+// ListAllScopePrices：没到 valid_from 时不生效；到了才生效。
+func TestScopePricesEffective(t *testing.T) {
 	_, db := priceHarness(t)
 	t1 := nextHour()
-	if err := db.InsertUserPrice(&store.UserPrice{
-		Scope: "default", Model: "m", Currency: "CNY",
+	if err := db.InsertScopePrice(&store.ScopePrice{
+		Scope: policy.SystemScope, Model: "m", Currency: "CNY",
 		InMiss: 1, Out: 1, ValidFrom: t1,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	// 现在还没生效
-	if us, _ := db.UserPricesEffective(time.Now()); len(us) != 0 {
+	if us, _ := db.ListAllScopePrices(time.Now()); len(us) != 0 {
 		t.Errorf("valid_from 之前不该生效，实际 %d 条", len(us))
 	}
 	// 到点后生效
-	if us, _ := db.UserPricesEffective(t1); len(us) != 1 {
+	if us, _ := db.ListAllScopePrices(t1); len(us) != 1 {
 		t.Errorf("valid_from 当刻应当生效，实际 %d 条", len(us))
+	}
+	// 空范围被拒，而不是静默当成「全局」
+	if err := db.InsertScopePrice(&store.ScopePrice{
+		Model: "bare", Currency: "CNY", InMiss: 1, Out: 1, ValidFrom: t1,
+	}); err == nil {
+		t.Error("scope 留空应当被拒")
 	}
 }

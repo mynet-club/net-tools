@@ -12,17 +12,29 @@ import (
 	"github.com/mynet-club/net-tools/llmproxy/internal/store"
 )
 
-// adminUsageExport：GET /v1/_admin/usage/export?user=&since=&until=&monthly=1
+// adminUsageExport：GET /v1/_admin/usage/export?scope=kind:id[&since=&until=&monthly=1]
 //
 // 输出 CSV（text/csv），给管理台下载或脚本拉账。金额口径与配额一致
 // （store.RowCharge 冻结优先），所以导出的数能和 /usage、status 对上。
+//
+// scope 省略 = 全部范围，每行带着自己的归属（运营者的账单总览）；要给某个主体单出一份
+// 就写精确的 kind:id。旧接口那个「裸用户名 = 用户范围」的参数随 §2.7 规则 8 删除 ——
+// 同名不同种类（用户 alice / 组织 alice）在裸串下无法区分，而导出的是钱。
 func (s *Server) adminUsageExport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error", "只支持 GET")
 		return
 	}
 	q := r.URL.Query()
-	user := strings.TrimSpace(q.Get("user"))
+	var scope *policy.ScopeRef
+	if raw := strings.TrimSpace(q.Get("scope")); raw != "" {
+		ref, err := parseScopeParam(raw)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "scope: "+err.Error())
+			return
+		}
+		scope = &ref
+	}
 	since, err := parseExportDay(q.Get("since"))
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "since: "+err.Error())
@@ -36,8 +48,8 @@ func (s *Server) adminUsageExport(w http.ResponseWriter, r *http.Request) {
 	monthly := q.Get("monthly") == "1" || q.Get("monthly") == "true"
 
 	name := "usage"
-	if user != "" {
-		name += "-" + user
+	if scope != nil {
+		name += "-" + scope.Display() // 只进文件名：Display 是渲染形式，不是存储键
 	}
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`.csv"`)
@@ -45,20 +57,20 @@ func (s *Server) adminUsageExport(w http.ResponseWriter, r *http.Request) {
 	defer cw.Flush()
 
 	if monthly {
-		rows, err := s.db.MonthlyRollup(since, until, user)
+		rows, err := s.monthlyRollupRows(scope, since, until)
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "internal", err.Error())
 			return
 		}
 		if err := cw.Write([]string{
-			"month", "user_name", "requests", "ok", "failed",
+			"month", "scope_kind", "scope_id", "requests", "ok", "failed",
 			"total_tokens", "charge", "frozen_charges",
 		}); err != nil {
 			return
 		}
 		for _, r := range rows {
 			_ = cw.Write([]string{
-				r.Month, r.UserName,
+				r.Month, string(r.Scope.Kind), r.Scope.ID,
 				fmt.Sprint(r.Requests), fmt.Sprint(r.OK), fmt.Sprint(r.Failed), fmt.Sprint(r.Tokens),
 				fmt.Sprintf("%.6f", r.Charge), fmt.Sprint(r.Frozen),
 			})
@@ -66,9 +78,7 @@ func (s *Server) adminUsageExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := s.db.UsageExportRows(store.UsageExportFilter{
-		UserName: user, Since: since, Until: until,
-	})
+	rows, err := s.usageExportRows(scope, since, until)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
@@ -76,7 +86,7 @@ func (s *Server) adminUsageExport(w http.ResponseWriter, r *http.Request) {
 	pricing := s.cfgStore.Current().Pricing
 	now := time.Now()
 	if err := cw.Write([]string{
-		"day", "user_name", "provider", "model", "upstream_model", "system_paid",
+		"day", "scope_kind", "scope_id", "provider", "model", "upstream_model", "system_paid",
 		"requests", "ok", "failed",
 		"prompt_tokens", "completion_tokens", "total_tokens",
 		"cache_hit_tokens", "cache_miss_tokens",
@@ -87,7 +97,7 @@ func (s *Server) adminUsageExport(w http.ResponseWriter, r *http.Request) {
 	for _, r := range rows {
 		amount := rowCharge(r.UsageRow, &pricing, now)
 		_ = cw.Write([]string{
-			r.Day, r.UserName, r.Provider, r.Model, r.UpstreamModel,
+			r.Day, string(r.Scope.Kind), r.Scope.ID, r.Provider, r.Model, r.UpstreamModel,
 			map[bool]string{true: "1", false: "0"}[r.SystemPaid],
 			fmt.Sprint(r.Requests), fmt.Sprint(r.OK), fmt.Sprint(r.Failed),
 			fmt.Sprint(r.PromptTokens), fmt.Sprint(r.CompletionTokens), fmt.Sprint(r.TotalTokens),
@@ -96,6 +106,22 @@ func (s *Server) adminUsageExport(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("%.6f", amount), pricing.Currency,
 		})
 	}
+}
+
+// usageExportRows / monthlyRollupRows 把「给了范围就只导那个范围」这一句选择收在
+// 一处：调用方不需要（也不该）为「空 = 全部」再写一遍分支。
+func (s *Server) usageExportRows(scope *policy.ScopeRef, since, until time.Time) ([]store.ScopeUsageRow, error) {
+	if scope == nil {
+		return s.db.AllScopesUsageExportRows(since, until)
+	}
+	return s.db.ScopeUsageExportRows(*scope, since, until)
+}
+
+func (s *Server) monthlyRollupRows(scope *policy.ScopeRef, since, until time.Time) ([]store.ScopeMonthlyRollupRow, error) {
+	if scope == nil {
+		return s.db.AllScopesMonthlyRollup(since, until)
+	}
+	return s.db.ScopeMonthlyRollup(*scope, since, until)
 }
 
 func parseExportDay(s string) (time.Time, error) {
@@ -135,22 +161,6 @@ func (s *Server) auditUser(actor, action, user, detail string) {
 	s.auditAt(scope, actor, action, user, detail)
 }
 
-// auditLegacyPriceScope 记一条「关于某个分发范围」的价目动作。
-//
-// 旧分发价接口收到的还是 'default' / 'user:<名>' 裸串，解析只此一处（复用 store 的
-// 那一个映射点），不在 server 里再立一套前缀约定。
-//
-// §2.7 规则 8：调用方改用结构化 ScopePrice 后随 store.DecodeLegacyPriceScope 一起删除。
-func (s *Server) auditLegacyPriceScope(actor, action, legacyScope, model, detail string) {
-	scope, err := store.DecodeLegacyPriceScope(legacyScope)
-	if err != nil {
-		s.auditAt(policy.SystemScope, actor, action, legacyScope+"/"+model,
-			detail+" （旧 scope 串当不了范围键："+err.Error()+"）")
-		return
-	}
-	s.auditAt(scope, actor, action, legacyScope+"/"+model, detail)
-}
-
 // adminAuditLog：GET /v1/_admin/audit?n=100[&scope=kind:id&scope=kind:id…]
 //
 // 不带 scope = 全量（网关管理员的面板）；带 scope = 只看这些范围的并集，
@@ -168,7 +178,7 @@ func (s *Server) adminAuditLog(w http.ResponseWriter, r *http.Request) {
 	if raw := r.URL.Query()["scope"]; len(raw) > 0 {
 		scopes := make([]policy.ScopeRef, 0, len(raw))
 		for _, sv := range raw {
-			ref, perr := parseAuditScope(sv)
+			ref, perr := parseScopeParam(sv)
 			if perr != nil {
 				writeJSONError(w, http.StatusBadRequest, "invalid_request_error", perr.Error())
 				return
@@ -186,10 +196,12 @@ func (s *Server) adminAuditLog(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"entries": list})
 }
 
-// parseAuditScope 把查询参数落成一个精确范围引用。
+// parseScopeParam 把一个查询参数落成一个精确范围引用。
+//
+// 审计面板与用量导出用的是同一份解析：两处各写一遍就会各认各的形式。
 // 只认 kind:id 的精确形式：通配选择器（organization:*）在服务端没有对应索引，
 // 与其静默返回半集，不如让调用方显式列出关心的范围。
-func parseAuditScope(s string) (policy.ScopeRef, error) {
+func parseScopeParam(s string) (policy.ScopeRef, error) {
 	sel, err := policy.ParseScopeSelector(s)
 	if err != nil {
 		return policy.ScopeRef{}, err

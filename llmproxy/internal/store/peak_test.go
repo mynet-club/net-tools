@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"path/filepath"
 	"testing"
+
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 )
 
 // 峰谷字段（含时区）要原样落库。peak_tz 是后加的列，最容易在迁移里丢掉。
@@ -31,22 +33,25 @@ func TestPricePeakFieldsRoundTrip(t *testing.T) {
 	}
 
 	// 分发价一侧：峰谷三列原本根本不存在，是这次一起补的
-	if err := s.InsertUserPrice(&UserPrice{
-		Scope: ScopeDefault, Model: "fast", ValidFrom: t9(), InMiss: 1, Out: 4,
+	if err := s.InsertScopePrice(&ScopePrice{
+		Scope: policy.SystemScope, Model: "fast", ValidFrom: t9(), InMiss: 1, Out: 4,
 		PeakHours: []string{"09:00-12:00"}, OffPeakRatio: &off, PeakTZ: "+08:00",
 	}); err != nil {
 		t.Fatal(err)
 	}
-	u, err := s.UserPriceAt("anyone", "fast", t9())
+	// 「某个用户 + 全局兜底」的链条：用户没有专属价，命中的是系统那一行
+	u, err := s.ScopePriceAtChain(
+		policy.MustScopeChain(policy.MustScope(policy.ScopeUser, "anyone"), policy.SystemScope),
+		"fast", t9())
 	if err != nil || u == nil {
 		t.Fatalf("查分发价目: %v %+v", err, u)
 	}
 	if u.PeakTZ != "+08:00" || u.OffPeakRatio == nil || *u.OffPeakRatio != 0.5 || len(u.PeakHours) != 1 {
 		t.Errorf("分发价目的峰谷没原样落库: %+v", u)
 	}
-	rows, err := s.ListUserPrices(ScopeDefault, "fast")
+	rows, err := s.ListScopePrices(policy.SystemScope, "fast")
 	if err != nil || len(rows) != 1 || rows[0].PeakTZ != "+08:00" || len(rows[0].PeakHours) != 1 {
-		t.Errorf("ListUserPrices 漏了峰谷字段: %v %+v", err, rows)
+		t.Errorf("ListScopePrices 漏了峰谷字段: %v %+v", err, rows)
 	}
 }
 
@@ -67,8 +72,8 @@ func TestPricePeakValidation(t *testing.T) {
 		}
 	}
 	// 分发价一侧同样被拒
-	if err := s.InsertUserPrice(&UserPrice{
-		Scope: ScopeDefault, Model: "m", ValidFrom: t9(), PeakTZ: "-13:00",
+	if err := s.InsertScopePrice(&ScopePrice{
+		Scope: policy.SystemScope, Model: "m", ValidFrom: t9(), PeakTZ: "-13:00",
 	}); err == nil {
 		t.Error("越界的 peak_tz 应当被拒")
 	}
@@ -90,8 +95,9 @@ func TestPricePeakValidation(t *testing.T) {
 	}); err == nil {
 		t.Error("显式 off_peak_ratio=0 应当被拒（想沿用全局就不要传这个字段）")
 	}
-	if err := s.InsertUserPrice(&UserPrice{
-		Scope: ScopeDefault, Model: "zero-ratio", ValidFrom: t9(),
+	// 分发价一侧显式 0 同样被拒——只有留空才是「回落全局」。
+	if err := s.InsertScopePrice(&ScopePrice{
+		Scope: policy.SystemScope, Model: "zero-ratio", ValidFrom: t9(),
 		PeakHours: []string{"09:00-12:00"}, OffPeakRatio: &zero, PeakTZ: "+08:00",
 	}); err == nil {
 		t.Error("分发价一侧显式 off_peak_ratio=0 也应当被拒")
@@ -160,13 +166,13 @@ INSERT INTO provider_prices (provider, upstream_model, peak_hours, off_peak_rati
 	}
 
 	// user_prices 的三列同样补齐
-	if err := s.InsertUserPrice(&UserPrice{
-		Scope: ScopeDefault, Model: "m", ValidFrom: t9(),
+	if err := s.InsertScopePrice(&ScopePrice{
+		Scope: policy.SystemScope, Model: "m", ValidFrom: t9(),
 		PeakHours: []string{"09:00-12:00"}, OffPeakRatio: &off, PeakTZ: "+08:00",
 	}); err != nil {
 		t.Fatalf("迁移后应当能写分发价的峰谷: %v", err)
 	}
-	if u, err := s.UserPriceAt("x", "m", t9()); err != nil || u == nil || u.PeakTZ != "+08:00" {
+	if u, err := s.ScopePriceAt(policy.SystemScope, "m", t9()); err != nil || u == nil || u.PeakTZ != "+08:00" {
 		t.Errorf("迁移后分发价的 peak_tz 没落库: %v %+v", err, u)
 	}
 

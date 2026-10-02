@@ -348,12 +348,15 @@ func (s *Store) ScopePriceAtChain(chain policy.ScopeChain, model string, t time.
 
 // sortBySpecificity 按具体度原地排序（越具体越靠前），同档按 kind、ID 稳定排序，
 // 这样排序结果与传入顺序无关 —— §2.8 要求不得依赖 map/切片原始顺序。
+//
+// scopeSpecificity 是「越具体数字越小」（user=0 … system=3），所以升序就是具体度降序；
+// 比较符写反会让全局兜底价压过某个人的专属价 —— 那是静默算错钱，不是排序瑕疵。
 func sortBySpecificity(scopes []policy.ScopeRef) {
 	for i := 1; i < len(scopes); i++ {
 		for j := i; j > 0; j-- {
 			a, b := scopes[j-1], scopes[j]
 			sa, sb := scopeSpecificity(a), scopeSpecificity(b)
-			if sa < sb || (sa == sb && a.Less(b)) {
+			if sa > sb || (sa == sb && b.Less(a)) {
 				scopes[j-1], scopes[j] = scopes[j], scopes[j-1]
 				continue
 			}
@@ -761,9 +764,30 @@ LIMIT 2000`, args...)
 	return out, rows.Err()
 }
 
+// UsageTotals 是一段用量区间的累计计数。
+//
+// 字段名与 JSON 键刻意不同：这套接口对外一律 snake_case，且输出 token 数在别处叫
+// completion_tokens，这里跟着叫，免得同一个人面对两套名字。
+// 它原来叫 UserTotals —— 键换成 (scope_kind, scope_id) 之后「用户」这个名字已经
+// 说不住它了（组织、项目读出来的也是同一份形状），随规则 8 一起改名。
+type UsageTotals struct {
+	Requests     int64 `json:"requests"`
+	OK           int64 `json:"ok"`
+	Failed       int64 `json:"failed"`
+	TotalTokens  int64 `json:"total_tokens"`
+	PromptTokens int64 `json:"prompt_tokens"`
+	OutputTokens int64 `json:"completion_tokens"`
+	// 输入侧的缓存拆分。命中率 = CacheHit / (CacheHit + CacheMiss)，两者都为 0 表示
+	// 上游压根没回报（不是「命中率 0%」），界面上要区分这两种情况。
+	CacheHitTokens  int64  `json:"cache_hit_tokens"`
+	CacheMissTokens int64  `json:"cache_miss_tokens"`
+	FirstDay        string `json:"first_day"`
+	LastDay         string `json:"last_day"`
+}
+
 // ScopeUsageTotals 汇总多个范围的累计计数（配额判断的 token 侧）。
-func (s *Store) ScopeUsageTotals(scopes []policy.ScopeRef, since, until time.Time) (UserTotals, error) {
-	var out UserTotals
+func (s *Store) ScopeUsageTotals(scopes []policy.ScopeRef, since, until time.Time) (UsageTotals, error) {
+	var out UsageTotals
 	if len(scopes) == 0 {
 		return out, fmt.Errorf("%w: ScopeUsageTotals 至少需要一个范围", ErrScopeRequired)
 	}
@@ -807,6 +831,47 @@ WHERE scope_kind=? AND scope_id=? AND system_paid=1 AND day >= ?`,
 	return out, err
 }
 
+// ScopeSystemUsageRows 按「上游 + 上游模型」拆开返回某个范围的系统付费用量。
+//
+// 内存里的配额计数在进程重启后要从库里重建金额，而金额必须按每个上游模型各自的
+// 单价算，所以这里不能只返回一个总数，得带上 upstream_model 与缓存拆分。
+// 返回的行按「跨日合计」口径填充：Day 与 AvgLatencyMs 恒为零值 —— 金额重建只看
+// token 拆分与冻结合计，把日切塞进来只会让人以为可以按日再算一次。
+func (s *Store) ScopeSystemUsageRows(scope policy.ScopeRef, since time.Time) ([]UsageRow, error) {
+	if err := checkScope("ScopeSystemUsageRows", scope); err != nil {
+		return nil, err
+	}
+	rows, err := s.query(`
+SELECT provider, model, upstream_model, system_paid,
+       SUM(requests), SUM(ok), SUM(failed),
+       SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
+       SUM(cache_hit_tokens), SUM(cache_miss_tokens),
+       COALESCE(SUM(charge),0), COALESCE(SUM(frozen_charges),0)
+FROM usage_scope_daily
+WHERE scope_kind=? AND scope_id=? AND system_paid=1 AND day >= ?
+GROUP BY provider, model, upstream_model, system_paid`,
+		append(scopeArgs(scope), since.Format("2006-01-02"))...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []UsageRow{}
+	for rows.Next() {
+		var r UsageRow
+		var systemPaid int64
+		if err := rows.Scan(&r.Provider, &r.Model, &r.UpstreamModel, &systemPaid,
+			&r.Requests, &r.OK, &r.Failed,
+			&r.PromptTokens, &r.CompletionTokens, &r.TotalTokens,
+			&r.CacheHitTokens, &r.CacheMissTokens, &r.Charge, &r.FrozenCharges); err != nil {
+			return nil, err
+		}
+		r.SystemPaid = systemPaid != 0
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // ScopeChargeTotal 按 RowCharge 口径（冻结优先 + 估算兜底）合计金额，给配额判断用。
 //
 // 口径与 2.x 完全一致（见 charge.go），只是聚合键从 user_name 换成了 (scope_kind, scope_id)。
@@ -822,6 +887,101 @@ func (s *Store) ScopeChargeTotal(scope policy.ScopeRef, since, until time.Time, 
 		total += RowCharge(r.UsageRow, cost, now)
 	}
 	return total, nil
+}
+
+// AllScopesUsageExportRows 导出**全部范围**的按日明细（运营者的账单总览）。
+//
+// 和 ScopeUsageExportRows 的差别只在 WHERE：这里不按范围收窄，每行带着自己的归属，
+// 所以「全部」是一个显式的读法，不是「传个空集合」那种会被误会的默认。
+func (s *Store) AllScopesUsageExportRows(since, until time.Time) ([]ScopeUsageRow, error) {
+	where, args := usageDayFilter(since, until)
+	return s.queryScopeUsage(`SELECT `+scopeUsageSelectCols+` FROM usage_scope_daily `+where+`
+GROUP BY day, scope_kind, scope_id, provider, model, upstream_model, system_paid
+ORDER BY day, scope_kind, scope_id, provider, model`, args...)
+}
+
+// ScopeMonthlyRollupRow 是「月 × 范围」的一行账单。
+//
+// 与 2.x 的 MonthlyRollupRow 只差归属那一列：这里带的是结构化范围，
+// 所以组织/项目层的账单第一次有地方落（user_name 只能记到人）。
+type ScopeMonthlyRollupRow struct {
+	Month    string          `json:"month"` // YYYY-MM
+	Scope    policy.ScopeRef `json:"scope"`
+	Requests int64           `json:"requests"`
+	OK       int64           `json:"ok"`
+	Failed   int64           `json:"failed"`
+	Tokens   int64           `json:"total_tokens"`
+	Charge   float64         `json:"charge"` // 冻结合计
+	Frozen   int64           `json:"frozen_charges"`
+}
+
+// ScopeMonthlyRollup 按「月 × 范围」合计某个范围的系统付费消耗（账单口径）。
+//
+// day 存的是 YYYY-MM-DD，取前 7 位即自然月；跨时区的自然月由调用方用 MonthStart 切好区间。
+// 只算 system_paid=1 那一半：自己上游的钱不是网关主人的账单。
+func (s *Store) ScopeMonthlyRollup(scope policy.ScopeRef, since, until time.Time) ([]ScopeMonthlyRollupRow, error) {
+	if err := checkScope("ScopeMonthlyRollup", scope); err != nil {
+		return nil, err
+	}
+	where, args := scopeDayFilter([]policy.ScopeRef{scope}, since, until)
+	return s.queryMonthlyRollup(`SELECT `+monthlyRollupCols+` FROM usage_scope_daily `+where+`
+ AND system_paid=1
+GROUP BY month, scope_kind, scope_id
+ORDER BY month, scope_kind, scope_id`, args...)
+}
+
+// AllScopesMonthlyRollup 是月合计的运营者视图：全部范围，每行带着自己的归属。
+func (s *Store) AllScopesMonthlyRollup(since, until time.Time) ([]ScopeMonthlyRollupRow, error) {
+	where, args := usageDayFilter(since, until)
+	return s.queryMonthlyRollup(`SELECT `+monthlyRollupCols+` FROM usage_scope_daily `+where+`
+ AND system_paid=1
+GROUP BY month, scope_kind, scope_id
+ORDER BY month, scope_kind, scope_id`, args...)
+}
+
+// monthlyRollupCols 的 month / 范围两列必须一起进 GROUP BY（ONLY_FULL_GROUP_BY 会拒裸列）。
+const monthlyRollupCols = `substr(day,1,7) AS month, scope_kind, scope_id,
+       SUM(requests), SUM(ok), SUM(failed), SUM(total_tokens),
+       COALESCE(SUM(charge),0), COALESCE(SUM(frozen_charges),0)`
+
+func (s *Store) queryMonthlyRollup(q string, args ...any) ([]ScopeMonthlyRollupRow, error) {
+	rows, err := s.query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []ScopeMonthlyRollupRow{}
+	for rows.Next() {
+		var r ScopeMonthlyRollupRow
+		var kind string
+		if err := rows.Scan(&r.Month, &kind, &r.Scope.ID,
+			&r.Requests, &r.OK, &r.Failed, &r.Tokens, &r.Charge, &r.Frozen); err != nil {
+			return nil, err
+		}
+		parsed, err := policy.ParseScopeKind(kind)
+		if err != nil {
+			return nil, fmt.Errorf("usage_scope_daily 里有非法 scope_kind: %w", err)
+		}
+		r.Scope = policy.ScopeRef{Kind: parsed, ID: r.Scope.ID}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// usageDayFilter 生成只按 day 区间收窄的 WHERE（不按范围 = 全部范围）。
+func usageDayFilter(since, until time.Time) (string, []any) {
+	where := "WHERE 1=1"
+	args := []any{}
+	if !since.IsZero() {
+		where += " AND day >= ?"
+		args = append(args, since.Format("2006-01-02"))
+	}
+	if !until.IsZero() {
+		where += " AND day <= ?"
+		args = append(args, until.Format("2006-01-02"))
+	}
+	return where, args
 }
 
 // ScopeUsageExportRows 按（日, 范围, 上游, 模型）导出用量，时间升序、不截断（出账用）。

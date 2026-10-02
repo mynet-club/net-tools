@@ -18,7 +18,9 @@ import (
 // 三条约束在 store 层保证，这里只是把它们暴露出来：
 //   - valid_from 必须整点（价格只在整点生效，拒绝非整点、不静默取整）
 //   - 价目按时间只追加，插入时自动收口此前的有效行（历史天然保留）
-//   - 分发价的 scope 只能是 "default" 或 "user:<用户名>"
+//   - 分发价的键是一个**范围**（§2.7 规则 1：scope_kind + scope_id 两列）。接口收精确的
+//     kind:id，不再认 2.x 的 'default' / 'user:<名>' 前缀串 —— 组织级、项目级价目从这一版
+//     起有了表达形式，取价时按 specificity 链条命中，全局兜底是 (system, global)。
 
 // providerPriceIn / userPriceIn 是接口的入参形状。
 // 时间用 RFC3339 字符串（例如 "2026-09-21T09:00:00+08:00"），**必须带时区偏移**
@@ -43,6 +45,9 @@ type providerPriceIn struct {
 }
 
 type userPriceIn struct {
+	// Scope 是精确的 kind:id（例如 user:alice、system:global、project:cs-lab）。
+	// 2.x 的 'default' / 'user:<名>' 前缀串不再受理：同一个字段名承载两种键法，
+	// 会让「这条价到底归谁」在解析处重新变成一处需要人记住的约定。
 	Scope         string   `json:"scope"`
 	Model         string   `json:"model"`
 	Currency      string   `json:"currency"`
@@ -97,9 +102,10 @@ func providerPriceJSON(p store.ProviderPrice) map[string]any {
 	return out
 }
 
-func userPriceJSON(p store.UserPrice) map[string]any {
+func scopePriceJSON(p store.ScopePrice) map[string]any {
 	out := map[string]any{
-		"id": p.ID, "scope": p.Scope, "model": p.Model, "currency": p.Currency,
+		"id": p.ID, "scope_kind": string(p.Scope.Kind), "scope_id": p.Scope.ID,
+		"model": p.Model, "currency": p.Currency,
 		"in_miss": p.InMiss, "in_hit": p.InHit, "in_write": p.InWrite,
 		"out": p.Out, "reasoning_out": p.ReasoningOut, "per_request_fee": p.PerRequestFee,
 		"note": p.Note, "created_at": p.CreatedAt, "valid_from": p.ValidFrom,
@@ -119,13 +125,25 @@ func userPriceJSON(p store.UserPrice) map[string]any {
 	return out
 }
 
+// priceScopeChain 给出查分发价时要看的范围：先这个范围自己，最后由全局默认
+// (system, global) 兜底。§2.8 要求不依赖传入顺序，链条的内部次序由 store 排。
+//
+// 少了兜底那一腿，「只配了全局默认价」这种最常见的部署会读成 priced:false ——
+// 金额明明在按请求冻结，接口却说自己没计价，这是自相矛盾（生产上撞见过）。
+func priceScopeChain(scope policy.ScopeRef) (policy.ScopeChain, error) {
+	return policy.NewScopeChain(scope, policy.SystemScope)
+}
+
 // adminPricesRoute 分发 /v1/_admin/prices/**。
 //
 //	PUT  /v1/_admin/prices/provider        写入一条上游价目
 //	GET  /v1/_admin/prices/provider?provider=&upstream_model=   查该键的全部历史
-//	PUT  /v1/_admin/prices/user            写入一条分发价目
-//	GET  /v1/_admin/prices/user?scope=&model=                    查该键的全部历史
+//	PUT  /v1/_admin/prices/user            写入一条分发价目（键是范围：scope=kind:id）
+//	GET  /v1/_admin/prices/user?scope=kind:id&model=            查该键的全部历史
 //	GET  /v1/_admin/prices/effective       当前仍然生效的全部上游价目（路由用）
+//
+// 路径里的 "user" 是「分发价」那一侧的历史叫法（我们对下游收多少，对应 provider 的上游成本），
+// 不是「范围只能是用户」：组织级、项目级价目走的是同一个入口，scope 给谁就归谁。
 func (s *Server) adminPricesRoute(w http.ResponseWriter, r *http.Request, tail string) {
 	switch {
 	case tail == "provider":
@@ -140,9 +158,9 @@ func (s *Server) adminPricesRoute(w http.ResponseWriter, r *http.Request, tail s
 	case tail == "user":
 		switch r.Method {
 		case http.MethodPut:
-			s.adminPutUserPrice(w, r)
+			s.adminPutScopePrice(w, r)
 		case http.MethodGet:
-			s.adminListUserPrices(w, r)
+			s.adminListScopePrices(w, r)
 		default:
 			writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error", "只支持 GET / PUT")
 		}
@@ -151,7 +169,7 @@ func (s *Server) adminPricesRoute(w http.ResponseWriter, r *http.Request, tail s
 	default:
 		writeJSONError(w, http.StatusNotFound, "invalid_request_error",
 			"可用路径：/v1/_admin/prices/provider[?provider=&upstream_model=]、"+
-				"/v1/_admin/prices/user[?scope=&model=]、/v1/_admin/prices/effective")
+				"/v1/_admin/prices/user?scope=kind:id&model=、/v1/_admin/prices/effective")
 	}
 }
 
@@ -241,9 +259,14 @@ func (s *Server) adminPutProviderPrice(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"inserted": providerPriceJSON(*p)})
 }
 
-func (s *Server) adminPutUserPrice(w http.ResponseWriter, r *http.Request) {
+func (s *Server) adminPutScopePrice(w http.ResponseWriter, r *http.Request) {
 	var in userPriceIn
 	if err := readJSONBody(w, r, &in); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	scope, err := parseScopeParam(in.Scope)
+	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
@@ -262,23 +285,24 @@ func (s *Server) adminPutUserPrice(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "valid_to: "+err.Error())
 		return
 	}
-	p := &store.UserPrice{
-		Scope: in.Scope, Model: in.Model, Currency: currency,
+	p := &store.ScopePrice{
+		Scope: scope, Model: in.Model, Currency: currency,
 		InMiss: in.InMiss, InHit: in.InHit, InWrite: in.InWrite, Out: in.Out,
 		ReasoningOut: in.ReasoningOut, PerRequestFee: in.PerRequestFee,
 		PeakHours: in.PeakHours, OffPeakRatio: in.OffPeakRatio, PeakTZ: in.PeakTZ,
 		ValidFrom: validFrom, ValidTo: validTo, Note: in.Note,
 	}
-	if err := s.db.InsertUserPrice(p); err != nil {
+	if err := s.db.InsertScopePrice(p); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 	s.usageCache.Flush() // 估算段金额跟着单价走
-	s.auditLegacyPriceScope("admin", "price.user", p.Scope, p.Model,
+	// 审计落在价目自己的范围上：组织管理员看本组织那条，而不是在全量流水里翻。
+	s.auditAt(scope, "admin", "price.user", p.Model,
 		fmt.Sprintf("valid_from=%s out=%v %s", p.ValidFrom.Format(time.RFC3339), p.Out, p.Currency))
 	s.log.Infof("写入分发价目 %s / %s（自 %s，out=%v %s）",
-		p.Scope, p.Model, p.ValidFrom.Format(time.RFC3339), p.Out, p.Currency)
-	writeJSON(w, http.StatusOK, map[string]any{"inserted": userPriceJSON(*p)})
+		scope.Display(), p.Model, p.ValidFrom.Format(time.RFC3339), p.Out, p.Currency)
+	writeJSON(w, http.StatusOK, map[string]any{"inserted": scopePriceJSON(*p)})
 }
 
 func (s *Server) adminListProviderPrices(w http.ResponseWriter, r *http.Request) {
@@ -304,25 +328,29 @@ func (s *Server) adminListProviderPrices(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-func (s *Server) adminListUserPrices(w http.ResponseWriter, r *http.Request) {
+func (s *Server) adminListScopePrices(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	scope := strings.TrimSpace(q.Get("scope"))
+	scope, err := parseScopeParam(q.Get("scope"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
 	model := strings.TrimSpace(q.Get("model"))
-	if scope == "" || model == "" {
+	if model == "" {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "需要 scope 与 model 两个查询参数")
 		return
 	}
-	rows, err := s.db.ListUserPrices(scope, model)
+	rows, err := s.db.ListScopePrices(scope, model)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
 	list := make([]map[string]any, 0, len(rows))
-	for _, p := range rows {
-		list = append(list, userPriceJSON(p))
+	for i := range rows {
+		list = append(list, scopePriceJSON(rows[i]))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"scope": scope, "model": model, "prices": list,
+		"scope_kind": string(scope.Kind), "scope_id": scope.ID, "model": model, "prices": list,
 	})
 }
 

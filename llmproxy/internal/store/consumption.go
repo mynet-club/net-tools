@@ -239,8 +239,13 @@ func (s *Store) ClearUserModels(userName string) (int64, error) {
 }
 
 // ------------------------------------------------------------------ 系统付费用量
+//
+// 2.x 这里还有两条按 user_name 读 usage_user_daily 的方法（SystemUsageSince /
+// SystemUsageRowsSince），已随 §2.7 规则 8 删除：读侧只剩 scope_store.go 里按
+// (scope_kind, scope_id) 的那一组 —— ScopeSystemUsage 给总数，
+// ScopeSystemUsageRows 给「按上游 + 上游模型」拆开的行。
 
-// SystemUsage 是某用户一段时间内**由系统上游承接**的用量。
+// SystemUsage 是一段区间内**由系统上游承接**的用量。
 // 只有这部分进入配额与金额估算 —— 用户用自己的上游时，账单不是网关主人的。
 type SystemUsage struct {
 	Requests         int64
@@ -251,59 +256,6 @@ type SystemUsage struct {
 	CacheMissTokens  int64
 	CompletionTokens int64
 	TotalTokens      int64
-}
-
-// SystemUsageSince 汇总 userName 从 since 起的系统付费用量。
-func (s *Store) SystemUsageSince(userName string, since time.Time) (SystemUsage, error) {
-	var out SystemUsage
-	err := s.queryRow(`
-SELECT COALESCE(SUM(requests),0), COALESCE(SUM(ok),0), COALESCE(SUM(failed),0),
-       COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(cache_hit_tokens),0),
-       COALESCE(SUM(cache_miss_tokens),0), COALESCE(SUM(completion_tokens),0),
-       COALESCE(SUM(total_tokens),0)
-FROM usage_user_daily
-WHERE user_name = ? AND system_paid = 1 AND day >= ?`,
-		userName, since.Format("2006-01-02")).Scan(
-		&out.Requests, &out.OK, &out.Failed,
-		&out.PromptTokens, &out.CacheHitTokens, &out.CacheMissTokens,
-		&out.CompletionTokens, &out.TotalTokens)
-	return out, err
-}
-
-// SystemUsageRowsSince 按「上游 + 上游模型」拆开返回系统付费用量。
-//
-// 内存计数在进程重启后要从库里重建金额，而金额必须按每个上游模型各自的单价算，
-// 所以这里不能只返回一个总数，得带上 upstream_model 与缓存拆分。
-func (s *Store) SystemUsageRowsSince(userName string, since time.Time) ([]UsageRow, error) {
-	rows, err := s.query(`
-SELECT '', provider, model, upstream_model, system_paid,
-       SUM(requests), SUM(ok), SUM(failed),
-       SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
-       0,
-       SUM(cache_hit_tokens), SUM(cache_miss_tokens),
-       COALESCE(SUM(charge),0), COALESCE(SUM(frozen_charges),0)
-FROM usage_user_daily
-WHERE user_name = ? AND system_paid = 1 AND day >= ?
-GROUP BY provider, model, upstream_model, system_paid`, userName, since.Format("2006-01-02"))
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	out := []UsageRow{}
-	for rows.Next() {
-		var r UsageRow
-		var systemPaid int64
-		if err := rows.Scan(&r.Day, &r.Provider, &r.Model, &r.UpstreamModel, &systemPaid,
-			&r.Requests, &r.OK, &r.Failed,
-			&r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.AvgLatencyMs,
-			&r.CacheHitTokens, &r.CacheMissTokens, &r.Charge, &r.FrozenCharges); err != nil {
-			return nil, err
-		}
-		r.SystemPaid = systemPaid != 0
-		out = append(out, r)
-	}
-	return out, rows.Err()
 }
 
 // MonthStart 返回 t 所在自然月的零点（按本地时区）。

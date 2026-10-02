@@ -358,13 +358,15 @@ func TestAdminUsageExportCSV(t *testing.T) {
 		t.Fatalf("export = %d %s", code, body)
 	}
 	text := string(body)
-	for _, col := range []string{"day", "user_name", "amount", "currency", "charge_frozen"} {
+	// 范围是两列（scope_kind + scope_id），不是 2.x 那个拼出来的 user_name：
+	// 导出件是给对账用的，读的人要能一眼看出这行归哪一档（§2.7 规则 1）。
+	for _, col := range []string{"day", "scope_kind", "scope_id", "amount", "currency", "charge_frozen"} {
 		if !strings.Contains(text, col) {
 			t.Errorf("CSV 缺列 %q: %s", col, text)
 		}
 	}
-	if !strings.Contains(text, "carol") {
-		t.Errorf("应当含 carol 的行: %s", text)
+	if !strings.Contains(text, "user,carol") {
+		t.Errorf("应当含 (user, carol) 那一行: %s", text)
 	}
 
 	code, body = adminGet(t, h, "/v1/_admin/usage/export?monthly=1")
@@ -442,7 +444,7 @@ func TestAdminAuditScopedQuery(t *testing.T) {
 		}
 	}
 	putPrice("user:auditee", "per-user-model")
-	putPrice("default", "default-model")
+	putPrice("system:global", "default-model")
 
 	entries := func(query string) []map[string]any {
 		t.Helper()
@@ -494,7 +496,7 @@ func TestAdminAuditScopedQuery(t *testing.T) {
 	if k, i := scopeOf(created[0]); k != "user" || i != "auditee" {
 		t.Errorf("user.create 归属错: %s:%s", k, i)
 	}
-	// 单用户覆盖价进用户范围，全局默认价进系统范围。
+	// 单用户覆盖价进用户范围，全局兜底价进系统范围。
 	if got := actionsWith(own, "price.user"); len(got) != 1 {
 		t.Fatalf("user:auditee 下应有 1 条 price.user，实际 %+v", got)
 	} else if !strings.Contains(stringified(got[0]), "per-user-model") {

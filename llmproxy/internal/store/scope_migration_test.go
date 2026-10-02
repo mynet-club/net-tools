@@ -507,3 +507,65 @@ func TestScopeQuotaBackfillWithoutLegacyColumns(t *testing.T) {
 		t.Errorf("两个用户都该有一行: %d", n)
 	}
 }
+
+// 结构已是 3.0、镜像却是空的 —— 那是「老账本没有任何读路径能看见」的形状：规则 8 之后
+// 用量只读 usage_scope_daily，补不上镜像就等于把老账本报成 0 元。这里钉住补齐的三种情形：
+// 没有老账单是空操作、空表补全、目标表非空时一条都不碰。
+func TestMirrorUsageScopeDailyOnlyFillsEmptyMirror(t *testing.T) {
+	s := openTestStore(t)
+
+	// 新库第一次打开就是这个形状：没有老账单，必须干净地什么都不做。
+	if err := mirrorUsageScopeDailyIfEmpty(s.db, s.dialect); err != nil {
+		t.Fatalf("没有老账单时不该报错: %v", err)
+	}
+
+	// 写 usage_user_daily 的那条路 3.0 已经不走，所以旧账单只能由裸 SQL 造出来。
+	const cols = `day, user_name, provider, model, upstream_model, system_paid,
+		requests, ok, failed, prompt_tokens, completion_tokens, total_tokens,
+		latency_sum_ms, charge, frozen_charges`
+	if _, err := s.db.Exec(`INSERT INTO usage_user_daily (` + cols + `) VALUES
+		('2026-09-01','old','deepseek','deepseek-flash','',0,3,3,0,900,300,1200,1500,0,0),
+		('2026-09-02','older','deepseek','deepseek-flash','',0,1,1,0,10,5,15,50,0,0)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := mirrorUsageScopeDailyIfEmpty(s.db, s.dialect); err != nil {
+		t.Fatalf("补镜像失败: %v", err)
+	}
+	old := policy.MustScope(policy.ScopeUser, "old")
+	tot, err := s.ScopeUsageTotals([]policy.ScopeRef{old}, time.Time{}, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tot.Requests != 3 || tot.TotalTokens != 1200 || tot.FirstDay != "2026-09-01" {
+		t.Errorf("老账单没按 (user, old) 补进来: %+v", tot)
+	}
+
+	// 目标表已经有行（上一轮补过、或者 3.0 正在记账）：那条镜像是整表 INSERT...SELECT，
+	// 非空时再跑一次就是双份账单，所以这里必须一条都不补。
+	if _, err := s.db.Exec(`INSERT INTO usage_user_daily (` + cols + `) VALUES
+		('2026-09-03','ghost','deepseek','deepseek-flash','',0,9,9,0,90,9,99,90,0,0)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := mirrorUsageScopeDailyIfEmpty(s.db, s.dialect); err != nil {
+		t.Fatalf("目标表非空时不该报错: %v", err)
+	}
+	if n, _, err := tableRowCount(s.db, s.dialect, "usage_scope_daily"); err != nil {
+		t.Fatal(err)
+	} else if n != 2 {
+		t.Errorf("目标表非空时一条都不该补，实际 %d 行", n)
+	}
+	if g := policy.MustScope(policy.ScopeUser, "ghost"); hasScopeUsageRows(t, s, g) {
+		t.Error("ghost 是补镜像之后才写进旧表的，不该出现在范围表里")
+	}
+}
+
+// hasScopeUsageRows 报告某个范围在 usage_scope_daily 里有没有行。
+func hasScopeUsageRows(t *testing.T, s *Store, scope policy.ScopeRef) bool {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM usage_scope_daily WHERE scope_kind=? AND scope_id=?`,
+		string(scope.Kind), scope.ID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n > 0
+}

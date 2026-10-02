@@ -15,6 +15,34 @@ import (
 	"github.com/mynet-club/net-tools/llmproxy/internal/store"
 )
 
+// ------------------------------------------------------------------ 用量的范围读法（测试共用）
+//
+// §2.7 规则 8 之后用量只有 usage_scope_daily 这一个读源，断言点因此都变成
+// 「按范围读」。范围键在这里现造（policy.MustScope），落法与记账侧
+// resolveRequestScope 对 UserName 的处理一致 —— 测试断言的范围和写入的范围同源，
+// 绿了才说明口径真的一致，而不是两边恰好各错一次。
+
+// mustSystemUsage 读某个用户范围的系统付费用量（配额那一侧的口径）。
+func mustSystemUsage(t *testing.T, db *store.Store, user string, since time.Time) store.SystemUsage {
+	t.Helper()
+	su, err := db.ScopeSystemUsage(policy.MustScope(policy.ScopeUser, user), since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return su
+}
+
+// mustScopeTotals 读某个用户范围的累计用量（含自带上游那部分，不进配额）。
+func mustScopeTotals(t *testing.T, db *store.Store, user string, since, until time.Time) store.UsageTotals {
+	t.Helper()
+	scope := policy.MustScope(policy.ScopeUser, user)
+	tot, err := db.ScopeUsageTotals([]policy.ScopeRef{scope}, since, until)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tot
+}
+
 // newMUHarnessWith 用指定配置搭多用户环境（newMUHarness 用的是固定那份 YAML）。
 func newMUHarnessWith(t *testing.T, yamlSrc string) *muHarness {
 	t.Helper()
@@ -248,10 +276,7 @@ func TestConsumptionUsesSystemPoolAndMeters(t *testing.T) {
 	}
 
 	// 库里那条用量必须标成系统付费，否则配额统计不到
-	su, err := h.db.SystemUsageSince("carol", store.MonthStart(time.Now()))
-	if err != nil {
-		t.Fatal(err)
-	}
+	su := mustSystemUsage(t, h.db, "carol", store.MonthStart(time.Now()))
 	if su.Requests != 1 || su.TotalTokens != 1500 {
 		t.Fatalf("系统付费用量不对: %+v", su)
 	}

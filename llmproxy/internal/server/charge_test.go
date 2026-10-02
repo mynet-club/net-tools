@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 	"github.com/mynet-club/net-tools/llmproxy/internal/store"
 )
 
@@ -26,7 +27,7 @@ func usageRows(t *testing.T, h *muHarness, user string) []map[string]any {
 	return out.Rows
 }
 
-// 分发价冻结：向用户收多少按 user_prices 冻结，**user:<名> 优先于 default**。
+// 分发价冻结：向用户收多少按 user_prices 冻结，**该用户的范围优先于全局兜底**。
 func TestFreezeDownstreamChargeUsesUserScope(t *testing.T) {
 	stub := newUsageStub(t, 0)
 	h := newConsumptionHarness(t, stub, testPricing)
@@ -34,13 +35,13 @@ func TestFreezeDownstreamChargeUsesUserScope(t *testing.T) {
 	setConsumption(t, h, "carol", "m", "")
 
 	from := hourFloor(time.Now().Add(-3 * time.Hour))
-	if err := h.db.InsertUserPrice(&store.UserPrice{
-		Scope: store.ScopeDefault, Model: "m", ValidFrom: from, InHit: 1, InMiss: 2, Out: 3,
+	if err := h.db.InsertScopePrice(&store.ScopePrice{
+		Scope: policy.SystemScope, Model: "m", ValidFrom: from, InHit: 1, InMiss: 2, Out: 3,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.db.InsertUserPrice(&store.UserPrice{
-		Scope: store.ScopeUser("carol"), Model: "m", ValidFrom: from, InHit: 0.5, InMiss: 1, Out: 1.5,
+	if err := h.db.InsertScopePrice(&store.ScopePrice{
+		Scope: policy.MustScope(policy.ScopeUser, "carol"), Model: "m", ValidFrom: from, InHit: 0.5, InMiss: 1, Out: 1.5,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -101,14 +102,15 @@ func TestChargeFallsBackToLegacyEstimate(t *testing.T) {
 func TestFreezeDownstreamSkippedForNonSystemPaid(t *testing.T) {
 	h := newConsumptionHarness(t, newUsageStub(t, 0), testPricing)
 	from := hourFloor(time.Now().Add(-time.Hour))
-	if err := h.db.InsertUserPrice(&store.UserPrice{
-		Scope: store.ScopeDefault, Model: "m", ValidFrom: from, InMiss: 2, Out: 8,
+	if err := h.db.InsertScopePrice(&store.ScopePrice{
+		Scope: policy.SystemScope, Model: "m", ValidFrom: from, InMiss: 2, Out: 8,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	prompt, completion := int64(1000), int64(100)
 	rec := &store.RequestRecord{
-		OK: true, UserName: "carol", Model: "m", Provider: "sys-a", UpstreamModel: "m",
+		OK: true, Scope: policy.MustScope(policy.ScopeUser, "carol"), UserName: "carol",
+		Model: "m", Provider: "sys-a", UpstreamModel: "m",
 		PromptTokens: &prompt, CompletionTokens: &completion, SystemPaid: false,
 	}
 	h.srv.freezeDownstreamCharge(rec, time.Now())
@@ -158,8 +160,8 @@ func TestUsageReportPricedReflectsDBPrices(t *testing.T) {
 	}
 
 	from := hourFloor(time.Now().Add(-time.Hour))
-	if err := h.db.InsertUserPrice(&store.UserPrice{
-		Scope: store.ScopeDefault, Model: "sys-model", ValidFrom: from,
+	if err := h.db.InsertScopePrice(&store.ScopePrice{
+		Scope: policy.SystemScope, Model: "sys-model", ValidFrom: from,
 		InMiss: 2, Out: 8, Currency: "CNY",
 	}); err != nil {
 		t.Fatal(err)

@@ -172,11 +172,8 @@ func TestUserTrafficGoesToOwnUpstream(t *testing.T) {
 		t.Errorf("X-LLMProxy-Provider = %q，期望 alice-up", got)
 	}
 
-	// 记账：用户维度要有数据
-	tot, err := h.db.TotalByUser(time.Time{}, "alice")
-	if err != nil {
-		t.Fatal(err)
-	}
+	// 记账：归属要落到他的范围上
+	tot := mustScopeTotals(t, h.db, "alice", time.Time{}, time.Time{})
 	if tot.Requests != 1 || tot.TotalTokens != 12 {
 		t.Errorf("用户维度用量不对: %+v", tot)
 	}

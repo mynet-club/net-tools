@@ -539,17 +539,15 @@ func scopeIDCol(ok bool, id string) any {
 	return id
 }
 
-// InsertRequest 写入一条请求明细，并同步更新 usage_daily / usage_user_daily / usage_scope_daily。
+// InsertRequest 写入一条请求明细，并同步更新 usage_daily / usage_scope_daily。
 //
-// 三张聚合表的分工（§2.7 规则 5）：
+// 两张聚合表的分工（§2.7 规则 5）：
 //
 //	usage_daily        全局按（日, 供应商, 模型）—— 2.x 就有，口径一字未动
-//	usage_user_daily   按（日, 用户名, ...）—— 2.x 的按用户账本，同样不动
-//	usage_scope_daily  按（日, 范围, ...）—— 3.0 新增的**叠加维度**
+//	usage_scope_daily  按（日, 范围, ...）—— 谁花掉了这些 token
 //
-// 「叠加」的含义：老表的行含义不会因为新表而改变，历史明细的归属因此保持不变。
-// 一次请求能进 usage_scope_daily 的前提是它定得出范围（rec.Scope 或 rec.UserName）；
-// 定不出就只落前两张 —— 补一个默认范围等于凭空造归属。
+// usage_user_daily 已经**不再写入**：那张表只剩 2.x 的历史行，读它的是 scope 迁移，
+// 运行时读用量一律走 usage_scope_daily（见 iface.go 的规则 8 说明）。
 func (s *Store) InsertRequest(rec RequestRecord) error {
 	if rec.Ts.IsZero() {
 		rec.Ts = time.Now()
@@ -647,52 +645,13 @@ ON CONFLICT(day, provider, model) DO UPDATE SET
 		}
 	}
 
-	// 多用户模式下额外记一份「按用户」的汇总；静态 key 没有归属用户，不记
-	if rec.UserName != "" {
-		systemPaid := 0
-		if rec.SystemPaid {
-			systemPaid = 1
-		}
-		// 上游模型名决定单价；取不到时退化成下游名（同名直通的情况下两者相同）
-		upstream := rec.UpstreamModel
-		if upstream == "" {
-			upstream = model
-		}
-		chargeVal, chargeFrozen := 0.0, 0
-		if rec.Charge != nil {
-			chargeVal, chargeFrozen = *rec.Charge, 1
-		}
-		_, err = txExec(tx, s.dialect, `
-INSERT INTO usage_user_daily (
-  day, user_name, provider, model, upstream_model, system_paid,
-  requests, ok, failed,
-  prompt_tokens, cache_hit_tokens, cache_miss_tokens, completion_tokens, total_tokens, latency_sum_ms,
-  charge, frozen_charges
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-ON CONFLICT(day, user_name, provider, model, upstream_model, system_paid) DO UPDATE SET
-  requests          = usage_user_daily.requests + excluded.requests,
-  ok                = usage_user_daily.ok + excluded.ok,
-  failed            = usage_user_daily.failed + excluded.failed,
-  prompt_tokens     = usage_user_daily.prompt_tokens + excluded.prompt_tokens,
-  cache_hit_tokens  = usage_user_daily.cache_hit_tokens + excluded.cache_hit_tokens,
-  cache_miss_tokens = usage_user_daily.cache_miss_tokens + excluded.cache_miss_tokens,
-  completion_tokens = usage_user_daily.completion_tokens + excluded.completion_tokens,
-  total_tokens      = usage_user_daily.total_tokens + excluded.total_tokens,
-  latency_sum_ms    = usage_user_daily.latency_sum_ms + excluded.latency_sum_ms,
-  charge            = usage_user_daily.charge + excluded.charge,
-  frozen_charges    = usage_user_daily.frozen_charges + excluded.frozen_charges`,
-			day, rec.UserName, provider, model, upstream, systemPaid, 1, okInc, failedInc,
-			int64Val(rec.PromptTokens), rec.CacheHitTokens, rec.CacheMissTokens,
-			int64Val(rec.CompletionTokens), int64Val(rec.TotalTokens),
-			rec.LatencyMs, chargeVal, chargeFrozen,
-		)
-		if err != nil {
-			return fmt.Errorf("写入 usage_user_daily 失败: %w", err)
-		}
-	}
-
-	// 3.0 的按范围聚合：与 usage_user_daily 同一套计数（同一事务、同一口径），
-	// 这样「按范围的合计」与「按用户的合计」可以对得上账。
+	// 3.0 的按范围聚合：一次请求能进 usage_scope_daily 的前提是定得出范围
+	// （rec.Scope，或退到 rec.UserName 落成 (user, 名) —— 解析只在 resolveRequestScope
+	// 这一处）；定不出就只落上面两张 —— 补一个默认范围等于凭空造归属。
+	//
+	// 这里**不再**写 usage_user_daily：那是 2.x 的按用户账本，3.0 的按范围账本是它的
+	// 超集（人 = (user, 名) 那一桶）。继续双写等于让同一笔钱有两个真源，
+	// 而迁移之后两者必然分叉（新范围种类的账单只会出现在新表里）。
 	if scoped {
 		upstream := rec.UpstreamModel
 		if upstream == "" {

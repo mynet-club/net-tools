@@ -35,8 +35,8 @@ func TestReopenRestoresUsersPricesFrozenAndStatus(t *testing.T) {
 	}
 
 	hour := time.Now().UTC().Truncate(time.Hour).Add(-time.Hour)
-	if err := s.InsertUserPrice(&UserPrice{
-		Scope: ScopeDefault, Model: "gpt", ValidFrom: hour, InMiss: 2, Out: 8,
+	if err := s.InsertScopePrice(&ScopePrice{
+		Scope: policy.SystemScope, Model: "gpt", ValidFrom: hour, InMiss: 2, Out: 8,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestReopenRestoresUsersPricesFrozenAndStatus(t *testing.T) {
 	}
 
 	// 分发价冻结（用户行）必须原样
-	aliceRows, err := s2.SystemUsageRowsSince("alice", time.Now().AddDate(0, 0, -1))
+	aliceRows, err := s2.ScopeSystemUsageRows(policy.MustScope(policy.ScopeUser, "alice"), time.Now().AddDate(0, 0, -1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestReopenRestoresUsersPricesFrozenAndStatus(t *testing.T) {
 	if aliceRows[0].Charge != 3.5 || aliceRows[0].FrozenCharges != 1 {
 		t.Errorf("分发冻结应当原样恢复 charge=3.5 frozen=1，实际 %+v", aliceRows[0])
 	}
-	bobRows, _ := s2.SystemUsageRowsSince("bob", time.Now().AddDate(0, 0, -1))
+	bobRows, _ := s2.ScopeSystemUsageRows(policy.MustScope(policy.ScopeUser, "bob"), time.Now().AddDate(0, 0, -1))
 	if len(bobRows) != 1 || bobRows[0].Charge != 3.5 {
 		t.Errorf("bob 的账应当独立且完整: %+v", bobRows)
 	}
@@ -150,12 +150,14 @@ func TestReopenRestoresUsersPricesFrozenAndStatus(t *testing.T) {
 		t.Error("bob 不该看到 alice 的熔断状态")
 	}
 
-	// 价目历史也回来，且仍按整点查询
-	p, err := s2.UserPriceAt("bob", "gpt", hour.Add(time.Minute))
+	// 价目历史也回来，且仍按整点查询。bob 没有专属价，走「具体范围 → 全局兜底」命中系统那一行。
+	p, err := s2.ScopePriceAtChain(
+		policy.MustScopeChain(policy.MustScope(policy.ScopeUser, "bob"), policy.SystemScope),
+		"gpt", hour.Add(time.Minute))
 	if err != nil || p == nil {
-		t.Fatalf("UserPriceAt: %v %v", p, err)
+		t.Fatalf("ScopePriceAtChain: %v %v", p, err)
 	}
-	if p.InMiss != 2 || p.Out != 8 {
+	if p.InMiss != 2 || p.Out != 8 || !p.Scope.Is(policy.SystemScope) {
 		t.Errorf("分发价恢复不对: %+v", p)
 	}
 }
@@ -228,7 +230,7 @@ func TestPriceChangeDoesNotRewriteFrozenHistory(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := s.SystemUsageRowsSince("u2", time.Now().AddDate(0, 0, -1))
+	rows, err := s.ScopeSystemUsageRows(policy.MustScope(policy.ScopeUser, "u2"), time.Now().AddDate(0, 0, -1))
 	if err != nil {
 		t.Fatal(err)
 	}

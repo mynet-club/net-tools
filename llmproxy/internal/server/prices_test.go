@@ -153,10 +153,10 @@ func TestAdminUserPriceAPI(t *testing.T) {
 			"in_hit":     0.02, "in_miss": 1.0, "out": 4.0,
 		}
 	}
-	// default + 单用户覆盖都能写
-	resp, raw := h.put(t, "/v1/_admin/prices/user", adminToken, body("default", "fast"))
+	// 全局兜底 + 单用户覆盖都能写
+	resp, raw := h.put(t, "/v1/_admin/prices/user", adminToken, body("system:global", "fast"))
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("写 default 分发价应 200，实际 %d: %s", resp.StatusCode, raw)
+		t.Fatalf("写全局兜底分发价应 200，实际 %d: %s", resp.StatusCode, raw)
 	}
 	resp, raw = h.put(t, "/v1/_admin/prices/user", adminToken, body("user:arthur", "fast"))
 	if resp.StatusCode != http.StatusOK {
@@ -164,16 +164,31 @@ func TestAdminUserPriceAPI(t *testing.T) {
 	}
 	// 查历史
 	resp, raw = h.get(t, "/v1/_admin/prices/user?scope=user:arthur&model=fast", adminToken)
-	if resp.StatusCode != http.StatusOK || !strings.Contains(string(raw), `"scope":"user:arthur"`) {
+	if resp.StatusCode != http.StatusOK ||
+		!strings.Contains(string(raw), `"scope_kind":"user"`) ||
+		!strings.Contains(string(raw), `"scope_id":"arthur"`) {
 		t.Errorf("查 user:arthur 的价目失败: %d %s", resp.StatusCode, raw)
 	}
-	// 非法 scope
-	resp, raw = h.put(t, "/v1/_admin/prices/user", adminToken, body("everyone", "fast"))
-	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(raw), "scope") {
-		t.Errorf("非法 scope 应 400 且指出 scope，实际 %d: %s", resp.StatusCode, raw)
+	// 返回体里不许出现折叠成一个串的 scope（§2.7 规则 1）
+	if strings.Contains(string(raw), `"scope":"user:arthur"`) {
+		t.Errorf("分发价响应不该把 (scope_kind, scope_id) 折成一个字段: %s", raw)
+	}
+	// 非法 scope：旧的 'default' 串与裸名字都不再是合法选择器
+	for _, bad := range []string{"everyone", "default", "arthur"} {
+		resp, raw = h.put(t, "/v1/_admin/prices/user", adminToken, body(bad, "fast"))
+		if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(raw), "scope") {
+			t.Errorf("非法 scope %q 应 400 且指出 scope，实际 %d: %s", bad, resp.StatusCode, raw)
+		}
+	}
+	// 通配选择器不能当存储键（* 与 kind:* 都没有确定的 scope_id）
+	for _, bad := range []string{"*", "user:*"} {
+		resp, raw = h.put(t, "/v1/_admin/prices/user", adminToken, body(bad, "fast"))
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("通配 scope %q 不该能录价，实际 %d: %s", bad, resp.StatusCode, raw)
+		}
 	}
 	// 非管理员
-	resp, _ = h.put(t, "/v1/_admin/prices/user", adminToken+"x", body("default", "nope"))
+	resp, _ = h.put(t, "/v1/_admin/prices/user", adminToken+"x", body("system:global", "nope"))
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("非管理员应 403，实际 %d", resp.StatusCode)
 	}
@@ -205,7 +220,7 @@ func TestPriceCurrencyGuard(t *testing.T) {
 
 	// 2) 分发价一侧同样被拒
 	resp, raw = h.put(t, "/v1/_admin/prices/user", adminToken, map[string]any{
-		"scope": "default", "model": "sys-model",
+		"scope": "system:global", "model": "sys-model",
 		"valid_from": base.Format(time.RFC3339),
 		"in_miss":    2.0, "out": 8.0, "currency": "USD",
 	})

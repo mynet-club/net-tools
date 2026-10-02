@@ -217,7 +217,7 @@ func userList(paths config.Paths) error {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "NAME\tENABLED\tUPSTREAMS\tREQUESTS\tTOKENS\tCREATED")
 	for _, u := range users {
-		tot, err := db.TotalByUser(time.Time{}, u.Name)
+		tot, err := userTotals(db, u.Name, time.Time{}, time.Time{})
 		if err != nil {
 			return err
 		}
@@ -258,7 +258,7 @@ func userShow(paths config.Paths, rest []string) error {
 	if u == nil {
 		return fmt.Errorf("用户 %q 不存在", name)
 	}
-	tot, err := db.TotalByUser(time.Time{}, name)
+	tot, err := userTotals(db, name, time.Time{}, time.Time{})
 	if err != nil {
 		return err
 	}
@@ -393,11 +393,15 @@ func userUsageCmd(paths config.Paths, rest []string) error {
 	defer db.Close()
 
 	since := time.Now().AddDate(0, 0, -*days)
-	rows, err := db.UsageByUser(since, name)
+	scope, err := userScopeOf(name)
 	if err != nil {
 		return err
 	}
-	tot, err := db.TotalByUser(since, name)
+	rows, err := db.UsageByScope(scope, since, time.Time{})
+	if err != nil {
+		return err
+	}
+	tot, err := userTotals(db, name, since, time.Time{})
 	if err != nil {
 		return err
 	}

@@ -70,13 +70,15 @@ func runIntegrationSuite(t *testing.T, driver, pathOrDSN string) {
 		t.Fatal(err)
 	}
 	model := "m-" + uid
-	if err := s.InsertUserPrice(&UserPrice{
-		Scope: ScopeDefault, Model: model, ValidFrom: hour, InMiss: 2, Out: 8,
+	if err := s.InsertScopePrice(&ScopePrice{
+		Scope: policy.SystemScope, Model: model, ValidFrom: hour, InMiss: 2, Out: 8,
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	// 请求账本 + 冻结
+	// uidScope 提前定义：账本按 (user, uid) 范围落，读侧也按同一个范围读。
+	uidScope := policy.MustScope(policy.ScopeUser, uid)
 	cost, charge := 1.5, 3.5
 	if err := s.InsertRequest(RequestRecord{
 		Ts: time.Now(), RequestID: "it-" + uid, UserName: uid, Model: model,
@@ -88,7 +90,7 @@ func runIntegrationSuite(t *testing.T, driver, pathOrDSN string) {
 		t.Fatal(err)
 	}
 
-	rows, err := s.SystemUsageRowsSince(uid, time.Now().AddDate(0, 0, -1))
+	rows, err := s.ScopeSystemUsageRows(uidScope, time.Now().AddDate(0, 0, -1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +110,6 @@ func runIntegrationSuite(t *testing.T, driver, pathOrDSN string) {
 	}
 
 	// 熔断状态
-	uidScope := policy.MustScope(policy.ScopeUser, uid)
 	if err := s.SaveProviderBucketStates([]ProviderBucketState{
 		{Scope: uidScope, Name: "up", Enabled: true, ConsecutiveFailures: 2},
 	}); err != nil {
@@ -135,7 +136,7 @@ func runIntegrationSuite(t *testing.T, driver, pathOrDSN string) {
 	if ms, _ := s.ListUserModels(uid); len(ms) != 0 {
 		t.Errorf("删用户后模型映射应清掉: %+v", ms)
 	}
-	if rows, _ := s.SystemUsageRowsSince(uid, time.Now().AddDate(0, 0, -1)); len(rows) == 0 {
+	if rows, _ := s.ScopeSystemUsageRows(uidScope, time.Now().AddDate(0, 0, -1)); len(rows) == 0 {
 		t.Error("删用户后用量账本应当保留")
 	}
 }

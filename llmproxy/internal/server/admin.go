@@ -72,11 +72,13 @@ func (s *Server) adminUsersRoute(w http.ResponseWriter, r *http.Request, tail st
 				writeJSONError(w, http.StatusNotFound, "not_found", err.Error())
 				return
 			}
-			s.router.ForgetScope(userBucket(name))
+			// 名字已经删了，范围只能在这里算一次：路由桶、报表缓存都按它清
+			bucket := userBucket(name)
+			s.router.ForgetScope(bucket)
 			if s.meters != nil {
 				s.meters.Forget(name)
 			}
-			s.usageCache.InvalidateUser(name)
+			s.usageCache.InvalidateScope(bucket)
 			_ = s.SyncUsers()
 			s.auditUser("admin", "user.delete", name, "")
 			s.log.Warnf("管理员删除了用户 %s", name)
@@ -156,7 +158,7 @@ func (s *Server) userSummary(name string) (map[string]any, error) {
 
 	// 本月「系统付费」用量：只有这部分进配额与金额
 	usedTokens, usedCost := s.meters.Snapshot(name)
-	all, err := s.db.TotalByUser(time.Time{}, name)
+	all, err := s.db.ScopeUsageTotals([]policy.ScopeRef{scope}, time.Time{}, time.Time{})
 	if err != nil {
 		return nil, err
 	}
@@ -472,7 +474,9 @@ func (s *Server) adminUserUsage(w http.ResponseWriter, r *http.Request, name str
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	s.writeUsageReport(w, name, days)
+	// 路径上的用户名落成范围键再读报表；落不成时 writeUsageReport 会回 400，
+	// 不会退化成「读全局范围」—— 那等于把别人的账单显示在这里。
+	s.writeUsageReport(w, userBucket(name), days)
 }
 
 // adminListSystemProviders 列出系统上游（config.yaml 里的 providers），

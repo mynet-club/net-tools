@@ -536,89 +536,9 @@ func (s *Store) DeleteUserProvider(userName, name string) (bool, error) {
 }
 
 // ------------------------------------------------------------------ 按用户统计
-
-// UsageByUser 查询某个用户的按日、按上游、按模型消耗。
-// since 为零值表示不限起始日期。
-func (s *Store) UsageByUser(since time.Time, userName string) ([]UsageRow, error) {
-	where := `WHERE user_name = ?`
-	args := []any{userName}
-	if !since.IsZero() {
-		where += ` AND day >= ?`
-		args = append(args, since.Format("2006-01-02"))
-	}
-	rows, err := s.query(`
-SELECT day, provider, model, upstream_model, system_paid,
-       SUM(requests), SUM(ok), SUM(failed),
-       SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
-       CASE WHEN SUM(requests)>0 THEN CAST(SUM(latency_sum_ms) AS REAL)/SUM(requests) ELSE 0 END,
-       SUM(cache_hit_tokens), SUM(cache_miss_tokens),
-       COALESCE(SUM(charge),0), COALESCE(SUM(frozen_charges),0)
-FROM usage_user_daily `+where+`
-GROUP BY day, provider, model, upstream_model, system_paid
-ORDER BY day DESC, model
-LIMIT 500`, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	out := []UsageRow{}
-	for rows.Next() {
-		var r UsageRow
-		var systemPaid int64
-		if err := rows.Scan(&r.Day, &r.Provider, &r.Model, &r.UpstreamModel, &systemPaid,
-			&r.Requests, &r.OK, &r.Failed,
-			&r.PromptTokens, &r.CompletionTokens, &r.TotalTokens, &r.AvgLatencyMs,
-			&r.CacheHitTokens, &r.CacheMissTokens, &r.Charge, &r.FrozenCharges); err != nil {
-			return nil, err
-		}
-		r.SystemPaid = systemPaid != 0
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
-
-// UserTotals 是某个用户的累计消耗。
 //
-// 字段名与 JSON 键刻意不同：这套接口对外一律 snake_case，
-// 且输出 token 数在别处叫 completion_tokens，这里跟着叫，免得同一个人面对两套名字。
-type UserTotals struct {
-	Requests     int64 `json:"requests"`
-	OK           int64 `json:"ok"`
-	Failed       int64 `json:"failed"`
-	TotalTokens  int64 `json:"total_tokens"`
-	PromptTokens int64 `json:"prompt_tokens"`
-	OutputTokens int64 `json:"completion_tokens"`
-	// 输入侧的缓存拆分。命中率 = CacheHit / (CacheHit + CacheMiss)，两者都为 0 表示
-	// 上游压根没回报（不是「命中率 0%」），界面上要区分这两种情况。
-	CacheHitTokens  int64  `json:"cache_hit_tokens"`
-	CacheMissTokens int64  `json:"cache_miss_tokens"`
-	FirstDay        string `json:"first_day"`
-	LastDay         string `json:"last_day"`
-}
-
-// TotalByUser 汇总某用户从 since 起的累计消耗。
-func (s *Store) TotalByUser(since time.Time, userName string) (UserTotals, error) {
-	where := `WHERE user_name = ?`
-	args := []any{userName}
-	if !since.IsZero() {
-		where += ` AND day >= ?`
-		args = append(args, since.Format("2006-01-02"))
-	}
-	var out UserTotals
-	var first, last sql.NullString
-	err := s.queryRow(`
-SELECT COALESCE(SUM(requests),0), COALESCE(SUM(ok),0), COALESCE(SUM(failed),0),
-       COALESCE(SUM(total_tokens),0), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
-       COALESCE(SUM(cache_hit_tokens),0), COALESCE(SUM(cache_miss_tokens),0),
-       MIN(day), MAX(day)
-FROM usage_user_daily `+where, args...).Scan(
-		&out.Requests, &out.OK, &out.Failed, &out.TotalTokens,
-		&out.PromptTokens, &out.OutputTokens,
-		&out.CacheHitTokens, &out.CacheMissTokens, &first, &last)
-	if err != nil {
-		return out, err
-	}
-	out.FirstDay, out.LastDay = first.String, last.String
-	return out, nil
-}
+// 2.x 这里的三条（UsageByUser / TotalByUser 及其 UserTotals）按 user_name 单键
+// 读 usage_user_daily，是 §2.7 规则 8 的最后一批兼容读法，已经删掉：
+// 读用量只有 scope_store.go 那一组按 (scope_kind, scope_id) 的 API。
+// 老报表要的是「某个人的账」，传 (user, 名) 进来就是同一件事，且不再要求这个人
+// 是账单的唯一一种主体。

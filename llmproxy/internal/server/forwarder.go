@@ -123,6 +123,14 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 	scope := auth.UserName
 	bucket := auth.Bucket // 熔断状态落哪个桶（结构化范围，见 authResult.Bucket）
 
+	// 记账的归属跟**身份**走，不跟熔断桶走：静态 key 与匿名本机请求的桶是
+	// system:global，那只说明「这次用的是全局池」，不代表这笔账记在系统头上
+	// （§2.7 规则 5：没有归属就留空，不猜）。DB 用户则在这里把结构化范围定实，
+	// 不必等 store 再从 UserName 反推（那条兜底是规则 3 留给旧调用方的）。
+	if auth.UserName != "" && bucket.Validate() == nil {
+		rec.Scope = bucket
+	}
+
 	// 用户级限流与配额：限流不依赖请求体，先判，省得白读一遍 body。
 	// 限流对两种模式都生效（单个用户打满网关跟模式无关）。
 	// **配额不在这里判** —— 它只约束「花网关的钱」，而混合模式下同一个模型可能有

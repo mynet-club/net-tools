@@ -541,12 +541,18 @@ func (s *Server) adminOK(r *http.Request) (bool, string) {
 	return true, ""
 }
 
-// meScope 返回自助接口应操作的作用域；静态 key 没有用户身份，不允许自助。
-func meScope(auth authResult) (string, bool) {
+// meScope 返回自助接口应操作的范围；静态 key 没有用户身份，不允许自助。
+//
+// 范围直接取鉴权结果里的 auth.Bucket，不在这里重新拼一次 (user, 名)：两处拼装
+// 迟早漂移，而自助接口读错范围等于读别人的账单。
+func meScope(auth authResult) (policy.ScopeRef, bool) {
 	if auth.UserName == "" {
-		return "", false
+		return policy.ScopeRef{}, false
 	}
-	return auth.UserName, true
+	if err := auth.Bucket.Validate(); err != nil {
+		return policy.ScopeRef{}, false
+	}
+	return auth.Bucket, true
 }
 
 // maskProvider 把一个上游渲染成可安全返回给客户端的形态（密钥只留尾部 4 位）。
@@ -589,11 +595,13 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, auth authResul
 	}
 	scope, ok := meScope(auth)
 	if !ok {
+		// 静态 key 没有身份；有身份却落不成范围键（库里遗留的脏名字）也走这里 ——
+		// 后者绝不能退化成「按全局范围读」，那等于把别人的账单交出去。
 		writeJSONError(w, http.StatusForbidden, "no_identity",
-			"当前凭证是静态 key，没有用户身份，无法使用自助接口")
+			"当前凭证无法落到可归属的范围（静态 key，或身份名不能作范围键），无法使用自助接口")
 		return
 	}
-	e := s.usersSnapshot().byName[scope]
+	e := s.usersSnapshot().byName[auth.UserName]
 	if e == nil {
 		writeJSONError(w, http.StatusNotFound, "not_found", "用户不存在")
 		return
@@ -606,7 +614,7 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, auth authResul
 			writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error", "只支持 GET")
 			return
 		}
-		tot, err := s.db.TotalByUser(time.Time{}, scope)
+		tot, err := s.db.ScopeUsageTotals([]policy.ScopeRef{scope}, time.Time{}, time.Time{})
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "internal", err.Error())
 			return
@@ -737,16 +745,21 @@ func (s *Server) handleMeRouting(w http.ResponseWriter, r *http.Request, e *user
 	for _, model := range all {
 		providers, _ := s.providersFor(e.Name, model)
 		tiers := s.router.PlanFor(userBucket(e.Name), providers, model)
-		// 分发价（向用户收多少）：有 DB 价目就报出来，界面做模型目录用
+		// 分发价（向用户收多少）：有 DB 价目就报出来，界面做模型目录用。
+		// 链条与冻结时一致（本人范围 → 全局默认），否则目录里显示的价格和实际扣的会两套口径。
 		var price map[string]any
-		if p, err := s.db.UserPriceAt(e.Name, model, now); err == nil && p != nil {
-			price = map[string]any{
-				"currency":   p.Currency,
-				"in_miss":    p.InMiss,
-				"in_hit":     p.InHit,
-				"in_write":   p.InWrite,
-				"out":        p.Out,
-				"valid_from": p.ValidFrom.Format(time.RFC3339),
+		if priceScope := userBucket(e.Name); priceScope.Validate() == nil {
+			if chain, cerr := priceScopeChain(priceScope); cerr == nil {
+				if p, err := s.db.ScopePriceAtChain(chain, model, now); err == nil && p != nil {
+					price = map[string]any{
+						"currency":   p.Currency,
+						"in_miss":    p.InMiss,
+						"in_hit":     p.InHit,
+						"in_write":   p.InWrite,
+						"out":        p.Out,
+						"valid_from": p.ValidFrom.Format(time.RFC3339),
+					}
+				}
 			}
 		}
 		if len(tiers) == 0 {
@@ -1108,7 +1121,7 @@ func (s *Server) findMyProvider(userName, name string) (*store.UserProvider, err
 	return nil, nil
 }
 
-func (s *Server) handleMeUsage(w http.ResponseWriter, r *http.Request, scope string) {
+func (s *Server) handleMeUsage(w http.ResponseWriter, r *http.Request, scope policy.ScopeRef) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error", "只支持 GET")
 		return
@@ -1121,25 +1134,35 @@ func (s *Server) handleMeUsage(w http.ResponseWriter, r *http.Request, scope str
 	s.writeUsageReport(w, scope, days)
 }
 
-// writeUsageReport 出一个用户的用量报表。用户自助（/v1/_me/usage）与管理员
+// writeUsageReport 出一个范围的用量报表。用户自助（/v1/_me/usage）与管理员
 // （/v1/_admin/users/{name}/usage）共用同一份实现 —— 两处各写一遍迟早会漂移。
 //
-// 结果按 (用户, 天数) 缓存几秒：这是界面轮询的热点，每次都现算会把 store 那条
+// 入参是结构化范围而不是用户名：自助侧传的是鉴权得到的 auth.Bucket，管理侧是从
+// 路径名落成的 (user, 名)。将来组织/项目面板要读同一张表时，这里不必再改签名。
+//
+// 结果按 (范围, 天数) 缓存几秒：这是界面轮询的热点，每次都现算会把 store 那条
 // 唯一 SQLite 连接占满，连带拖慢请求落库。配额判断不走这份缓存（见 meters）。
-func (s *Server) writeUsageReport(w http.ResponseWriter, scope string, days int) {
+func (s *Server) writeUsageReport(w http.ResponseWriter, scope policy.ScopeRef, days int) {
+	if err := scope.Validate(); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
 	cacheKey := usageReportKey{scope: scope, days: days}
 	if hit := s.usageCache.Get(cacheKey); hit != nil {
 		writeJSON(w, http.StatusOK, hit)
 		return
 	}
 
+	// 报表按「今天往回 days 天」给，所以区间右端不裁（until 零值 = 不限）。
 	since := time.Now().AddDate(0, 0, -days)
-	rows, err := s.db.UsageByUser(since, scope)
+	until := time.Time{}
+	scopeSet := []policy.ScopeRef{scope}
+	rows, err := s.db.UsageByScope(scope, since, until)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
-	tot, err := s.db.TotalByUser(since, scope)
+	tot, err := s.db.ScopeUsageTotals(scopeSet, since, until)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
@@ -1181,7 +1204,7 @@ func (s *Server) writeUsageReport(w http.ResponseWriter, scope string, days int)
 		// 只有网关自己掏钱的那部分才谈得上金额；用户用自己的上游是他自己跟供应商结算。
 		// 金额口径与配额一致：冻结优先、未冻结按 legacy 单价表估算兜底。
 		if r.SystemPaid && (r.FrozenCharges > 0 || pricing.Enabled()) {
-			c := rowCharge(r, &pricing, now)
+			c := rowCharge(r.UsageRow, &pricing, now)
 			item.Cost = &c
 			item.Charge = r.Charge
 			item.FrozenCharges = r.FrozenCharges
@@ -1191,7 +1214,7 @@ func (s *Server) writeUsageReport(w http.ResponseWriter, scope string, days int)
 
 	// 汇总金额同样只算系统付费的部分，和配额口径保持一致
 	var monthCost float64
-	if rows, err := s.db.SystemUsageRowsSince(scope, store.MonthStart(now)); err == nil {
+	if rows, err := s.db.ScopeSystemUsageRows(scope, store.MonthStart(now)); err == nil {
 		for _, r := range rows {
 			monthCost += rowCharge(r, &pricing, now)
 		}
@@ -1203,8 +1226,12 @@ func (s *Server) writeUsageReport(w http.ResponseWriter, scope string, days int)
 	// false，字面自相矛盾（生产上就撞见过：frozen_charges=1 而 priced=false）。
 	priced := pricing.Enabled()
 	if !priced && s.db != nil {
-		if ok, err := s.db.HasEffectiveUserPrices(scope, now); err == nil {
-			priced = ok
+		// 链条与冻结取价一致：这个范围自己 + 全局默认。只看本范围会把「只配了全局默认价」
+		// 读成 priced:false —— 金额在冻结、接口却说自己没计价。
+		if chain, cerr := priceScopeChain(scope); cerr == nil {
+			if ok, err := s.db.HasEffectiveScopePrices(now, []policy.ScopeRef(chain)...); err == nil {
+				priced = ok
+			}
 		}
 	}
 

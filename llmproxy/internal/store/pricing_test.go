@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 )
 
 func t9() time.Time  { return time.Date(2026, 9, 21, 9, 0, 0, 0, time.UTC) }
@@ -215,46 +217,99 @@ func TestProviderPricesEffective(t *testing.T) {
 	}
 }
 
-// 分发价取价规则：user:<名> 优先，没有则回落 default。
-func TestUserPriceAtScopeResolution(t *testing.T) {
+// 分发价取价规则：链条里最具体的范围优先，没有则回落系统全局兜底。
+func TestScopePriceChainResolution(t *testing.T) {
 	s := openTestStore(t)
-	if err := s.InsertUserPrice(&UserPrice{Scope: ScopeDefault, Model: "fast", ValidFrom: t9(), InMiss: 2, Out: 8}); err != nil {
+	if err := s.InsertScopePrice(&ScopePrice{Scope: policy.SystemScope, Model: "fast", ValidFrom: t9(), InMiss: 2, Out: 8}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.InsertUserPrice(&UserPrice{Scope: ScopeUser("arthur"), Model: "fast", ValidFrom: t9(), InMiss: 1, Out: 4}); err != nil {
+	if err := s.InsertScopePrice(&ScopePrice{
+		Scope: policy.MustScope(policy.ScopeUser, "arthur"), Model: "fast", ValidFrom: t9(), InMiss: 1, Out: 4,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	// arthur 有专属价
-	got, err := s.UserPriceAt("arthur", "fast", t9())
+	got, err := s.ScopePriceAtChain(
+		policy.MustScopeChain(policy.MustScope(policy.ScopeUser, "arthur"), policy.SystemScope),
+		"fast", t9())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got == nil || got.InMiss != 1 || got.Scope != ScopeUser("arthur") {
+	if got == nil || got.InMiss != 1 || !got.Scope.Is(policy.MustScope(policy.ScopeUser, "arthur")) {
 		t.Errorf("arthur 应当拿到自己的价，实际 %+v", got)
 	}
-	// bob 没有专属价 → 回落 default
-	got, err = s.UserPriceAt("bob", "fast", t9())
+	// bob 没有专属价 → 回落全局兜底
+	got, err = s.ScopePriceAtChain(
+		policy.MustScopeChain(policy.MustScope(policy.ScopeUser, "bob"), policy.SystemScope),
+		"fast", t9())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got == nil || got.InMiss != 2 || got.Scope != ScopeDefault {
-		t.Errorf("bob 应当回落到 default 价，实际 %+v", got)
+	if got == nil || got.InMiss != 2 || !got.Scope.Is(policy.SystemScope) {
+		t.Errorf("bob 应当回落到全局兜底价，实际 %+v", got)
 	}
-	// 没有该模型的价目 → nil
-	if got, err := s.UserPriceAt("arthur", "nope", t9()); err != nil || got != nil {
+	// 没有该模型的价目 → nil（缺席即否不适用于价格：没有价目时由调用方决定兜底报价，
+	// 把分发价当 0 会让配额形同虚设）
+	if got, err := s.ScopePriceAtChain(
+		policy.MustScopeChain(policy.MustScope(policy.ScopeUser, "arthur"), policy.SystemScope),
+		"nope", t9()); err != nil || got != nil {
 		t.Errorf("没有价目时应当返回 nil: %+v %v", got, err)
 	}
-	// scope 非法被拒
-	if err := s.InsertUserPrice(&UserPrice{Scope: "everyone", Model: "fast", ValidFrom: t9()}); err == nil {
+	// 空链条被拒：至少得有一个范围，否则「这一笔算在谁头上」没有答案
+	if _, err := s.ScopePriceAtChain(policy.ScopeChain{}, "fast", t9()); err == nil {
+		t.Error("空链条应当被拒")
+	}
+	// 非法 scope 被拒：kind 不在白名单里
+	if err := s.InsertScopePrice(&ScopePrice{
+		Scope: policy.ScopeRef{Kind: "everyone", ID: "x"}, Model: "fast", ValidFrom: t9(),
+	}); err == nil {
 		t.Error("非法 scope 应当被拒")
 	}
-	// scope 留空 = default
-	up := &UserPrice{Model: "bare", ValidFrom: t9(), Out: 1}
-	if err := s.InsertUserPrice(up); err != nil {
-		t.Fatalf("scope 留空应当当 default 处理: %v", err)
+	// scope 留空不再隐含「全局默认」：§2.7 规则 1 要求范围显式，
+	// 静默补默认会把价录进谁都想不到的桶里。
+	if err := s.InsertScopePrice(&ScopePrice{Model: "bare", ValidFrom: t9(), Out: 1}); err == nil {
+		t.Error("scope 留空应当被拒（要录全局兜底价就显式写 system:global）")
 	}
-	if up.Scope != ScopeDefault {
-		t.Errorf("scope 留空时应当变成 %q，实际 %q", ScopeDefault, up.Scope)
+}
+
+// 分发价的 specificity 次序必须与链条的**传入顺序**无关，而且永远是 user > project >
+// organization > system：全局兜底价压过某个人的专属价属于静默算错钱。
+func TestScopePriceChainIsOrderIndependent(t *testing.T) {
+	s := openTestStore(t)
+	user := policy.MustScope(policy.ScopeUser, "arthur")
+	proj := policy.MustScope(policy.ScopeProject, "proj-lab-7")
+	org := policy.MustScope(policy.ScopeOrganization, "campus")
+	for _, p := range []ScopePrice{
+		{Scope: policy.SystemScope, Model: "fast", ValidFrom: t9(), InMiss: 4},
+		{Scope: org, Model: "fast", ValidFrom: t9(), InMiss: 3},
+		{Scope: proj, Model: "fast", ValidFrom: t9(), InMiss: 2},
+		{Scope: user, Model: "fast", ValidFrom: t9(), InMiss: 1},
+	} {
+		cp := p
+		if err := s.InsertScopePrice(&cp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	chains := []policy.ScopeChain{
+		policy.MustScopeChain(user, proj, org, policy.SystemScope),
+		policy.MustScopeChain(policy.SystemScope, org, proj, user),
+		policy.MustScopeChain(org, user, policy.SystemScope, proj),
+	}
+	for i, chain := range chains {
+		got, err := s.ScopePriceAtChain(chain, "fast", t9())
+		if err != nil || got == nil {
+			t.Fatalf("第 %d 条链条: %v %+v", i, err, got)
+		}
+		if !got.Scope.Is(user) || got.InMiss != 1 {
+			t.Errorf("第 %d 条链条应当拿到 arthur 的专属价，实际 %+v", i, got)
+		}
+	}
+	// 没有用户专属价时按 project > organization > system 逐层回落
+	got, err := s.ScopePriceAtChain(
+		policy.MustScopeChain(policy.SystemScope, proj, org, policy.MustScope(policy.ScopeUser, "dave")),
+		"fast", t9())
+	if err != nil || got == nil || !got.Scope.Is(proj) || got.InMiss != 2 {
+		t.Errorf("dave 应当落到项目价，实际 %+v err=%v", got, err)
 	}
 }
 
@@ -335,68 +390,74 @@ func openTestStoreAt(t *testing.T, path string) *Store {
 	return s
 }
 
-// HasEffectiveUserPrices 要能区分「真的没有价目」与「有但此刻不生效」。
+// HasEffectiveScopePrices 要能区分「真的没有价目」与「有但此刻不生效」。
 //
 // 它支撑的是用量接口里的 priced 字段：只看 config.yaml 的 legacy 兜底表会自相矛盾 ——
 // 录了 DB 价目、金额也确实在按请求冻结，接口却回 priced:false（生产上撞见过）。
-func TestHasEffectiveUserPrices(t *testing.T) {
+func TestHasEffectiveScopePrices(t *testing.T) {
 	now := time.Now().UTC()
 	hour := now.Truncate(time.Hour)
+	alice := policy.MustScope(policy.ScopeUser, "alice")
 
 	// 一条都没有
 	s := openTestStore(t)
-	if ok, err := s.HasEffectiveUserPrices("alice", now); err != nil || ok {
+	if ok, err := s.HasEffectiveScopePrices(now, alice, policy.SystemScope); err != nil || ok {
 		t.Errorf("空表应当 false，实际 ok=%v err=%v", ok, err)
 	}
 
-	// default 行生效
-	if err := s.InsertUserPrice(&UserPrice{
-		Scope: ScopeDefault, Model: "m", ValidFrom: hour, InMiss: 2, Out: 8,
+	// 全局兜底行生效
+	if err := s.InsertScopePrice(&ScopePrice{
+		Scope: policy.SystemScope, Model: "m", ValidFrom: hour, InMiss: 2, Out: 8,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := s.HasEffectiveUserPrices("alice", now); err != nil || !ok {
-		t.Errorf("有 default 行时应当 true，实际 ok=%v err=%v", ok, err)
+	if ok, err := s.HasEffectiveScopePrices(now, alice, policy.SystemScope); err != nil || !ok {
+		t.Errorf("有全局兜底行时应当 true，实际 ok=%v err=%v", ok, err)
 	}
-	if ok, _ := s.HasEffectiveUserPrices("", now); !ok {
-		t.Error("用户名为空（静态 key）也应当看到 default 行")
+	// 静态 key 没有归属范围，链条只剩全局兜底 —— 仍然要算「有价目」
+	if ok, _ := s.HasEffectiveScopePrices(now, policy.SystemScope); !ok {
+		t.Error("只看全局兜底范围时也应当算「有价目」")
+	}
+	// 非法范围被拒，而不是静默当作「没有」
+	if _, err := s.HasEffectiveScopePrices(now, policy.ScopeRef{}); err == nil {
+		t.Error("空范围应当被拒")
 	}
 
 	// 只有别人的覆盖行时，对 alice 不算「有价目」
 	s2 := openTestStore(t)
-	if err := s2.InsertUserPrice(&UserPrice{
-		Scope: ScopeUser("bob"), Model: "m", ValidFrom: hour, InMiss: 2, Out: 8,
+	if err := s2.InsertScopePrice(&ScopePrice{
+		Scope: policy.MustScope(policy.ScopeUser, "bob"), Model: "m", ValidFrom: hour, InMiss: 2, Out: 8,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if ok, _ := s2.HasEffectiveUserPrices("alice", now); ok {
-		t.Error("只有 bob 的覆盖行时，alice 不该算「有价目」")
+	if ok, _ := s2.HasEffectiveScopePrices(now, alice, policy.SystemScope); ok {
+		t.Error("只有 bob 的覆盖行时，alice 的范围集合不该算「有价目」")
 	}
-	if ok, _ := s2.HasEffectiveUserPrices("bob", now); !ok {
+	if ok, _ := s2.HasEffectiveScopePrices(now, policy.MustScope(policy.ScopeUser, "bob"), policy.SystemScope); !ok {
 		t.Error("bob 自己应当算「有价目」")
 	}
 
 	// valid_from 在未来的行不算「当前生效」
 	s3 := openTestStore(t)
-	if err := s3.InsertUserPrice(&UserPrice{
-		Scope: ScopeDefault, Model: "m", ValidFrom: hour.Add(2 * time.Hour), InMiss: 2, Out: 8,
+	if err := s3.InsertScopePrice(&ScopePrice{
+		Scope: policy.SystemScope, Model: "m", ValidFrom: hour.Add(2 * time.Hour), InMiss: 2, Out: 8,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if ok, _ := s3.HasEffectiveUserPrices("alice", now); ok {
+	if ok, _ := s3.HasEffectiveScopePrices(now, alice, policy.SystemScope); ok {
 		t.Error("valid_from 在未来的行不该算「当前生效」")
 	}
 
 	// 已收口（valid_to 在过去）的行不算
 	s4 := openTestStore(t)
-	if err := s4.InsertUserPrice(&UserPrice{
-		Scope: ScopeDefault, Model: "m",
+	if err := s4.InsertScopePrice(&ScopePrice{
+		Scope: policy.SystemScope, Model: "m",
 		ValidFrom: hour.Add(-2 * time.Hour), ValidTo: hour.Add(-time.Hour),
 		InMiss: 2, Out: 8,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if ok, _ := s4.HasEffectiveUserPrices("alice", now); ok {
+	if ok, _ := s4.HasEffectiveScopePrices(now, alice, policy.SystemScope); ok {
 		t.Error("已过期的行不该算「当前生效」")
 	}
 }

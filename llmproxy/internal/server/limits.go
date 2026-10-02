@@ -6,18 +6,22 @@ import (
 	"time"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/config"
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 	"github.com/mynet-club/net-tools/llmproxy/internal/store"
 )
 
 // 消费模式的运行时状态：当月用量计数 + 限流。
 //
-// 为什么放在内存里：配额判断在请求路径上，而 usage_user_daily 走的是单连接 SQLite
+// 为什么放在内存里：配额判断在请求路径上，而 usage_scope_daily 走的是单连接 SQLite
 // （SetMaxOpenConns(1)），每请求查一次库会把网关的吞吐直接压到那条连接上。
 // 所以：
 //   - 计数在内存累加，只在「当月首次用到某个用户」时从库里装载一次；
-//   - 那次装载的 DB 读**在任何锁外**做（见 ensureMonthLoaded）—— 否则持锁抢唯一那条
-//     连接期间，所有用户的限流与配额判断全堵在后面，跨月瞬间就是一次集体停顿；
-//   - 落库照旧走 usage_user_daily，内存计数只为快速判断。
+//   - 那次装载的 DB 读发生在**单个用户的桶锁**里而不是 meterSet.mu 里 —— 只挡住他
+//     自己的并发请求，别人的限流与配额照常走（见 loadMonthLocked）；
+//   - 落库照旧走 usage_scope_daily，内存计数只为快速判断。
+//
+// 配额读的是 scope_quota 那一张表（§2.7 规则 2）：users 行上已经没有额度列，
+// 「读不到配额行就回读 users」的兜底也随规则 8 删掉了。
 //
 // 锁的两层，是为了别让 A 用户的请求把 B 用户的限流也堵住：
 //   - meterSet.mu（RWMutex）只护 map 的读写，临界区里不碰计数、更不读库；
@@ -216,12 +220,20 @@ func (m *meterSet) loadMonthLocked(um *userMeter) {
 	um.loaded = true
 }
 
-// loadMonth 从库里读出某用户当月的已用量。
+// loadMonth 从库里读出某个用户范围当月的已用量。
+//
+// 配额目前只落到 (user, 名) 这一档，所以这里由用户名现造范围键，不在 meters 里
+// 再存一份范围。名字成不了范围键（库里遗留的脏名字）就按「没有历史用量」处理 ——
+// 绝不能退回按全局范围读，那会把别人的消耗算进他头上并把他的配额直接压满。
 func (m *meterSet) loadMonth(user string, now time.Time) (tokens int64, cost float64) {
 	if m.db == nil {
 		return 0, 0
 	}
-	rows, err := m.db.SystemUsageRowsSince(user, store.MonthStart(now))
+	scope, err := policy.NewScopeRef(policy.ScopeUser, user)
+	if err != nil {
+		return 0, 0
+	}
+	rows, err := m.db.ScopeSystemUsageRows(scope, store.MonthStart(now))
 	if err != nil {
 		return 0, 0
 	}
