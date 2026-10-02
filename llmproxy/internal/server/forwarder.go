@@ -198,9 +198,16 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 	shot := s.policyEvaluate(s.policyFor(cfg), scope, probe.Model, requestID, r.URL.Path,
 		providers, affinityPrefer, started)
 	if shot != nil {
-		// 影子也写 policy_version（§3.0 明文要求）；routing_seed 与候选摘要**不写**，
-		// 那两个字段描述的是真正跑过的计划，写进去等于让回放在复现一次没发生的决策。
+		// 影子也写 policy_version（§3.0 明文要求）；routing_seed / 代 / 候选摘要**不写**，
+		// 那三个字段描述的是真正跑过的计划，写进去等于让回放在复现一次没发生的决策。
 		rec.PolicyVersion = shot.Version
+		if shot.Applied {
+			// 计划真的作用到这条请求上了，§2.8 的可复现输入才成立：三个字段成组落库，
+			// 缺一个（尤其是 epoch）就没人能凭 seed 复原当时用的是哪一代随机源。
+			rec.RoutingEpoch = shot.Epoch
+			rec.RoutingSeed = shot.Seed
+			rec.CandidatesDigest = shot.CandidatesDigest
+		}
 		if shot.Blocked != "" {
 			s.fail(w, rec, http.StatusForbidden, "policy_denied", shot.Blocked, 0, started)
 			return

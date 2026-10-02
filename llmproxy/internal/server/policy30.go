@@ -14,9 +14,13 @@ package server
 //     任何 handler 都不许自己拼 —— 拼出来的版本没法回放，也没法按 scope 回滚。
 //
 // 落库口径：shadow 只把 policy_version 写进请求记录（§3.0 要求影子也出版本），
-// routing_seed / candidates_digest **不写**，因为那两个字段描述的是「真正跑的计划」，
-// 而影子的计划没跑。它们进差异报告和日志，不进回放输入 —— 否则 internal/replay
-// 会把一次没发生的决策当成事实复现。
+// routing_seed / routing_epoch / candidates_digest **不写**，因为那三个字段描述的是
+// 「真正跑的计划」，而影子的计划没跑。它们进差异报告和日志，不进回放输入 —— 否则
+// internal/replay 会把一次没发生的决策当成事实复现。
+//
+// enforce 且计划确实生效（shot.Applied）时三个字段一起写：§2.8 要求在线请求至少能
+// 被逐位复现，缺了 seed 就只剩「解释性回放」，而缺了 epoch 连 seed 是从哪一代随机源
+// 派生的都无从判断。三者必须成组出现，半个痕迹比没痕迹更坏 —— 它会让人以为能复现。
 
 import (
 	"fmt"
@@ -139,6 +143,7 @@ func (s *Server) policyFor(cfg *config.Config) *policyRuntime {
 		// 健康检查会说「策略 vX 在效」而实际一条规则都没生效。
 		s.metrics.setPolicyVersion("")
 		s.policyBadRev = rev
+		s.policyBadErr = err.Error()
 		s.policyRun, s.policyRunRev = nil, rev
 		return nil
 	}
@@ -154,6 +159,7 @@ func (s *Server) policyFor(cfg *config.Config) *policyRuntime {
 	// 而请求记录里的版本回答的是「这次判定用了哪几条」。
 	s.metrics.setPolicyVersion(rt.version)
 	s.policyRun, s.policyRunRev, s.policyBadRev = rt, rev, 0
+	s.policyBadErr = ""
 	return rt
 }
 
@@ -221,8 +227,14 @@ type policyShot struct {
 	// Excluded 是计划里被**策略类**原因排除的候选（授权、区域、分级），只进差异报告。
 	// 技术性排除（能力不符、健康度、无价目）不列：旧链路自己会判，而且把
 	// 「D 看不到实时熔断」的结论当成禁令会让一次抖动变成全站 502。
-	Excluded map[string]policy.Reason
-	// Seed / CandidatesDigest 进差异报告（不进请求记录，理由见文件头）。
+	// Candidates 是喂给 D 的完整候选集（含档序与健康度），**只给管理口的路由模拟用**：
+	// 差异报告不列它，因为一份没跑的池子进报告就等于把「可能」写成「事实」。
+	Candidates routing.Offers
+	Excluded   map[string]policy.Reason
+	// Seed / CandidatesDigest 进差异报告；Epoch 是 seed 的第三个派生输入，
+	// 落库时三者要能凑齐，否则回放拿着 seed 却不知道用的是哪一代随机源（§2.8）。
+	// 它们只在计划真正作用到本请求时才进请求记录（理由见文件头）。
+	Epoch            string
 	Seed             string
 	CandidatesDigest string
 	// LegacyFirst / PlanOrder 是两条链路的首选与次序，差异报告的数据源。
@@ -250,12 +262,26 @@ func excludedByPolicy(r policy.Reason) bool {
 	return false
 }
 
-// policyEvaluate 跑一次 3.0 判定并（在 enforce 下）决定它对这次请求的作用。
+// policyEvaluate 是线上请求的入口：判定 + 决定它对这次请求的作用面。
+func (s *Server) policyEvaluate(rt *policyRuntime, scope, model, requestID, path string,
+	providers []config.Provider, sticky string, now time.Time) *policyShot {
+	shot := s.policyJudge(rt, scope, model, requestID, path, providers, sticky, now)
+	if shot == nil {
+		return nil
+	}
+	return s.finishPolicy(rt, shot)
+}
+
+// policyJudge 只跑一次 3.0 判定，不落任何统计、不改任何运行态。
+//
+// 拆成两层是为了让管理口的路由模拟（/v1/_admin/policy/simulate）能复用同一个判定核：
+// §3.0 的线 1 要求影子只读，而模拟比影子更要「一点痕迹都不留」。如果模拟另写一份判定，
+// 它就是第二个真值源 —— 界面上「会通过」而线上拒了，这种误差足以让人放弃策略包。
 //
 // 顺序与 §3.0 一致：范围链 → 身份 → 授权判定 → 候选集 → 计划。
 // 任何一步拿不到结论都不硬失败：影子模式绝不能因为 3.0 报错而让用户的请求变差；
 // enforce 下则由 fallback_to_legacy 决定回落还是拒绝（缺省回落，§3.0 要求可按 scope 回滚）。
-func (s *Server) policyEvaluate(rt *policyRuntime, scope, model, requestID, path string,
+func (s *Server) policyJudge(rt *policyRuntime, scope, model, requestID, path string,
 	providers []config.Provider, sticky string, now time.Time) *policyShot {
 	if rt == nil {
 		return nil
@@ -267,14 +293,14 @@ func (s *Server) policyEvaluate(rt *policyRuntime, scope, model, requestID, path
 	if err != nil {
 		shot.Note = fmt.Sprintf("范围链不合法: %v", err)
 		shot.elapsedFrom(started)
-		return s.finishPolicy(rt, shot)
+		return shot
 	}
 	res, version, err := rt.resolverFor(chain)
 	if err != nil {
 		// 没有任何包覆盖这条链 —— 该范围没启用 3.0，继续走旧路由（就是按 scope 回滚）。
 		shot.Note = fmt.Sprintf("范围 %s 没有生效的策略包，走旧路由", chain.Display())
 		shot.elapsedFrom(started)
-		return s.finishPolicy(rt, shot)
+		return shot
 	}
 	shot.Version = version
 
@@ -282,13 +308,13 @@ func (s *Server) policyEvaluate(rt *policyRuntime, scope, model, requestID, path
 	if err != nil {
 		shot.Note = fmt.Sprintf("身份不可构造: %v", err)
 		shot.elapsedFrom(started)
-		return s.finishPolicy(rt, shot)
+		return shot
 	}
 	ctx, err := policy.NewPolicyContext(id, policyPurposeFor(path), rt.dataLevel)
 	if err != nil {
 		shot.Note = fmt.Sprintf("策略上下文不合法: %v", err)
 		shot.elapsedFrom(started)
-		return s.finishPolicy(rt, shot)
+		return shot
 	}
 	ctx.PolicyVersion = version
 
@@ -300,17 +326,19 @@ func (s *Server) policyEvaluate(rt *policyRuntime, scope, model, requestID, path
 	if err != nil {
 		shot.Note = fmt.Sprintf("候选构造失败: %v", err)
 		shot.elapsedFrom(started)
-		return s.finishPolicy(rt, shot)
+		return shot
 	}
 	shot.LegacyFirst = s.legacyFirstTier(scope, providers, model)
+	shot.Candidates = offers
 
 	seed, err := policy.DeriveRoutingSeed(requestID, version, rt.epoch)
 	if err != nil {
 		shot.Note = fmt.Sprintf("seed 派生失败: %v", err)
 		shot.elapsedFrom(started)
-		return s.finishPolicy(rt, shot)
+		return shot
 	}
 	shot.Seed = seed
+	shot.Epoch = rt.epoch
 
 	in := routing.Input{
 		RequestID:   requestID,
@@ -350,7 +378,7 @@ func (s *Server) policyEvaluate(rt *policyRuntime, scope, model, requestID, path
 		}
 	}
 	shot.elapsedFrom(started)
-	return s.finishPolicy(rt, shot)
+	return shot
 }
 
 func (sh *policyShot) elapsedFrom(started time.Time) { sh.Elapsed = time.Since(started) }
@@ -361,6 +389,13 @@ func (s *Server) finishPolicy(rt *policyRuntime, shot *policyShot) *policyShot {
 		s.recordShadowDiff(shot)
 		return shot
 	}
+	return s.applyPolicyVerdict(rt, shot)
+}
+
+// applyPolicyVerdict 算出「如果这次判定作用到请求上会怎样」。无副作用：不写库、
+// 不碰熔断/粘性/计量，也不进影子统计 —— 管理口的路由模拟靠它给出 enforce 下的结论，
+// 而模拟请求一旦进影子计数，差异报告里的「一致率」就掺进了人为流量（§3.0 线 1）。
+func (s *Server) applyPolicyVerdict(rt *policyRuntime, shot *policyShot) *policyShot {
 	// 授权层面已经拒绝整个请求：这是策略结论，不是「3.0 算不出来」，
 	// fallback_to_legacy 对它没有豁免权 —— 否则一个开关就能绕过 deny-first。
 	if !shot.Decision.Allowed && shot.Version != "" {

@@ -91,6 +91,10 @@ type Server struct {
 	policyRun    *policyRuntime
 	policyRunRev int64
 	policyBadRev int64
+	// policyBadErr 是这一版配置加载失败的原因串（policyBadRev 非 0 时才有值）。
+	// 只留日志里的话，管理台就只能报「策略没生效」而说不出为什么 —— 而「为什么没生效」
+	// 恰恰是影子→enforce 推进时唯一要看的东西。
+	policyBadErr string
 }
 
 // now 返回当前时刻；测试可以通过 nowFn 固定它。

@@ -1234,6 +1234,8 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		s.adminUsersRoute(w, r, strings.Trim(strings.TrimPrefix(rest, "users"), "/"))
 	case rest == "config" || strings.HasPrefix(rest, "config/"):
 		s.handleAdminConfig(w, r, strings.Trim(strings.TrimPrefix(rest, "config"), "/"))
+	case rest == "policy" || strings.HasPrefix(rest, "policy/"):
+		s.adminPolicyRoute(w, r, strings.Trim(strings.TrimPrefix(rest, "policy"), "/"))
 	case rest == "prices" || strings.HasPrefix(rest, "prices/"):
 		s.adminPricesRoute(w, r, strings.Trim(strings.TrimPrefix(rest, "prices"), "/"))
 	case rest == "usage/export" || rest == "usage/export/":
@@ -1260,7 +1262,8 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSONError(w, http.StatusNotFound, "invalid_request_error",
 			"可用路径：/v1/_admin/users[/{name}[/token|enable|disable|providers|models|usage]]、"+
-				"/v1/_admin/usage/export、/v1/_admin/providers[/{name}/discover]、/v1/_admin/config[/providers|/validate]")
+				"/v1/_admin/usage/export、/v1/_admin/providers[/{name}/discover]、"+
+				"/v1/_admin/config[/providers|/validate]、/v1/_admin/policy[/simulate|/trace]")
 	}
 }
 

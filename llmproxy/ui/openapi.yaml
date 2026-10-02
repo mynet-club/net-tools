@@ -189,6 +189,58 @@ paths:
         - { name: n, in: query, schema: { type: integer, default: 100 } }
       responses:
         '200': { description: OK }
+  /v1/_admin/policy:
+    get:
+      tags: [admin]
+      summary: 当前生效的策略配置（只读）
+      description: |
+        回答「3.0 现在到底跑到哪一步」：模式、生效中的策略包版本、声明但未加载的包，
+        以及**没生效时的原因**（legacy 或加载失败 + 错误原文）。
+        「配了 shadow 但一根 3.0 线索都没有」是推进期最常见的困惑，这里必须说清是哪种。
+      security: [{adminAuth: []}]
+      responses:
+        '200': { description: OK }
+  /v1/_admin/policy/simulate:
+    post:
+      tags: [admin]
+      summary: 路由模拟（只读，不留任何痕迹）
+      description: |
+        按指定范围/模型跑一次 3.0 判定，返回授权结论、候选池、计划与被排除原因。
+        与线上请求走同一个判定核，所以结论不会和真实判定分叉；
+        它**不写**影子差异统计、不碰熔断/粘性/计量 —— 否则差异报告的一致率掺进人为流量。
+        响应只出标识与结论：条件值、上游 base_url、密钥、正文一律不外泄。
+      security: [{adminAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model]
+              properties:
+                model: { type: string }
+                scope: { type: string, description: 空 = 系统范围；否则填用户名 }
+                path: { type: string, description: 缺省 /v1/chat/completions，决定用途档位 }
+                session_id: { type: string, description: 给定时按当时的粘性偏好判定 }
+                request_id: { type: string, description: 给定则可复现；缺省时每次新生成 }
+      responses:
+        '200': { description: OK }
+        '409': { description: 策略链路没在跑（legacy 或加载失败），模拟无意义 }
+  /v1/_admin/policy/trace:
+    get:
+      tags: [admin]
+      summary: 单条请求的决策痕迹（只读）
+      description: |
+        按 request_id 回当时的策略版本、路由代、seed 与候选摘要。
+        `exactly_replayable` 只在 enforce 且计划真的作用到请求上时为 true；
+        影子请求与回落旧路由的请求为 false，响应会写明只能做解释性回放。
+      security: [{adminAuth: []}]
+      parameters:
+        - { name: request_id, in: query, required: true, schema: { type: string } }
+      responses:
+        '200': { description: OK }
+        '400': { description: 缺 request_id }
+        '404': { description: 没有这条请求的痕迹 }
   /v1/_admin/prices/provider:
     put:
       tags: [admin]
