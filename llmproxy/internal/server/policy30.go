@@ -74,6 +74,11 @@ type policyRuntime struct {
 	// 知识库准入吃的是范围链与策略版本，单独缓存必然和策略改动对不上。
 	kb *knowledgeRuntime
 
+	// exec 是本修订对应的执行器装配态（§3.F 接线，见 executor30.go）。同一条理由：
+	// 「哪个执行器名算注册上了」由这份修订决定，而它跟着候选池与计划一起换，
+	// 单独缓存会让「计划说用 X 执行器」与「本网关注册了什么」对不上。
+	exec *executorRuntime
+
 	mu        sync.Mutex
 	resolvers map[string]*policy.Resolver // chain.Display() → 判定内核
 }
@@ -168,6 +173,9 @@ func (s *Server) policyFor(cfg *config.Config) *policyRuntime {
 	rt.proc = s.buildProcRuntime(cfg, rt)
 	// 知识源同理：坏端点不丢掉策略运行态，原因记在源上，命中它的检索请求据此报错。
 	rt.kb = s.buildKnowledgeRuntime(cfg, rt)
+	// 执行器声明表跟着同一版配置换：新修订下注册不上的执行器名必须立刻变成
+	// 「拒候选」，而不是继续用旧修订那张表。
+	rt.exec = s.buildExecutorRuntime()
 	// 健康检查/指标要能报出「当前在效的策略版本」：运维判断差异率是不是新配置带来的，
 	// 靠的就是这一眼。版本在这里取整集版本（不是子集）—— 它回答的是「加载了什么」，
 	// 而请求记录里的版本回答的是「这次判定用了哪几条」。

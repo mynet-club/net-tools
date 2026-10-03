@@ -361,20 +361,53 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 			continue
 		}
 
-		// 用户自有上游带拨号层出网校验（防 DNS rebinding）；系统池不带
-		tr, err := s.transportFor(cand.Provider.SystemPaid, proxyURL)
-		if err != nil {
-			s.log.Errorf("供应商 %s 构造代理失败: %v", cand.Provider.Name, err)
-			lastErr = err
-			exclude[cand.Provider.Name] = true
-			continue
-		}
-
 		provTimeout := time.Duration(cand.Provider.TimeoutMs) * time.Millisecond
 		timeout := provTimeout
 		if globalTimeout > 0 && globalTimeout < timeout {
 			timeout = globalTimeout
 		}
+
+		// base_url 已在配置校验里去掉末尾斜杠；上游路径按 OpenAI 兼容约定拼接
+		suffix := strings.TrimPrefix(r.URL.Path, "/v1")
+		if suffix == "" {
+			suffix = r.URL.Path
+		}
+
+		// §3.F 接线：这一次交换由谁承载 —— 委托判定、执行器装配、Attempt 构造都在
+		// executor30.go。位置排在 transportFor 之前：委托时连接池由执行器实例持有，
+		// 这里再拿一份会让同一条池子有两个来源、装配失败有两个报错点。
+		del, delErr := s.executorCallFor(rt, shot, executorAsk{
+			prov:          &cand.Provider,
+			model:         probe.Model,
+			upstreamModel: cand.UpstreamModel,
+			requestID:     requestID,
+			path:          suffix,
+			accept:        r.Header.Get("Accept"),
+			proxyURL:      proxyURL,
+			isStream:      probe.Stream,
+			timeout:       timeout,
+			body:          raw,
+		})
+		if delErr != nil {
+			// 计划声明的执行器跑不起来 = 这个候选不能用：不出网，也不回落到 2.x 通道。
+			s.log.Warnf("供应商 %s 的执行器不可用: %v", cand.Provider.Name, delErr)
+			lastErr = delErr
+			exclude[cand.Provider.Name] = true
+			continue
+		}
+
+		// 用户自有上游带拨号层出网校验（防 DNS rebinding）；系统池不带
+		var tr *http.Transport
+		if del == nil {
+			tr, err = s.transportFor(cand.Provider.SystemPaid, proxyURL)
+			if err != nil {
+				s.log.Errorf("供应商 %s 构造代理失败: %v", cand.Provider.Name, err)
+				lastErr = err
+				exclude[cand.Provider.Name] = true
+				continue
+			}
+		}
+
 		// 流式不用总时限（长回答会被正常掐断），改成「连续多久没数据」的看门狗。
 		// 见 idle.go 的说明。
 		var (
@@ -390,45 +423,27 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 			ctx, cancel = context.WithTimeout(r.Context(), timeout)
 		}
 
-		upBody, err := rewriteModelBody(raw, cand.UpstreamModel, probe.Stream)
-		if err != nil {
-			cancel()
-			lastErr = err
-			exclude[cand.Provider.Name] = true
-			continue
-		}
-
-		// base_url 已在配置校验里去掉末尾斜杠；上游路径按 OpenAI 兼容约定拼接
-		suffix := strings.TrimPrefix(r.URL.Path, "/v1")
-		if suffix == "" {
-			suffix = r.URL.Path
-		}
-		upURL := cand.Provider.BaseURL + suffix
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, upURL, bytes.NewReader(upBody))
-		if err != nil {
-			cancel()
-			lastErr = err
-			exclude[cand.Provider.Name] = true
-			continue
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+cand.Provider.APIKey)
-		req.Header.Set("User-Agent", "llmproxy/"+config.Version)
-		req.ContentLength = int64(len(upBody))
-		if accept := r.Header.Get("Accept"); accept != "" {
-			req.Header.Set("Accept", accept)
-		}
-		for k, v := range cand.Provider.ExtraHeaders {
-			if strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "Host") {
-				continue // 绝不让配置覆盖鉴权与 Host
+		// ---- 一次上游交换：交给 F 执行器，或者走 2.x 的传输。
+		// 两条路**共用下面这一块失败归因**：哪些算客户端走了、哪些算超时、哪些要报给
+		// 熔断 —— 归因一旦分叉就会出现两套错误文案，排障时谁也说不清哪条是准的。
+		var (
+			resp *http.Response
+			xErr error
+		)
+		if del != nil {
+			// 观测头：这次交换确实由计划声明的那个执行器承载。与 X-Llmproxy-Affinity
+			// 同一类用途 —— 上线验证要一眼看出「委托生效了」，而不是翻日志。
+			w.Header().Set("X-Llmproxy-Executor", del.name)
+			resp, xErr = del.roundTrip(ctx)
+		} else {
+			var upBody []byte
+			upBody, xErr = rewriteModelBody(raw, cand.UpstreamModel, probe.Stream)
+			if xErr == nil {
+				resp, xErr = roundTripUpstream(ctx, tr, &cand.Provider, r, upBody, suffix)
 			}
-			req.Header.Set(k, v)
 		}
-		// 刻意不转发下游的 Authorization / Cookie / X-Api-Key
-
-		resp, err := tr.RoundTrip(req)
-		if err != nil {
+		if xErr != nil {
+			err = xErr
 			// 注意：这里才能 cancel。context 会控制整个请求-响应生命周期，
 			// 过早 cancel 会导致后续读 body 失败。
 			cancel()
@@ -452,8 +467,10 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 				rec.UpstreamModel = cand.UpstreamModel
 				s.fail(w, rec, 499, "client_gone", "客户端在上游返回前断开", attempts, started)
 				return
-			} else if errMsg := err.Error(); strings.Contains(errMsg, "context deadline exceeded") || strings.Contains(errMsg, "Client.Timeout") {
-				err = fmt.Errorf("供应商 %s 请求超时（%s）", cand.Provider.Name, timeout)
+			} else if msg, ok := upstreamFailMessage(err, cand.Provider.Name, timeout); ok {
+				// 超时那句归因文本对两条路同形：F 的错误文本刻意不含底层措辞
+				// （只有稳定码），2.x 那边才按文本判，映射集中在 upstreamFailMessage 一处。
+				err = errors.New(msg)
 			}
 			s.log.Warnf("供应商 %s 请求失败: %v", cand.Provider.Name, err)
 			s.router.ReportFailureFor(bucket, cand.Provider.Name, err)
@@ -544,6 +561,35 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 		msg = fmt.Sprintf("所有上游供应商均不可用：%v", lastErr)
 	}
 	s.fail(w, rec, lastStatus, "upstream_unavailable", msg, attempts, started)
+}
+
+// roundTripUpstream 是 2.x 的传输段：请求构造、鉴权头与附加头，然后一次 RoundTrip。
+//
+// §3.F 接线之后只有「未委托的交换」走这里（三条边界见 executor30.go 文件头）。
+// 把它从选路循环里搬出来而不是就地留着，是为了让两条路共用同一个失败归因块：
+// 归因一旦分叉（哪些算客户端断开、哪些算超时、哪些要报给熔断），线上就会同时
+// 存在两套错误文案，而排障的人不知道该信哪一套。
+func roundTripUpstream(ctx context.Context, tr http.RoundTripper, prov *config.Provider,
+	r *http.Request, upBody []byte, suffix string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, prov.BaseURL+suffix, bytes.NewReader(upBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+prov.APIKey)
+	req.Header.Set("User-Agent", "llmproxy/"+config.Version)
+	req.ContentLength = int64(len(upBody))
+	if accept := r.Header.Get("Accept"); accept != "" {
+		req.Header.Set("Accept", accept)
+	}
+	for k, v := range prov.ExtraHeaders {
+		if strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "Host") {
+			continue // 绝不让配置覆盖鉴权与 Host
+		}
+		req.Header.Set(k, v)
+	}
+	// 刻意不转发下游的 Authorization / Cookie / X-Api-Key
+	return tr.RoundTrip(req)
 }
 
 // relayOutcome 是 relay 的结果，用来决定熔断计数与会话粘性怎么记。

@@ -156,6 +156,7 @@ curl http://127.0.0.1:8787/v1 -H "Authorization: Bearer sk-local-change-me"
 X-Llmproxy-Provider: deepseek
 X-Llmproxy-Request-Id: cfd1913d91b05c41
 X-Llmproxy-Affinity: sticky        # new / cheapest / sticky / drift
+X-Llmproxy-Executor: http-openai   # 仅在 3.0 enforce 且非流式时出现：这次交换由哪个执行器承载
 ```
 
 ---
