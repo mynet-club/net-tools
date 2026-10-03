@@ -413,6 +413,8 @@ log:
 | POST | `/v1/_me/providers/{name}/discover` | 用这个上游的地址与密钥拉一次 `/v1/models`，拿模型名列表给界面做勾选候选 |
 | GET | `/v1/_me/usage?days=N` | 按日 / 按模型的消耗 |
 | GET | `/v1/_me/routing` | 每个模型**实际会按什么顺序消费上游**（混合模式下尤其有用：自有档 → 系统档） |
+| GET | `/v1/_me/knowledge` | 每个知识库**到底被不被策略准入**、问哪个委托入口（不回委托端点地址） |
+| POST | `/v1/_me/knowledge/search` | 一次带策略准入的检索委托：被拒与未声明的库一个请求都不出网；回话只有 `source_id` + 摘要，正文与标题请凭它回源取 |
 
 ### 管理接口（用 `server.admin_token` 鉴权）
 

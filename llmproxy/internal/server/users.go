@@ -695,8 +695,14 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, auth authResul
 		s.handleMeRotateToken(w, r, e)
 		return
 	}
+	if rest == "knowledge" || strings.HasPrefix(rest, "knowledge/") {
+		// sub 是 "knowledge" 之后剩下的那一段："" = 准入清单，"search" = 委托检索。
+		s.handleMeKnowledge(w, r, e, scope, strings.Trim(strings.TrimPrefix(rest, "knowledge"), "/"))
+		return
+	}
 	writeJSONError(w, http.StatusNotFound, "invalid_request_error",
-		"可用路径：/v1/_me、/v1/_me/providers、/v1/_me/usage、/v1/_me/routing、/v1/_me/token")
+		"可用路径：/v1/_me、/v1/_me/providers、/v1/_me/usage、/v1/_me/routing、"+
+			"/v1/_me/token、/v1/_me/knowledge、/v1/_me/knowledge/search")
 }
 
 // handleMeRouting 回答「我这些模型到底会按什么顺序消费上游」。

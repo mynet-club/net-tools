@@ -118,6 +118,51 @@ paths:
       security: [{bearerAuth: []}]
       responses:
         '200': { description: OK }
+  /v1/_me/knowledge:
+    get:
+      tags: [me]
+      summary: 我的知识库准入清单（哪个库被授权、问哪个委托入口）
+      description: |
+        准入只由策略内核算（资源 `knowledge:<库>` + 动作 `read`），界面与本页都不重算（§9）。
+        回话**不含委托端点地址**：库能不能问是用户的事，入口的网络位置属于运维面。
+        `policy.mode: legacy` 下返回 501（没有策略真值源可判）。
+      security: [{bearerAuth: []}]
+      responses:
+        '200': { description: 'policy_version / max_data_level / knowledge_bases[] / sources[]' }
+        '403': { description: 身份无法构成范围链（静态 key）或范围没有生效策略包 }
+        '501': { description: 未启用多用户策略链路或未配置知识源 }
+  /v1/_me/knowledge/search:
+    post:
+      tags: [me]
+      summary: 一次带策略准入的知识检索委托
+      description: |
+        出网前先用策略内核把候选库收窄；被拒或未被任何源声明的库一个请求都不会发出去。
+        检索词只以 sha256 摘要进审计；引用只含 `source_id` + 摘要，**不含标题与正文**，
+        内容请凭 source_id 回源知识源取，由源侧再判一次权限（§2.9 规则 4/6）。
+        知识源失败不会返回部分结果：全失败 = 502 + 每个源的原因码，而不是「0 命中」。
+        每次检索按源落一条范围审计（action `knowledge.search`）；审计落库失败则不交付结果。
+      operationId: meKnowledgeSearch
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query: { type: string, maxLength: 4096 }
+                knowledge_bases:
+                  type: array
+                  items: { type: string }
+                  description: 只能收窄候选；没被策略准入或没被任何源声明的库会被点名拒绝
+                max_results: { type: integer, minimum: 1, maximum: 100 }
+      responses:
+        '200': { description: 'hit_count / citations[] / denied_knowledge_bases[] / undeclared_knowledge_bases[] / failures[]' }
+        '400': { description: query 为空或超长、max_results 越界、请求体含未知字段 }
+        '403': { description: 身份无法构成范围链（静态 key）或范围没有生效策略包 }
+        '501': { description: 未启用多用户策略链路或未配置知识源 }
+        '502': { description: 所有被准入的知识源都失败（没有任何可读结果，不是没有命中） }
   /v1/_admin/users:
     get:
       tags: [admin]

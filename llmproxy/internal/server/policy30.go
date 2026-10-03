@@ -70,6 +70,10 @@ type policyRuntime struct {
 	// 共同决定，两套缓存必然出现「策略改了而链没跟着重建」。
 	proc *procRuntime
 
+	// kb 是本修订对应的知识源装配态（nil = 这个配置没声明知识源）。与 proc 同一条理由：
+	// 知识库准入吃的是范围链与策略版本，单独缓存必然和策略改动对不上。
+	kb *knowledgeRuntime
+
 	mu        sync.Mutex
 	resolvers map[string]*policy.Resolver // chain.Display() → 判定内核
 }
@@ -162,6 +166,8 @@ func (s *Server) policyFor(cfg *config.Config) *policyRuntime {
 	// 处理器声明跟着这一版配置装配（同一修订、同一生命周期）。装配失败不丢掉运行态：
 	// 策略判定仍然有效，而坏声明的错误文案要在命中它的那条请求上原样端出来。
 	rt.proc = s.buildProcRuntime(cfg, rt)
+	// 知识源同理：坏端点不丢掉策略运行态，原因记在源上，命中它的检索请求据此报错。
+	rt.kb = s.buildKnowledgeRuntime(cfg, rt)
 	// 健康检查/指标要能报出「当前在效的策略版本」：运维判断差异率是不是新配置带来的，
 	// 靠的就是这一眼。版本在这里取整集版本（不是子集）—— 它回答的是「加载了什么」，
 	// 而请求记录里的版本回答的是「这次判定用了哪几条」。
@@ -458,6 +464,10 @@ func policyIdentity(scope string) (policy.Identity, error) {
 // 用可观测事实而不是配置里的常量：用途参与 deny 条件（问答与批量作业的费用与
 // 合规口径完全不同），把它做成全局常量会让所有 purpose 条件都失配。
 // 取值集合固定为 chat / embedding / inference（新路径要在此追加并进策略文档）。
+//
+// 知识检索委托不走这里：它的用途是 knowledge-search（见 knowledge30.go 的 kbPurpose）。
+// 模型调用与检索的费用口径、正文处理规则都不一样，两边共用一个值的话，
+// 按 purpose 写的 deny 条件会在其中一侧静默失配。
 func policyPurposeFor(path string) string {
 	switch {
 	case strings.Contains(path, "embeddings"):
