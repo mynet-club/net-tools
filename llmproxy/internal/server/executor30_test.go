@@ -641,3 +641,107 @@ func TestExecutor30Upstream503StillSurfacesUpstreamStatus(t *testing.T) {
 		t.Errorf("失败该归属到跑过的这家，实际 ok=%v provider=%q", rec.OK, rec.Provider)
 	}
 }
+
+// §3.I：委托面长在指标上，而且四种形态分得开 —— 跑成功、上游明确说不行、
+// 候选压根没出网、本该委托却退回 2.x。
+//
+// 为什么值得单独立一条：委托与否线上已经有一个响应头（X-Llmproxy-Executor），
+// 而头只在客户端看得见那一发。指标要回答的是「这一小时里委托真的发生过吗」，
+// 所以断言必须同时吃两个面：头说有、指标也得说同一件事。
+func TestExecutor30MetricsRecordDelegationOutcomes(t *testing.T) {
+	// 1) 正常委托：一次交换、零失败。
+	okUp := startExecUp(t, procJSON("fine"))
+	okH := execHarness(t, okUp.url(), "enforce", 0)
+	resp, body := procChat(t, okH, "req-exec-m-ok", "hello", false)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("正常委托该 200，实际 %d: %s", resp.StatusCode, truncateMsg(string(body), 200))
+	}
+	if got := resp.Header.Get("X-Llmproxy-Executor"); got != policyExecutorOpenAI {
+		t.Fatalf("前提不成立：这条没走执行器（头 %q）", got)
+	}
+	sec := execMetrics(t, okH)
+	if got := int64Map(sec["exchanges"])[policyExecutorOpenAI]; got != 1 {
+		t.Errorf("exchanges[%s] = %d，want 1 —— 响应头说承载者换成了执行器而指标说没发生过，两个面必然有一个在说谎",
+			policyExecutorOpenAI, got)
+	}
+	if len(nestedInt64Map(sec["failures_by_reason"])) != 0 {
+		t.Errorf("成功不该长出失败维度: %v", sec["failures_by_reason"])
+	}
+	// 抓取面展开成带标签的序列（不是只存在于 /healthz 的 JSON 里）。
+	if _, raw := okH.get(t, "/metrics", ""); !strings.Contains(string(raw),
+		`llmproxy_executor_exchanges_total{executor="`+policyExecutorOpenAI+`"} 1`) {
+		t.Errorf("/metrics 里没有展开的委托序列:\n%s", truncateMsg(string(raw), 600))
+	}
+
+	// 2) 上游一直 503：交换次数与失败次数必须相等 —— 每条委托交换要么没有失败码，
+	// 要么有且仅有一个（这条不变量只有按标签拆开才看得见）。
+	badUp := startExecUp(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, `{"error":{"type":"server_error","message":"no capacity"}}`)
+	})
+	badH := execHarness(t, badUp.url(), "enforce", 0)
+	if resp503, _ := procChat(t, badH, "req-exec-m-503", "retry me", false); resp503.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("上游 503 该透出去，实际 %d", resp503.StatusCode)
+	}
+	badSec := execMetrics(t, badH)
+	exchanged := int64Map(badSec["exchanges"])[policyExecutorOpenAI]
+	if exchanged < 1 {
+		t.Fatalf("一条 503 都没记进交换数: %v", badSec["exchanges"])
+	}
+	failed := nestedInt64Map(badSec["failures_by_reason"])[policyExecutorOpenAI][string(executor.ReasonUpstreamServerStatus)]
+	if failed != exchanged {
+		t.Errorf("failures(server_status)=%d 而 exchanges=%d，一次委托交换只能有一个结论", failed, exchanged)
+	}
+
+	// 3) 计划声明了本网关注册不上的名字：拒候选计数，且**不带**那个名字（标签空间
+	// 封闭；那个值本身就是被拒原因，让它进标签等于让被观测的东西决定基数）。
+	prov := execProvider(t, okH, "vendorA")
+	rt := execRT(config.PolicyModeEnforce, map[string]executor.Protocol{})
+	shot := execShot(true, execPlan("vendorA", "ollama-native", "gpt-4o"))
+	if _, err := okH.srv.executorCallFor(rt, shot, executorAsk{
+		prov: prov, model: "gpt-4o", upstreamModel: "gpt-4o",
+		requestID: "req-exec-m-reject", path: "/chat/completions",
+		timeout: time.Minute, body: []byte(`{"model":"gpt-4o","messages":[]}`),
+	}); err == nil {
+		t.Fatal("注册不上的名字该拒候选")
+	}
+	rejected := int64Map(execMetrics(t, okH)["rejected_by_stage"])
+	if rejected[executorRejectUnregistered] != 1 {
+		t.Errorf("rejected_by_stage = %v", rejected)
+	}
+	for stage := range rejected {
+		if strings.Contains(stage, "ollama-native") {
+			t.Errorf("计划里的执行器名不该进标签: %q", stage)
+		}
+	}
+	// 被拒的候选一次都没出网，所以交换数不变（第 1 步那发之后仍是 1）。
+	if got := int64Map(execMetrics(t, okH)["exchanges"])[policyExecutorOpenAI]; got != 1 {
+		t.Errorf("拒候选不该算成交换，实际 exchanges=%d", got)
+	}
+
+	// 4) 计划与真实目标漂移：这是唯一「本该委托却静默回到 2.x」的路径，必须单独可见。
+	driftRT := execRT(config.PolicyModeEnforce, nil)
+	driftShot := execShot(true, execPlan("vendorA", policyExecutorOpenAI, "gpt-4o-mini"))
+	call, err := okH.srv.executorCallFor(driftRT, driftShot, executorAsk{
+		prov: prov, model: "gpt-4o", upstreamModel: "gpt-4o",
+		requestID: "req-exec-m-drift", path: "/chat/completions",
+		timeout: time.Minute, body: []byte(`{"model":"gpt-4o","messages":[]}`),
+	})
+	if err != nil || call != nil {
+		t.Fatalf("漂移应「不委托」而不是报错或委托，实际 call=%v err=%v", call, err)
+	}
+	if got := int64Map(execMetrics(t, okH)["skipped"])[executorSkipPlanDrift]; got != 1 {
+		t.Errorf("skipped[%s] = %d，want 1", executorSkipPlanDrift, got)
+	}
+}
+
+// execMetrics 取这份运行态的执行器段（缺失即失败，不允许「段没出来」被读成「都是 0」）。
+func execMetrics(t *testing.T, h *harness) map[string]any {
+	t.Helper()
+	sec, ok := h.srv.metrics.snapshot()["executor"].(map[string]any)
+	if !ok {
+		t.Fatal("metrics 快照里没有 executor 段")
+	}
+	return sec
+}

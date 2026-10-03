@@ -739,6 +739,15 @@ EXEC=$(curl -s -D - -o /dev/null -X POST "$GW/v1/chat/completions" \
   -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}' \
   | tr -d '\r' | sed -n 's/^[Xx]-[Ll]lmproxy-[Ee]xecutor: *//p')
 chk "非流式那一段真的换执行器承载" "$EXEC" "http-openai"
+# §3.I 指标埋点：委托这件事实得在**可抓取的面**上留数 —— 响应头只服务当前那一发，
+# 日志会滚，而「这一小时里委托真的发生过吗」是抓取端要答的。
+EXCH=$(curl -s "$GW/metrics" | sed -n 's/^llmproxy_executor_exchanges_total{executor="http-openai"} *//p')
+HB=$(curl -s "$GW/healthz" | python3 -c 'import json,sys;print(json.load(sys.stdin)["metrics"]["executor"]["exchanges"].get("http-openai",0))')
+if [ "${EXCH:-0}" -ge 2 ] && [ "${HB:-0}" -ge 2 ]; then
+  pass "执行器交换次数同时进了 /metrics 与 /healthz（$EXCH / ${HB}）"
+else
+  fail "委托发生了却没长指标：/metrics=$EXCH /healthz=$HB"
+fi
 RID="e2e-trace-$$"
 curl -s -o /dev/null -X POST "$GW/v1/chat/completions" -H "Authorization: Bearer $A_TOKEN" \
   -H "X-Request-Id: $RID" -H 'Content-Type: application/json' \
@@ -788,7 +797,13 @@ fi
 # 23g 回滚：切回 legacy 之后，2.x 行为必须逐条恢复 —— 这是紧急开关的实测，不是推演
 chk "切回 legacy" "$(POLICY_MODE '{"mode":"legacy"}')" "200"
 sleep 2.5
+# 委托计数的基线必须在**回滚之后**现取：切回 legacy 之前那几发 enforce 请求是合法委托，
+# 拿切换前的快照去比等于要求计数器忘掉它们真正发生过的那几交换。
+EXCH0=$(curl -s "$GW/metrics" | sed -n 's/^llmproxy_executor_exchanges_total{executor="http-openai"} *//p')
 chk "回滚后 deny 不再参与路由（行为恢复）" "$(alice_chat "$SECRET_MODEL")" "200"
+chk "回滚后范围内的模型照常可用" "$(alice_chat "deepseek-chat")" "200"
+EXCH1=$(curl -s "$GW/metrics" | sed -n 's/^llmproxy_executor_exchanges_total{executor="http-openai"} *//p')
+chk "切回 legacy 后新请求不再产生委托（legacy 没有计划，也就没有计划声明的执行器）" "$EXCH1" "$EXCH0"
 curl -s -o "$H/insp.json" "$GW/v1/_admin/policy" -H "Authorization: Bearer $ADMIN"
 chk "回滚后核对表说 3.0 没在跑" "$(jget "$H/insp.json" running)" "False"
 chk "并且说清为什么没跑" "$(jget "$H/insp.json" inactive_reason)" "policy_mode_legacy"

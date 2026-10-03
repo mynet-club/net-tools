@@ -664,3 +664,70 @@ func mustJSON(t *testing.T, v any) []byte {
 	}
 	return raw
 }
+
+// §3.I：检索委托面的指标维度。
+//
+// 盯的是接线会犯的错，不是 knowledge 包的归因能力（那边测过）：
+//   - 失败只落审计、不落指标 → 「检索失败率」这个维度今天根本不存在；
+//   - 分母缺失（只记失败不记被问到）→ 1 次失败看着像 100% 挂掉，其实是 1/50；
+//   - 耗时样本把「委托都没发出去」的那也算进去 → 均值被一批 0 拉低，慢源反而不难看出来。
+func TestKnowledge30MetricsCountQueriesAndFailures(t *testing.T) {
+	failing := startKBStub(t)
+	failing.status = http.StatusInternalServerError
+	h := kbHarness(t, failing.url(), "enforce")
+	token := h.addUser(t, "alice")
+
+	if status, out := kbSearch(t, h, token, map[string]any{"query": "源侧 500"}); status != http.StatusBadGateway {
+		t.Fatalf("全源失败必须 502，实际 %d: %v", status, out)
+	}
+	sec, ok := h.srv.metrics.snapshot()["knowledge"].(map[string]any)
+	if !ok {
+		t.Fatal("metrics 快照里没有 knowledge 段")
+	}
+	if got := int64Map(sec["queries_by_source"])["t-src"]; got != 1 {
+		t.Errorf("queries_by_source[t-src] = %d，want 1（分母不记，失败率无从算起）", got)
+	}
+	wantReason := string(knowledge.ReasonUpstreamStatus)
+	if got := nestedInt64Map(sec["failures_by_source"])["t-src"][wantReason]; got != 1 {
+		t.Errorf("failures_by_source[t-src][%s] = %d，实际 %v", wantReason, got, sec["failures_by_source"])
+	}
+	if got := int64Map(sec["failures_by_reason"])[wantReason]; got != 1 {
+		t.Errorf("跨源汇总的失败维度 = %v", sec["failures_by_reason"])
+	}
+	// 源侧真的答过一次（500 也是答），所以耗时样本存在；命中数必须是 0 ——
+	// 失败时交付引用是 §3.C 的越权方向，指标里也不能出现。
+	if got := int64Value(sec["measured"]); got != 1 {
+		t.Errorf("measured = %d，want 1", got)
+	}
+	if got := int64Value(sec["citations"]); got != 0 {
+		t.Errorf("失败检索不该贡献命中数，实际 %d", got)
+	}
+	if _, raw := h.get(t, "/metrics", ""); !strings.Contains(string(raw),
+		`llmproxy_knowledge_failures_total{source="t-src",reason="`+wantReason+`"} 1`) {
+		t.Errorf("/metrics 里没展开成带标签的失败序列:\n%s", truncateMsg(string(raw), 600))
+	}
+
+	// 成功那一侧：被问到、没有失败码、命中数进得来。
+	okStub := startKBStub(t)
+	okStub.docs = func(req knowledge.RetrieveRequest) []knowledge.ReturnedDocument {
+		return []knowledge.ReturnedDocument{kbDoc("kb-open", "doc-1", policy.LevelPublic.String())}
+	}
+	h2 := kbHarness(t, okStub.url(), "enforce")
+	token2 := h2.addUser(t, "bob")
+	if status, out := kbSearch(t, h2, token2, map[string]any{"query": "健康的源"}); status != http.StatusOK {
+		t.Fatalf("健康源该 200，实际 %d: %v", status, out)
+	}
+	sec2, _ := h2.srv.metrics.snapshot()["knowledge"].(map[string]any)
+	if int64Map(sec2["queries_by_source"])["t-src"] != 1 {
+		t.Errorf("成功那次没记进分母: %v", sec2["queries_by_source"])
+	}
+	if len(nestedInt64Map(sec2["failures_by_source"])) != 0 {
+		t.Errorf("成功不该长出失败维度: %v", sec2["failures_by_source"])
+	}
+	if got := int64Value(sec2["citations"]); got != 1 {
+		t.Errorf("citations = %d，want 1", got)
+	}
+	if got := int64Value(sec2["truncated"]); got != 0 {
+		t.Errorf("truncated = %d，want 0", got)
+	}
+}

@@ -2,11 +2,14 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/mynet-club/net-tools/llmproxy/internal/executor"
+	"github.com/mynet-club/net-tools/llmproxy/internal/knowledge"
 	"github.com/mynet-club/net-tools/llmproxy/internal/store"
 )
 
@@ -158,5 +161,154 @@ func TestPrometheusMetrics(t *testing.T) {
 	}
 	if !strings.Contains(text, `llmproxy_latency_ms{q="p99"}`) {
 		t.Errorf("延迟分位标签不对:\n%s", text)
+	}
+}
+
+// ---------------------------------------------------------------- §3.I 委托面维度
+
+// 执行器与检索两个面的计数与快照形状。
+//
+// 这里刻意喂三类「不该记」的输入（空名、空原因码、负耗时）：它们都必须被丢掉而不是
+// 变成一个 0 值序列 —— 一个凭空的 0 会被读成「观测过且没事」，而实际是没观测过。
+func TestRuntimeMetricsExecutorAndKnowledgeDimensions(t *testing.T) {
+	m := newRuntimeMetrics()
+	m.observeExecutorExchange("http-openai", "")
+	m.observeExecutorExchange("http-openai", string(executor.ReasonTimeout))
+	m.observeExecutorExchange("", "不该进标签")
+	m.noteExecutorRejection(executorRejectUnregistered)
+	m.noteExecutorRejection("")
+	m.noteExecutorSkip(executorSkipPlanDrift)
+
+	m.noteKnowledgeQuery("t-src")
+	m.noteKnowledgeFailure("t-src", string(knowledge.ReasonTimeout))
+	m.noteKnowledgeFailure("t-src", "")
+	m.noteKnowledgeFailure("", string(knowledge.ReasonTimeout))
+	m.observeKnowledgeResult(120, 3, true)
+	m.observeKnowledgeResult(-1, 5, false) // 坏样本：不进均值也不计命中
+
+	snap := m.snapshot()
+	ex, ok := snap["executor"].(map[string]any)
+	if !ok {
+		t.Fatalf("metrics 缺 executor 段: %v", snap["executor"])
+	}
+	if got := int64Map(ex["exchanges"])["http-openai"]; got != 2 {
+		t.Errorf("exchanges[http-openai] = %d，want 2（空名那条不许记账）", got)
+	}
+	fails := nestedInt64Map(ex["failures_by_reason"])
+	if got := fails["http-openai"][string(executor.ReasonTimeout)]; got != 1 {
+		t.Errorf("失败维度不对: %v", fails)
+	}
+	if int64Map(ex["rejected_by_stage"])[executorRejectUnregistered] != 1 {
+		t.Errorf("rejected_by_stage = %v", ex["rejected_by_stage"])
+	}
+	if int64Map(ex["skipped"])[executorSkipPlanDrift] != 1 {
+		t.Errorf("skipped = %v", ex["skipped"])
+	}
+
+	kb, ok := snap["knowledge"].(map[string]any)
+	if !ok {
+		t.Fatalf("metrics 缺 knowledge 段: %v", snap["knowledge"])
+	}
+	// 被问到 1 次、失败 1 次：分子分母都在，失败率才谈得上算。
+	if int64Map(kb["queries_by_source"])["t-src"] != 1 {
+		t.Errorf("queries_by_source = %v", kb["queries_by_source"])
+	}
+	if nestedInt64Map(kb["failures_by_source"])["t-src"][string(knowledge.ReasonTimeout)] != 1 {
+		t.Errorf("failures_by_source = %v", kb["failures_by_source"])
+	}
+	if int64Map(kb["failures_by_reason"])[string(knowledge.ReasonTimeout)] != 1 {
+		t.Errorf("跨源汇总的失败维度 = %v", kb["failures_by_reason"])
+	}
+	if got := int64Value(kb["measured"]); got != 1 {
+		t.Errorf("measured = %d，负耗时那条不许占样本", got)
+	}
+	if got := int64Value(kb["avg_duration_ms"]); got != 120 {
+		t.Errorf("avg_duration_ms = %d", got)
+	}
+	if got := int64Value(kb["citations"]); got != 3 {
+		t.Errorf("citations = %d，坏样本的命中数不许累加", got)
+	}
+	if got := int64Value(kb["truncated"]); got != 1 {
+		t.Errorf("truncated = %d", got)
+	}
+
+	// legacy（一次委托都没发生）时两段都在、都是空表：字段在不在不能取决于跑没跑过。
+	empty := newRuntimeMetrics().snapshot()
+	if _, ok := empty["executor"].(map[string]any); !ok {
+		t.Error("空快照也该有 executor 段")
+	}
+	if _, ok := empty["knowledge"].(map[string]any); !ok {
+		t.Error("空快照也该有 knowledge 段")
+	}
+}
+
+// 委托交换的失败维度必须落进两个封闭集合之内。
+//
+// 未注册的 ReasonCode 值走 wiring_unclassified：ReasonCode.String() 对它会拼出
+// executor_unregistered(<原样>)，那串文本长度与内容都不受控，进标签就是让一次
+// 越界的码值决定 /metrics 的序列数。
+func TestExecutorExchangeReasonStaysInClosedSets(t *testing.T) {
+	cases := []struct {
+		name   string
+		err    error
+		status int
+		want   string
+	}{
+		{"成功无失败码", nil, 200, ""},
+		{"上游 4xx", nil, 404, string(executor.ReasonUpstreamClientStatus)},
+		{"上游 5xx", nil, 503, string(executor.ReasonUpstreamServerStatus)},
+		{"注册码", &executor.ExecutionError{Code: executor.ReasonConnectFailed}, 0, string(executor.ReasonConnectFailed)},
+		{"未注册码", &executor.ExecutionError{Code: executor.ReasonCode("编一个")}, 0, executorReasonUnclassified},
+		{"空码", &executor.ExecutionError{}, 0, executorReasonUnclassified},
+		{"非执行器错误", errors.New("别的东西"), 0, executorReasonUnclassified},
+		{"错误优先于状态码", &executor.ExecutionError{Code: executor.ReasonTimeout}, 500, string(executor.ReasonTimeout)},
+	}
+	for _, tc := range cases {
+		got := executorExchangeReason(tc.err, tc.status)
+		if got != tc.want {
+			t.Errorf("%s: reason = %q，want %q", tc.name, got, tc.want)
+		}
+		if got == "" {
+			continue
+		}
+		if got == executorReasonUnclassified {
+			continue
+		}
+		if !executor.ReasonCode(got).Valid() {
+			t.Errorf("%s: 标签值 %q 不在执行器注册码表里", tc.name, got)
+		}
+	}
+}
+
+// 标签值来自配置（知识源名），而那一列的校验只禁空白与路径分隔符、**没禁引号**：
+// /metrics 不鉴权，没转义的一个 `"` 就是 exposition 文本注入。
+func TestPromLabelEscapesQuotedNames(t *testing.T) {
+	if got := promLabel(`a"b`); got != `a\"b` {
+		t.Errorf("引号没转义: %q", got)
+	}
+	if got := promLabel(`a\b`); got != `a\\b` {
+		t.Errorf("反斜杠没转义: %q", got)
+	}
+	if got := promLabel("a\nb"); got != `a\nb` {
+		t.Errorf("换行没转义: %q", got)
+	}
+	// 转义顺序也要成立：先转义反斜杠，否则 \" 里的 \ 会被二次转义。
+	if got := promLabel(`a\"b`); got != `a\\\"b` {
+		t.Errorf("复合转义不对: %q", got)
+	}
+}
+
+// 未注册的知识原因码不建标签（口径同审计写入侧：那种值在审计就要被拒）。
+func TestKnowledgeFailureMetricIgnoresUnregisteredReason(t *testing.T) {
+	m := newRuntimeMetrics()
+	kbFailureMetric(m, "t-src", knowledge.Reason("retrieval_made_up"))
+	kbFailureMetric(m, "t-src", knowledge.ReasonTimeout)
+	snap := m.snapshot()["knowledge"].(map[string]any)
+	byReason := int64Map(snap["failures_by_reason"])
+	if len(byReason) != 1 {
+		t.Fatalf("失败维度 = %v，未注册的码不该建序列", byReason)
+	}
+	if _, ok := byReason[string(knowledge.ReasonTimeout)]; !ok {
+		t.Errorf("注册过的码没记上: %v", byReason)
 	}
 }

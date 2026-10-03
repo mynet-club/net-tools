@@ -435,6 +435,13 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 			// 同一类用途 —— 上线验证要一眼看出「委托生效了」，而不是翻日志。
 			w.Header().Set("X-Llmproxy-Executor", del.name)
 			resp, xErr = del.roundTrip(ctx)
+			// §3.I 指标：只记「确实交给了执行器」的交换。归因见 executorExchangeReason
+			// —— 标签空间封闭，不在这里新增任何按请求内容取的维度。
+			exchangedStatus := 0
+			if resp != nil {
+				exchangedStatus = resp.StatusCode
+			}
+			s.metrics.observeExecutorExchange(del.name, executorExchangeReason(xErr, exchangedStatus))
 		} else {
 			var upBody []byte
 			upBody, xErr = rewriteModelBody(raw, cand.UpstreamModel, probe.Stream)

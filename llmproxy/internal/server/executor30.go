@@ -44,6 +44,23 @@ import (
 // 声明面改了就静默变成「计划里的名字没注册」，而那条路是拒候选。
 const executorNameOpenAI = policyExecutorOpenAI
 
+// 观测维度用的固定标签值（§3.I）。三组都是**接线侧的封闭集合**，取值不来自请求内容：
+//
+//   - rejected：候选在网关侧被拒、一次都没出网的阶段名。计划里那个注册不上的执行器名
+//     刻意不进标签 —— 它本身就是被拒原因，让被观测的东西决定 /metrics 的基数，
+//     一个错配的策略包就能把序列数打爆（这两个端点都不鉴权）。
+//   - skipped：本该委托却退回 2.x 的原因。今天只有一种（计划与真实目标对不上），
+//     正常不委托的几种边界不记，否则「委托率」读起来像失败率。
+//   - wiring_unclassified：执行器返回了非 ExecutionError 的错误。今天只有一处
+//     （roundTrip 里「error 为空却没有 body」那种自相矛盾）。它**不是** executor 包
+//     注册码，所以单独占一个值，不去冒充 reasons.go 里的任何一个。
+const (
+	executorRejectUnregistered = "plan_name_unregistered"
+	executorRejectChannel      = "channel_build_failed"
+	executorSkipPlanDrift      = "plan_upstream_mismatch"
+	executorReasonUnclassified = "wiring_unclassified"
+)
+
 // executorChannelMax 是执行器实例缓存的条数上限。一条 = 一个（执行器, 归属, 代理）
 // 组合，键的空间由用户可自建上游的代理数决定，不设上限就等于让一份运行态里的 map
 // 跟着 DB 长。越界后不再缓存、每请求现构造：宁可少复用连接池（底层 transport 仍由
@@ -234,6 +251,9 @@ func (s *Server) executorCallFor(rt *policyRuntime, shot *policyShot, ask execut
 	// 请求生命周期里换过版）。这时按 2.x 原样跑并留痕：拿计划里的名字去覆盖
 	// 真实目标，等于让审计描述一次没发生的交换。
 	if cand.UpstreamModel != "" && cand.UpstreamModel != ask.upstreamModel {
+		// 这条也是委托面唯一会「本该走执行器却静默回到 2.x」的路径，所以给它一个
+		// 指标位（§3.I）：日志会滚，而运维要的是「这一小时有没有出现过」。
+		s.metrics.noteExecutorSkip(executorSkipPlanDrift)
 		s.log.Warnf("event=executor_plan_drift request_id=%s provider=%s plan_upstream=%s actual_upstream=%s 本次不委托",
 			ask.requestID, ask.prov.Name, cand.UpstreamModel, ask.upstreamModel)
 		return nil, nil
@@ -242,6 +262,7 @@ func (s *Server) executorCallFor(rt *policyRuntime, shot *policyShot, ask execut
 	if !ok {
 		// 计划里有这家、名字却注册不上 —— 这是唯一「宁可不跑也不猜一个」的分支：
 		// 回落到 2.x 等于把计划声明的执行器降级成注释。
+		s.metrics.noteExecutorRejection(executorRejectUnregistered)
 		return nil, fmt.Errorf("计划声明的执行器 %q 本网关未注册（已注册：%s）",
 			cand.Executor, strings.Join(rt.exec.sortedNames(), ", "))
 	}
@@ -253,6 +274,7 @@ func (s *Server) executorCallFor(rt *policyRuntime, shot *policyShot, ask execut
 	}
 	ex, err := rt.exec.channel(s, ch)
 	if err != nil {
+		s.metrics.noteExecutorRejection(executorRejectChannel)
 		return nil, err
 	}
 
@@ -337,6 +359,38 @@ func (c *executorCall) roundTrip(ctx context.Context) (*http.Response, error) {
 		ProtoMajor: 1,
 		ProtoMinor: 1,
 	}, nil
+}
+
+// executorExchangeReason 把一次委托交换折算成稳定的失败维度（§3.I 的指标标签）。
+//
+// 三个来源按次序判，返回空串表示「这次交换没有失败码」：
+//
+//  1. ExecutionError 且码在注册表内 —— 直接用它（封闭集合，见 reasons.go）；
+//  2. 其它错误（含码不在表里）—— wiring_unclassified，不冒充 reasons.go 里的任何一个码；
+//  3. 交换成功但上游返回 4xx/5xx —— 用 executor 包里**已导出的**那两个常量，
+//     阈值（4xx/5xx）与包内非导出的 reasonForStatus 同形。这里不写字符串字面量，
+//     否则将来执行器改分类口径，指标会跟着历史归因分叉。
+//
+// 注意上游 4xx/5xx 算进「失败」维度是有意的：这两个码在执行器侧的定义就是
+// 「一次完成了的交换、但对方明确说不行」。看板要把执行器自身故障与上游业务状态
+// 分开看，靠的是 reason 标签，不是靠这里少记一笔。
+func executorExchangeReason(err error, statusCode int) string {
+	if err != nil {
+		var ee *executor.ExecutionError
+		// 只认注册表内的码：ReasonCode.String() 对未注册值会拼出
+		// executor_unregistered(<原样>)，那串东西可能带任意文本，不能进标签。
+		if errors.As(err, &ee) && ee.Code.Valid() {
+			return string(ee.Code)
+		}
+		return executorReasonUnclassified
+	}
+	switch {
+	case statusCode >= 400 && statusCode < 500:
+		return string(executor.ReasonUpstreamClientStatus)
+	case statusCode >= 500:
+		return string(executor.ReasonUpstreamServerStatus)
+	}
+	return ""
 }
 
 // upstreamFailMessage 把一次上游交换的失败折算回现网那句归因文本。

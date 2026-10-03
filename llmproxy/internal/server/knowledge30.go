@@ -288,6 +288,17 @@ func (o *kbOutcome) allFailed() bool {
 // 因为一次检索可能涉及多个入口，「哪一家」必须在范围键之外单独可查。
 type kbSearchSink func(ev knowledge.AuditEvent, target string) error
 
+// kbFailureMetric 把一个**注册过**的原因码抄给指标（§3.I 的检索失败维度）。
+//
+// 未注册的码不建标签：那种值在审计写入侧就会被 knowledge 包拒掉，指标再给它一条
+// 序列等于为一个还没定型的归因建历史基线。
+func kbFailureMetric(m *runtimeMetrics, source string, reason knowledge.Reason) {
+	if !reason.Valid() {
+		return
+	}
+	m.noteKnowledgeFailure(source, string(reason))
+}
+
 // kbSearch 对每个被准入的源发一次委托，逐源留审计。
 //
 // 总预算取各源预算之和并以 MaxBudget 为顶，每个源再按「此刻还剩多少」收窄截止时间：
@@ -333,6 +344,9 @@ func (s *Server) kbSearch(ctx context.Context, kc *knowledgeCall, allowed []stri
 			continue
 		}
 		out.Queried++
+		// §3.I 指标：被问到就算一次，不看后面成不成。分子分母都齐了才谈得上失败率，
+		// 而「装配阶段就失败」的那些源正是要在指标里露出来的部分。
+		s.metrics.noteKnowledgeQuery(src.name)
 		// gatewayFailure 是「失败在网关这一侧、委托压根没发出去」这一类结论的统一落法：
 		// 先留一条最小审计，再记失败。少了前半段，「这个源从来没生效」与「没人查过」在
 		// 审计上就同形了 —— 而边界 5 要求凡被问到的源都恰好留下一条痕。
@@ -340,6 +354,7 @@ func (s *Server) kbSearch(ctx context.Context, kc *knowledgeCall, allowed []stri
 			if err := sink(minKBAudit(kc, kbs, q, reason, detail), src.name); err != nil {
 				return err
 			}
+			kbFailureMetric(s.metrics, src.name, reason)
 			out.Failures = append(out.Failures, kbFailure{src.name, kbs, string(reason), detail})
 			return nil
 		}
@@ -374,8 +389,12 @@ func (s *Server) kbSearch(ctx context.Context, kc *knowledgeCall, allowed []stri
 		if err := sink(outcome.Audit, src.name); err != nil {
 			return nil, err
 		}
+		// §3.I 指标：耗时/命中/截断一律取审计事件里的源侧事实，不在接线侧另算一份
+		// （自己掐表会得到「含落库的耗时」，那与源侧响应慢不是一回事）。
+		s.metrics.observeKnowledgeResult(outcome.Audit.DurationMS, outcome.Audit.HitCount, outcome.Audit.Truncated)
 		if outcome.Failure != nil {
 			// Citations 必空（C 包不变量），这里也不做「留一点算一点」的补偿。
+			kbFailureMetric(s.metrics, src.name, outcome.Failure.Reason)
 			out.Failures = append(out.Failures, kbFailure{src.name, kbs, string(outcome.Failure.Reason), outcome.Audit.FailureDetail})
 			continue
 		}
