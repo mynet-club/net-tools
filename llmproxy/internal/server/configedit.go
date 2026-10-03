@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/config"
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 	"github.com/mynet-club/net-tools/llmproxy/internal/secrets"
 )
 
@@ -103,7 +104,10 @@ func configProviderView(p config.ProviderRaw) map[string]any {
 		"weight":       p.Weight,
 		"proxy":        p.Proxy,
 		"timeout_ms":   p.TimeoutMs,
-		"models":       models,
+		// 分级声明是 3.0 分级门的事实来源，界面要能看见并改它。空串 = 未声明，
+		// 保存时同样按「留空 = 沿用原值」处理，否则一次保存就把声明抹掉了。
+		"max_data_level": strings.TrimSpace(p.MaxDataLevel),
+		"models":         models,
 	}
 }
 
@@ -148,14 +152,15 @@ func (s *Server) adminShowConfig(w http.ResponseWriter) {
 func (s *Server) adminSaveProviders(w http.ResponseWriter, r *http.Request, dryRun bool) {
 	var req struct {
 		Providers []struct {
-			Name      string          `json:"name"`
-			Enabled   *bool           `json:"enabled"`
-			BaseURL   string          `json:"base_url"`
-			APIKey    string          `json:"api_key"`
-			Weight    float64         `json:"weight"`
-			Proxy     string          `json:"proxy"`
-			TimeoutMs int             `json:"timeout_ms"`
-			Models    json.RawMessage `json:"models"`
+			Name         string          `json:"name"`
+			Enabled      *bool           `json:"enabled"`
+			BaseURL      string          `json:"base_url"`
+			APIKey       string          `json:"api_key"`
+			Weight       float64         `json:"weight"`
+			Proxy        string          `json:"proxy"`
+			TimeoutMs    int             `json:"timeout_ms"`
+			MaxDataLevel string          `json:"max_data_level"`
+			Models       json.RawMessage `json:"models"`
 		} `json:"providers"`
 	}
 	if err := readJSONBody(w, r, &req); err != nil {
@@ -183,8 +188,10 @@ func (s *Server) adminSaveProviders(w http.ResponseWriter, r *http.Request, dryR
 		return
 	}
 	current := map[string]string{}
+	currentLevel := map[string]string{}
 	for _, p := range rawList {
 		current[p.Name] = p.APIKey
+		currentLevel[p.Name] = strings.TrimSpace(p.MaxDataLevel)
 	}
 
 	out := make([]config.ProviderRaw, 0, len(req.Providers))
@@ -213,6 +220,23 @@ func (s *Server) adminSaveProviders(w http.ResponseWriter, r *http.Request, dryR
 			APIKey: in.APIKey, Weight: in.Weight,
 			Proxy: strings.TrimSpace(in.Proxy), TimeoutMs: in.TimeoutMs,
 		}
+		// 分级声明：留空 = 沿用原值（同 api_key 的规矩 —— 界面读到的是当前声明，
+		// 不该因为一次无关保存就被抹成未声明）。非空必须先过词表，
+		// 拼错的值写进文件会让整份配置在加载期被拒。
+		// 反方向（把已声明的改成未声明）在 API 上做不到：留空的语义已经被「沿用」
+		// 占住了，不能同时表示「清空」；而那是一次**放松**收紧声明的动作，
+		// 只能由直接改文件的人做。
+		level := strings.TrimSpace(in.MaxDataLevel)
+		if level != "" {
+			if _, err := policy.ParseDataLevel(level); err != nil {
+				writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
+					fmt.Sprintf("供应商 %s 的 max_data_level 不合法: %v", name, err))
+				return
+			}
+		} else {
+			level = currentLevel[name]
+		}
+		p.MaxDataLevel = level
 		if in.Enabled != nil {
 			p.Enabled.Set = true
 			p.Enabled.Value = *in.Enabled

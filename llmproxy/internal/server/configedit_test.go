@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -385,5 +386,120 @@ func TestAdminConfigWarnsWhenStrictLoadFails(t *testing.T) {
 	saved, _ := os.ReadFile(h.configPath)
 	if !strings.Contains(string(saved), "DEFINITELY_NOT_SET_KEY") {
 		t.Error("配置应当被写入文件")
+	}
+}
+
+// providers 的分级声明（max_data_level）必须能从管理接口读写。
+//
+// 这是 §3.I 线上接线时抓到的真缺口：请求结构、下发视图、渲染函数三处都没有这个字段，
+// 于是「逐家声明分级 → 切影子模式」这条 §3.0 唯一的启用路径**只能手改 config.yaml**；
+// 更糟的是接口不带它时，一次无关的保存会走「留空 = 沿用原值」以外的路径把它丢掉。
+// 三段断言对应三条规矩：写得进去、留空沿用、拼错就拒且文件一字不动。
+func TestAdminConfigProviderDataLevelRoundTrip(t *testing.T) {
+	h := configHarness(t, "")
+	path := h.configPath
+
+	// body 只给「改哪些字段」，其余保持夹具原样
+	putProviders := func(change map[string]any) (int, []byte) {
+		p := map[string]any{
+			"name": "keepme", "enabled": true, "base_url": "https://api.example.com/v1",
+			"weight": 1, "proxy": "direct", "timeout_ms": 10000, "models": []string{"*"},
+		}
+		for k, v := range change {
+			p[k] = v
+		}
+		resp, raw := h.put(t, "/v1/_admin/config/providers", adminToken,
+			map[string]any{"providers": []map[string]any{p}})
+		return resp.StatusCode, raw
+	}
+
+	if code, raw := putProviders(map[string]any{"max_data_level": "internal"}); code != 200 {
+		t.Fatalf("声明分级应 200，实际 %d: %s", code, raw)
+	}
+	saved, _ := os.ReadFile(path)
+	if !strings.Contains(string(saved), "max_data_level: internal") {
+		t.Fatalf("分级声明没写进文件:\n%s", saved)
+	}
+	// 视图要回显磁盘上那一版：界面看不见就改不了，而 3.0 的启用前置正是它
+	info := adminGetConfig(t, h)
+	provs, _ := info["providers"].([]any)
+	if len(provs) != 1 {
+		t.Fatalf("应当只有 1 个供应商: %v", info["providers"])
+	}
+	if got := provs[0].(map[string]any)["max_data_level"]; got != "internal" {
+		t.Errorf("下发视图应带当前声明，实际 %v", got)
+	}
+
+	// 留空 = 沿用：只改权重不该把一条收紧声明抹成未声明
+	if code, raw := putProviders(map[string]any{"weight": 3}); code != 200 {
+		t.Fatalf("改权重应 200，实际 %d: %s", code, raw)
+	}
+	after, _ := os.ReadFile(path)
+	if !strings.Contains(string(after), "max_data_level: internal") {
+		t.Errorf("留空保存把分级声明抹掉了:\n%s", after)
+	}
+	if !strings.Contains(string(after), "weight: 3") {
+		t.Errorf("改动没写进去:\n%s", after)
+	}
+
+	// 拼错的值不能「当作没配」：加载期会直接拒掉整份配置，写进去等于让服务起不来
+	before := string(after)
+	code, raw := putProviders(map[string]any{"max_data_level": "sensative"})
+	if code != 400 || !strings.Contains(string(raw), "max_data_level") {
+		t.Errorf("拼错分级应 400 并点名 max_data_level，实际 %d: %s", code, raw)
+	}
+	if got, _ := os.ReadFile(path); string(got) != before {
+		t.Errorf("校验失败时文件必须原样，实际:\n%s", got)
+	}
+}
+
+// 从管理接口一路开到影子模式：这是 §3.0 的启用路径，缺口存在时它是唯一走不通的一段。
+//
+// 断言的是**顺序**而不是单个接口：段与包先齐（legacy 下发布不要求分级），此时切 shadow
+// 会因为供应商未声明而被拒；**通过接口**补上声明后再切才应通过。中途任何一步退回
+// 「分级只能手改 config.yaml」都会红。
+func TestAdminConfigDataLevelUnblocksShadowMode(t *testing.T) {
+	h := configHarness(t, "")
+
+	// 先把段与包准备好，让「切不动」的原因只剩分级声明这一件事
+	if code, _, raw := policyReq(t, h, http.MethodPost, "/v1/_admin/policy/mode", adminToken,
+		map[string]any{"mode": "legacy"}); code != http.StatusOK {
+		t.Fatalf("先落 legacy 段应 200: %s", raw)
+	}
+	if code, _, raw := policyReq(t, h, http.MethodPut, "/v1/_admin/policy/bundles/first", adminToken,
+		bundleBody(1, "system:gateway", []map[string]any{{
+			"subject": "*", "resource": "model:*", "action": "use", "effect": "allow"}})); code != http.StatusOK {
+		t.Fatalf("legacy 段下发布应 200: %s", raw)
+	}
+
+	// 夹具里的供应商没声明分级：这一步必须被拒，且点名 max_data_level 而不是笼统「不合法」
+	if code, _, raw := policyReq(t, h, http.MethodPost, "/v1/_admin/policy/mode", adminToken,
+		map[string]any{"mode": "shadow", "data_level": "internal"}); code != http.StatusBadRequest ||
+		!strings.Contains(string(raw), "max_data_level") {
+		t.Fatalf("未声明分级时切 shadow 应 400 并点名 max_data_level，实际 %d: %s", code, raw)
+	}
+
+	if resp, raw := h.put(t, "/v1/_admin/config/providers", adminToken, map[string]any{
+		"providers": []map[string]any{{
+			"name": "keepme", "enabled": true, "base_url": "https://api.example.com/v1",
+			"weight": 1, "proxy": "direct", "timeout_ms": 10000,
+			"max_data_level": "internal", "models": []string{"*"},
+		}},
+	}); resp.StatusCode != 200 {
+		t.Fatalf("通过接口补声明应 200: %s", raw)
+	}
+
+	if code, _, raw := policyReq(t, h, http.MethodPost, "/v1/_admin/policy/mode", adminToken,
+		map[string]any{"mode": "shadow", "data_level": "internal"}); code != http.StatusOK {
+		t.Fatalf("声明齐了之后切 shadow 应 200，实际 %d: %s", code, raw)
+	}
+	reloadConfig(t, h)
+	if _, body := adminGet(t, h, "/v1/_admin/policy"); !strings.Contains(string(body), `"running":true`) {
+		t.Errorf("切到影子模式后应在跑: %s", body)
+	}
+	// providers 段的编辑不该动 policy 段：整份文件只剩这一处启用痕迹是对的
+	saved, _ := os.ReadFile(h.configPath)
+	if !strings.Contains(string(saved), "mode: shadow") {
+		t.Errorf("policy 段被 providers 保存冲掉了:\n%s", saved)
 	}
 }

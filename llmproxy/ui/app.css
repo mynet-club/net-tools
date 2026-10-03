@@ -317,7 +317,7 @@ select:focus { outline: 2px solid #c7c3f7; outline-offset: 1px; }
 .prow { border: 1px solid var(--border); border-radius: 9px; padding: 14px; margin-top: 12px; background: #fcfcfd; }
 .prow-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
 .prow-head .pname { max-width: 220px; font-family: var(--mono); font-size: 12px; font-weight: 500; }
-.prow-grid { display: grid; grid-template-columns: 2fr 1.4fr 0.6fr 1.2fr 0.8fr; gap: 12px; }
+.prow-grid { display: grid; grid-template-columns: 2fr 1.4fr 0.6fr 1.2fr 0.8fr 1.1fr; gap: 12px; }
 .prow-grid > div > label { font-size: 12px; }
 .prow-models { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); display: flex; gap: 18px; flex-wrap: wrap; align-items: center; }
 .mmap { width: 100%; margin-top: 8px; }

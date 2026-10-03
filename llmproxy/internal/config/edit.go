@@ -121,7 +121,7 @@ func findTopLevelKey(root *yaml.Node, name string) (*yaml.Node, *yaml.Node) {
 // renderProviders 渲染 providers 段的正文（每行已带两格缩进）。
 //
 // 字段顺序写死在这里，为的是输出稳定、可读：name / enabled / base_url / api_key /
-// weight / proxy / timeout_ms / models / extra_headers。
+// weight / proxy / timeout_ms / max_data_level / models / extra_headers。
 // models 用 yaml.Node 原样编码 —— `["*"]` 这种流式写法能被保住。
 func renderProviders(ps []ProviderRaw) ([]byte, error) {
 	var b bytes.Buffer
@@ -165,6 +165,15 @@ func renderProviders(ps []ProviderRaw) ([]byte, error) {
 		}
 		if p.TimeoutMs != 0 {
 			fmt.Fprintf(&b, "    timeout_ms: %d\n", p.TimeoutMs)
+		}
+		if p.MaxDataLevel != "" {
+			// 只走词表里有的四个值：写错分级比不写更危险 —— 加载期会直接拒掉整份配置，
+			// 而这里拒掉的是一条**收紧声明**，绝不能降级成「当作没配」静默丢弃。
+			v, err := yamlScalar(p.MaxDataLevel)
+			if err != nil {
+				return nil, fmt.Errorf("供应商 %s 的 max_data_level %w", p.Name, err)
+			}
+			fmt.Fprintf(&b, "    max_data_level: %s\n", v)
 		}
 		models, err := renderModels(&p.Models)
 		if err != nil {

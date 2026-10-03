@@ -512,8 +512,17 @@ log:
 从 `legacy` 起步只有一条诚实的启用序列，服务端会在做错顺序时点名缺哪一步：
 
 ```
-mode: legacy → 发布策略包（发布本身不开始判定）→ mode: shadow 观察一致率 → mode: enforce
+mode: legacy → 逐家声明供应商 max_data_level → 发布策略包（发布本身不开始判定）
+            → mode: shadow 观察一致率 → mode: enforce
 ```
+
+中间那一步不能省，也不能靠服务端猜：`policy.mode ≠ legacy` 时每家**已启用**的供应商都必须
+声明自己能承接哪一等级数据（`public` / `internal` / `confidential` / `restricted`），
+否则切模式直接 400。缺省往严（用户自配上游按最低级处理）会让分级门对用户流量永久失效，
+缺省往宽等于给一条没人核对过的出网路径放行 —— 两种猜法都会在审计里留下「看起来配好了」的计划。
+声明的读写走 `GET/PUT /v1/_admin/config/providers`（管理台供应商行里也有这一格），
+与 `api_key` 同规：**留空 = 沿用原值**，一次只改权重的保存不会抹掉已声明的分级；
+反方向（改成未声明）在接口上做不到，那是放松一条收紧声明，只能由直接编辑配置文件的人做。
 
 `GET /v1/_admin/policy/bundles` 的 `drift_warning` 要单独说一句：加载是「引用与内容逐字段
 核对、全有或全无」，所以两边漂了的表现是**整段策略不生效**，而 `policy.mode` 仍然写着

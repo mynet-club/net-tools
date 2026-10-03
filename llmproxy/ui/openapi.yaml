@@ -254,6 +254,8 @@ paths:
       description: |
         下发 `api_key: ""` + `has_key` + `api_key_hint`（尾 4 位或 `${ENV}` 变量名）。
         留空在保存时意味着「沿用原值」，所以界面上回显脱敏值不会把密钥清掉。
+        `max_data_level`（"" = 磁盘上没写）同样是「留空 = 沿用原值」：它是 3.0 分级门的
+        事实来源，一次无关的权重调整不该把已声明的分级抹成未声明。
       security: [{adminAuth: []}]
       responses:
         '200': { description: OK }
@@ -264,6 +266,11 @@ paths:
       description: |
         写回前后各做一次加载校验（宽松通道 + 严格通道），通过后备份再原子替换。
         段外的注释、`server:` 与 `policy:` 等段落一字不动 —— 管理台改一处不该重排整份配置。
+        `max_data_level` 必须是 public / internal / confidential / restricted 之一，
+        否则 400 且不写文件；启用 3.0（`policy.mode` ≠ legacy）后，已启用的供应商缺它
+        会在同一道校验里被拒 —— 所以「切影子模式」的前置条件就是在这里把分级逐家声明齐。
+        API 上**不能**把已声明的分级改回未声明（留空=沿用，而非清空）：那是放松一条收紧
+        声明，只能由直接编辑配置文件的人做。
       security: [{adminAuth: []}]
       responses:
         '200': { description: 'written / applied / backup / strict_ok' }

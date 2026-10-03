@@ -711,6 +711,38 @@ func TestPolicy30ScopeChainAndIdentityForStaticKey(t *testing.T) {
 	}
 }
 
+// 网关侧有两个 system 范围 id，它们不打架**只靠一条不变量**，这里把它钉住。
+//
+//	判定链：静态 key 的请求落在 system:gateway（policySystemScope，§3.0 线 1）
+//	审计/发布归属：system 级策略写侧落在 system:global（policy.SystemScope）
+//
+// 于是「在管理台以 system:global 的名义发布的那一版」能作用到 system:gateway 的链上，
+// 唯一原因是 PolicyBundle.Covers 对**任意** system 包按 Kind 放行、不看 ID。
+// 这条哪天被改窄（按 id 精确匹配），失败方向是「策略静默不生效」而不是报错 ——
+// 审计里照常写着发布成功，判定却回到旧链路，是整条链上最难查的那种分叉。
+// 反向也要守住：非 system 包仍然必须精确命中，放宽只留给 Kind==system 这一格。
+func TestSystemBundleCoversGatewayChainRegardlessOfID(t *testing.T) {
+	chain, err := policy.NewScopeChain(policy.MustScope(policy.ScopeSystem, policySystemScope))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	global := policy.PolicyBundle{ID: "g", Version: 1, Scope: policy.SystemScope}
+	if global.Scope.ID != "global" || policySystemScope != "gateway" {
+		t.Fatalf("前置条件变了：两个 id 分别应当是 global 与 gateway，实际 %q 与 %q",
+			global.Scope.ID, policySystemScope)
+	}
+	if !global.Covers(chain) {
+		t.Error("system 范围的包必须覆盖 system:gateway 的链（Covers 按 Kind 不按 ID）")
+	}
+
+	project := policy.PolicyBundle{ID: "p", Version: 1,
+		Scope: policy.MustScope(policy.ScopeProject, "cs-lab")}
+	if project.Covers(chain) {
+		t.Error("项目包不该命中只含 system 的链：放宽只能留在 Kind==system 那一格")
+	}
+}
+
 // 粘性必须如实传给 D：不传的话计划永远按「新会话」算，
 // 差异报告里的 primary_moved 大半是假的。
 func TestPolicy30StickyStateOnlyForNamedProvider(t *testing.T) {

@@ -230,8 +230,17 @@ me=$(curl -s "$GW/v1/_me" -H "Authorization: Bearer $D_TOKEN")
 echo "$me" | grep -q '"mode":"consumption"' && pass "/v1/_me 报 consumption 模式" || fail "模式字段不对：$me"
 echo "$me" | grep -q '"fast"' && pass "/v1/_me 列出可用模型" || fail "没列出可用模型：$me"
 echo "$me" | grep -q '"used_tokens":2' && pass "计量只算系统付费的那次（2 token）" || fail "计量不对：$me"
-sqlite3 "$H/data/llmproxy.db" "SELECT COUNT(*) FROM usage_user_daily WHERE user_name='dave' AND system_paid=1;" | grep -q '^1$' \
-  && pass "用量标成了 system_paid" || fail "用量没标 system_paid"
+# 用量的真源是**按范围**那张表（§2.7 规则 5/8）：人 = (user, dave) 那一桶。
+# usage_user_daily 从 3.0 起不再写入，运行时也没有读路径 —— 这里既断言新表标了
+# system_paid（网关替他付上游的钱），也断言老表没有新行：同一笔钱有两个真源，
+# 迁移之后两者必然分叉。
+sqlite3 "$H/data/llmproxy.db" \
+  "SELECT COUNT(*) FROM usage_scope_daily WHERE scope_kind='user' AND scope_id='dave' AND system_paid=1;" \
+  | grep -q '^1$' && pass "用量按范围落成 (user,dave) 且标了 system_paid" \
+  || fail "usage_scope_daily 里没有这条系统付费的账"
+sqlite3 "$H/data/llmproxy.db" "SELECT COUNT(*) FROM usage_user_daily WHERE user_name='dave';" \
+  | grep -q '^0$' && pass "2.x 的按用户账本不再双写" \
+  || fail "usage_user_daily 又长出新行了（双写没退干净）"
 
 echo
 echo "=== 10. 白名单：没映射的模型直接拒绝，不打上游 ==="
@@ -637,6 +646,172 @@ if [ -n "$PID" ]; then
 else
   fail "找不到进程 pid，无法做 SIGKILL 演练"
 fi
+
+echo
+echo "=== 23. 3.0 接线：发布 → 影子 → 强制 → 跨进程回放 → 回滚 ==="
+# 上面每一节都能在 httptest 夹具里等价地跑，这一节不行 —— 它要的是真进程：
+# 配置热加载、磁盘上的策略包文件与权限、独立 CLI 进程从磁盘重跑记录、
+# 以及「切回 legacy 之后行为真的恢复」。这些只在接线上成立，单元层碰不到（§3.I）。
+#
+# data_level 用 public：它是最低级，而用户自配上游没有声明承接级别时按最低处理
+# （Provider.DataLevelCeiling 的收紧方向）。声明成 internal 会让这些候选在分级门
+# 上被排除，于是计划永不生效、执行器永不委托 —— 断言就会因为与本节无关的原因飘红。
+SECRET_MODEL="e2e-secret-model"
+BDIR="$H/policy-bundles"   # config.DefaultBundleDir 相对配置文件：改默认目录要一起改这里
+# alice 的上游在第 6 节被刻意杀掉（那是「不回退全局」那条不变量的前提），这里补回来：
+# 本节要证明的是策略会不会改变路由，不该被「上游在不在」这种别的事实决定。
+"$STUB" -name alice-up -port "$APORT" -log "$H/alice-up2.log" -models "m-one,m-two" &
+for _ in $(seq 1 20); do
+  curl -sf "http://127.0.0.1:$APORT/v1/models" >/dev/null 2>&1 && break
+  sleep 0.25
+done
+POLICY_MODE() {
+  curl -s -o "$H/mode.json" -w '%{http_code}' -X POST "$GW/v1/_admin/policy/mode" \
+    -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d "$1"
+}
+# 读一份 JSON 文件里的点分路径；缺字段给空串而不是让 python 炸掉整节。
+jget() {
+  python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+for p in sys.argv[2].split("."):
+    d = d.get(p) if isinstance(d,dict) else None
+print("" if d is None else d)' "$1" "$2"
+}
+alice_chat() { # $1=模型 $2=额外 curl 参数…
+  local m=$1; shift
+  curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/chat/completions" \
+    -H "Authorization: Bearer $A_TOKEN" -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" "$@"
+}
+
+# 23a 顺序闸门：policy 段必须先由人显式选定模式，服务端不替刚发布的策略集开门
+chk "模式可以先落成 legacy（policy 段由此长出）" "$(POLICY_MODE '{"mode":"legacy"}')" "200"
+grep -q '^policy:' "$H/config.yaml" && pass "配置里写出了 policy 段" || fail "policy 段没进配置"
+chk "还没有策略包时切 enforce 被拒" \
+  "$(POLICY_MODE '{"mode":"enforce","data_level":"public"}')" "400"
+grep -q '至少一个策略包' "$H/mode.json" && pass "拒因点名缺的是哪一步" || fail "拒因不指路：$(cat "$H/mode.json")"
+
+# 23b 发布：一条 allow 全部 + 一条 deny 特定模型（deny 优先级由 A 的内核保证）
+code=$(curl -s -o "$H/pub.json" -w '%{http_code}' -X PUT "$GW/v1/_admin/policy/bundles/e2e-base" \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d "{
+  \"version\": 1, \"scope\": \"system:global\", \"entitlements\": [
+    {\"subject\":\"*\",\"resource\":\"model:*\",\"action\":\"use\",\"effect\":\"allow\"},
+    {\"subject\":\"*\",\"resource\":\"model:$SECRET_MODEL\",\"action\":\"use\",\"effect\":\"deny\"}
+  ]}")
+chk "发布一条系统范围策略包" "$code" "200"
+[ -f "$BDIR/e2e-base.yaml" ] && pass "内容真的落到磁盘（回滚按文件比才成立）" || fail "磁盘上没有策略包内容：$BDIR"
+BPERM=$(stat -f '%Lp' "$BDIR/e2e-base.yaml" 2>/dev/null || stat -c '%a' "$BDIR/e2e-base.yaml")
+chk "策略包内容文件权限收到 0600" "$BPERM" "600"
+
+# 23c 分级门的 fail-closed 实况：系统池里有人没声明 max_data_level 时启用 3.0 必须被拒。
+# 放宽成「未声明按最高级」是这条链上最便宜的通过方式，也是最贵的一次错误。
+code=$(POLICY_MODE '{"mode":"shadow","data_level":"public"}')
+chk "上游没逐家声明分级上限时切 shadow 被拒" "$code" "400"
+grep -q '未声明不能按最宽松处理' "$H/mode.json" && pass "拒因说明为什么不能放宽" || fail "拒因不对：$(cat "$H/mode.json")"
+
+curl -s -o "$H/putprov.json" -X PUT "$GW/v1/_admin/config/providers" \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d "{\"providers\":[
+    {\"name\":\"global-up\",\"enabled\":true,\"base_url\":\"http://127.0.0.1:$GPORT/v1\",\"api_key\":\"\",\"weight\":1,\"proxy\":\"direct\",\"timeout_ms\":10000,\"models\":[\"*\"],\"max_data_level\":\"public\"},
+    {\"name\":\"declared-up\",\"enabled\":true,\"base_url\":\"http://127.0.0.1:$IPORT/v1\",\"api_key\":\"sk-declared\",\"weight\":1,\"proxy\":\"direct\",\"timeout_ms\":10000,\"models\":{\"only-here\":\"only-here\"},\"max_data_level\":\"public\"}]}"
+grep -q '"written":true' "$H/putprov.json" && pass "补齐分级上限声明写进了配置" || fail "声明没写进去：$(cat "$H/putprov.json")"
+sleep 2.5
+
+# 23d 影子只读：判定照跑、计数照进，但一条路由也不改
+chk "声明齐了之后切 shadow" "$(POLICY_MODE '{"mode":"shadow","data_level":"public"}')" "200"
+sleep 2.5
+chk "影子里被 deny 的模型照样可用（3.0 不参与路由）" "$(alice_chat "$SECRET_MODEL")" "200"
+SH1=$(curl -s "$GW/healthz" | python3 -c 'import json,sys;print(json.load(sys.stdin)["metrics"]["policy_shadow"]["evaluated"])')
+[ "${SH1:-0}" -ge 1 ] && pass "影子计数进了 /healthz（$SH1 条）" || fail "影子判了却没计数：$SH1"
+SIM=$(curl -s -X POST "$GW/v1/_admin/policy/simulate" -H "Authorization: Bearer $ADMIN" \
+  -H 'Content-Type: application/json' -d "{\"scope\":\"alice\",\"model\":\"$SECRET_MODEL\"}")
+echo "$SIM" | grep -q '"allowed":false' && pass "路由模拟判出 deny（界面据此能说这条会被拒）" || fail "模拟结论不对：$SIM"
+SH2=$(curl -s "$GW/healthz" | python3 -c 'import json,sys;print(json.load(sys.stdin)["metrics"]["policy_shadow"]["evaluated"])')
+chk "管理口的模拟不进影子计数（§3.0 线 1：只读旁观者）" "$SH2" "$SH1"
+
+# 23e 强制：策略开始影响请求，且观测面跟着落地
+chk "切到 enforce" "$(POLICY_MODE '{"mode":"enforce","data_level":"public"}')" "200"
+sleep 2.5
+chk "enforce 下 deny 生效" "$(alice_chat "$SECRET_MODEL")" "403"
+chk "enforce 下范围内的模型照常可用" "$(alice_chat "deepseek-chat")" "200"
+EXEC=$(curl -s -D - -o /dev/null -X POST "$GW/v1/chat/completions" \
+  -H "Authorization: Bearer $A_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}' \
+  | tr -d '\r' | sed -n 's/^[Xx]-[Ll]lmproxy-[Ee]xecutor: *//p')
+chk "非流式那一段真的换执行器承载" "$EXEC" "http-openai"
+RID="e2e-trace-$$"
+curl -s -o /dev/null -X POST "$GW/v1/chat/completions" -H "Authorization: Bearer $A_TOKEN" \
+  -H "X-Request-Id: $RID" -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$SECRET_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
+curl -s -o "$H/trace.json" "$GW/v1/_admin/policy/trace?request_id=$RID" -H "Authorization: Bearer $ADMIN"
+# 被拒那条**也要留痕**（失败路径的证据比成功路径更常被问），但它没有路由计划：
+# 给它写 seed 就是引导人去逐位复现一次没发生的决策，所以这里两面都要断言。
+chk "痕迹按 request_id 读得回当时判用的版本" "$(jget "$H/trace.json" policy_version)" "e2e-base@1"
+chk "被拒的请求不声称逐位可复现（没有计划可复现）" "$(jget "$H/trace.json" exactly_replayable)" "False"
+grep -q '解释性回放' "$H/trace.json" && pass "没 seed 时痕迹自带说明" || fail "痕迹缺解释: $(cat "$H/trace.json")"
+RID2="e2e-trace-ok-$$"
+curl -s -o /dev/null -X POST "$GW/v1/chat/completions" -H "Authorization: Bearer $A_TOKEN" \
+  -H "X-Request-Id: $RID2" -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}'
+curl -s -o "$H/trace2.json" "$GW/v1/_admin/policy/trace?request_id=$RID2" -H "Authorization: Bearer $ADMIN"
+chk "放行那条有 seed，因此可逐字段回放" "$(jget "$H/trace2.json" exactly_replayable)" "True"
+chk "放行的痕迹也带归属范围（user:alice）" \
+  "$(jget "$H/trace2.json" scope_kind):$(jget "$H/trace2.json" scope_id)" "user:alice"
+
+# 23f 回放证据链：CLI 是**另一个进程**，它只认磁盘上的策略包和记录文件
+"$BIN" replay on >/dev/null 2>&1 && pass "replay on（走管理口）" || fail "replay on 失败"
+alice_chat "deepseek-chat" >/dev/null
+alice_chat "$SECRET_MODEL" >/dev/null
+"$BIN" replay collect -out "$H/records.json" >/dev/null 2>&1
+if [ -f "$H/records.json" ]; then
+  RPERM=$(stat -f '%Lp' "$H/records.json" 2>/dev/null || stat -c '%a' "$H/records.json")
+  chk "导出的记录文件权限收到 0600" "$RPERM" "600"
+  grep -q '"schema_version"' "$H/records.json" && pass "导出的是记录文件本身" || fail "文件不像记录文件"
+  LEAK=""
+  for bad in '"body"' 'api_key' 'sk-alice-own' 'Bearer ' 'base_url'; do
+    grep -q -- "$bad" "$H/records.json" && LEAK="$LEAK $bad"
+  done
+  [ -z "$LEAK" ] && pass "记录里没有正文与凭证（禁词逐个查）" || fail "记录里出现了不该有的字段：$LEAK"
+  NOW30=$(python3 -c 'import datetime;print(datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))')
+  if "$BIN" replay run -records "$H/records.json" -now "$NOW30" > "$H/replay.out" 2>&1; then
+    pass "跨进程回放通过（独立进程 + 磁盘策略包 + 钉住的时钟）"
+  else
+    fail "跨进程回放没通过："
+    sed -n '1,12p' "$H/replay.out" | sed 's/^/       /'
+  fi
+  grep -q '差异 0' "$H/replay.out" && pass "报告里差异为 0" || fail "报告不是干净的：$(head -1 "$H/replay.out")"
+else
+  fail "replay collect 没导出文件（窗口里应当有 enforce 的记录）"
+fi
+"$BIN" replay off >/dev/null 2>&1 && pass "replay off（证据链不长期开着采集）" || fail "replay off 失败"
+
+# 23g 回滚：切回 legacy 之后，2.x 行为必须逐条恢复 —— 这是紧急开关的实测，不是推演
+chk "切回 legacy" "$(POLICY_MODE '{"mode":"legacy"}')" "200"
+sleep 2.5
+chk "回滚后 deny 不再参与路由（行为恢复）" "$(alice_chat "$SECRET_MODEL")" "200"
+curl -s -o "$H/insp.json" "$GW/v1/_admin/policy" -H "Authorization: Bearer $ADMIN"
+chk "回滚后核对表说 3.0 没在跑" "$(jget "$H/insp.json" running)" "False"
+chk "并且说清为什么没跑" "$(jget "$H/insp.json" inactive_reason)" "policy_mode_legacy"
+PV30=$(curl -s "$GW/healthz" | python3 -c 'import json,sys;print(json.load(sys.stdin)["metrics"]["policy_shadow"]["policy_version"])')
+chk "回滚后 /healthz 的策略版本清零（不能留着一个看起来还在效的版本）" "$PV30" ""
+# 引用与磁盘内容都还在：回滚不该顺手删掉别人发布的策略集
+[ -f "$BDIR/e2e-base.yaml" ] && pass "回滚保留策略包内容（切回时不用重抄）" || fail "回滚把内容删了"
+
+# 23h fail-closed 的实况：legacy 下 replay run 必须报错，而不是「跑了一遍、0 条差异」
+if "$BIN" replay run -records "$H/records.json" -now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$H/run2.out" 2>&1; then
+  fail "legacy 下 replay run 应当失败（没有可回放的策略包）"
+else
+  grep -q '没有可回放的策略包' "$H/run2.out" && pass "legacy 下 replay run 明确拒绝并说明原因" \
+    || fail "退出码对了但话没说清：$(head -2 "$H/run2.out")"
+fi
+
+# 23i 字段稳定性：/metrics 的指标名与审计的范围列是对外契约，改名等于破坏 dashboard
+curl -s "$GW/metrics" | grep -q '^llmproxy_requests_total ' && pass "/metrics 仍在暴露稳定指标名" || fail "/metrics 少了 llmproxy_requests_total"
+NQ=$(sqlite3 "$DB" "SELECT COUNT(*) FROM audit_log WHERE action LIKE 'policy.%' AND (scope_kind='' OR scope_id='');")
+chk "策略写侧审计每条都带范围（§2.7 规则 1）" "$NQ" "0"
+sqlite3 "$DB" "SELECT COUNT(*) FROM audit_log WHERE detail LIKE '%sk-%';" | grep -q '^0$' \
+  && pass "审计 detail 里没有密钥明文" || fail "审计里翻出了疑似密钥"
+echo "    本节的策略/回放写侧审计：$(sqlite3 "$DB" "SELECT group_concat(action||'@'||scope_kind||':'||scope_id, ' | ') FROM audit_log WHERE action LIKE 'policy.%' OR action LIKE 'replay.%';")"
 
 echo
 echo "================ 结果：通过 $PASS 项，失败 $FAIL 项 ================"

@@ -98,6 +98,7 @@ async function loadSysProviders() {
       weight: p.weight || 1,
       proxy: p.proxy || 'direct',
       timeout_ms: p.timeout_ms || 120000,
+      max_data_level: p.max_data_level || '',
       passthrough: !!(p.models && p.models.passthrough),
       map: Object.entries((p.models && p.models.map) || {}),
       catchAll: !!(p.models && p.models.catch_all),
@@ -155,6 +156,16 @@ function cfgRow(p, i) {
   enabled.checked = p.enabled;
   enabled.addEventListener('change', () => { p.enabled = enabled.checked; touchCfg(); });
 
+  // 分级声明是 3.0 分级门的事实来源：启用 shadow/enforce 时每家已启用的上游都必须选它。
+  // 「（未声明）」只在 legacy 下合法，选中它发出去等价于「不改本行」。
+  const level = h('select', { class: 'plevel' });
+  level.replaceChildren(
+    h('option', { value: '', text: '（留空 = 不改）' }),
+    ...['public', 'internal', 'confidential', 'restricted'].map((v) => h('option', { value: v, text: v })),
+  );
+  level.value = p.max_data_level || '';
+  level.addEventListener('change', () => { p.max_data_level = level.value; touchCfg(); });
+
   const radioAll = h('input', { type: 'radio', name: 'cfgmode' + i });
   const radioPick = h('input', { type: 'radio', name: 'cfgmode' + i });
   radioAll.checked = p.passthrough;
@@ -210,6 +221,7 @@ function cfgRow(p, i) {
       h('div', null, h('label', { text: '权重' }), num('pweight', p.weight, (v) => { p.weight = v; })),
       h('div', null, h('label', { text: '代理' }), text('pproxy mono', p.proxy, 'direct', (v) => { p.proxy = v; })),
       h('div', null, h('label', { text: '超时 (ms)' }), num('ptimeout', p.timeout_ms, (v) => { p.timeout_ms = v; })),
+      h('div', null, h('label', { text: '可承接最高分级' }), level),
     ),
     h('div', { class: 'prow-models' },
       h('label', { class: 'inline' }, radioAll, '全部直通（任何模型名都转发）'),
@@ -442,6 +454,7 @@ function cfgPayload() {
         weight: p.weight,
         proxy: p.proxy.trim(),
         timeout_ms: p.timeout_ms,
+        max_data_level: p.max_data_level || '',
       };
       if (p.passthrough) {
         body.models = ['*'];
@@ -1881,7 +1894,7 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('pick
 $('cfg-add').addEventListener('click', () => {
   ADM.cfg.providers.push({
     name: '', enabled: true, base_url: '', api_key: '', keyHint: '（未设置）',
-    weight: 1, proxy: 'direct', timeout_ms: 120000, passthrough: true, map: [], catchAll: false,
+    weight: 1, proxy: 'direct', timeout_ms: 120000, max_data_level: '', passthrough: true, map: [], catchAll: false,
   });
   renderCfg();
 });
