@@ -167,6 +167,52 @@
       <div id="pc-vocab"></div>
     </section>
 
+    <!-- 回放证据链（3.0 §2.8）：把采集开起来、把记录取走、取完清掉。
+         判定与回放都不在这屏里跑 —— 回放是另一个进程拿着这份文件加当时那套策略包做的事。 -->
+    <section class="card" id="replay">
+      <div class="head">
+        <h2>回放证据链</h2>
+        <span class="mono muted" id="rp-asof"></span>
+        <span class="grow"></span>
+        <button type="button" id="rp-refresh" class="ghost sm">刷新</button>
+      </div>
+      <p class="sub">这一屏只管三件事：开多大比例的采集、把窗口里的记录取走、取完把窗口清掉。
+        记录里带<b>用户名</b>（谁在什么时候被授权用了哪个模型），所以缺省是关的 ——
+        运维口径是「要证据时打开 → 跑一批流量 → 导出取走 → 关掉或清空」，而不是长期开着。
+        回放本身不在这里跑：那份文件要在<b>另一个进程</b>里配合当时那套策略包重跑
+        （<code>llmproxy replay run -records … -now …</code>），这屏给出的每一条数字都只是窗口的计数。</p>
+      <p class="banner" id="rp-status" hidden></p>
+      <div id="rp-stats" class="gridn"></div>
+
+      <h3 class="sub-h">采集开关</h3>
+      <p class="sub">四个字段各管各的：留空的<b>不动</b>（服务端是指针语义，不是整体覆盖），
+        所以只想调比例时不必先把当前范围过滤抄一遍。千分率 1000 = 全采。
+        范围过滤只认 <code>user:&lt;用户名&gt;</code> 这种精确值 —— 通配在这里匹配不上任何范围，
+        那会是「开了采集却一条没收」这种最难查的形态。</p>
+      <div class="row">
+        <label class="inline"><input type="checkbox" id="rp-enabled"> 开启采集</label>
+        <input id="rp-permille" class="mono" inputmode="numeric" placeholder="千分率，如 50" autocomplete="off">
+        <input id="rp-filter" class="mono" placeholder="范围过滤，如 user:alice（留空=不过滤）" autocomplete="off">
+        <input id="rp-capacity" class="mono" inputmode="numeric" placeholder="窗口条数上限" autocomplete="off">
+        <button type="button" id="rp-save" class="primary sm">保存开关</button>
+        <span class="err" id="rp-err" hidden></span>
+      </div>
+      <p class="hint" id="rp-hint"></p>
+
+      <h3 class="sub-h">导出与清空</h3>
+      <p class="sub">导出拿到的就是记录文件<b>本身</b>（<code>replay.File</code>，不加包装字段），
+        所以浏览器存下来的那份可以直接交给另一个进程重跑；这里也刻意不做任何「下载后再拼一层」的处理。
+        空窗口导出的是一个只含 <code>schema_version</code> 的合法文件 ——
+        「没有记录」与「这个端点不存在」是两件事，回放侧会报前者。</p>
+      <div class="row">
+        <input id="rp-export-scope" class="mono" placeholder="导出过滤，如 user:alice（留空=全窗口）" autocomplete="off">
+        <button type="button" id="rp-export" class="sm">导出记录文件</button>
+        <button type="button" id="rp-clear" class="ghost sm">清空窗口</button>
+        <span class="err" id="rp-exp-err" hidden></span>
+      </div>
+      <p class="hint" id="rp-exp-hint"></p>
+    </section>
+
     <!-- 用户列表 -->
     <section class="card">
       <div class="head">

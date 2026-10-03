@@ -41,7 +41,7 @@ async function enterAdmin() {
   $('login').hidden = true;
   $('admin').hidden = false;
   $('admin-base').textContent = state.base;
-  await Promise.all([loadSysProviders(), loadAdminUsers(), loadPolicy()]);
+  await Promise.all([loadSysProviders(), loadAdminUsers(), loadPolicy(), loadReplay()]);
   // 用户列表与策略包是并行拉回来的，范围选项此时才完整（列表本身 loadPolicy 已经查过）。
   fillAuditScopes();
 }
@@ -586,6 +586,9 @@ async function loadPolicy(keepMsg) {
   // 声明段的「参与/不参与请求」完全由 policy.mode 决定，所以模式一变就要跟着重读。
   // 它失败不该挡住策略这一屏（两边是不同的段），自己会说明为什么读不到。
   loadDeclarations(true).catch(() => {});
+  // 同理，采集窗口只在 enforce 下收记录：模式一按下去，回放那一屏的横幅必须跟着变，
+  // 否则「开关是开的、窗口是空的」就没人解释了。它也失败不挡这一屏。
+  loadReplay(true).catch(() => {});
   // 策略写侧每次都落审计（policypublish.go 的落盘通道），所以这一屏刷新过之后
   // 审计列表也要跟着刷新：面板停在改动前的记录，等于把刚按下的按钮记的那条藏起来。
   fillAuditScopes();
@@ -1353,6 +1356,182 @@ function markDeclInput(which, text) {
   $(s.hint).textContent = '编辑中（未保存）· 保存的是整段';
   showErr($(s.err), '');
 }
+
+/* ── 回放证据链（§2.8 的管理台面）──────────────────────────────────
+   读 GET /v1/_admin/replay，写 POST …/sampling 与 POST …/clear，取件 GET …/export。
+   这四个端点是 §2.8 那一包交付的，OpenAPI 里已有，这一屏不新增契约也不改字段语义。
+   界面不跑判定、不跑回放、不复算权限：回放是另一个进程拿这份文件加当时那套策略包做的事，
+   这里的数字全部是服务端窗口报出来的原值。 */
+
+function showRpStatus(msg, kind) {
+  const el = $('rp-status');
+  el.textContent = msg || '';
+  el.className = 'banner' + (kind === 'err' ? ' err-banner' : '');
+  el.hidden = !msg;
+}
+
+async function loadReplay(keepMsg, forceEcho) {
+  if (!keepMsg) showRpStatus('');
+  let data;
+  try {
+    ({ data } = await adminApi('/v1/_admin/replay'));
+  } catch (e) {
+    showRpStatus('读不到采集窗口状态：' + e.message, 'err');
+    return;
+  }
+  renderReplay(data, !!keepMsg, !!forceEcho);
+}
+
+function renderReplay(d, keepMsg, forceEcho) {
+  $('rp-asof').textContent = '窗口快照 ' + (d.as_of || '—');
+  // 「配了开关但一条都不收」是这一屏最容易被误读的状态：非 enforce 下窗口恒空，
+  // 而开关看起来是开着的。服务端把这句话放在 warning 字段里，界面照实顶到最上面。
+  if (d.warning) showRpStatus(d.warning, 'err');
+  else if (!keepMsg) showRpStatus('');
+  const filter = d.scope_filter && d.scope_filter !== '-' ? d.scope_filter : '';
+  $('rp-enabled').checked = !!d.enabled;
+  // 输入框只回显、不覆盖别人正在打的字：这四个字段是指针语义，误清一个就等于改一个。
+  // forceEcho 是给「这次提交被服务端拒了」那条路用的 —— 那时框里那串已经是**确定没生效**
+  // 的值，留着它会让下一屏说「千分率 500‰」而框里写着 2000，于是没人说得清哪个是真的。
+  if (forceEcho || !rpDirty.permille) $('rp-permille').value = d.sample_permille == null ? '' : String(d.sample_permille);
+  if (forceEcho || !rpDirty.filter) $('rp-filter').value = filter;
+  if (forceEcho || !rpDirty.capacity) $('rp-capacity').value = d.capacity == null ? '' : String(d.capacity);
+  $('rp-hint').textContent = '当前：' + (d.enabled ? '采集中' : '未采集')
+    + ' · 千分率 ' + num(d.sample_permille) + '‰'
+    + ' · 过滤 ' + (filter || '无') + ' · 上限 ' + num(d.capacity) + ' 条'
+    + ' · mode=' + (d.mode || '—') + (d.running ? '' : '（3.0 没在跑）');
+  $('rp-stats').replaceChildren(
+    stat('窗口内判定', num(d.decisions), 'sm', '当前还在窗口里的判定记录条数（溢出会丢最旧的）'),
+    stat('窗口内选路', num(d.routings), 'sm', '带路由计划记录的条数 —— 只有计划真的作用到请求上才有'),
+    stat('累计收到', num(d.captured), 'sm'),
+    stat('累计丢弃', num(d.dropped), 'sm', '容量越界丢最旧：这个数字非零就说明窗口小了或取走得太晚'),
+    stat('采集失败', num(d.failed), 'sm', '判定发生了但组不出记录（缺版本/缺分级），数字本身就是要查的东西'),
+    stat('回放默认抽样', d.sampling_algo_replay_default || '—', 'sm',
+      '线上用 ' + (d.sampling_algo_declared || '—') + '，回放缺省用这个 —— 两者不同，所以记录默认只做解释性回放'),
+    stat('首选顺序逐位复现', d.bit_exact_primary_order ? '是' : '否', 'sm',
+      '否是当前事实，不是缺陷：逐位复现需要路由侧的重放入口，那是接口裁决'),
+  );
+  rpDirty = { permille: false, filter: false, capacity: false };
+}
+
+let rpDirty = { permille: false, filter: false, capacity: false };
+
+/* rpInt 只管「这是不是一个整数」这一件格式上的事；取值域（千分率 0~1000、
+   容量 1~上限）仍然只由服务端判 —— 界面复算业务规则就会和注册表版本赛跑。
+   留空 = 这个字段不动（服务端是指针语义）。 */
+function rpInt(id) {
+  const raw = $(id).value.trim();
+  if (raw === '') return {};
+  const n = Number(raw);
+  if (!Number.isInteger(n)) return { bad: raw };
+  return { value: n };
+}
+
+/* rpBody 组的是「这一屏看得见什么就提交什么」：
+   - enabled 永远带上（复框没有「没填」这个状态）；
+   - 千分率与上限留空 = 这个字段不动；
+   - scope 永远带上，包括空串 —— 清空过滤框就是要清掉过滤，留着不动的话
+     「我明明清空了怎么还在按 alice 采」会变成查不出来的状态。 */
+function rpBody() {
+  const body = { enabled: $('rp-enabled').checked, scope: $('rp-filter').value.trim() };
+  const pm = rpInt('rp-permille');
+  if (pm.value !== undefined) body.sample_permille = pm.value;
+  const cp = rpInt('rp-capacity');
+  if (cp.value !== undefined) body.capacity = cp.value;
+  return { body, bad: pm.bad || cp.bad };
+}
+
+async function rpSave() {
+  const btn = $('rp-save');
+  const { body, bad } = rpBody();
+  if (bad) {
+    // 不把「abc」静默丢掉：那会让人以为改过了，而窗口里还是上一个千分率。
+    showErr($('rp-err'), '「' + bad + '」不是整数 —— 千分率与窗口上限都只收整数，本次没有提交。');
+    return;
+  }
+  btn.disabled = true;
+  showErr($('rp-err'), '');
+  try {
+    const { data } = await adminApi('/v1/_admin/replay/sampling', {
+      method: 'POST', body: JSON.stringify(body),
+    });
+    showRpStatus(data.note || '开关已改。', data.warning ? 'err' : '');
+    await loadReplay(true);
+  } catch (e) {
+    showErr($('rp-err'), e.message);
+    await loadReplay(true, e.status === 400);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function rpClear() {
+  const btn = $('rp-clear');
+  btn.disabled = true;
+  showErr($('rp-exp-err'), '');
+  try {
+    const { data } = await adminApi('/v1/_admin/replay/clear', { method: 'POST' });
+    showRpStatus(data.note || '窗口已清空。');
+    await loadReplay(true);
+  } catch (e) {
+    showErr($('rp-exp-err'), e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* 导出：拿的是记录文件**本身**那串字节，不做二次序列化。
+   客户端把 JSON 解析后再拼回去，字段顺序与数字格式都可能变，而那份文件要交给另一个
+   进程逐字段重跑 —— 「界面里导出的文件」和「磁盘上的记录文件」必须是一串字节。 */
+async function rpExport() {
+  const btn = $('rp-export');
+  btn.disabled = true;
+  showErr($('rp-exp-err'), '');
+  const scope = $('rp-export-scope').value.trim();
+  const q = scope ? ('?scope=' + encodeURIComponent(scope)) : '';
+  try {
+    const res = await fetch(state.base + '/v1/_admin/replay/export' + q, {
+      headers: { Authorization: 'Bearer ' + state.token },
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      let msg = res.status + ' ' + res.statusText;
+      try {
+        const j = JSON.parse(text);
+        msg = (j && j.error && (j.error.message || j.error.type)) || msg;
+      } catch { /* 非 JSON 的错误体就按状态码说 */ }
+      throw new Error(msg);
+    }
+    let counted = '';
+    try {
+      const f = JSON.parse(text);
+      counted = ' ' + ((f.decisions || []).length) + ' 条判定 / '
+        + ((f.routings || []).length) + ' 条选路，' + new Blob([text]).size + ' 字节';
+    } catch { counted = ' （这份文件读不出结构，仍按原样交付）'; }
+    const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+    const a = h('a', { href: url, download: 'llmproxy-replay-records.json' });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    // 延迟释放：Safari 在 click 之后异步取件，立刻 revoke 会拿到一个空文件。
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    $('rp-exp-hint').textContent = '已导出' + counted + '。拿它去另一个进程重跑：'
+      + 'llmproxy replay run -records <这份文件> -now <当时时刻>。';
+    await loadReplay(true);
+  } catch (e) {
+    showErr($('rp-exp-err'), e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$('rp-refresh').addEventListener('click', () => loadReplay().catch(() => {}));
+$('rp-save').addEventListener('click', rpSave);
+$('rp-clear').addEventListener('click', rpClear);
+$('rp-export').addEventListener('click', rpExport);
+$('rp-permille').addEventListener('input', () => { rpDirty.permille = true; });
+$('rp-filter').addEventListener('input', () => { rpDirty.filter = true; });
+$('rp-capacity').addEventListener('input', () => { rpDirty.capacity = true; });
 
 /* ── 操作审计 ────────────────────────────────────────────────────── */
 
