@@ -57,6 +57,10 @@ const usageText = `llmproxy %s — 自用 LLM 转发网关
   test [-model M] [-stream]     通过本机网关发一条测试请求
   admin token         打印管理凭证（管理台 /admin/ 用）
   admin rotate        轮换管理凭证并写回 config.yaml
+  replay status       看回放记录采集窗口的状态
+  replay on|off       开启 / 关闭线上决策记录采集（见 llmproxy replay -h）
+  replay collect      导出采集窗口里的记录文件
+  replay run          用当时的策略包重跑记录（跨进程回放，-records/-now 必填）
   config get          列出可设置项的当前值
   config set <段.键> <值>  改一项（备份 → 校验 → 原子改名，2 秒内热加载）
   price list           列出当前生效的价目 / 指定键的全部历史
@@ -115,6 +119,8 @@ func main() {
 		err = cmdUser(paths, args)
 	case "admin":
 		err = cmdAdmin(paths, args)
+	case "replay":
+		err = cmdReplay(paths, args)
 	case "config":
 		err = cmdConfig(paths, args)
 	case "price", "prices":

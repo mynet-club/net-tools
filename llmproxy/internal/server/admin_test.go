@@ -417,9 +417,12 @@ func TestOpenAPISpec(t *testing.T) {
 	// 声明段的两个端点必须在 spec 里点名：§3.H 的「H 只能调用服务端策略接口」要有
 	// 一份可对外的契约，而界面用的路径与契约不一致时，看 OpenAPI 的人会比界面更困惑。
 	// §3.C 的两个自助端点同理：检索委托的出网面与审计面都要能在契约里查到。
+	// §2.8 的导出端点更要查得到：运维在另一台机器上重跑判定时，唯一的现场说明就是这份契约。
 	for _, want := range []string{"openapi: 3", "paths:", "/v1/chat/completions", "/v1/_admin/usage/export",
 		"/v1/_admin/config/processors", "/v1/_admin/config/knowledge_sources", "processor.config.write",
-		"/v1/_me/knowledge", "/v1/_me/knowledge/search", "knowledge.search", "meKnowledgeSearch"} {
+		"/v1/_me/knowledge", "/v1/_me/knowledge/search", "knowledge.search", "meKnowledgeSearch",
+		"/v1/_admin/replay/export", "/v1/_admin/replay/sampling", "replay.sampling.set",
+		"bit_exact_primary_order"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("spec 缺 %q", want)
 		}

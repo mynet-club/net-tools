@@ -96,6 +96,13 @@ type Server struct {
 	// 只留日志里的话，管理台就只能报「策略没生效」而说不出为什么 —— 而「为什么没生效」
 	// 恰恰是影子→enforce 推进时唯一要看的东西。
 	policyBadErr string
+
+	// replayWin 是 §2.8 的回放记录采集窗口（有界内存，缺省关闭，见 replay30.go）。
+	//
+	// 挂在 Server 上而不是 policyRuntime 上：窗口里的记录要跨配置修订活着，而采集的
+	// 门禁（enforce + 版本非空）读的是当次请求那份运行态。热加载换修订不该把
+	// 「刚采到的证据」清掉 —— 运维恰恰是在改配置前后各采一批来对比的。
+	replayWin *replayWindow
 }
 
 // now 返回当前时刻；测试可以通过 nowFn 固定它。
@@ -123,6 +130,7 @@ func New(cfgStore *config.Store, db *store.Store, r *router.Router, lg *logx.Log
 		discoverGate: newDiscoverGate(),
 		usageCache:   newUsageReportCache(),
 		metrics:      newRuntimeMetrics(),
+		replayWin:    newReplayWindow(),
 	}
 	if ac := cfgStore.Current(); ac != nil {
 		s.quotaAlerts = newQuotaAlert(ac.Alerts.WebhookURL, ac.Alerts.EffectiveWarnRatio())

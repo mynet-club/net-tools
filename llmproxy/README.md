@@ -534,6 +534,39 @@ shadow。热加载只看配置文件 mtime，因此「内存里还是上一次�
 路由模拟、决策痕迹。界面**不复算权限**（只检查 JSON 语法与必填项），条件键、选择器形态、
 分级取值一律由服务端领域校验判 —— 前端算一套就会出现「界面说会过、线上拒了」的分叉。
 
+#### 回放证据链（3.0）：把线上判定取出来，换个进程重跑一遍
+
+| 方法 | 路径 | 用途 |
+|------|------|------|
+| GET | `/v1/_admin/replay` | 采集窗口的配置与计数（**不含任何 subject**），外加 mode、当前版本、两条抽样算法标识与 `bit_exact_primary_order` |
+| POST | `/v1/_admin/replay/sampling` | 改开关：`enabled` / `sample_permille`(0~1000) / `scope`(kind:id) / `capacity`(1~4096)，指针语义 —— 没带的字段不动 |
+| GET | `/v1/_admin/replay/export[?scope=user:名字]` | 导出记录文件本身（schema v1），**不加包装字段** |
+| POST | `/v1/_admin/replay/clear` | 清空记录与计数（开关与过滤条件保持） |
+
+命令行是同一组能力，回放那一步必须在网关进程之外跑：
+
+```bash
+llmproxy replay status                       # 采了多少、按什么配置采
+llmproxy replay on -permille 1000 -scope user:alice
+llmproxy replay collect -out /tmp/rec.json   # 0600；解不开就当场报错
+llmproxy replay run -records /tmp/rec.json -now 2026-10-03T12:00:00Z
+```
+
+三处不猜的地方：
+
+- **`-now` 必填**。策略与身份的过期语义只有钉住回放时钟才能复现；用当前时间兜底会让
+  「昨天拒绝的授权」在今天变成通过，而报告看起来完全正常。
+- **只采 `policy.mode=enforce` 且判定出了版本的请求**，选路记录另要求计划真的作用到本次
+  选路。影子的判定没作用到任何请求上，不构成证据；管理口的路由模拟**不**进窗口，
+  否则证据里掺的是人为流量。
+- **首选顺序今天不比对**。线上抽样是 `routing-seeded-splitmix64-v1`，回放缺省抽样器是
+  另一个算法，所以回放降级为**解释性回放**（仍复核候选摘要、排除原因与授权），状态口把
+  `bit_exact_primary_order: false` 明写出来 —— 让人以为逐位复现了，比不复现更糟。
+
+窗口是**进程内**的有界缓冲：重启即空、溢出丢最旧并计入 `dropped`。所以流程是「要证据时
+打开 → 跑一批流量 → collect 取走 → off 或 clear」，而不是长期开着 —— 记录里带用户名，
+它不同于 `/usage` 那类只出聚合数的只读面。
+
 ### 两条要么想清楚、要么别动的规则
 
 1. **用户配了自己的上游，就只用他自己的。** 哪怕他配的上游全部不可用，也**不会**悄悄回退到
@@ -893,6 +926,10 @@ llmproxy user models|add-model <名字>  消费模式的模型白名单（也是
 llmproxy user add-provider <用户> <上游名>   代用户配上游
 llmproxy admin token         打印管理凭证（管理台 /admin/ 用）
 llmproxy admin rotate        轮换管理凭证并写回 config.yaml
+llmproxy replay status       回放记录采集窗口的配置与计数
+llmproxy replay on|off       开 / 关线上判定记录采集（缺省关）
+llmproxy replay collect      把窗口里的记录导出成文件（0600）
+llmproxy replay run          用当时的策略包重跑记录（跨进程回放，-records/-now 必填）
 llmproxy config get [段.键]  看可设置项的当前值
 llmproxy config set <段.键> <值>       改一项（备份 → 校验 → 原子改名，2 秒内热加载）
 llmproxy price list          当前生效的价目 / 指定键的全部历史

@@ -643,6 +643,80 @@ paths:
       responses:
         '200': { description: 已切换 }
         '400': { description: 模式非法，或该模式要求的字段缺失 }
+  /v1/_admin/replay:
+    get:
+      tags: [admin]
+      summary: 回放记录采集窗口的配置与计数
+      description: |
+        只回答「采了多少、按什么配置采」：enabled / sample_permille / scope_filter / capacity /
+        entries / decisions / routings / captured / dropped / failed，外加 as_of、policy.mode、
+        当前策略版本，以及两条抽样算法标识与 `bit_exact_primary_order: false`。
+        **不含任何 subject**：谁被采到只出现在导出那份文件里（§2.9 规则 6）。
+        非 enforce 时带 `warning` —— 开关已开但窗口不会采集，这必须看得见。
+      security: [{adminAuth: []}]
+      responses:
+        '200': { description: OK }
+  /v1/_admin/replay/sampling:
+    post:
+      tags: [admin]
+      summary: 改回放记录采集开关（缺省关闭）
+      description: |
+        指针语义：只改随请求带来的字段，缺省字段保持原值。`sample_permille` 是千分率
+        （0~1000，1000 = 全采）；`scope` 是精确选择器 kind:id（通配直接 400 —— 窗口按字符串
+        相等匹配，带通配会一个都匹配不上而静默空采）；`capacity` 1~4096，缩小会挤掉最旧的
+        记录并计入 dropped。窗口是**进程内**有界缓冲：重启即空，溢出丢最旧。
+        记录只在 `policy.mode=enforce` 且判定出了策略版本时采集；选路记录另要求计划真的
+        作用到本次选路。管理口的路由模拟**不**进窗口（证据里不许掺人为流量）。
+        动作 `replay.sampling.set` 落审计，归属 `system:global`。
+      security: [{adminAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enabled: { type: boolean }
+                sample_permille: { type: integer, minimum: 0, maximum: 1000 }
+                scope: { type: string, example: user:alice }
+                capacity: { type: integer, minimum: 1, maximum: 4096 }
+      responses:
+        '200': { description: 返回改后的窗口快照 }
+        '400': { description: 取值越界、scope 不是精确 kind:id、或含未知字段 }
+  /v1/_admin/replay/export:
+    get:
+      tags: [admin]
+      summary: 导出采集窗口里的回放记录
+      description: |
+        响应体是记录文件本身的 JSON（`replay.File`，schema v1），**不加任何包装字段** ——
+        另一个进程拿这份文件 + 当时那套策略包就能重跑判定；包一层就等于造出
+        「界面里的记录」与「文件里的记录」两份真相。
+        内容面由 `internal/replay` 的禁用词扫描把住：正文、密钥、端点这类字段名在解码期
+        就被拒，导出侧写坏了会当场 500 而不是导出一份看起来正常的文件。
+        `?scope=user:<用户名>` 只导出那一个人的记录（窗口按 2.x 的路由作用域采集，
+        其它范围种类今天进不了窗口）。空窗口导出一份合法的空白记录文件而不是 404。
+        动作 `replay.export` 落审计，detail 只有条数与计数。
+        CLI 等价入口：`llmproxy replay collect`。
+      security: [{adminAuth: []}]
+      parameters:
+        - name: scope
+          in: query
+          required: false
+          schema: { type: string, example: user:alice }
+      responses:
+        '200': { description: 'schema_version / decisions[] / routings[]（application/json 附件）' }
+        '400': { description: scope 不是精确的 user:<用户名> }
+        '500': { description: 记录编码失败（采集侧缺陷，绝不下发半成品文件） }
+  /v1/_admin/replay/clear:
+    post:
+      tags: [admin]
+      summary: 清空回放记录窗口
+      description: |
+        只清记录与计数，不动开关与过滤条件 —— 拿走这批证据不该顺手关掉观测面。
+        动作 `replay.clear` 落审计，归属 `system:global`。
+      security: [{adminAuth: []}]
+      responses:
+        '200': { description: 返回清空后的窗口快照 }
   /v1/_admin/prices/provider:
     put:
       tags: [admin]

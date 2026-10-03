@@ -210,6 +210,11 @@ func TestExecutor30MeteringMatchesLegacyPath(t *testing.T) {
 	if mDel != mLeg {
 		t.Errorf("同一条请求在两条链路下的账不一致：\n委托 %+v\n2.x  %+v", mDel, mLeg)
 	}
+	// 时延不进等式（它是墙钟读数），但两条路都必须**量到了**：委托侧漏测 TTFT 的表现为
+	// 「账完全一致、报表却少一列」，只有这一条能把它抓出来。
+	if del.TTFTMs == nil || *del.TTFTMs < 0 || leg.TTFTMs == nil || *leg.TTFTMs < 0 {
+		t.Errorf("两条链路都要记录 TTFT（可以为 0，不能没有）：委托 %+v / 2.x %+v", del.TTFTMs, leg.TTFTMs)
+	}
 	// 数值本身也要对得上上游回报：一致但不等于 5/7/12 说明两条路一起错了。
 	if mDel.total != 12 || mDel.prompt != 5 || mDel.completion != 7 {
 		t.Errorf("usage 应为 5/7/12，实际 %d/%d/%d", mDel.prompt, mDel.completion, mDel.total)
@@ -272,18 +277,21 @@ func seedProviderPrice(t *testing.T, h *harness) {
 
 // meterView 是一次交换里「请求行读得出的账」（loadRecent 的列面），不含时延。
 // 指针字段用 -1 表示「上游没报」，好让整张表能用 == 一次比完。
+//
+// TTFT 刻意不在这里：它是两次独立请求各自的墙钟读数，不是账。把它比进等式，
+// 「两条链路的账一致」就变成「两条链路的耗时恰好相等」，`-race` 下必然抖 1ms。
+// 时延仍然单独断言「两条路都真的量到了」（见 TestExecutor30MeteringMatchesLegacyPath）。
 type meterView struct {
-	prompt, completion, total, ttft int64
-	status                          int
-	ok, stream, systemPaid          bool
-	attempts                        int
-	provider, upstream, model       string
+	prompt, completion, total int64
+	status                    int
+	ok, stream, systemPaid    bool
+	attempts                  int
+	provider, upstream, model string
 }
 
 func meterOf(r store.RequestRecord) meterView {
 	return meterView{
 		prompt: ptr64(r.PromptTokens), completion: ptr64(r.CompletionTokens), total: ptr64(r.TotalTokens),
-		ttft:   ptr64(r.TTFTMs),
 		status: r.StatusCode, ok: r.OK, stream: r.Stream,
 		systemPaid: r.SystemPaid, attempts: r.Attempts,
 		provider: r.Provider, upstream: r.UpstreamModel, model: r.Model,

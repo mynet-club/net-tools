@@ -263,6 +263,18 @@ type policyShot struct {
 	LegacyFirst []string
 	PlanOrder   []string
 	Elapsed     time.Duration
+
+	// 下面这组是 §2.8 记录导出要的**现场**：只在判定函数里赋值、只被 captureReplay 读。
+	// 它们不进任何响应、不参与任何结论 —— 差异报告与 enforce 的作用面全在上面那些
+	// 导出字段里。为什么要把当时已经算过的东西留在 shot 上：记录必须描述「当时」，
+	// 采集时再去问一遍活的策略就已经不是当时那份结论了（范围链、身份、上下文同理）。
+	chain    policy.ScopeChain
+	subject  policy.Identity
+	judgeCtx policy.PolicyContext
+	res      *policy.Resolver
+	resource string
+	action   string
+	judgeNow time.Time
 }
 
 // excludedByPolicy 报告一个排除原因是否属于「策略说了算」的那一类。
@@ -284,14 +296,20 @@ func excludedByPolicy(r policy.Reason) bool {
 	return false
 }
 
-// policyEvaluate 是线上请求的入口：判定 + 决定它对这次请求的作用面。
+// policyEvaluate 是线上请求的入口：判定 + 决定它对这次请求的作用面 + 采集回放记录。
+//
+// 采集挂在这一层而不是判定核里：管理口的路由模拟（policyJudge + applyPolicyVerdict）
+// 复用同一个判定核，却必须一点痕迹都不留 —— 模拟请求进了窗口，证据链里就掺进了
+// 人为流量（§3.0 线 1 禁止模拟进影子计数，同一条理由）。
 func (s *Server) policyEvaluate(rt *policyRuntime, scope, model, requestID, path string,
 	providers []config.Provider, sticky string, now time.Time) *policyShot {
 	shot := s.policyJudge(rt, scope, model, requestID, path, providers, sticky, now)
 	if shot == nil {
 		return nil
 	}
-	return s.finishPolicy(rt, shot)
+	shot = s.finishPolicy(rt, shot)
+	s.captureReplay(rt, scope, requestID, shot)
+	return shot
 }
 
 // policyJudge 只跑一次 3.0 判定，不落任何统计、不改任何运行态。
@@ -317,6 +335,10 @@ func (s *Server) policyJudge(rt *policyRuntime, scope, model, requestID, path st
 		shot.elapsedFrom(started)
 		return shot
 	}
+	shot.chain = chain
+	shot.judgeNow = now
+	shot.resource = "model:" + model
+	shot.action = "use"
 	res, version, err := rt.resolverFor(chain)
 	if err != nil {
 		// 没有任何包覆盖这条链 —— 该范围没启用 3.0，继续走旧路由（就是按 scope 回滚）。
@@ -324,6 +346,7 @@ func (s *Server) policyJudge(rt *policyRuntime, scope, model, requestID, path st
 		shot.elapsedFrom(started)
 		return shot
 	}
+	shot.res = res
 	shot.Version = version
 
 	id, err := policyIdentity(scope)
@@ -332,6 +355,7 @@ func (s *Server) policyJudge(rt *policyRuntime, scope, model, requestID, path st
 		shot.elapsedFrom(started)
 		return shot
 	}
+	shot.subject = id
 	ctx, err := policy.NewPolicyContext(id, policyPurposeFor(path), rt.dataLevel)
 	if err != nil {
 		shot.Note = fmt.Sprintf("策略上下文不合法: %v", err)
@@ -339,10 +363,11 @@ func (s *Server) policyJudge(rt *policyRuntime, scope, model, requestID, path st
 		return shot
 	}
 	ctx.PolicyVersion = version
+	shot.judgeCtx = ctx
 
 	// 授权判定：deny-first。这一步在候选集之前 —— 模型本身不被授权时，
 	// 「池子里有没有这家」与「能不能用这家」是两个问题，答案必须是「不能用」。
-	shot.Decision = res.Evaluate(ctx, chain, "model:"+model, "use", now)
+	shot.Decision = res.Evaluate(ctx, chain, shot.resource, shot.action, now)
 
 	offers, err := s.policyOffers(scope, providers, model, now)
 	if err != nil {
