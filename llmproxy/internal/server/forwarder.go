@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/config"
+	"github.com/mynet-club/net-tools/llmproxy/internal/processor"
 	"github.com/mynet-club/net-tools/llmproxy/internal/store"
 )
 
@@ -205,7 +206,10 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 	// deny 回答「能不能用这家」，配额回答「这个月还花得起吗」，把配额排在前面
 	// 会让一次策略拒绝显示成一次超额，运维去找财务而真正该改的是策略包。
 	// 影子模式在这里只产出差异报告；enforce 才允许拒绝请求与指定首选。
-	shot := s.policyEvaluate(s.policyFor(cfg), scope, probe.Model, requestID, r.URL.Path,
+	// rt 单独取出来：处理器执行要用同一份运行态（模式、data level、装配好的链），
+	// 再调一次 policyFor 就等于允许两次取到不同修订的配置。
+	rt := s.policyFor(cfg)
+	shot := s.policyEvaluate(rt, scope, probe.Model, requestID, r.URL.Path,
 		providers, affinityPrefer, started)
 	if shot != nil {
 		// 影子也写 policy_version（§3.0 明文要求）；routing_seed / 代 / 候选摘要**不写**，
@@ -291,6 +295,33 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 	attempts := 0
 
 	prefer := s.routingPrefer(scope, probe.Model, affinityPrefer, shot, providers)
+
+	// §3.0 执行期接线：processors 段的声明在 enforce 下真的跑起来（见 procexec.go 文件头）。
+	// 位置排在判定与配额之后、选路之前 —— 被策略拒掉的请求不该再去打 sidecar，
+	// 而「before-route」的语义边界是这次请求实际选哪家。
+	pc := s.processorCall(rt, scope, requestID, probe.Model, r.URL.Path, probe.Stream, started)
+	if pc != nil {
+		// audit 阶段的正文句柄在 E 包里是结构性缺席的，这里能带的只有结论元数据。
+		// ctx 用 WithoutCancel：请求已经结束时 r.Context() 必然已取消，
+		// 拿它去跑审计会让每个处理器在第一毫秒就报超时，留痕全变成噪音。
+		auditCtx := context.WithoutCancel(r.Context())
+		defer func() { pc.runAudit(auditCtx, procAuditMetadata(&rec)) }()
+
+		sent, pErr := pc.runRequest(r.Context(), raw)
+		if pErr != nil {
+			status, kind, msg := processorHTTP(pErr)
+			// 详情只进日志、不进回话：错误原文可能含实例路径与处理器配置片段。
+			s.log.Errorf("event=processor_reject request_id=%s scope=%s status=%d err=%s",
+				requestID, pc.scope, status, processorMessage(pErr))
+			s.fail(w, rec, status, kind, msg, 0, started)
+			return
+		}
+		if len(sent) != len(raw) || !bytes.Equal(sent, raw) {
+			// §2.9 规则 8：进了缓冲管道必须显式声明，让客户端与排障工具都能看到。
+			raw = sent
+			markBodyPipeline(w.Header(), "buffered")
+		}
+	}
 
 	for i := 0; i < maxAttempts; i++ {
 		cand, err := s.router.PickFromPreferring(bucket, providers, probe.Model, exclude, prefer)
@@ -464,7 +495,7 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 
 		outcome := func() relayOutcome {
 			defer cancel()
-			return s.relay(w, r, resp, &rec, started, wd)
+			return s.relay(w, r, resp, &rec, started, wd, pc)
 		}()
 
 		// 熔断要等 relay 的结果再记：一家「返回 200 响应头、然后卡死不吐字节」的供应商，
@@ -549,7 +580,11 @@ func writeBadGateway(w http.ResponseWriter, msg string) {
 }
 
 // relay 把上游响应原样写给下游；同时提取 usage / TTFT 元数据。
-func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Response, rec *store.RequestRecord, started time.Time, wd *idleWatchdog) relayOutcome {
+//
+// pc 非 nil 时响应侧处理器参与（见 procexec.go）：流式走逐段包装、非流式走一次性改写。
+// 处理器的失败**一律不记成供应商失败** —— 链子起不来是网关自己的事，
+// 把一家正常返回 200 的上游打进冷却是拿熔断当错误处理器用。
+func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Response, rec *store.RequestRecord, started time.Time, wd *idleWatchdog, pc *procCall) relayOutcome {
 	defer resp.Body.Close()
 
 	// 复制响应头（跳过 hop-by-hop）。
@@ -581,7 +616,6 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 	var copyErr error
 	outcome := relayOK
 	if isSSE {
-		w.WriteHeader(resp.StatusCode)
 		// 流式：边转发边扫 usage，不缓存全文。
 		// body 外面包一层，读到字节就喂一次看门狗 —— 于是「上游慢但活着」不会被误杀，
 		// 「上游卡住不动」会在空闲上限处失败。
@@ -589,12 +623,37 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 		if wd != nil {
 			body = &activityReader{r: resp.Body, touch: wd.Touch}
 		}
-		// scanner 必须排在 dest 前面：MultiWriter 在任一 writer 出错时就停止、
-		// 不再写后面的，而 usage chunk 恰恰在流的末尾。反过来的话，客户端在
-		// 收到 usage 之前断开（网络抖动，或者故意掐这个时机）就会拿到完整答案
-		// 而记账为 0 —— 上游那边 token 已经生成、钱已经付了。
-		// scanner.Write 恒返回 (len(p), nil)，放前面绝不会截断给客户端的数据。
-		written, copyErr = io.Copy(io.MultiWriter(scanner, dest), body)
+		// §2.9 规则 7：流式响应**绝不**因为「统一接口」而缓存全文。链上的处理器只能
+		// 逐段增量处理，包装层必须插在看门狗触达层的**下游**（否则过滤器一卡就没人
+		// touch 看门狗，空闲超时形同废掉），并且插在 WriteHeader **之前**
+		// —— 那时还没发过任何字节，起不来链子能干净地回一个错误。
+		var st *processor.Stream
+		proceed := true
+		if pc.participates() {
+			var stErr error
+			st, stErr = pc.wrapStream(r.Context(), resp.StatusCode, contentType, resp.ContentLength, body)
+			if stErr != nil {
+				rec.ErrorType = "processor"
+				rec.ErrorMsg = processorMessage(stErr)
+				copyErr = stErr
+				outcome = relayAmbiguous
+				writeProcessorError(w, stErr)
+				proceed = false
+			} else if st != nil {
+				body = st
+				markBodyPipeline(w.Header(), "stream")
+			}
+		}
+		if proceed {
+			w.WriteHeader(resp.StatusCode)
+			// scanner 必须排在 dest 前面：MultiWriter 在任一 writer 出错时就停止、
+			// 不再写后面的，而 usage chunk 恰恰在流的末尾。反过来的话，客户端在
+			// 收到 usage 之前断开（网络抖动，或者故意掐这个时机）就会拿到完整答案
+			// 而记账为 0 —— 上游那边 token 已经生成、钱已经付了。
+			// scanner.Write 恒返回 (len(p), nil)，放前面绝不会截断给客户端的数据。
+			written, copyErr = io.Copy(io.MultiWriter(scanner, dest), body)
+			pc.streamAudit(st)
+		}
 	} else {
 		// 非流式：先读完、再发状态码，并且**有上限**（见 maxUpstreamResponseBytes）。
 		// LimitReader 读满 n 字节且不报错就代表「可能还有更多」，据此判截断。
@@ -616,11 +675,36 @@ func (s *Server) relay(w http.ResponseWriter, r *http.Request, resp *http.Respon
 			outcome = relayUpstreamFailed
 			writeBadGateway(w, rec.ErrorMsg)
 		default:
-			scanner.consumeJSON(buf.Bytes())
-			w.WriteHeader(resp.StatusCode)
-			if _, werr := w.Write(buf.Bytes()); werr != nil {
-				// 头已经发出去了，改判不了；只记下来。写不进去多半是下游断开。
-				copyErr = werr
+			data := buf.Bytes()
+			deliver := true
+			if pc.participates() {
+				out, pErr := pc.runResponse(r.Context(), resp.StatusCode, contentType, data)
+				if pErr != nil {
+					rec.ErrorType = "processor"
+					rec.ErrorMsg = processorMessage(pErr)
+					copyErr = pErr
+					outcome = relayAmbiguous
+					// 状态码还没发出去：这里能干净地改判。usage 因此**不进记录**，
+					// 与写失败/超限那两条路径同一口径 —— 客户端没拿到内容，
+					// 就不按内容计费。
+					writeProcessorError(w, pErr)
+					deliver = false
+				} else if len(out) != len(data) || !bytes.Equal(out, data) {
+					data = out
+					// §2.9 规则 8：进了缓冲管道要显式声明。
+					// Content-Length 必须跟着改写后的长度改：上游的头是原样复制过来的，
+					// 留着旧长度只会让客户端读出一坨残缺 JSON，比一个错误更难排障。
+					w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+					markBodyPipeline(w.Header(), "buffered")
+				}
+			}
+			if deliver {
+				scanner.consumeJSON(data)
+				w.WriteHeader(resp.StatusCode)
+				if _, werr := w.Write(data); werr != nil {
+					// 头已经发出去了，改判不了；只记下来。写不进去多半是下游断开。
+					copyErr = werr
+				}
 			}
 		}
 	}

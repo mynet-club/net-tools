@@ -54,7 +54,8 @@ func (s *Server) adminShowDeclarations(w http.ResponseWriter, section string) {
 		"vocabulary": config.Vocabulary(),
 		"warnings":   cfg.Warnings,
 		"boundary": "这一段声明的是约束（阶段/档位/上限/失败策略/出网白名单）；" +
-			"运行参数（规则表、Schema、sidecar 客户端）由部署在注册期绑定，不在这里配",
+			"运行参数在配置文件同级的 processor_params/<声明名>.json，" +
+			"HTTP 客户端与原文出网授权判定器由网关按出网策略和生效策略包注入，两处都不在这里配",
 	}
 	if st, statErr := os.Stat(path); statErr == nil {
 		info["mtime"] = st.ModTime().Format("2006-01-02T15:04:05Z07:00")

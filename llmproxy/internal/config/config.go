@@ -64,7 +64,8 @@ type Config struct {
 
 	// Processors 是 3.0 的处理器**声明表**（§2.6 的 ProcessorSpec 字段集）。
 	// 这里只声明约束（阶段、档位、上限、失败策略、出网白名单），不含运行参数：
-	// 脱敏规则表、JSON Schema、sidecar 客户端与原文出网授权判定器都由注册期绑定，
+	// 后者在配置文件同级的 processor_params/<声明名>.json，由 internal/server 装配时读；
+	// HTTP 客户端与原文出网授权判定器连文件都不接受（前者绕过出网白名单、后者是授权面）。
 	// 理由见 procconf.go 的文件头与 processor.Registry.Register 的注释。
 	Processors []ProcessorDef `yaml:"processors"`
 	// KnowledgeSources 是知识检索的**委托入口**声明（协议见 docs/3.0-knowledge-delegation.md）。

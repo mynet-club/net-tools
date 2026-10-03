@@ -31,7 +31,7 @@ var (
 
 const (
 	processorsSectionComment = "  # 本段是处理器的声明表（阶段/档位/上限/失败策略/出网白名单）；\n" +
-		"  # 运行参数（规则表、Schema、sidecar 客户端）由部署在注册期绑定，不在这里。\n"
+		"  # 运行参数在同级 processor_params/<声明名>.json，HTTP 客户端与原文授权判定器由网关注入，都不在这里。\n"
 	knowledgeSectionComment = "  # 本段是知识检索的委托入口；transport 由接线方从出网策略注入，凭证不进 URL。\n"
 )
 

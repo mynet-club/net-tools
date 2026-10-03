@@ -277,6 +277,13 @@ func cmdStart(paths config.Paths) error {
 	if err := server.CheckPolicyRuntime(cfg); err != nil {
 		return fmt.Errorf("3.0 策略配置不可用，拒绝启动: %w", err)
 	}
+	// 处理器的运行参数文件与策略包文件是同一类事故面：声明在配置里、参数在文件里，
+	// 参数文件写坏了 JSON 或键名拼错时**处理器会整条装不起来**。enforce 下那会让命中
+	// 声明的请求全被拒，而 legacy/影子下表现是「界面说这条声明存在、运行时没人跑它」。
+	// 两者都不该等到第一个真实请求才暴露（同一个理由见上面的 CheckPolicyRuntime）。
+	if err := server.CheckProcessorParams(cfg); err != nil {
+		return fmt.Errorf("处理器运行参数不可用，拒绝启动: %w", err)
+	}
 
 	db, err := openStore(cfg.Database)
 	if err != nil {

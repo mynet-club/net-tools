@@ -147,10 +147,26 @@ log:
 
 # ============================ 处理器声明表（§2.6 / §3.H）============================
 # 这一段只声明**约束**：阶段、正文档位、大小与超时上限、失败策略、出网白名单。
-# 运行参数不在这里 —— 脱敏规则表、字段替换映射、JSON Schema、sidecar 的 HTTP 客户端
-# 与「原文出网」的授权判定器，都由部署在处理器注册期绑定（见 internal/processor
-# 的 Registry.Register 注释）：把那些塞进配置文件等于让配置变成第二个真值来源，
-# 而且 pseudonym key 这类密钥会跟着进文件。
+# 运行参数（脱敏类型子集、字段替换规则、JSON Schema、过滤词表、sidecar 的端点与请求头）
+# 不在这里，而在 **<配置文件目录>/processor_params/<声明名>.json**：
+#
+#   processor_params/pii-cn.json          →  {"pii_types":["email","phone"]}
+#   processor_params/schema-check.json    →  {"schema":{…}}
+#   processor_params/rewrite.json         →  {"endpoint":"https://…","headers":{…}}
+#
+# 每条声明可写的键按类型固定（写错类型或多余的键都在**启动期**报错，不会静默忽略 ——
+# 「配了 schema 而它从来没跑过」在界面上看着像两条声明都在）。可用键：
+#   pii-mask        pii_types
+#   field-replace   rules、max_path_depth
+#   json-schema     schema
+#   result-filter   filter_rules、filter_mode、filter_replacement、max_line_bytes
+#   http-sidecar    endpoint、headers、max_retries、idempotent
+# 只有 pii-mask 可以没有文件（用内置词表 + 每请求随机 salt）；其余类型缺文件即拒绝启动。
+#
+# 为什么单独一个目录：让这些进 config.yaml 就有两个真值来源，而 sidecar 的请求头常带令牌 ——
+# 那是把密钥拉进一份会被备份、被同步的文件里。HTTP 客户端、「原文出网」授权判定器与
+# pseudonym key 因此**不接受文件注入**：前两个由 server 侧按出网策略与生效策略包注入
+# （见 internal/server/procruntime.go），第三个是密钥。
 #
 # 只有 policy.mode=enforce 才允许这些声明参与判定（§3.0 规则 2）；
 # shadow / legacy 下声明了也不会跑，加载时会出一条 warning 说破这件事 ——

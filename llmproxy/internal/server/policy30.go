@@ -65,6 +65,11 @@ type policyRuntime struct {
 	planner   *routing.Planner
 	epoch     string // routing_epoch：配置每修订一次就换一代，seed 跟着变
 
+	// proc 是本修订对应的处理器链装配态（nil = 这个配置没声明任何处理器）。
+	// 挂在策略运行态上而不是单独一份缓存：声明的生效面由「mode + 范围链 + 策略版本」
+	// 共同决定，两套缓存必然出现「策略改了而链没跟着重建」。
+	proc *procRuntime
+
 	mu        sync.Mutex
 	resolvers map[string]*policy.Resolver // chain.Display() → 判定内核
 }
@@ -154,6 +159,9 @@ func (s *Server) policyFor(cfg *config.Config) *policyRuntime {
 	} else {
 		s.log.Infof("3.0 策略链路就绪（模式 %s，修订 %d，策略版本 %s，代 %s）", rt.mode, rev, rt.version, rt.epoch)
 	}
+	// 处理器声明跟着这一版配置装配（同一修订、同一生命周期）。装配失败不丢掉运行态：
+	// 策略判定仍然有效，而坏声明的错误文案要在命中它的那条请求上原样端出来。
+	rt.proc = s.buildProcRuntime(cfg, rt)
 	// 健康检查/指标要能报出「当前在效的策略版本」：运维判断差异率是不是新配置带来的，
 	// 靠的就是这一眼。版本在这里取整集版本（不是子集）—— 它回答的是「加载了什么」，
 	// 而请求记录里的版本回答的是「这次判定用了哪几条」。
@@ -355,6 +363,16 @@ func (s *Server) policyJudge(rt *policyRuntime, scope, model, requestID, path st
 		// 粘性如实传给 D：不传的话计划永远按「新会话」算，差异报告里的
 		// primary_moved 大半是假的。D 内部粘性命中时不消耗随机数（§2.8）。
 		Sticky: stickyState(sticky, version),
+	}
+	// 处理器链如实进计划（§2.5 要求计划带它，而 D 只原样携带、不推导）。
+	// 这里取的是「这条范围链上会跑什么」，与 forwarder 执行用的是同一次 pipelineFor：
+	// 模拟界面里的 processor_chain 因此不是猜的，而 enforce 真跑的那条链与它一致。
+	// 装配失败（perr 非空）时留空而不是编一条：计划描述的是路由，
+	// 「处理器装不起来」由执行侧拒请求，影子/模拟不该把它伪装成一条链。
+	if pipe, perr := rt.proc.pipelineFor(chain, version); perr == nil && pipe != nil {
+		for _, spec := range pipe.Specs() {
+			in.ProcessorChain = append(in.ProcessorChain, spec.Name)
+		}
 	}
 	plan, replay, err := rt.planner.PlanWithReplay(ctx, chain, in)
 	if err != nil {
