@@ -390,7 +390,10 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 		})
 		if delErr != nil {
 			// 计划声明的执行器跑不起来 = 这个候选不能用：不出网，也不回落到 2.x 通道。
-			s.log.Warnf("供应商 %s 的执行器不可用: %v", cand.Provider.Name, delErr)
+			// 同一个 event= 词汇让「被拒」与「跑过」两条在日志里能一起 grep 到 ——
+			// 只看 200 数量分不出「真的没出网」和「出网了但没记录」。
+			s.log.Warnf("event=executor_rejected request_id=%s provider=%s 候选被拒不出网: %v",
+				requestID, cand.Provider.Name, delErr)
 			lastErr = delErr
 			exclude[cand.Provider.Name] = true
 			continue
@@ -441,7 +444,23 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 			if resp != nil {
 				exchangedStatus = resp.StatusCode
 			}
-			s.metrics.observeExecutorExchange(del.name, executorExchangeReason(xErr, exchangedStatus))
+			reason := executorExchangeReason(xErr, exchangedStatus)
+			s.metrics.observeExecutorExchange(del.name, reason)
+			// 执行记录：一次委托的六项事实落在同一个结构化行上 —— 承载者、目标、时限、
+			// 响应上限、状态、失败类型。响应头只有承载者，指标只有累计数，而排障要问的是
+			// 「这一发到底用了什么时限」。落库是待裁决项（docs/3.0-decision-packages.md 第 4 条：
+			// 一张表 = store 三方言各一遍迁移），这里只做日志面。
+			//
+			// attempt 里带着 APIKey 与 Body，它们不得跨出这一跳（§2.9），所以字段是逐个
+			// 点名取的，不是把 attempt 整个打出来。
+			reasonText := reason
+			if reasonText == "" {
+				reasonText = exchangeReasonNone
+			}
+			s.log.Infof("event=executor_exchange request_id=%s executor=%s provider=%s model=%s upstream_model=%s protocol=%s timeout_ms=%d max_response_bytes=%d status=%d reason=%s",
+				requestID, del.name, del.attempt.Provider, del.attempt.Model, del.attempt.UpstreamModel,
+				del.attempt.Protocol, del.attempt.Timeout.Milliseconds(), del.attempt.MaxResponseBytes,
+				exchangedStatus, reasonText)
 		} else {
 			var upBody []byte
 			upBody, xErr = rewriteModelBody(raw, cand.UpstreamModel, probe.Stream)

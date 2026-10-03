@@ -103,7 +103,10 @@ sleep 0.6
 
 echo "=== 起网关（多用户模式）==="
 export LLMPROXY_HOME=$H
-"$BIN" start > "$H/svc.log" 2>&1 &
+# GWLOG = 当前活着那个进程实例的日志面。§22 会停启两次，后面的节要读的是**这一份**：
+# 写死 svc.log 会让「记录没落地」与「读错了文件」在断言里长得一模一样。
+GWLOG="$H/svc.log"
+"$BIN" start > "$GWLOG" 2>&1 &
 for _ in $(seq 1 40); do
   curl -sf "$GW/healthz" >/dev/null 2>&1 && break
   sleep 0.25
@@ -610,7 +613,8 @@ else
 fi
 
 # 22b. 重开：数据原样
-"$BIN" start > "$H/svc2.log" 2>&1 &
+GWLOG="$H/svc2.log"
+"$BIN" start > "$GWLOG" 2>&1 &
 for _ in $(seq 1 40); do
   curl -sf "$GW/healthz" >/dev/null 2>&1 && break
   sleep 0.25
@@ -640,7 +644,8 @@ if [ -n "$PID" ]; then
   # 崩溃不会清 PID 文件：先让 stop 把陈旧 pid 抹掉，否则 start 会拒「已在运行」
   LLMPROXY_HOME=$H "$BIN" stop >/dev/null 2>&1 || true
   rm -f "$H/llmproxy.pid"
-  "$BIN" start > "$H/svc3.log" 2>&1 &
+  GWLOG="$H/svc3.log"
+  "$BIN" start > "$GWLOG" 2>&1 &
   for _ in $(seq 1 40); do
     curl -sf "$GW/healthz" >/dev/null 2>&1 && break
     sleep 0.25
@@ -756,6 +761,27 @@ if [ "${EXCH:-0}" -ge 2 ] && [ "${HB:-0}" -ge 2 ]; then
   pass "执行器交换次数同时进了 /metrics 与 /healthz（$EXCH / ${HB}）"
 else
   fail "委托发生了却没长指标：/metrics=$EXCH /healthz=$HB"
+fi
+# §3.F 执行记录：真进程上「这一发到底用了什么时限」只能从日志里读 —— 响应头只服务
+# 当前那一发，指标只有累计数。这一条也在证明记录落的是**这个进程写出去的那份 stdout**：
+# e2e 的配置没开日志文件（log.file 缺省），所以 svc.log 就是它唯一的日志面。
+REC_RID="e2e-exec-rec-$$"
+curl -s -o /dev/null -X POST "$GW/v1/chat/completions" -H "Authorization: Bearer $A_TOKEN" \
+  -H "X-Request-Id: $REC_RID" -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}'
+sleep 0.4
+RECLINE=$(grep "event=executor_exchange" "$GWLOG" | grep "$REC_RID" | tail -1)
+if [ -n "$RECLINE" ]; then pass "真实进程的日志里留下了这次委托的执行记录"
+else fail "委托跑过了却没写执行记录（$GWLOG 里没有）：$(tail -3 "$GWLOG" | tr '\n' ' ')"; fi
+for f in "executor=http-openai" "provider=alice-up" "timeout_ms=" "max_response_bytes=" "status=200" "reason=-"; do
+  if [ -n "$RECLINE" ] && echo "$RECLINE" | grep -q "$f"; then pass "执行记录带 ${f%=}"
+  else fail "执行记录缺 ${f%=}：$RECLINE"; fi
+done
+# 泄漏面：记录只点名字段，attempt 里的密钥与正文不得跨出这一跳（§2.9）。
+if grep "event=executor_exchange" "$GWLOG" | grep -q "sk-alice-own-1234"; then
+  fail "执行记录里出现上游密钥明文"
+else
+  pass "执行记录不含上游密钥明文"
 fi
 RID="e2e-trace-$$"
 curl -s -o /dev/null -X POST "$GW/v1/chat/completions" -H "Authorization: Bearer $A_TOKEN" \

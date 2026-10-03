@@ -59,6 +59,9 @@ const (
 	executorRejectChannel      = "channel_build_failed"
 	executorSkipPlanDrift      = "plan_upstream_mismatch"
 	executorReasonUnclassified = "wiring_unclassified"
+	// exchangeReasonNone 是执行记录里「这次交换没有失败码」的写法。空串在日志里
+	// 会塌成一个看不见的字段，而 reason= 这一位正是用来区分「成功」与「没记上」。
+	exchangeReasonNone = "-"
 )
 
 // executorChannelMax 是执行器实例缓存的条数上限。一条 = 一个（执行器, 归属, 代理）
