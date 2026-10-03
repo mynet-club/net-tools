@@ -107,7 +107,7 @@ llmproxy-v1.2.3-linux-amd64.tar.gz
 SHA256SUMS
 ```
 
-三点值得说明：
+四点值得说明：
 
 - **不需要交叉工具链**：`CGO_ENABLED=0`，因为 SQLite 用的是 `modernc.org/sqlite`（纯 Go 实现）。
   一条命令就能出四个平台，脚本还会把 `GOOS/GOARCH/CGO_ENABLED` 从二进制里读回来核对一遍。
@@ -116,6 +116,12 @@ SHA256SUMS
   `-ldflags "-X .../internal/config.Version=v1.2.3"` 把 tag 写进去，
   所以 `llmproxy version` 报的永远是发布时的 tag，不用手工改源码。
   工作区有未提交改动时会自动标成 `1.2.3-dirty`，防止把半成品当正式版发出去。
+- **发行件可以直接当被测对象**：解包后
+  `LLMPROXY_BIN=<解包目录>/llmproxy bash scripts/e2e-multiuser.sh`
+  会让整套端到端（含第 23 节那 43 条 3.0 断言：发布 → shadow → enforce → 采集导出 → 跨进程
+  回放 → 回滚 → legacy 拒切）跑在**将要发出去的那个文件**上，而不是 `go build` 的等价物 ——
+  管理台是 `go:embed` 编进二进制的，只有跑产物才能证明它随包发出去了。假上游仍从源码编译，
+  它是夹具不是被测对象。
 
 ### 发布
 

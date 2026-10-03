@@ -6,13 +6,16 @@
 # 它自己在一个临时运行时目录里起一个独立实例（独立端口、独立数据库）。
 #
 # 用法：bash scripts/e2e-multiuser.sh
+#       LLMPROXY_BIN=/path/to/llmproxy bash scripts/e2e-multiuser.sh
+#   给了 LLMPROXY_BIN 就不编译网关 —— 这一跑验的是那个产物本身（§3.I 的发布与回滚演练：
+#   要练的是将要发出去的那个文件，不是 `go build` 出来的等价物）。假上游仍从源码编译。
 set -u
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SRC="$ROOT"
 H=$(mktemp -d /tmp/llmproxy-e2e.XXXXXX)
 STUB=$H/e2estub
-BIN=$H/llmproxy
+BIN=${LLMPROXY_BIN:-$H/llmproxy}
 PASS=0; FAIL=0
 
 # 端口全部动态取，避免和上一次运行的残留实例撞车
@@ -39,7 +42,13 @@ cleanup() {
 trap cleanup EXIT
 
 echo "=== 编译（二进制与假上游都放临时目录，不污染仓库）==="
-(cd "$SRC" && go build -o "$BIN" ./cmd/llmproxy && go build -o "$STUB" ./cmd/e2estub) || exit 1
+if [ "${BIN}" = "${H}/llmproxy" ]; then
+  (cd "$SRC" && go build -o "$BIN" ./cmd/llmproxy) || exit 1
+else
+  [ -x "$BIN" ] || { echo "  [NG] LLMPROXY_BIN 不可执行：$BIN"; exit 1; }
+  echo "  网关用外部产物：${BIN}（$("${BIN}" --version 2>/dev/null | head -1)）"
+fi
+(cd "$SRC" && go build -o "$STUB" ./cmd/e2estub) || exit 1
 
 echo "=== 临时运行时目录 $H ==="
 mkdir -p "$H/data" "$H/logs"
