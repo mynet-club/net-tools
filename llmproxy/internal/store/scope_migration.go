@@ -115,12 +115,16 @@ type ScopeMigrationReport struct {
 	ChargeUser  float64 `json:"charge_user"`
 	ChargeScope float64 `json:"charge_scope"`
 
-	// 检查 ④：归属覆盖。
-	MappedBuckets      int64    `json:"mapped_buckets"`      // provider_stats 映射出的桶数
-	MappedPrices       int64    `json:"mapped_prices"`       // user_prices 映射出的价目行数
-	UnknownAttribution int64    `json:"unknown_attribution"` // requests 里 scope 为 NULL 的行（刻意的）
-	OrphanScopeRows    int64    `json:"orphan_scope_rows"`   // (user,名) 在 users 里查不到的行（只报告）
-	OrphanSources      []string `json:"orphan_sources,omitempty"`
+	// 检查 ④：归属覆盖（外加版本 4 的摘要列读数）。
+	MappedBuckets      int64 `json:"mapped_buckets"`      // provider_stats 映射出的桶数
+	MappedPrices       int64 `json:"mapped_prices"`       // user_prices 映射出的价目行数
+	UnknownAttribution int64 `json:"unknown_attribution"` // requests 里 scope 为 NULL 的行（刻意的）
+	// SummaryUnknown 是 requests 里 executor 为 NULL 的行数 —— 即「这一行没有执行面事实」
+	// 有多少条。它们全部来自版本 4 之前：迁移之后的写入只会给空串（不应用）或名字（走过），
+	// 造不出 NULL。这个计数就是「NULL 与空串两读法」的账面证据，运维据此知道历史段有多长。
+	SummaryUnknown  int64    `json:"summary_unknown"`
+	OrphanScopeRows int64    `json:"orphan_scope_rows"` // (user,名) 在 users 里查不到的行（只报告）
+	OrphanSources   []string `json:"orphan_sources,omitempty"`
 
 	// 备份与恢复入口。
 	BackupPath   string `json:"backup_path,omitempty"`
@@ -139,10 +143,13 @@ type scopeSchemaState struct {
 	userPricesLegacy    bool
 	userPrices30        bool
 	requests30          bool
-	audit30             bool
-	usageUserDaily      bool // 回填来源
-	scopeQuota          bool // 目标表已存在（可能是上一轮跑到一半留下的）
-	usageScopeDaily     bool
+	// requestsExec30 是版本 4 那两列的形状位（用 executor 一列代表整组，
+	// 与 usersQuotaLegacy 同一套做法：两列是同一次补列动作的产物，不会只有一个）。
+	requestsExec30  bool
+	audit30         bool
+	usageUserDaily  bool // 回填来源
+	scopeQuota      bool // 目标表已存在（可能是上一轮跑到一半留下的）
+	usageScopeDaily bool
 	// usersQuotaLegacy 是 users 上还留着 2.x 那四列配额/限流列。它只决定**回填读哪份输入**
 	// （旧列的值 vs 全 0 初值），不参与 needsWork —— 「有没有配额列」不是 2.x 账单形状的
 	// 判据：比消费模式更早的库同样没有那四列，把它的行搬对靠的是收口校验而不是列探测。
@@ -200,6 +207,9 @@ func loadScopeSchemaState(db *sql.DB, d Dialect) (scopeSchemaState, error) {
 		}
 	}
 	if st.requests30, err = d.HasColumn(db, "requests", "scope_kind"); err != nil {
+		return st, err
+	}
+	if st.requestsExec30, err = d.HasColumn(db, "requests", "executor"); err != nil {
 		return st, err
 	}
 	if st.audit30, err = d.HasColumn(db, "audit_log", "scope_kind"); err != nil {
@@ -275,6 +285,11 @@ func migrateScopeSchema(db *sql.DB, d Dialect, pathOrDSN string) error {
 		if err := execScopeIndexes(db, d); err != nil {
 			return err
 		}
+		// 摘要列同样在这条分支补一次：与上面两条同一个理由 —— 半恢复过的库结构可能对不上，
+		// 而读侧（SELECT executor FROM requests …）第一次撞「列不存在」时没人能想到是这里。
+		if _, err := addRequestSummaryColumns(db, d); err != nil {
+			return err
+		}
 		// 再补一次旧列退役：**上一版的二进制**迁完时还没有这一步，它的库里 users 仍带着
 		// 2.x 那四列配额列（3.0 不读它们，但形状没收干净）。删不动只打提示 ——
 		// 版本号已落、结构是完整的 3.0，不该为一句收尾的 DDL 把库锁在门外。
@@ -313,6 +328,12 @@ func migrateScopeSchema(db *sql.DB, d Dialect, pathOrDSN string) error {
 		// 版本号一落，下次的早退分支虽然也会补，但那一轮的收口校验已经不再管这批账了。
 		if err := mirrorUsageScopeDailyIfEmpty(db, d); err != nil {
 			return err
+		}
+		// 版本 4 的摘要列：这条分支是「形状已经是 3.0，只有版本号要落」，
+		// 而此刻要落的版本号是 4，所以列必须先补上再盖章 —— 顺序反了就会造出一个
+		// 「版本号说列在、列其实不在」的库，那正是收口校验要拦的形状。
+		if _, err := addRequestSummaryColumns(db, d); err != nil {
+			return fmt.Errorf("%w: 补执行面摘要列失败: %w", ErrScopeMigration, err)
 		}
 		if err := stampScopeSchemaVersion(db, d, scopeBackup{}, time.Now()); err != nil {
 			return err
@@ -687,6 +708,7 @@ func (p *scopeMigrationPlan) exec(q string, args ...any) error {
 //  1. 重建 provider_stats（改主键，唯一必须整表搬的一张）
 //  2. user_prices 换代（补列 + 逐行映射，不重建表 —— 保住 id 与 requests 的引用）
 //  3. 补 requests / audit_log 的列，然后才建这三张表上的范围索引
+//     3b. 补 requests 的执行面摘要列（版本 4 新增的那一位，只加列不回填）
 //  4. 回填 scope_quota（users 的 1:1 镜像）
 //  5. 回填 usage_scope_daily（usage_user_daily 的镜像，原表一行不动）
 //  6. 收口校验：四项全过才允许继续
@@ -704,6 +726,7 @@ func (p *scopeMigrationPlan) runAll(st scopeSchemaState, rep *ScopeMigrationRepo
 		{"重建 provider_stats", func() error { return p.rebuildProviderStats(st, rep) }},
 		{"换代 user_prices", func() error { return p.migrateUserPrices(st, rep) }},
 		{"补 requests/audit_log 的列", func() error { return p.addScopeColumns(st, rep) }},
+		{"补 requests 的执行面摘要列", func() error { return p.addRequestSummaryPhase() }},
 		{"回填 scope_quota", func() error { return p.backfillScopeQuota(st, rep) }},
 		{"回填 usage_scope_daily", func() error { return p.backfillUsageScopeDaily(st, rep) }},
 		{"收口校验", func() error { return p.verify(st, rep) }},
@@ -967,6 +990,80 @@ func (p *scopeMigrationPlan) addScopeColumns(st scopeSchemaState, _ *ScopeMigrat
 	return nil
 }
 
+// addRequestSummaryColumns 补齐 requests 的执行面摘要两列（版本 4，2026-10-04 裁决 4=B）。
+//
+// 只加列、一律**不回填**，理由与 requests 的归属列不同但同样硬：
+// 归属列不回填是怕猜错主体污染账单（§2.7 规则 5），这两列不回填是因为空串另有含义 ——
+// 「这次没交给执行器」是迁移之后才存在的读法，把历史行填成空串就等于替老库编造了一次
+// 「当时决定不委托」。留 NULL 才是实话：那一代形状里根本没有这件事。
+//
+// 返回实际补上的列名（可能为空），调用方据此登记补偿；重复执行是空转。
+// 三条调用路径共用这一个实现：runAll 的阶段表、「结构已是 3.0」那条早退分支、
+// 以及版本号已落时的补建分支（用外部逻辑备份半恢复过的库会走到第三条）。
+func addRequestSummaryColumns(db *sql.DB, d Dialect) ([]string, error) {
+	var missing []string
+	for _, c := range requestsExecCols30 {
+		has, err := d.HasColumn(db, "requests", c.name)
+		if err != nil {
+			return nil, err
+		}
+		if !has {
+			missing = append(missing, c.name)
+		}
+	}
+	if len(missing) == 0 {
+		return nil, nil
+	}
+	if err := addColumnsIfMissing(db, d, "requests", scopeColsMap(requestsExecCols30)); err != nil {
+		return nil, err
+	}
+	fmt.Fprintf(scopeMigrationOutput,
+		"[scope-migration] requests 补上执行面摘要列（%s）；历史行保持 NULL = 那一代没有这个事实，"+
+			"空串才是「不应用」\n", strings.Join(missing, ", "))
+	return missing, nil
+}
+
+// addRequestSummaryPhase 是 runAll 里的阶段形式：补列 + 登记「把补上的列删回去」。
+//
+// 补偿写法沿用 addScopeColumns 的那一份：DROP COLUMN 逐条执行，execMulti 认「对象本来
+// 就不存在」为可忽略，所以哪一列其实没被这次动过也不会因为撤它而失败。
+func (p *scopeMigrationPlan) addRequestSummaryPhase() error {
+	added, err := addRequestSummaryColumns(p.db, p.d)
+	if err != nil {
+		return err
+	}
+	if len(added) == 0 {
+		return nil
+	}
+	stmts := make([]string, 0, len(added))
+	for _, c := range added {
+		stmts = append(stmts, "ALTER TABLE requests DROP COLUMN "+c)
+	}
+	p.add("删掉 requests 补上的执行面摘要列", func() error {
+		return execMulti(p.db, p.d, stmts)
+	})
+	return nil
+}
+
+// checkRequestSummaryColumns 是收口校验里属于版本 4 的那一项：两列必须在。
+//
+// 只由迁移路径调用（verify），不进只读体检 —— 体检的对象可能就是还没升的 2.x 库，
+// 在那里缺列是事实而不是故障。反过来迁移走到收口时缺列，意味着补列那一步被方言差异
+// 或人工干预吃掉了，而版本号一旦落下就对外宣称「这两列可查」。
+func checkRequestSummaryColumns(db *sql.DB, d Dialect) error {
+	for _, c := range requestsExecCols30 {
+		has, err := d.HasColumn(db, "requests", c.name)
+		if err != nil {
+			return err
+		}
+		if !has {
+			return fmt.Errorf("%w: requests.%s 没补上 —— 不许把没有执行面摘要列的库标成版本 %d",
+				ErrScopeMigration, c.name, ScopeSchemaVersion)
+		}
+	}
+	return nil
+}
+
 // writeScopeQuotaRows 落「每个 user 一行配额」这件事：先按旧列覆盖已有行，再补没有的键。
 //
 // 输入按 st.usersQuotaLegacy 二选一（见 backfillScopeQuota），两条语句都**不删行**，
@@ -1169,7 +1266,8 @@ func mirrorUsageScopeDailyIfEmpty(db *sql.DB, d Dialect) error {
 
 // ------------------------------------------------------------------ 收口校验
 
-// verify 跑手册 §2.7 交付要求的四项检查；任一项不过就返回错误（触发补偿 + 拒绝启动）。
+// verify 跑手册 §2.7 交付要求的四项检查，再加版本 4 自己的形状检查（⑤）；
+// 任一项不过就返回错误（触发补偿 + 拒绝启动）。
 //
 // scopeMigrationFault 让「DDL 已做完之后才失败」这条路径可被测试覆盖。
 func (p *scopeMigrationPlan) verify(st scopeSchemaState, rep *ScopeMigrationReport) error {
@@ -1264,7 +1362,14 @@ func (p *scopeMigrationPlan) verify(st scopeSchemaState, rep *ScopeMigrationRepo
 	if err := checkScopeCoverage(p.db, p.d, rep); err != nil {
 		return err
 	}
-	return injectFault("归属覆盖")
+	if err := injectFault("归属覆盖"); err != nil {
+		return err
+	}
+	// ⑤ 版本 4 的形状：执行面摘要两列必须在，否则「版本 4」这个盖章是空头承诺。
+	if err := checkRequestSummaryColumns(p.db, p.d); err != nil {
+		return err
+	}
+	return injectFault("执行面摘要列")
 }
 
 func pkCheckTables() []struct {
@@ -1403,6 +1508,18 @@ func checkScopeCoverage(db *sql.DB, d Dialect, rep *ScopeMigrationReport) error 
 			return err
 		}
 		rep.UnknownAttribution = n
+	}
+	// 摘要列的 NULL 读数：只在列已经补上之后才有意义（2.x 库上这里直接跳过 ——
+	// 那时候「没有这一列的事实」是整张表的形状，不是一个可计数的行状态）。
+	// 它只报告，不判失败：历史行留 NULL 正是裁决要的形态。
+	if ok, err := d.HasColumn(db, "requests", "executor"); err != nil {
+		return err
+	} else if ok {
+		n, err := dbScalarInt(db, d, `SELECT COUNT(*) FROM requests WHERE executor IS NULL`)
+		if err != nil {
+			return err
+		}
+		rep.SummaryUnknown = n
 	}
 	// scope_quota 的孤儿 = 硬失败。
 	if err := checkNoOrphanScope(db, d, "scope_quota", true); err != nil {

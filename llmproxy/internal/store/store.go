@@ -79,6 +79,19 @@ type RequestRecord struct {
 	RoutingEpoch     string
 	RoutingSeed      string
 	CandidatesDigest string
+
+	// 执行面摘要（2026-10-04 裁决第 4 条：B）：这次请求**最后一次真正发生的上游交换**
+	// 由哪个执行器承载、那一发的结果码是什么。
+	//
+	// 两列成对，取值口径见 scope_schema.go 的 requestsExecCols30：空串 = 「事实是不应用」
+	// （这一次请求没有一次交换交给执行器，或者根本没出网），而 NULL = 「这一行没有执行面
+	// 事实」（只有版本 4 之前的历史行才是它，写入侧造不出 NULL）。
+	// '-' 表示「走了执行器、那一发没有失败码」。
+	//
+	// 被拒不出网的候选（计划声明了本网关注册不上的执行器名）不改写这两列 ——
+	// 那一发压根没发生，与 rec.Provider 只记「最后真打过的那家」同一条口径。
+	Executor       string
+	ExchangeReason string
 }
 
 // UsageRow 是统计查询的一行结果。
@@ -225,7 +238,9 @@ CREATE TABLE IF NOT EXISTS requests (
   -- 3.0 §2.7 规则 2 + §2.8：归属范围与路由决策痕迹，全部可空 ——
   -- 静态 key 的请求没有归属范围，2.x 的历史行也一律不回填（猜的归属会污染账单，规则 5）。
   -- 这里同样**没有任何正文/提示词列**，列定义见 scope_schema.go。
-` + scopeColsFragment(requestsScopeCols30) + `
+` + scopeColsFragment(requestsScopeCols30) + `,
+  -- 执行面摘要两列（§2.8 + 2026-10-04 裁决 4=B）：可空，且 NULL 与空串两种读法必须留着
+` + scopeColsFragment(requestsExecCols30) + `
 );
 CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
 CREATE INDEX IF NOT EXISTS idx_requests_provider_ts ON requests(provider, ts);
@@ -592,8 +607,9 @@ INSERT INTO requests (
   prompt_tokens, completion_tokens, total_tokens,
   attempts, error_type, error_msg,
   cache_write_tokens, price_upstream_id, cost_upstream, price_downstream_id, charge, currency,
-  scope_kind, scope_id, policy_version, routing_epoch, routing_seed, candidates_digest
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+  scope_kind, scope_id, policy_version, routing_epoch, routing_seed, candidates_digest,
+  executor, exchange_reason
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		nowMs(rec.Ts), rec.RequestID, rec.ClientKeyHash, rec.ClientLabel, rec.ClientIP,
 		model, provider, rec.UpstreamModel, stream,
 		nullable(int64(rec.StatusCode)), map[bool]int{true: 1, false: 0}[rec.OK],
@@ -607,6 +623,9 @@ INSERT INTO requests (
 		scopeCol(scoped, scope.Kind), scopeIDCol(scoped, scope.ID),
 		emptyToNil(rec.PolicyVersion), emptyToNil(rec.RoutingEpoch),
 		emptyToNil(rec.RoutingSeed), emptyToNil(rec.CandidatesDigest),
+		// 执行面摘要**不走 emptyToNil**：这里的空串是有意义的取值（「没交给执行器」），
+		// 落成 NULL 就把「不应用」和「没有这一列的事实」并成一格了（见 requestsExecCols30）。
+		rec.Executor, rec.ExchangeReason,
 	)
 	if err != nil {
 		return fmt.Errorf("写入 requests 失败: %w", err)

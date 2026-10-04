@@ -58,10 +58,17 @@ INSERT INTO provider_stats (scope, name, enabled, total_requests, total_failures
 INSERT INTO user_prices (scope, model, in_miss, out, valid_from, created_at)
   VALUES ('default', 'gpt-4o', 2.5, 10, 1, 1), ('user:alice', 'gpt-4o', 1.5, 6, 1, 1);
 -- requests 也留一张：它没有拼接归属列，但有账单，是「迁移不许动明细行」最硬的样本。
+-- 那六个 2.x 就有的原始列是刻意写全的：迁移后的库要能被 InsertRequest 写进去，
+-- 「老行 NULL / 迁移后的行空串」这两格才会出现在同一张表里，测试才分得出它们。
+-- 只缺这一张表的原始列会让写路径在 fixture 上报「列不存在」，而生产上根本不会。
 CREATE TABLE requests (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, request_id TEXT NOT NULL,
-  client_key_hash TEXT, model TEXT NOT NULL, provider TEXT, ok INTEGER NOT NULL DEFAULT 0,
-  latency_ms INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER,
+  client_key_hash TEXT, client_label TEXT, client_ip TEXT,
+  model TEXT NOT NULL, provider TEXT, upstream_model TEXT,
+  stream INTEGER NOT NULL DEFAULT 0, status_code INTEGER,
+  ok INTEGER NOT NULL DEFAULT 0,
+  latency_ms INTEGER, ttft_ms INTEGER,
+  prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER,
   attempts INTEGER NOT NULL DEFAULT 0, error_type TEXT, error_msg TEXT
 );
 INSERT INTO requests (ts, request_id, model, provider, ok) VALUES (1, 'old-req', 'gpt-4o', 'pool-a', 1);

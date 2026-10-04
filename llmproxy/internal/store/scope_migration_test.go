@@ -229,8 +229,11 @@ func TestScopeMigrationRollsBackOnLateVerifyFailure(t *testing.T) {
 	if has, err := columnExists(db, "provider_stats", "scope"); err != nil || !has {
 		t.Errorf("回滚后 provider_stats.scope 应当还在（那是唯一的退路）: has=%v err=%v", has, err)
 	}
+	// 执行面摘要两列（版本 4）和 scope 两列一样是本轮补的，回滚必须一并撤掉：
+	// 留着它们，「结构退回 2.x」这句话就是假的——老库会被读成「有摘要列、只是没值」。
 	for _, t2 := range []struct{ table, col string }{
-		{"provider_stats", "scope_kind"}, {"user_prices", "scope_id"}, {"requests", "routing_seed"},
+		{"provider_stats", "scope_kind"}, {"user_prices", "scope_id"},
+		{"requests", "routing_seed"}, {"requests", "executor"}, {"requests", "exchange_reason"},
 	} {
 		if has, err := columnExists(db, t2.table, t2.col); err != nil || has {
 			t.Errorf("回滚后 %s.%s 不该存在: has=%v err=%v", t2.table, t2.col, has, err)
@@ -272,7 +275,7 @@ func TestScopeMigrationRollsBackOnLateVerifyFailure(t *testing.T) {
 		t.Errorf("迁移完成后拼接列必须消失: has=%v err=%v", has, err)
 	}
 	// 补列路径也要走通：回滚删掉的列，第二轮得重新补上，且明细行还是那一条。
-	for _, col := range []string{"scope_kind", "routing_seed"} {
+	for _, col := range []string{"scope_kind", "routing_seed", "executor", "exchange_reason"} {
 		if has, err := columnExists(s.db, "requests", col); err != nil || !has {
 			t.Errorf("第二轮迁移后 requests.%s 应当存在: has=%v err=%v", col, has, err)
 		}
@@ -568,4 +571,174 @@ func hasScopeUsageRows(t *testing.T, s *Store, scope policy.ScopeRef) bool {
 		t.Fatal(err)
 	}
 	return n > 0
+}
+
+// scanRequestSummary 读回一条请求的执行面摘要。
+//
+// 刻意用 sql.NullString：这三种读法（NULL / 空串 / 有值）的区别就是裁决第 4 条的全部
+// 落点，用 string 扫会把 NULL 塌成空串，测试当场变成空跑。
+func scanRequestSummary(t *testing.T, s *Store, requestID string) (sql.NullString, sql.NullString) {
+	t.Helper()
+	var exe, reason sql.NullString
+	if err := s.db.QueryRow(`SELECT executor, exchange_reason FROM requests WHERE request_id=?`,
+		requestID).Scan(&exe, &reason); err != nil {
+		t.Fatalf("读 %s 的执行面摘要失败: %v", requestID, err)
+	}
+	return exe, reason
+}
+
+// assertSummaryNULL 断言「这一行没有执行面事实」。
+func assertSummaryNULL(t *testing.T, s *Store, requestID, why string) {
+	t.Helper()
+	exe, reason := scanRequestSummary(t, s, requestID)
+	if exe.Valid || reason.Valid {
+		t.Errorf("%s：executor/exchange_reason 都该是 NULL（%s），实际 %q(valid=%v) / %q(valid=%v)",
+			requestID, why, exe.String, exe.Valid, reason.String, reason.Valid)
+	}
+}
+
+// assertSummary 断言摘要两列的确切取值（want 为空串时读出的就是「不应用」）。
+func assertSummary(t *testing.T, s *Store, requestID, wantExecutor, wantReason, why string) {
+	t.Helper()
+	exe, reason := scanRequestSummary(t, s, requestID)
+	if !exe.Valid || !reason.Valid {
+		t.Errorf("%s：两列都该是有值的一格（%s），实际 executor valid=%v / reason valid=%v",
+			requestID, why, exe.Valid, reason.Valid)
+		return
+	}
+	if exe.String != wantExecutor || reason.String != wantReason {
+		t.Errorf("%s：摘要不对（%s），期望 %q/%q，实际 %q/%q",
+			requestID, why, wantExecutor, wantReason, exe.String, reason.String)
+	}
+}
+
+// TestRequestSummaryColumnsAreNotBackfilled 钉住版本 4 迁移的「补列不回填」那半条裁决。
+//
+// 2026-10-04 裁决第 4 条（B）要求新查询能分清两件事：「没有这一列的事实」与
+// 「事实是不应用」。这两格只有靠历史行保持 NULL 才分得开 —— 迁移把老行填成空串，
+// 就等于替 2.x 编造了一次「当时决定不走执行器」，而那时执行器还不存在。
+//
+// 同时钉住写入侧：迁移之后的行永远落在另外两格里，读侧因此可以按「NULL 只可能是历史」
+// 来解释计数，而不必去比对时间戳。
+func TestRequestSummaryColumnsAreNotBackfilled(t *testing.T) {
+	s := openTestStoreAt(t, newLegacyScopeDBFile(t))
+
+	if v, err := s.AppliedScopeSchemaVersion(); err != nil || v != ScopeSchemaVersion {
+		t.Fatalf("迁移应当盖到版本 %d: %d err=%v", ScopeSchemaVersion, v, err)
+	}
+	// fixture 里那条 requests 行（old-req）是 2.x 时代的账单。
+	assertSummaryNULL(t, s, "old-req", "历史行不许回填")
+
+	alice := policy.MustScope(policy.ScopeUser, "alice")
+	if err := s.CreateUser("alice", TokenHash("sk-alice")); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	// 没交给执行器的一次（2.x 传输）：两列都是空串。
+	if err := s.InsertRequest(RequestRecord{
+		Ts: now, RequestID: "legacy-transport", Scope: alice,
+		Model: "deepseek-flash", Provider: "p1", OK: true, StatusCode: 200,
+	}); err != nil {
+		t.Fatalf("InsertRequest: %v", err)
+	}
+	// 交给执行器、且那一发超时的一次：承载者与结果码各归一位。
+	if err := s.InsertRequest(RequestRecord{
+		Ts: now, RequestID: "delegated", Scope: alice,
+		Model: "deepseek-flash", Provider: "p1", OK: false, StatusCode: 0,
+		Executor: "http-openai", ExchangeReason: "executor_timeout",
+	}); err != nil {
+		t.Fatalf("InsertRequest: %v", err)
+	}
+	assertSummary(t, s, "legacy-transport", "", "", "空串才是「不应用」这一格")
+	assertSummary(t, s, "delegated", "http-openai", "executor_timeout", "走过执行器就得留下承载者与结果码")
+
+	// 账面证据：只有历史行算「没有执行面事实」。
+	rep, err := s.ScopeMigrationReportForDialect()
+	if err != nil {
+		t.Fatalf("只读报告失败: %v", err)
+	}
+	if rep.SummaryUnknown != 1 {
+		t.Errorf("summary_unknown 应当只数历史行（1 条），实际 %d", rep.SummaryUnknown)
+	}
+}
+
+// TestNewDBRequestSummaryColumnsFromDDL 钉住新库这一侧：两列由建表语句直接带出来，
+// 不靠迁移补，因而新库里**造不出** NULL。
+//
+// 这条和上一条是同一个契约的两半：只有「NULL 只可能来自版本 4 之前」成立，
+// 按 NULL 统计历史段才是可信的；新库若也漏出 NULL，那个计数就变成两种原因的混合。
+func TestNewDBRequestSummaryColumnsFromDDL(t *testing.T) {
+	s := openTestStore(t)
+	for _, col := range []string{"executor", "exchange_reason"} {
+		if has, err := columnExists(s.db, "requests", col); err != nil || !has {
+			t.Errorf("新库的 requests.%s 应当由 DDL 直接建出来: has=%v err=%v", col, has, err)
+		}
+	}
+	bob := policy.MustScope(policy.ScopeUser, "bob")
+	if err := s.CreateUser("bob", TokenHash("sk-bob")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertRequest(RequestRecord{
+		Ts: time.Now(), RequestID: "fresh", Scope: bob,
+		Model: "m", Provider: "p1", OK: true, StatusCode: 200,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertSummary(t, s, "fresh", "", "", "新库不委托的一发也必须落在空串格里")
+
+	rep, err := s.ScopeMigrationReportForDialect()
+	if err != nil {
+		t.Fatalf("只读报告失败: %v", err)
+	}
+	if rep.SummaryUnknown != 0 {
+		t.Errorf("新库不该有「没有执行面事实」的行: %d", rep.SummaryUnknown)
+	}
+}
+
+// TestRequestSummaryColumnsHealAfterVersionThree 钉住第三条调用路径：
+// 结构已经是 3.0（版本 3 迁完）、只有版本号要往前走的库。
+//
+// 现网真有这种库 —— 上一版二进制迁的就是版本 3。它打开时 needsWork() 为假，
+// 走的是「不动数据、不建备份、直接盖章」那条最短的分支；如果补列没挂在那条分支上，
+// 这些库会带着一个「版本 4 却没有两列」的形状启动，而读侧第一次撞「列不存在」时
+// 没人能想到原因在启动序列里。
+func TestRequestSummaryColumnsHealAfterVersionThree(t *testing.T) {
+	path := newLegacyScopeDBFile(t)
+	s := openTestStoreAt(t, path)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 退回「版本 3 迁完」的形状：列删掉、版本号改成 3（其余结构不动）。
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, col := range []string{"executor", "exchange_reason"} {
+		if _, err := db.Exec("ALTER TABLE requests DROP COLUMN " + col); err != nil {
+			t.Fatalf("撤掉 %s 失败: %v", col, err)
+		}
+	}
+	if err := metaSetInt(db, SQLiteDialect{}, metaScopeSchemaVersion, 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2 := openTestStoreAt(t, path)
+	if v, err := s2.AppliedScopeSchemaVersion(); err != nil || v != ScopeSchemaVersion {
+		t.Fatalf("版本 3 的库必须升到 %d: %d err=%v", ScopeSchemaVersion, v, err)
+	}
+	for _, col := range []string{"executor", "exchange_reason"} {
+		if has, err := columnExists(s2.db, "requests", col); err != nil || !has {
+			t.Errorf("补建之后 requests.%s 必须存在: has=%v err=%v", col, has, err)
+		}
+	}
+	// 补建只加列，一样不许回填：那条历史行还是 NULL。
+	assertSummaryNULL(t, s2, "old-req", "补建路径同样不许回填")
+	// 明细行没被这次启动动过。
+	if n, err := dbScalarInt(s2.db, s2.dialect, "SELECT COUNT(*) FROM requests"); err != nil || n != 1 {
+		t.Errorf("补建不该增删 requests 行: %d err=%v", n, err)
+	}
 }

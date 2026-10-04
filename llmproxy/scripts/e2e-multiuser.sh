@@ -899,6 +899,31 @@ sqlite3 "$DB" "SELECT COUNT(*) FROM audit_log WHERE detail LIKE '%sk-%';" | grep
   && pass "审计 detail 里没有密钥明文" || fail "审计里翻出了疑似密钥"
 echo "    本节的策略/回放写侧审计：$(sqlite3 "$DB" "SELECT group_concat(action||'@'||scope_kind||':'||scope_id, ' | ') FROM audit_log WHERE action LIKE 'policy.%' OR action LIKE 'replay.%';")"
 
+# 23j 执行面摘要列（2026-10-04 裁决第 4 条：B）：落库那一半必须在真进程上读得回。
+# 这一节只查三件事，它们各自对应一条「不这么做就会有的读法」：
+#   - 委托那发要在明细里留下承载者与结果码 —— 否则「这一发走了执行器」只有会滚的日志知道；
+#   - 没委托那发要留**空串**而不是 NULL —— 空串才是「事实是不应用」，NULL 留给版本 4 之前的历史行；
+#   - 两列只能装标签，装不下正文与密钥（列宽 64 的上界见 scope_schema.go）。
+LEG_RID="e2e-exec-summary-legacy-$$"
+curl -s -o /dev/null -X POST "$GW/v1/chat/completions" -H "Authorization: Bearer $A_TOKEN" \
+  -H "X-Request-Id: $LEG_RID" -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}'
+sleep 0.4
+chk "委托那发的摘要落进了请求明细" \
+  "$(sqlite3 "$DB" "SELECT executor||'|'||exchange_reason FROM requests WHERE request_id='$REC_RID';")" \
+  "http-openai|-"
+# legacy 模式下没有计划、也就没有计划声明的执行器：这一发走的是 2.x 传输。
+# 留着上一发的值，就等于让明细行声称「这次请求由 http-openai 承载」，而答复客户端的那一发不是它打的。
+chk "2.x 传输那发显式回到「不应用」（空串，不是 NULL）" \
+  "$(sqlite3 "$DB" "SELECT CASE WHEN executor IS NULL THEN 'NULL' WHEN exchange_reason IS NULL THEN 'NULL' ELSE executor||'|'||exchange_reason END FROM requests WHERE request_id='$LEG_RID';")" \
+  "|"
+# 这个库是本次演练新建的：NULL 那一格只有版本 4 之前的历史行才够得着（迁移一律不回填）。
+NULLS=$(sqlite3 "$DB" "SELECT COUNT(*) FROM requests WHERE executor IS NULL OR exchange_reason IS NULL;")
+chk "新库的明细里没有「没有这个事实」的那一格" "$NULLS" "0"
+LEAKY=$(sqlite3 "$DB" "SELECT COUNT(*) FROM requests WHERE length(executor)>64 OR length(exchange_reason)>64 OR executor LIKE '% %' OR exchange_reason LIKE '% %' OR executor LIKE '%sk-%' OR exchange_reason LIKE '%sk-%' OR exchange_reason LIKE '%Bearer%';")
+chk "摘要两列里没有正文、密钥或多于标签的形状" "$LEAKY" "0"
+echo "    摘要列读数：$(sqlite3 "$DB" "SELECT group_concat(executor||'/'||exchange_reason, ' | ') FROM (SELECT executor, exchange_reason FROM requests ORDER BY id DESC LIMIT 4);")"
+
 echo
 echo "================ 结果：通过 $PASS 项，失败 $FAIL 项 ================"
 [ "$FAIL" -eq 0 ] || exit 1

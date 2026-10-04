@@ -13,6 +13,7 @@ package store
 // 跳过条件写死在 openIntegration：环境变量为空就 t.Skip，绝不静默假绿。
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 	"strings"
@@ -96,6 +97,65 @@ func runIntegrationSuite(t *testing.T, driver, pathOrDSN string) {
 	}
 	if len(rows) != 1 || rows[0].Charge != 3.5 {
 		t.Fatalf("冻结金额应当回来: %+v", rows)
+	}
+
+	// 执行面摘要两列（2026-10-04 裁决第 4 条：B）在真库上必须同时成立三件事，
+	// 每一件都只在某一种驱动上坏：
+	//   - 列建得出来：列定义是 SQLite 形状，VARCHAR(64) 要经 RewriteDDL 翻译；
+	//   - 33 列配 33 个值：占位符数错一位，SQLite 当场报，MySQL 报的是列数不匹配；
+	//   - 空串写成空串：这里的空串是有意义的一格（「这次没交给执行器」），
+	//     被 NULL 顶掉就把「不应用」和「没有这个事实」并成了一格。
+	if err := s.InsertRequest(RequestRecord{
+		Ts: time.Now(), RequestID: "it-exec-" + uid, UserName: uid, Model: model,
+		Provider: prov, UpstreamModel: "m-up", SystemPaid: true, OK: false,
+		Executor: "http-openai", ExchangeReason: "executor_timeout",
+	}); err != nil {
+		t.Fatalf("%s: 写带执行面摘要的 requests 失败: %v", driver, err)
+	}
+	for _, tc := range []struct{ id, exec, reason string }{
+		{"it-" + uid, "", ""},
+		{"it-exec-" + uid, "http-openai", "executor_timeout"},
+	} {
+		var gotExec, gotReason sql.NullString
+		if err := s.db.QueryRow(s.dialect.Rebind(
+			`SELECT executor, exchange_reason FROM requests WHERE request_id=?`), tc.id).
+			Scan(&gotExec, &gotReason); err != nil {
+			t.Fatalf("%s: 读 %s 的执行面摘要失败: %v", driver, tc.id, err)
+		}
+		if !gotExec.Valid || !gotReason.Valid {
+			t.Errorf("%s: %s 的摘要读成 NULL（valid=%v/%v），新建的库不该有那一格",
+				driver, tc.id, gotExec.Valid, gotReason.Valid)
+			continue
+		}
+		if gotExec.String != tc.exec || gotReason.String != tc.reason {
+			t.Errorf("%s: %s 摘要 = %q/%q，期望 %q/%q", driver, tc.id, gotExec.String, gotReason.String, tc.exec, tc.reason)
+		}
+	}
+
+	// 真库上的补列：把两列撤掉再走生产那条路径补回来。
+	// 之所以在真库上撤/补而不是只查建表语句 —— 「ALTER 语法各家不收」与
+	// 「类型没翻译」这两类坏法，只有在对方言的真实服务器上才露得出来；
+	// 顺带钉住补列不回填：撤列再补之后，已有行一律读成 NULL。
+	total, err := dbScalarInt(s.db, s.dialect, "SELECT COUNT(*) FROM requests")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range requestsExecCols30 {
+		if _, err := s.db.Exec(s.dialect.Rebind("ALTER TABLE requests DROP COLUMN " + c.name)); err != nil {
+			t.Fatalf("%s: 撤掉 requests.%s 失败（补列断言的前置）: %v", driver, c.name, err)
+		}
+	}
+	added, err := addRequestSummaryColumns(s.db, s.dialect)
+	if err != nil {
+		t.Fatalf("%s: 补执行面摘要列失败: %v", driver, err)
+	}
+	if len(added) != len(requestsExecCols30) {
+		t.Errorf("%s: 两列都撤掉了，补列应当报补上 %d 列，实际 %d", driver, len(requestsExecCols30), len(added))
+	}
+	if n, err := dbScalarInt(s.db, s.dialect, "SELECT COUNT(*) FROM requests WHERE executor IS NULL"); err != nil {
+		t.Fatal(err)
+	} else if n != total {
+		t.Errorf("%s: 补列之后 %d 行全都该读成 NULL（不回填），实际 %d 行", driver, total, n)
 	}
 
 	// RowCharge 全冻结直接取冻结值 —— 与驱动无关

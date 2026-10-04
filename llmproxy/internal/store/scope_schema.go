@@ -118,6 +118,32 @@ var requestsScopeCols30 = []scopeColumn{
 	{"candidates_digest", "VARCHAR(64)"},
 }
 
+// requestsExecCols30 是执行面摘要两列（2026-10-04 裁决第 4 条：B —— 只加摘要列，不建明细表）。
+//
+// 一列一个事实，且**只有**摘要：承载这次交换的执行器名、那一发的结果码。
+// 时限、响应上限、协议形态都不在这里 —— 前两个是「这一发怎么配的」（日志面已经逐发记下，
+// 且随配置变），第三个由名字唯一决定，重复存一份就是第二个事实源。
+//
+// 与 requestsScopeCols30 **刻意分成两份清单**：那一份属于版本 3 的 scope 迁移，
+// 已经落过版本号的库不会再走一遍它的补列步骤。这一份挂在版本 4 上（见 scope.go），
+// 由 addRequestSummaryColumns 独立补齐。
+//
+// NULL 与空串是两件事，这里是整条裁决的落点：
+//   - NULL = 「这一行没有执行面事实」—— 只有版本 4 之前的历史行才是这个形状，迁移一律不回填；
+//   - ”   = 「事实是不应用」—— 迁移之后的写入，这次请求没有一次交换交给执行器；
+//   - 非空 = 最后一次真正发生的上游交换的承载者 / 其结果码（无失败码时是 '-'）。
+//
+// 把历史行填成空串就把前两种读法并成一格，而「上周有没有走过执行器」与
+// 「上周有多少请求压根没委托」是两个不同的问题 —— 这正是裁决要求必须分开的口径。
+//
+// 列宽 64 的依据是两个取值集合的上界：执行器名今天只有 `http-openai` 一个（由
+// internal/server 的通道表注册），结果码是 internal/executor/reasons.go 的封闭标签
+// （最长 `executor_upstream_client_status`，31 字节）外加接线侧的 '-' 与两个固定值。
+var requestsExecCols30 = []scopeColumn{
+	{"executor", "VARCHAR(64)"},
+	{"exchange_reason", "VARCHAR(64)"},
+}
+
 // auditScopeCols30 是审计表的 scope 维度。
 //
 // 与 requests 相反：audit_log 在 2.x 只记管理员操作，那些操作**本来就**属于

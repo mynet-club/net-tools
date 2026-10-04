@@ -90,31 +90,57 @@ step "SQLite 集成（基线，始终跑）"
 go test ./internal/store/ -count=1 -run 'TestIntegrationSQLite' -v
 
 
+# wait_container <容器名> <探测命令...>：最多等 60 秒，探测走容器内部执行。
+wait_container() {
+  local name="$1"; shift
+  local _
+  for _ in $(seq 1 60); do
+    if docker exec "$name" "$@" >/dev/null 2>&1; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
 start_containers() {
   command -v docker >/dev/null 2>&1 || { echo "没有 docker，跳过真库" >&2; return 1; }
   docker rm -f llmp-it-mysql llmp-it-pg >/dev/null 2>&1 || true
   step "起一次性 MySQL / PostgreSQL 容器"
-  docker run -d --name llmp-it-mysql \
-    -e MYSQL_ROOT_PASSWORD=llmp -e MYSQL_DATABASE=llmproxy_test \
-    -p 127.0.0.1:3307:3306 mysql:8.0 >/dev/null
-  docker run -d --name llmp-it-pg \
-    -e POSTGRES_PASSWORD=llmp -e POSTGRES_DB=llmproxy_test \
-    -p 127.0.0.1:5433:5432 postgres:16 >/dev/null
-  export LLMPROXY_TEST_MYSQL_DSN='root:llmp@tcp(127.0.0.1:3307)/llmproxy_test?parseTime=true'
-  export LLMPROXY_TEST_PG_DSN='postgres://postgres:llmp@127.0.0.1:5433/llmproxy_test?sslmode=disable'
-  # 等就绪
-  for i in $(seq 1 60); do
-    if docker exec llmp-it-mysql mysqladmin ping -uroot -pllmp --silent 2>/dev/null; then
-      break
+
+  # 两条腿各自独立判「容器起来了 + 探测说它就绪」，只有成立才导出对应 DSN。
+  #
+  # 为什么要改这一处：本函数是被 `start_containers || true` 调的，errexit 在里面不生效，
+  # 所以老写法在 docker run 失败后照样导出两个 DSN —— 集成测试于是红成
+  # `dial tcp 127.0.0.1:3307: connect: connection refused`。那句话说的是「结构迁移失败」,
+  # 真实原因却是「镜像没拉到」（本机撞过的原文：
+  # `error getting credentials - err: exit status 1, out: User canceled the operation.`）。
+  # 缺现场就得报成缺现场：跳过要跳过得看得见，且不带退出码，
+  # 否则矩阵的「非 0 = 有失败」这一条会被环境问题污染成代码问题。
+  local out
+  if out=$(docker run -d --name llmp-it-mysql \
+      -e MYSQL_ROOT_PASSWORD=llmp -e MYSQL_DATABASE=llmproxy_test \
+      -p 127.0.0.1:3307:3306 mysql:8.0 2>&1 >/dev/null); then
+    if wait_container llmp-it-mysql mysqladmin ping -uroot -pllmp --silent; then
+      export LLMPROXY_TEST_MYSQL_DSN='root:llmp@tcp(127.0.0.1:3307)/llmproxy_test?parseTime=true'
+    else
+      echo "  [跳过] MySQL 腿：容器起来了，但 60 秒内没就绪" >&2
     fi
-    sleep 1
-  done
-  for i in $(seq 1 60); do
-    if docker exec llmp-it-pg pg_isready -U postgres >/dev/null 2>&1; then
-      break
+  else
+    echo "  [跳过] MySQL 腿：容器没起来（缺的是现场，不是代码）。docker 原话：" >&2
+    printf '%s\n' "$out" | sed 's/^/         /' >&2
+  fi
+
+  if out=$(docker run -d --name llmp-it-pg \
+      -e POSTGRES_PASSWORD=llmp -e POSTGRES_DB=llmproxy_test \
+      -p 127.0.0.1:5433:5432 postgres:16 2>&1 >/dev/null); then
+    if wait_container llmp-it-pg pg_isready -U postgres; then
+      export LLMPROXY_TEST_PG_DSN='postgres://postgres:llmp@127.0.0.1:5433/llmproxy_test?sslmode=disable'
+    else
+      echo "  [跳过] PostgreSQL 腿：容器起来了，但 60 秒内没就绪" >&2
     fi
-    sleep 1
-  done
+  else
+    echo "  [跳过] PostgreSQL 腿：容器没起来（缺的是现场，不是代码）。docker 原话：" >&2
+    printf '%s\n' "$out" | sed 's/^/         /' >&2
+  fi
 }
 
 cleanup() {
@@ -134,14 +160,16 @@ if [ -n "${LLMPROXY_TEST_MYSQL_DSN:-}" ]; then
   step "MySQL 集成"
   go test ./internal/store/ -count=1 -run 'TestIntegrationMySQL' -v
 else
-  step "跳过 MySQL（未设 LLMPROXY_TEST_MYSQL_DSN）"
+  # 手动设了 DSN 却没跑这一腿，与 --docker 起容器失败被跳过，是两种不同的原因；
+  # 上面 start_containers 已经把后者按 docker 的原话报出来了。
+  step "跳过 MySQL（没有 LLMPROXY_TEST_MYSQL_DSN —— 外部真库请自行导出，--docker 模式下即容器没起来）"
 fi
 
 if [ -n "${LLMPROXY_TEST_PG_DSN:-}" ]; then
   step "PostgreSQL 集成"
   go test ./internal/store/ -count=1 -run 'TestIntegrationPostgres' -v
 else
-  step "跳过 PostgreSQL（未设 LLMPROXY_TEST_PG_DSN）"
+  step "跳过 PostgreSQL（没有 LLMPROXY_TEST_PG_DSN —— 同上）"
 fi
 
 echo

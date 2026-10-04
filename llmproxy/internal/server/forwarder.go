@@ -448,8 +448,12 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 			s.metrics.observeExecutorExchange(del.name, reason)
 			// 执行记录：一次委托的六项事实落在同一个结构化行上 —— 承载者、目标、时限、
 			// 响应上限、状态、失败类型。响应头只有承载者，指标只有累计数，而排障要问的是
-			// 「这一发到底用了什么时限」。落库是待裁决项（docs/3.0-decision-packages.md 第 4 条：
-			// 一张表 = store 三方言各一遍迁移），这里只做日志面。
+			// 「这一发到底用了什么时限」。
+			//
+			// 落库那一半已经按 2026-10-04 裁决第 4 条（B）接上：`requests` 上带 executor /
+			// exchange_reason 两列摘要（裁决明确**不建明细表**），日志继续承载逐发细节
+			// （时限与上限是「每一发」的事实，一次请求最多一行明细，塞不进库里就不该假称
+			// 库里能问回来）。
 			//
 			// 流式那一发会记成 timeout_ms=0 max_response_bytes=0：那是**显式声明**的
 			// 「时限在调用方 ctx 里 / 不缓存逐段透传」（同一条文档的第 2 项裁决），
@@ -461,11 +465,23 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 			if reasonText == "" {
 				reasonText = exchangeReasonNone
 			}
+			// 同一份事实也落进请求明细（2026-10-04 裁决 4=B）：日志会滚窗，而「这一小时
+			// 有没有走过执行器」要能按时间问回来。取值口径见 store.requestsExecCols30 ——
+			// 空串是「不应用」，NULL 是「这一行没有执行面事实」，所以这里必须写空串而不是留 NULL。
+			// 记的是**最后一次真正发生的交换**：一次请求最多一行明细，而重试循环里每一发
+			// 都有自己的日志行；被拒不出网的候选不写这里（那一发压根没发生）。
+			rec.Executor = del.name
+			rec.ExchangeReason = reasonText
 			s.log.Infof("event=executor_exchange request_id=%s executor=%s provider=%s model=%s upstream_model=%s protocol=%s timeout_ms=%d max_response_bytes=%d status=%d reason=%s",
 				requestID, del.name, del.attempt.Provider, del.attempt.Model, del.attempt.UpstreamModel,
 				del.attempt.Protocol, del.attempt.Timeout.Milliseconds(), del.attempt.MaxResponseBytes,
 				exchangedStatus, reasonText)
 		} else {
+			// 这一发走的是 2.x 传输。摘要列必须显式回到「不应用」：上一次尝试可能是
+			// 委托过的（计划只描述了一部分候选），留着旧值就等于让明细行声称
+			// 「这次请求由 http-openai 承载」，而最终答复客户端的那一发根本不是它打的。
+			rec.Executor = ""
+			rec.ExchangeReason = ""
 			var upBody []byte
 			upBody, xErr = rewriteModelBody(raw, cand.UpstreamModel, probe.Stream)
 			if xErr == nil {
