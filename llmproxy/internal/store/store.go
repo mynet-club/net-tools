@@ -389,7 +389,7 @@ func execSchema(db *sql.DB, d Dialect, ddl string) error {
 			if isIgnorableDDL(d, stmt, err) {
 				continue
 			}
-			return fmt.Errorf("执行 DDL 失败（%s）: %w", firstLine(stmt), err)
+			return fmt.Errorf("执行 DDL 失败（%s）: %w", ddlHead(stmt), err)
 		}
 	}
 	return nil
@@ -401,7 +401,7 @@ func isIgnorableDDL(d Dialect, stmt string, err error) bool {
 		return false
 	}
 	msg := err.Error()
-	return strings.HasPrefix(firstLine(stmt), "CREATE INDEX") &&
+	return strings.HasPrefix(ddlHead(stmt), "CREATE INDEX") &&
 		(strings.Contains(msg, "1061") || strings.Contains(msg, "Duplicate key name"))
 }
 
@@ -422,6 +422,25 @@ func firstLine(s string) string {
 		return strings.TrimSpace(s[:i])
 	}
 	return strings.TrimSpace(s)
+}
+
+// ddlHead 返回一段 DDL 里第一行真正干活的语句文本：跳过空行与 -- 注释行。
+//
+// 为什么不复用 firstLine：splitStatements 只按分号切，而 DDL 常量里习惯给索引写
+// 一行说明（scope_schema.go 的桶索引就是「注释紧贴在 CREATE INDEX 上面」的形态），
+// 于是整段的第一行是注释。凡是拿「第一行」判断语句类型的地方都会因此看错 ——
+// 代价最大的一处是 isIgnorableDDL：它认不出这是条 CREATE INDEX，重开一个已迁移的
+// MySQL 库时「重复索引名 1061」就从幂等变成硬失败（真库上实测）。
+// 报错文本也用它：说得出是哪条语句，而不是把注释当语句念出来。
+func ddlHead(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "--") {
+			continue
+		}
+		return t
+	}
+	return ""
 }
 
 // migrateProviderStatsScope 把单用户时代的 provider_stats（主键只有 name）

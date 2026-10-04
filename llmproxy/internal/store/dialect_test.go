@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -131,6 +132,57 @@ func TestSplitStatements(t *testing.T) {
 	}
 	if firstLine("CREATE TABLE a (\n  x INT\n);") != "CREATE TABLE a (" {
 		t.Errorf("firstLine = %q", firstLine("CREATE TABLE a (\n  x INT\n);"))
+	}
+}
+
+// 重开一个已迁移的 MySQL 库时，重复索引名（1061）必须按幂等吞掉。
+//
+// 为什么单独钉这一条：DDL 常量习惯在索引上面写一行说明，而 splitStatements 只按分号切，
+// 于是「整段的第一行」是注释。按第一行判语句类型时，那条 CREATE INDEX 就不认识了 ——
+// 真库腿第一次在真 MySQL 上重开时正是这样硬失败的（Error 1061 冒成迁移失败）。
+// 断言用 scopeSchema30 / scopeIndexDDL30 这两份**发货中的** DDL 逐条过，
+// 而不是手抄一行：手抄的那份会和常量各自漂移，漂走的那天这条守卫就不在测真东西了。
+func TestIsIgnorableDDLHandlesCommentPrefixedIndexes(t *testing.T) {
+	d := MySQLDialect{}
+	dupErr := fmt.Errorf("Error 1061 (42000): Duplicate key name 'idx_x'")
+
+	// 两份发货 DDL：建表段与挂在既有表上的范围索引段，都过一遍 MySQL 的 RewriteDDL
+	chunks := []string{scopeSchema30}
+	for _, ix := range scopeIndexDDL30 {
+		chunks = append(chunks, ix.ddl)
+	}
+
+	indexes := 0
+	for _, src := range chunks {
+		for _, stmt := range splitStatements(d.RewriteDDL(src)) {
+			if !strings.HasPrefix(ddlHead(stmt), "CREATE INDEX") {
+				continue
+			}
+			indexes++
+			if !isIgnorableDDL(d, stmt, dupErr) {
+				t.Errorf("重复建索引要按幂等吞掉，实际当成失败: %q", ddlHead(stmt))
+			}
+			// 同一句话术只有 1061 才吞：真出错（列不存在）必须照红。
+			if isIgnorableDDL(d, stmt, fmt.Errorf("Error 1054 (42S22): Unknown column 'scope_kind'")) {
+				t.Errorf("非「已经建过」的错误不许被吞: %q", ddlHead(stmt))
+			}
+		}
+	}
+	if indexes == 0 {
+		t.Fatal("发货 DDL 里一条 CREATE INDEX 都没扫到，夹具或切分变了")
+	}
+
+	// 带说明注释的那一形态单独钉一次（上面扫到的第一条未必带注释）。
+	commented := "-- 说明行\nCREATE INDEX idx_x ON t(a)"
+	if firstLine(commented) == ddlHead(commented) {
+		t.Errorf("ddlHead 应当跳过注释行，实际 %q", ddlHead(commented))
+	}
+	if !isIgnorableDDL(d, commented, dupErr) {
+		t.Error("注释在前的 CREATE INDEX 仍要认出语句类型")
+	}
+	// 其它方言没有「吞 1061」这回事：PG 的 IF NOT EXISTS 自己就幂等。
+	if isIgnorableDDL(PostgresDialect{}, commented, dupErr) {
+		t.Error("只有 MySQL 走这条兜底")
 	}
 }
 
