@@ -543,6 +543,64 @@ func TestPolicy30FinishPolicyFallbackCannotOverrideDeny(t *testing.T) {
 	}
 }
 
+// 一次拒绝有两个受众（2026-10-05 裁决 16′：规则标识只给管理侧）。
+//
+// 两半必须写在同一个测试里断言：只测「下游不含标识」的话，「两侧都不含」也能过 ——
+// 而那等于把 P6 花一整包建起来的取证面（哪条规则拒的、当时哪一版生效）从根上拆掉。
+// 反过来只测「管理侧含标识」也不行：那正是本次要收窄的那一半。
+func TestPolicy30DenySplitsCallerAndAdminMessage(t *testing.T) {
+	up := startMockUpstream(t, &mockUpstream{name: "a", apiKey: "sk-a"})
+	h := newHarness(t, cfgYAML(map[string]string{"a": up.baseURL}, []string{"sk-local"}))
+
+	newDenied := func() *policyShot {
+		return &policyShot{
+			Version: "t@1",
+			Decision: policy.Decision{
+				Allowed: false, Reason: policy.ReasonModelNotAllowed, PolicyVersion: "t@1",
+				Matched: []policy.MatchedRule{{
+					Subject: "role:guest", Resource: "model:secret-model", Action: "use",
+					Effect: policy.EffectDeny, Precedence: policy.PrecedenceDeny,
+				}},
+			},
+		}
+	}
+	out := h.srv.finishPolicy(&policyRuntime{mode: config.PolicyModeEnforce}, newDenied())
+	if !strings.Contains(out.Blocked, "命中规则") || !strings.Contains(out.Blocked, "role:guest") {
+		t.Errorf("管理侧那一份必须带完整规则标识（路由模拟与差异报告读它），实际 %q", out.Blocked)
+	}
+	if strings.Contains(out.BlockedForCaller, "命中规则") ||
+		strings.Contains(out.BlockedForCaller, "role:guest") {
+		t.Errorf("下游那一句不得带规则标识，实际 %q", out.BlockedForCaller)
+	}
+	// 收窄不等于把可行动的信息一起抹掉：调用方还得知道结论码与是哪一版策略不同意。
+	if !strings.Contains(out.BlockedForCaller, string(policy.ReasonModelNotAllowed)) ||
+		!strings.Contains(out.BlockedForCaller, "t@1") {
+		t.Errorf("下游那一句要留住原因码与生效版本，实际 %q", out.BlockedForCaller)
+	}
+
+	// 另一条拒绝路径（enforce 下没有可用候选）本来就不含规则标识：两侧同形且都非空。
+	// 这条对照防的是「新增分支只填 Blocked」—— 那会让一次 fail-closed 发出一条空文案，
+	// 调用方只拿到 403 而没有任何解释。
+	noop := &policyShot{
+		Version:  "t@1",
+		Decision: policy.Decision{Allowed: true, PolicyVersion: "t@1"},
+		PlanErr:  errors.New("routing: 没有可用候选"),
+	}
+	strict := h.srv.finishPolicy(&policyRuntime{mode: config.PolicyModeEnforce}, noop)
+	if strict.Blocked == "" || strict.BlockedForCaller != strict.Blocked {
+		t.Errorf("无候选那条两侧应同形且非空，实际 blocked=%q caller=%q",
+			strict.Blocked, strict.BlockedForCaller)
+	}
+
+	// 影子与允许路径：两个字段都得是空，否则「这次是否被拒」与「给下游哪一句」脱钩。
+	// 每次新建夹具：shadow 分支原样返回同一个指针，复用会让上一条 enforce 写进的两份
+	// 文案漏到这里，断言就在测夹具而不是测行为。
+	shadow := h.srv.finishPolicy(&policyRuntime{mode: config.PolicyModeShadow}, newDenied())
+	if shadow.Blocked != "" || shadow.BlockedForCaller != "" {
+		t.Errorf("影子不得产出拒绝文案，实际 %q / %q", shadow.Blocked, shadow.BlockedForCaller)
+	}
+}
+
 // ---------------------------------------------------------------- 第三类：回滚恢复
 
 // 全局回滚：mode 改成 legacy 之后，同一条被策略拒绝的请求必须恢复 2.x 行为，

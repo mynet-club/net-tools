@@ -121,7 +121,7 @@ done
 # 自证：端口上必须是我们刚起的这个实例（admin_token 是本次独有的）
 code=$(curl -s -o /dev/null -w '%{http_code}' "$GW/v1/_admin/users" -H "Authorization: Bearer $ADMIN")
 if [ "$code" != "200" ]; then
-  echo "  [NG] $GW 上没有我们的实例（admin 返回 $code）——可能端口被别的进程占用，或启动失败"
+  echo "  [NG] $GW 上没有我们的实例（admin 返回 ${code}）——可能端口被别的进程占用，或启动失败"
   echo "       启动日志：$H/svc.log"
   sed -n '1,5p' "$H/svc.log" 2>/dev/null | sed 's/^/       /'
   exit 1
@@ -819,7 +819,7 @@ sleep 0.4
 STREAMLINE=$(grep "event=executor_exchange" "$GWLOG" | grep "$STR_RID" | tail -1)
 for f in "timeout_ms=0" "max_response_bytes=0" "status=200" "reason=-"; do
   if [ -n "$STREAMLINE" ] && echo "$STREAMLINE" | grep -q "$f"; then pass "流式执行记录带 $f"
-  else fail "流式执行记录缺 $f：$STREAMLINE"; fi
+  else fail "流式执行记录缺 ${f}：$STREAMLINE"; fi
 done
 # 同一个非流式 request 的记录已经证明那两个位置会写正数（上面 6 项里查过字段存在），
 # 这里的 0 才是「按形态显式声明」而不是「整条链路压根没填」。
@@ -973,10 +973,36 @@ chk "为取证留痕重新进入 enforce（public 档）" \
 sleep 2.5
 MARK="e2e-audit-body-marker"
 DENY_RID="e2e-audit-deny-$$"
-DENY_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/chat/completions" \
+DENY_CODE=$(curl -s -o "$H/deny403.json" -w '%{http_code}' -X POST "$GW/v1/chat/completions" \
   -H "Authorization: Bearer $A_TOKEN" -H "X-Request-Id: $DENY_RID" -H 'Content-Type: application/json' \
   -d "{\"model\":\"$SECRET_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"$MARK 手机 13800138000\"}]}")
 chk "为留痕再造一次真实拒绝" "$DENY_CODE" "403"
+# 2026-10-05 裁决 16′：规则标识只给管理侧。两侧对着钉 ——
+#   - 跨出网关的那一句只剩结论码与生效版本（「命中规则 …/… 档位 …」整段摘掉）；
+#   - 同一条请求的审计行照旧指得出决定性规则。
+# 只断第一半会允许「两侧都不含标识」，那是把下面这条取证断言要防的拆动作放过去；
+# 只断第二半则等于没收窄。少任何一半，这一节就测不出裁决落地了没有。
+if grep -q '命中规则\|档位' "$H/deny403.json"; then
+  fail "403 文案漏出规则标识（选择器/档位只属于管理侧）：$(cat "$H/deny403.json")"
+else
+  pass "403 文案不含命中规则与档位"
+fi
+grep -q '"error"' "$H/deny403.json" \
+  && pass "收窄后的 403 仍是带结构的错误响应（不是空 body）" || fail "403 body 形状变了：$(cat "$H/deny403.json")"
+# 结论码不写死：模型资源上的 deny 主原因是 `model_not_allowed`（`deny_rule` 只在原因链里，
+# resolver.go:174-184），把字面量抄进脚本等于用一次猜测当断言。取审计行里那个码回来对读 ——
+# 两侧必须由**同一个**结论码说话，这才是收窄后仍然成立的事实。
+DENY_REASON=$(sqlite3 "$DB" "SELECT json_extract(detail,'\$.reason') FROM audit_log WHERE action='policy.deny' AND detail LIKE '%$DENY_RID%';")
+if [ -n "$DENY_REASON" ] && grep -q "$DENY_REASON" "$H/deny403.json"; then
+  pass "收窄后的 403 仍带结论码，且与审计行是同一个（${DENY_REASON}）"
+else
+  fail "403 的结论码与审计行分叉（审计 reason=${DENY_REASON}，body=$(cat "$H/deny403.json")）"
+fi
+grep -q 'e2e-base@1' "$H/deny403.json" \
+  && pass "收窄后的 403 仍指出是哪一版策略不同意" || fail "403 没带生效版本：$(cat "$H/deny403.json")"
+chk "同一条请求的审计 winner 照旧指得出规则（subject/处置/档位）" \
+  "$(sqlite3 "$DB" "SELECT json_extract(detail,'\$.winner.subject')||'|'||json_extract(detail,'\$.winner.effect')||'|'||json_extract(detail,'\$.winner.precedence') FROM audit_log WHERE action='policy.deny' AND detail LIKE '%$DENY_RID%';")" \
+  "*|deny|deny"
 chk "拒绝留痕按真实身份归到 user:alice，并指着被拒的那个模型" \
   "$(sqlite3 "$DB" "SELECT scope_kind||':'||scope_id||'|'||actor||'|'||target FROM audit_log WHERE action='policy.deny' AND detail LIKE '%$DENY_RID%';")" \
   "user:alice|alice|model:$SECRET_MODEL"

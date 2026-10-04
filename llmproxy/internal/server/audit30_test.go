@@ -119,6 +119,15 @@ func TestAudit30DenyEvidence(t *testing.T) {
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("secret-model 应被拒，实际 %d: %s", resp.StatusCode, truncateMsg(string(body), 200))
 	}
+	// 2026-10-05 裁决 16′ 的正反两面写在这一条里：下游那一句不带规则标识，
+	// 而**同一次**拒绝的审计行必须照旧带 —— 只断言前者会把取证面拆掉，
+	// 只断言后者会漏掉这次收窄要防的外泄。
+	if strings.Contains(string(body), "命中规则") {
+		t.Errorf("403 文案不得含命中规则选择器（规则标识只给管理侧）: %s", body)
+	}
+	if !strings.Contains(string(body), "拒绝（") || !strings.Contains(string(body), "策略版本 t-open@1") {
+		t.Errorf("403 文案仍要给结论码与生效版本，实际 %s", body)
+	}
 
 	rows := auditRows(t, h, policy.SystemScope, auditActionPolicyDeny30)
 	if len(rows) != 1 {

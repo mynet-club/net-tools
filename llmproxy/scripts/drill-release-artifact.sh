@@ -140,7 +140,7 @@ curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1 && bad 代码 "stop �
 if [ -n "${SRV_PID:-}" ] && kill -0 "$SRV_PID" 2>/dev/null; then
   bad 代码 "stop 之后 pid $SRV_PID 那个进程还在"
 fi
-[ -f "$PID_FILE" ] && bad 代码 "stop 之后 pid 文件还留着（$PID_FILE）"
+[ -f "$PID_FILE" ] && bad 代码 "stop 之后 pid 文件还留着（${PID_FILE}）"
 printf '  退出后 data/：%s\n' "$(ls -la "$(dirname "$DB")" | tail -n +2 | awk '{printf "%s(%s) ", $9, $5}')"
 if [ -f "$DB-wal" ] && [ "$(wc -c < "$DB-wal" | tr -d ' ')" -gt 100000 ]; then
   bad 代码 "优雅退出后 WAL 仍有 $(wc -c < "$DB-wal" | tr -d ' ') 字节，checkpoint 可能没做"

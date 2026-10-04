@@ -246,7 +246,13 @@ type policyShot struct {
 	// Applied 表示 enforce 下结论确实生效（把计划首选指定为 prefer）。
 	Applied bool
 	// Blocked 非空表示整条请求被策略拒绝，调用方要短路返回 403。
+	// 这一串是**管理侧**的完整解释（含命中规则的选择器）：路由模拟、差异报告读它。
+	// 下发给调用方的那一句用 BlockedForCaller —— 2026-10-05 裁决 16′ 把两者分开。
 	Blocked string
+	// BlockedForCaller 是同一次拒绝里**下游可见**的那一句：只留原因码与生效版本，
+	// 不留「哪条规则、哪个主体、什么档位」。非空的形态与 Blocked 完全一致 ——
+	// 两者总是一起赋值，所以判「这次是否被拒」仍然只看 Blocked。
+	BlockedForCaller string
 	// Note 是没生效的原因（回落 legacy / 范围无包覆盖），只进日志。
 	Note string
 	// Excluded 是计划里被**策略类**原因排除的候选（授权、区域、分级），只进差异报告。
@@ -474,6 +480,7 @@ func (s *Server) applyPolicyVerdict(rt *policyRuntime, shot *policyShot) *policy
 	// fallback_to_legacy 对它没有豁免权 —— 否则一个开关就能绕过 deny-first。
 	if !shot.Decision.Allowed && shot.Version != "" {
 		shot.Blocked = shot.Decision.Explain()
+		shot.BlockedForCaller = callerDenyMessage30(shot.Decision)
 		return shot
 	}
 	if shot.PlanErr != nil || shot.Primary == "" {
@@ -482,10 +489,28 @@ func (s *Server) applyPolicyVerdict(rt *policyRuntime, shot *policyShot) *policy
 			return shot
 		}
 		shot.Blocked = fmt.Sprintf("策略 %s 下没有可用候选: %v", shot.Version, shot.PlanErr)
+		shot.BlockedForCaller = shot.Blocked
 		return shot
 	}
 	shot.Applied = true
 	return shot
+}
+
+// callerDenyMessage30 是拒绝结论里**下游可见**的那一句（2026-10-05 裁决 16′：规则标识只给
+// 管理侧）。它只留原因码与生效版本，不留 `Decision.Explain()` 那段
+// 「命中规则 `<subject>` `<resource>`/`<action>` 档位 `<precedence>`」—— 那讲的是别人的策略
+// 结构（谁在哪个范围上开了哪扇门、按什么优先级排的），跟着 403 出网关等于让调用方拿它试探。
+//
+// 为什么不复用 Explain() 再切字符串：那个接口的形状是冻结的、管理台在用它，而两侧从此
+// 面向不同受众；在它的输出上做字符串手术会把两半绑回同一个格式，改一处排版就改了受众边界。
+// 完整的标识仍然在 `shot.Blocked` 上 —— 审计（`policy.deny` 的 winner）、回放记录与管理口
+// 的路由模拟读的都是那一串，一个字没少。
+func callerDenyMessage30(d policy.Decision) string {
+	msg := "拒绝（" + string(d.Reason) + "）"
+	if d.PolicyVersion != "" {
+		msg += " 策略版本 " + d.PolicyVersion
+	}
+	return msg
 }
 
 // policyChainFor 把 2.x 的路由作用域翻译成范围链。

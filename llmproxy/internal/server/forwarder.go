@@ -228,7 +228,9 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 			// requests 那一行也只有错误串，而「哪条规则拒的、当时哪个版本生效」
 			// 是事后要按 org/project 导得回来的东西。
 			s.auditPolicyDeny30(requestAuditScope30(scope), scope, requestID, shot)
-			s.fail(w, rec, http.StatusForbidden, "policy_denied", shot.Blocked, 0, started)
+			// 下游读到的那一句不含规则标识（2026-10-05 第 16′ 条）：完整解释留在审计、
+			// 回放与管理口的路由模拟里，跨出网关的这一句只有原因码与生效版本。
+			s.fail(w, rec, http.StatusForbidden, "policy_denied", shot.BlockedForCaller, 0, started)
 			return
 		}
 		// enforce 的逐家收窄：计划里被**策略类**原因排除的上游不再进入选路池（§3.0 规则 2）。

@@ -338,9 +338,12 @@ func TestAdminPolicySimulateAllowAndDeny(t *testing.T) {
 		t.Errorf("verdict = %v，want %s", denied["verdict"], shadowDecisionDenied)
 	}
 	// enforce 预览要说「会拦」——这正是模拟最该回答的问题，而线上此刻还没拦。
+	// 2026-10-05 裁决 16′ 之后，规则标识**只在这一侧出现**（连同 decision.explain 与审计的
+	// winner）：下游 403 那句已经摘掉它，所以这一屏必须照旧带全，两侧对着钉
+	// （下游那半在 TestAudit30DenyEvidence）。
 	p2, _ := denied["enforce_preview"].(map[string]any)
-	if blocked, _ := p2["blocked"].(string); blocked == "" {
-		t.Error("enforce 预览应给出会拒绝的理由")
+	if blocked, _ := p2["blocked"].(string); !strings.Contains(blocked, "命中规则") {
+		t.Errorf("管理口的 enforce 预览必须带命中规则标识，实际 %q", blocked)
 	}
 	// 被拒的请求没有候选次序，seed 也就没有可复现的对象：这里报一个，
 	// 同一个 request_id 就会在「路由模拟」里有 seed、在「决策痕迹」里没有 ——
