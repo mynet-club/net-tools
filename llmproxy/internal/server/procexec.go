@@ -52,8 +52,11 @@ type procCall struct {
 	model     string
 	path      string
 	scope     string
-	stream    bool
-	now       time.Time
+	// actor 是这次请求的范围原值（用户名，静态 key 为空）：留痕的归属由它算，
+	// 与拒绝/出网两条动作用同一条规则（见 audit30.go 的 requestAuditScope30）。
+	actor  string
+	stream bool
+	now    time.Time
 }
 
 // processorCall 决定处理器是否参与这次请求，并带回执行上下文。
@@ -66,7 +69,7 @@ func (s *Server) processorCall(rt *policyRuntime, scope, requestID, model, path 
 	if rt == nil || rt.mode != config.PolicyModeEnforce || rt.proc == nil {
 		return nil
 	}
-	pc := &procCall{server: s, requestID: requestID, model: model, path: path, stream: stream, now: now}
+	pc := &procCall{server: s, actor: scope, requestID: requestID, model: model, path: path, stream: stream, now: now}
 	chain, err := policyChainFor(scope)
 	if err != nil {
 		pc.err = fmt.Errorf("范围链不合法: %w", err)
@@ -93,16 +96,76 @@ func (s *Server) processorCall(rt *policyRuntime, scope, requestID, model, path 
 	}
 	ctx.PolicyVersion = version
 	pc.ctx = ctx
-	_ = res
 
 	pipe, perr := rt.proc.pipelineFor(chain, version)
 	pc.pipe = pipe
 	pc.err = perr
-	if perr == nil && pc.participates() {
+	if perr == nil {
+		pc.err = s.traceRawBodyGrant30(res, pc)
+	}
+	if pc.err == nil && pc.participates() {
 		s.log.Debugf("event=processor_chain request_id=%s scope=%s policy_version=%s chain=%s buffer=%t",
 			requestID, pc.scope, version, strings.Join(pc.chainNames(), ","), pc.pipe.RequiresBodyBuffering())
 	}
 	return pc
+}
+
+// traceRawBodyGrant30 给「链上有处理器声明要未脱敏正文、而且这次真的被授权了」留一条
+// egress.allow，并在留痕写不进去时让这次请求根本进不到处理器（返回非空 err）。
+//
+// 为什么在这一层：sidecar 每次调用都自己现判（processor.Input 拿不到 request_id），
+// 而「凭什么这份内容能出网」这条证据必须指得回是哪一次请求。判定仍然只有 A 包一个
+// 真值源，这里只是把同一个结论在它有 request_id 的地方记下来 —— 于是运行时那次判定
+// 与留痕可能隔着一次策略包发布，两个结论各自都成立：审计记的是「装配时已授权」，
+// 处理器侧的 GrantReason 记的是「送出那一刻的判定」，两条都在，不做互相冒充。
+//
+// 只记被授权的这一半是刻意的：没授权时 sidecar 只拿到脱敏正文，那是缺省形态，
+// requests 表逐条记着这次交换。把缺省也写一遍等于把审计表养成第二张流量表（§6 体积）。
+//
+// 写不进去就拒：锁定口径「任何降级不得绕过权限或隐私策略」在这一条上的意思就是
+// 「写审计失败」不能变成「原文照常出网」。
+func (s *Server) traceRawBodyGrant30(res *policy.Resolver, pc *procCall) error {
+	names := rawBodyProcessors30(pc.pipe)
+	if len(names) == 0 || res == nil {
+		return nil
+	}
+	granted, reason := res.AllowsRawBody(pc.ctx, pc.chain, pc.now)
+	if !granted {
+		return nil
+	}
+	scope := requestAuditScope30(pc.actor)
+	for _, name := range names {
+		detail := egressDetail30{
+			RequestID:     pc.requestID,
+			Why:           egressWhyRawBody,
+			DataLevel:     pc.ctx.DataLevel.String(),
+			Processor:     name,
+			AllowRawBody:  true,
+			GrantReason:   string(reason),
+			PolicyVersion: pc.ctx.PolicyVersion,
+		}
+		if err := s.auditDetail30(scope, pc.actor, auditActionEgressAllow30, "processor:"+name, detail); err != nil {
+			return fmt.Errorf("原文出网授权(%s)的留痕写不进审计库，本次请求不予处理: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// rawBodyProcessors30 按装配顺序列出声明需要未脱敏正文的处理器名。
+//
+// 用 BodyAccessAdmissions 而不是新加一个 Pipeline 方法：那张表已经逐条给出
+// RawBodyWanted，再加一个访问器就是同一件事的两个来源。
+func rawBodyProcessors30(pipe *processor.Pipeline) []string {
+	if pipe == nil {
+		return nil
+	}
+	var out []string
+	for _, adm := range pipe.BodyAccessAdmissions() {
+		if adm.RawBodyWanted {
+			out = append(out, adm.Processor)
+		}
+	}
+	return out
 }
 
 // participates 报告这条链上是否真的有处理器。

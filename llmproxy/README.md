@@ -590,6 +590,31 @@ llmproxy replay run -records /tmp/rec.json -now 2026-10-03T12:00:00Z
 打开 → 跑一批流量 → collect 取走 → off 或 clear」，而不是长期开着 —— 记录里带用户名，
 它不同于 `/usage` 那类只出聚合数的只读面。
 
+#### 请求期取证留痕（3.0）：拒绝证据与出网授权
+
+`audit_log` 里有两类**由请求生命周期写出**的行，`GET /v1/_admin/audit?scope=kind:id`
+读得到，管理台「操作审计」也读得到：
+
+| action | 什么时候写 | detail 里的字段 |
+|--------|-----------|----------------|
+| `policy.deny` | `mode=enforce` 且这一发真的被策略拒了（403） | `request_id` / `resource` / `reason` / `reasons`（最多 8 条，截断则 `reasons_truncated`）/ `winner`（决定性规则：subject、resource、action、effect、source、version、precedence）/ `policy_version` / `mode` |
+| `egress.allow` | 这一发**拿到了非缺省的出网授权**：要么内容有声明的上限（高于 `public`）却仍然出网，要么链上有处理器拿到了未脱敏正文 | `request_id` / `why`（`data_level` 或 `raw_body`）/ `data_level` / `provider` / `provider_max_data_level` / `executor` / `processor` / `allow_raw_body` / `grant_reason` / `policy_version` |
+
+四条口径，都是为了让这一张表在事后还问得出话：
+
+- **只记非缺省。** `public` 内容出网、shadow 模式的判定、legacy 模式，一条都不写 ——
+  那些 `requests` 表逐条记着 provider 与结果码，重复写一遍只是把审计表养成第二张流量表。
+  `mode=shadow` 的观察数据也不冒充处置事实：它没有作用到任何请求上。
+- **归属走真实身份，与另外两条写审计的路径共用一条规则。** DB 用户 → `user:<名字>`，
+  静态 key（`server.api_keys`）→ `system:global`。写错的代价不是当场报错，
+  是「按范围导的时候导不到」。
+- **detail 是结构化字段，不是自由文本。** 原因码只装 `policy.Reason` 注册过的那些，
+  正文、密钥、上游地址一个字都不进（实测单条 307 / 189 字节，回归上限 2 KiB / 1 KiB）。
+- **写不进去就不出网。** 出网授权那一类是 fail closed 的：留痕落不进审计库，这一发直接
+  `503 audit_unavailable`，一个字节都不离开网关 —— 「审计失败」不能变成「原文照常出网」。
+  拒绝那一类不是：它本来就打算拦掉，留痕写失败只记一条
+  `event=policy_deny_audit_failed` 日志，客户端照旧拿 403。
+
 ### 两条要么想清楚、要么别动的规则
 
 1. **用户配了自己的上游，就只用他自己的。** 哪怕他配的上游全部不可用，也**不会**悄悄回退到

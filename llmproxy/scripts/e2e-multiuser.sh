@@ -32,6 +32,12 @@ pass() { echo "  [OK] $1"; PASS=$((PASS+1)); }
 fail() { echo "  [NG] $1"; FAIL=$((FAIL+1)); }
 chk()  { if [ "$2" = "$3" ]; then pass "$1（$2）"; else fail "$1：期望 $3，实际 $2"; fi; }
 
+# fileperm：八进制权限位，GNU stat 与 BSD stat 都能用。
+# 顺序不能反 —— GNU 的 `stat -f` 不是「格式化」而是「看文件系统」，它会**成功**并打印
+# 一堆 filesystem info，于是 `-f ... || -c ...` 这种写法在 Linux 上永远取不到权限，
+# 「文件权限收到 0600」这类断言会飘成完全无关的文本（本机 darwin 上跑不出来）。
+fileperm() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
+
 cleanup() {
   LLMPROXY_HOME=$H "$BIN" stop >/dev/null 2>&1
   # 只杀本次运行的假上游（路径带 $H），不动别的实例
@@ -715,7 +721,7 @@ code=$(curl -s -o "$H/pub.json" -w '%{http_code}' -X PUT "$GW/v1/_admin/policy/b
   ]}")
 chk "发布一条系统范围策略包" "$code" "200"
 [ -f "$BDIR/e2e-base.yaml" ] && pass "内容真的落到磁盘（回滚按文件比才成立）" || fail "磁盘上没有策略包内容：$BDIR"
-BPERM=$(stat -f '%Lp' "$BDIR/e2e-base.yaml" 2>/dev/null || stat -c '%a' "$BDIR/e2e-base.yaml")
+BPERM=$(fileperm "$BDIR/e2e-base.yaml")
 chk "策略包内容文件权限收到 0600" "$BPERM" "600"
 
 # 23c 分级门的 fail-closed 实况：系统池里有人没声明 max_data_level 时启用 3.0 必须被拒。
@@ -844,7 +850,7 @@ alice_chat "deepseek-chat" >/dev/null
 alice_chat "$SECRET_MODEL" >/dev/null
 "$BIN" replay collect -out "$H/records.json" >/dev/null 2>&1
 if [ -f "$H/records.json" ]; then
-  RPERM=$(stat -f '%Lp' "$H/records.json" 2>/dev/null || stat -c '%a' "$H/records.json")
+  RPERM=$(fileperm "$H/records.json")
   chk "导出的记录文件权限收到 0600" "$RPERM" "600"
   grep -q '"schema_version"' "$H/records.json" && pass "导出的是记录文件本身" || fail "文件不像记录文件"
   # v2 是「逐位凭据有地方放」的前提：写出版本还停在 v1，说明采集侧根本没带快照。
@@ -953,6 +959,79 @@ chk "新库的明细里没有「没有这个事实」的那一格" "$NULLS" "0"
 LEAKY=$(sqlite3 "$DB" "SELECT COUNT(*) FROM requests WHERE length(executor)>64 OR length(exchange_reason)>64 OR executor LIKE '% %' OR exchange_reason LIKE '% %' OR executor LIKE '%sk-%' OR exchange_reason LIKE '%sk-%' OR exchange_reason LIKE '%Bearer%';")
 chk "摘要两列里没有正文、密钥或多于标签的形状" "$LEAKY" "0"
 echo "    摘要列读数：$(sqlite3 "$DB" "SELECT group_concat(executor||'/'||exchange_reason, ' | ') FROM (SELECT executor, exchange_reason FROM requests ORDER BY id DESC LIMIT 4);")"
+
+# 23k 请求期取证留痕（2026-10-04 裁决第 6 条：C）：拒绝证据与出网授权要在真进程里落库。
+# 单元夹具锁得住字段集合、体积与 fail-closed，锁不住这两件只在接线上成立的事：
+#   - 归属走**真实身份**：alice 是 DB 用户 → user:alice，静态 key → system:global。
+#     写错的代价不是报错，是「按范围导的时候导不到」（§2.7 规则 2）。
+#   - 体积闸在带 provider 的真实配置下成立：public 内容出网**不**留痕，
+#     因为 requests 表已经逐条记着 provider 与结果码（§6 点名的第二张流量表）。
+# 23g 已经回滚到 legacy，而 legacy 没有判定也就没有拒绝：不重新进入 enforce，
+# 下面这一发会拿到 200，留痕断言会在一个根本没发生判定的窗口里找行。
+chk "为取证留痕重新进入 enforce（public 档）" \
+  "$(POLICY_MODE '{"mode":"enforce","data_level":"public"}')" "200"
+sleep 2.5
+MARK="e2e-audit-body-marker"
+DENY_RID="e2e-audit-deny-$$"
+DENY_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/chat/completions" \
+  -H "Authorization: Bearer $A_TOKEN" -H "X-Request-Id: $DENY_RID" -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$SECRET_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"$MARK 手机 13800138000\"}]}")
+chk "为留痕再造一次真实拒绝" "$DENY_CODE" "403"
+chk "拒绝留痕按真实身份归到 user:alice，并指着被拒的那个模型" \
+  "$(sqlite3 "$DB" "SELECT scope_kind||':'||scope_id||'|'||actor||'|'||target FROM audit_log WHERE action='policy.deny' AND detail LIKE '%$DENY_RID%';")" \
+  "user:alice|alice|model:$SECRET_MODEL"
+# 取证要问得出的三件事：当时哪一版生效、哪条规则定的、以什么处置方式。
+chk "留痕的 detail 说得出决定性规则与生效版本" \
+  "$(sqlite3 "$DB" "SELECT json_extract(detail,'\$.mode')||'|'||json_extract(detail,'\$.winner.resource')||'|'||json_extract(detail,'\$.policy_version') FROM audit_log WHERE action='policy.deny' AND detail LIKE '%$DENY_RID%';")" \
+  "enforce|model:$SECRET_MODEL|e2e-base@1"
+if [ "$(sqlite3 "$DB" "SELECT COUNT(*) FROM audit_log WHERE action='policy.deny' AND detail LIKE '%$DENY_RID%' AND (detail LIKE '%$MARK%' OR detail LIKE '%13800138000%');")" = "0" ]; then
+  pass "拒绝留痕不带正文字节（正文只属于那一发请求）"
+else
+  fail "拒绝留痕里翻出了正文"
+fi
+# 本节到这里为止的内容档都是 public：出网就是流量本身，审计表不该再接一遍。
+chk "public 出网一条 egress.allow 都不写（只记非缺省）" \
+  "$(sqlite3 "$DB" "SELECT COUNT(*) FROM audit_log WHERE action='egress.allow';")" "0"
+
+# 换成内部档：把系统池的承接上限声明到 internal，再用静态 key（system:global）发一发。
+# 为什么用静态 key 而不是 alice：alice 的自有上游没声明上限、按最低档处理，
+# 那一发会在分级门上被排除，测不到「授权成立并留痕」这条主干。
+curl -s -o "$H/putprov2.json" -X PUT "$GW/v1/_admin/config/providers" \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d "{\"providers\":[
+    {\"name\":\"global-up\",\"enabled\":true,\"base_url\":\"http://127.0.0.1:$GPORT/v1\",\"api_key\":\"sk-global\",\"weight\":1,\"proxy\":\"direct\",\"timeout_ms\":10000,\"models\":[\"*\"],\"max_data_level\":\"internal\"},
+    {\"name\":\"declared-up\",\"enabled\":true,\"base_url\":\"http://127.0.0.1:$IPORT/v1\",\"api_key\":\"sk-declared\",\"weight\":1,\"proxy\":\"direct\",\"timeout_ms\":10000,\"models\":{\"only-here\":\"only-here\"},\"max_data_level\":\"internal\"}]}"
+grep -q '"written":true' "$H/putprov2.json" && pass "系统池上限声明升到 internal" || fail "上限声明没写进去：$(cat "$H/putprov2.json")"
+chk "内部档下启用 3.0" "$(POLICY_MODE '{"mode":"enforce","data_level":"internal"}')" "200"
+sleep 2.5
+EG_RID="e2e-audit-egress-$$"
+EG_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/chat/completions" \
+  -H "Authorization: Bearer sk-single-user" -H "X-Request-Id: $EG_RID" -H 'Content-Type: application/json' \
+  -d "{\"model\":\"deepseek-chat\",\"messages\":[{\"role\":\"user\",\"content\":\"$MARK internal\"}]}")
+chk "内部档请求正常转发" "$EG_CODE" "200"
+chk "高于 public 的内容出网恰好留 1 条授权" \
+  "$(sqlite3 "$DB" "SELECT COUNT(*) FROM audit_log WHERE action='egress.allow' AND detail LIKE '%$EG_RID%';")" "1"
+chk "这条授权归 system:global（静态 key 没有用户范围）" \
+  "$(sqlite3 "$DB" "SELECT scope_kind||':'||scope_id||'|'||target FROM audit_log WHERE action='egress.allow' AND detail LIKE '%$EG_RID%';")" \
+  "system:global|provider:global-up"
+# 两个级别字段各说一件事：这次内容的档 vs 这家上游被允许承接的上限。合成一个数就没法
+# 回答「是内容太敏感，还是这家上游本来就不该接」。
+chk "留痕把「这次内容的档」「上游上限」「为什么算非缺省」分开记" \
+  "$(sqlite3 "$DB" "SELECT json_extract(detail,'\$.data_level')||'|'||json_extract(detail,'\$.provider_max_data_level')||'|'||json_extract(detail,'\$.why') FROM audit_log WHERE action='egress.allow' AND detail LIKE '%$EG_RID%';")" \
+  "internal|internal|data_level"
+if [ "$(sqlite3 "$DB" "SELECT COUNT(*) FROM audit_log WHERE action='egress.allow' AND detail LIKE '%$EG_RID%' AND (detail LIKE '%$MARK%' OR detail LIKE '%sk-%');")" = "0" ]; then
+  pass "出网授权留痕不带正文也不带上游密钥"
+else
+  fail "出网授权留痕里翻出了正文或密钥"
+fi
+# 回滚后再验一次方向：legacy 没有判定，也就没有「拒绝证据」和「非缺省授权」可记。
+AUDIT_BEFORE=$(sqlite3 "$DB" "SELECT COUNT(*) FROM audit_log WHERE action IN ('policy.deny','egress.allow');")
+chk "切回 legacy" "$(POLICY_MODE '{"mode":"legacy"}')" "200"
+sleep 2.5
+alice_chat "$SECRET_MODEL" >/dev/null
+alice_chat "deepseek-chat" >/dev/null
+chk "legacy 下一类新留痕也不写（观察数据不冒充处置事实）" \
+  "$(sqlite3 "$DB" "SELECT COUNT(*) FROM audit_log WHERE action IN ('policy.deny','egress.allow');")" "$AUDIT_BEFORE"
+echo "    取证留痕读数：$(sqlite3 "$DB" "SELECT group_concat(action||'@'||scope_kind||':'||scope_id, ' | ') FROM (SELECT action, scope_kind, scope_id FROM audit_log WHERE action IN ('policy.deny','egress.allow') ORDER BY id DESC LIMIT 6);")"
 
 echo
 echo "================ 结果：通过 $PASS 项，失败 $FAIL 项 ================"

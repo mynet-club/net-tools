@@ -231,6 +231,13 @@ func (s *Server) sidecarClient(spec processor.Spec) (*http.Client, error) {
 // 它不是「一个 Resolver」：Resolver 是按范围链构造的，而判定发生在请求期、
 // 用的是那次请求的链。做成薄壳现取，才能守住「授权判定的唯一业务源是 A 包」
 // （E 包里那句 *policy.Resolver 天然满足接口 的意义就在这里落地）。
+//
+// 原文出网的**留痕**不在这里（audit30.go 的 egress.allow），而在 processorCall
+// 构造那一刻：留痕要带 request_id 才指得回是哪一次请求，而这个方法拿到的只有
+// (ctx, chain, now) —— 接口那三位参数是刻意与 *policy.Resolver 同形的，加一位
+// request_id 就会破掉「E 不重做判定次序、也不 import 判定实现」这条被测试钉住的
+// 设计性质（admission_test.go 那句 var checker RawBodyGrantChecker = resolver）。
+// 所以判定留在这里，留痕与 fail closed 上移到唯一知道 request_id 的那一层。
 type procGrant struct{ rt *policyRuntime }
 
 func (g *procGrant) AllowsRawBody(ctx policy.PolicyContext, chain policy.ScopeChain, now time.Time) (bool, policy.Reason) {

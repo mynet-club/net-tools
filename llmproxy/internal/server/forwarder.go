@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/config"
+	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 	"github.com/mynet-club/net-tools/llmproxy/internal/processor"
 	"github.com/mynet-club/net-tools/llmproxy/internal/store"
 )
@@ -223,6 +224,10 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 			rec.CandidatesDigest = shot.CandidatesDigest
 		}
 		if shot.Blocked != "" {
+			// 处置事实按范围留痕（2026-10-04 第 6 条 C）：403 的文案会随版本改，
+			// requests 那一行也只有错误串，而「哪条规则拒的、当时哪个版本生效」
+			// 是事后要按 org/project 导得回来的东西。
+			s.auditPolicyDeny30(requestAuditScope30(scope), scope, requestID, shot)
 			s.fail(w, rec, http.StatusForbidden, "policy_denied", shot.Blocked, 0, started)
 			return
 		}
@@ -309,6 +314,14 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 
 		sent, pErr := pc.runRequest(r.Context(), raw)
 		if pErr != nil {
+			if errors.Is(pErr, errAuditTrace30) {
+				// 归因必须和「处理器链起不来」分开：那种情况查 sidecar/参数文件，
+				// 这种情况查审计库，而两者在处理器侧的错误面上长得一模一样。
+				s.log.Errorf("event=egress_audit_failed request_id=%s scope=%s err=%s 原文授权留痕写不进去，本次不出网",
+					requestID, pc.scope, processorMessage(pErr))
+				s.fail(w, rec, http.StatusServiceUnavailable, "audit_unavailable", auditUnavailableMsg30, 0, started)
+				return
+			}
 			status, kind, msg := processorHTTP(pErr)
 			// 详情只进日志、不进回话：错误原文可能含实例路径与处理器配置片段。
 			s.log.Errorf("event=processor_reject request_id=%s scope=%s status=%d err=%s",
@@ -397,6 +410,31 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 			lastErr = delErr
 			exclude[cand.Provider.Name] = true
 			continue
+		}
+
+		// 出网授权留痕（2026-10-04 第 6 条 C）：只有非缺省形态才出行 —— 高于 public 的
+		// 内容出到某家上游，回答的是「凭什么这份内容能出网」；public 那一半 requests
+		// 表逐条记着 provider 与结果码，重复写只是把审计表撑成第二张流量表。
+		//
+		// 位置在 transport 与委托分支之前：这是「这一发要出网」的最后确定点，必须排在
+		// 出网之前。写不进去就不出网（锁定口径：任何降级不得绕过权限或隐私策略），
+		// 与检索侧「审计落不进去就不交付结果」同形。
+		if shot != nil && shot.Mode == config.PolicyModeEnforce &&
+			shot.judgeCtx.DataLevel.Exceeds(policy.LevelPublic) {
+			executor := exchangeLegacyXport
+			if del != nil {
+				executor = del.name
+			}
+			if aErr := s.auditEgressDataLevel30(requestAuditScope30(scope), scope, requestID, shot,
+				cand.Provider.Name, cand.Provider.DataLevelCeiling().String(), executor); aErr != nil {
+				// 写不进留痕时这一发不出网。回话与日志都不带 err 原文：那条错误链里可能有
+				// 表名、路径甚至被拒写的字段值，而它们对客户端的下一步动作没有信息量
+				// （与 §2.9 规则 6 同形；详情只留在上一条日志里）。
+				s.log.Errorf("event=egress_audit_failed request_id=%s provider=%s err=%s 授权留痕写不进去，这一发不出网",
+					requestID, cand.Provider.Name, aErr)
+				s.fail(w, rec, http.StatusServiceUnavailable, "audit_unavailable", auditUnavailableMsg30, attempts, started)
+				return
+			}
 		}
 
 		// 用户自有上游带拨号层出网校验（防 DNS rebinding）；系统池不带
