@@ -424,17 +424,19 @@ func TestReplay30WindowDefaultOffAndScopeFilter(t *testing.T) {
 		t.Fatalf("permille=0 不该采，实际 entries=%v", got)
 	}
 
-	// 范围过滤：只采 alice。bob 与静态 key（scope 空）都不进窗口。
+	// 范围过滤：只采 alice。bob 与静态 key（scope 空 → system:global）都不进窗口。
 	alice := h.addUser(t, "alice")
 	h.addProvider(t, "alice", "own", "http://127.0.0.1:9/v1", "sk-alice-key", `["*"]`)
 	bob := h.addUser(t, "bob")
 	h.addProvider(t, "bob", "own", "http://127.0.0.1:9/v1", "sk-bob-key", `["*"]`)
 
 	full := replayPermilleFull
-	onlyAlice := "alice"
+	onlyAlice := policy.MustScope(policy.ScopeUser, "alice")
 	h.srv.replayWin.configure(&on, &full, &onlyAlice, nil)
-	if got := h.srv.replayWin.stats()["scope_filter"]; got != "alice" {
-		t.Fatalf("范围过滤没配进去: %v", got)
+	// 键与过滤都是 kind:id 全串（裁决 7=C）：窗口里那个键如果还是裸用户名，
+	// 「按 org 导」就无从比对，而状态口里那串也会和导出参数两种写法。
+	if got := h.srv.replayWin.stats()["scope_filter"]; got != "user:alice" {
+		t.Fatalf("范围过滤没配进去（要 kind:id 全串形态）: %v", got)
 	}
 
 	chatWith(t, h.harness, bob, "s-2", "gpt-x")
@@ -465,9 +467,128 @@ func TestReplay30WindowDefaultOffAndScopeFilter(t *testing.T) {
 	if _, all := replayExport(t, h, ""); !strings.Contains(string(all), "s-1") {
 		t.Errorf("整体导出漏了记录")
 	}
-	// 非 user 范围今天还进不了窗口（旧链路的池子按用户分），要明说而不是静默导空。
-	if code, body := replayExport(t, h, "?scope=organization:university"); code != http.StatusBadRequest {
-		t.Errorf("组织范围导出应 400，实际 %d: %s", code, body)
+	// 组织范围不再被 400 挡在门口（裁决 7=C）。但今天真流量的链上只有 user 与 system
+	// —— 身份适配层那条「claim → organization」还没接进请求路径 —— 所以按 org 导是
+	// **命中 0 条**。这一条必须问得出来：回一个「看起来正常的空文件」会让人去查窗口，
+	// 而真正的原因是链里没有那个范围。
+	if code, body := replayExport(t, h, "?scope=organization:university"); code != http.StatusOK {
+		t.Fatalf("组织范围导出应 200（导 0 条也是合法答案），实际 %d: %s", code, body)
+	} else if empty := mustDecodeRecords(t, body); len(empty.Decisions) != 0 {
+		t.Fatalf("链上没有这个组织，不该导出任何记录: %+v", empty.Decisions)
+	}
+	rows := auditRows(t, h.harness, policy.SystemScope, "replay.export")
+	if len(rows) == 0 {
+		t.Fatalf("导出没落审计（或归属不是 system:global）")
+	}
+	last := rows[0] // AuditRecentByScope 是 id DESC，第一条就是刚才那次
+	// org 级导出的审计指着那个 org 引用，而不是窗口里碰到的某一个用户名。
+	if last.Target != "organization:university" {
+		t.Errorf("导出审计的 target 应是范围引用，实际 %q", last.Target)
+	}
+	if !strings.Contains(last.Detail, "命中 0 条") {
+		t.Errorf("0 命中要在审计里说破原因: %s", last.Detail)
+	}
+	// 通配仍然当场拒：按字符串相等它一个都匹配不上，而证据链里的静默空采比报错更糟。
+	if code, body := replayExport(t, h, "?scope=organization:*"); code != http.StatusBadRequest {
+		t.Errorf("通配导出应 400，实际 %d: %s", code, body)
+	}
+
+	// 静态 key 的流量现在也导得出来了：它的键是 system:global，而不是过去那个空串。
+	// 这一条是键型改动的直接收益 —— 旧形态下「网关自己那批判定」在过滤面上是不可寻址的。
+	if code, body := adminPostRaw(t, h, "/v1/_admin/replay/sampling",
+		map[string]any{"scope": "system:global"}); code != http.StatusOK {
+		t.Fatalf("切到 system:global 过滤应 200，实际 %d: %v", code, body)
+	}
+	before := h.srv.replayWin.stats()["entries"]
+	chatWith(t, h.harness, "sk-static", "s-4", "gpt-x")
+	chatWith(t, h.harness, alice, "s-5", "gpt-x")
+	// 窗口不清空，所以断言增量：换过滤不该把已经躺在里面的记录删掉，
+	// 也不该让 alice 那条顺着新过滤进来。
+	if got := h.srv.replayWin.stats()["entries"]; got != before.(int)+1 {
+		t.Fatalf("system:global 过滤下应只多收静态 key 那一条，entries=%v（此前 %v）", got, before)
+	}
+	if code, body := replayExport(t, h, "?scope=system:global"); code != http.StatusOK ||
+		!strings.Contains(string(body), "s-4") {
+		t.Fatalf("按 system:global 导出没拿到那条: %d %s", code, body)
+	}
+	if _, body := replayExport(t, h, "?scope=system:global"); strings.Contains(string(body), "s-5") {
+		t.Errorf("alice 那条串进了 system:global 的导出")
+	}
+}
+
+// TestReplay30ScopeFilterMatchesChain 钉住「按范围过滤」的两个条件（裁决 7=C 的落点）。
+//
+// 为什么 org 那一半只能靠 chain：2.x 传进来的请求范围永远是一个人
+// （forwarder 的 scope 就是用户名），而一次判定同时覆盖 user / organization / project。
+// 只比键的话，「把这次事故涉及的那个组织的全部判定导出来」今天照样做不到 ——
+// 而这正是这条裁决要解的问题。
+//
+// 这里在窗口层直接喂记录对，是因为真流量的链今天还没有 org ref：internal/identity
+// 那条 claim→organization 的映射没有接进请求路径（policyChainFor 只产出 user 或
+// system）。所以「链上真有 org 时过滤对不对」只能在这里锁，
+// 「今天线上导出来是什么形态」由 §23 的真进程断言锁 —— 两条不互相冒充。
+func TestReplay30ScopeFilterMatchesChain(t *testing.T) {
+	alice := policy.MustScope(policy.ScopeUser, "alice")
+	bob := policy.MustScope(policy.ScopeUser, "bob")
+	org := policy.MustScope(policy.ScopeOrganization, "university")
+	other := policy.MustScope(policy.ScopeOrganization, "hospital-a")
+	proj := policy.MustScope(policy.ScopeProject, "lab-7")
+	aliceChain := policy.MustScopeChain(alice, org, proj)
+	bobChain := policy.MustScopeChain(bob, other)
+
+	w := newReplayWindow()
+	on := true
+	full := replayPermilleFull
+	w.configure(&on, &full, nil, nil)
+	w.add(replayEntry{key: alice, decision: replay.DecisionRecord{
+		RequestID: "a-1", Chain: aliceChain}})
+	w.add(replayEntry{key: bob, decision: replay.DecisionRecord{
+		RequestID: "b-1", Chain: bobChain}})
+
+	ids := func(filter policy.ScopeRef) []string {
+		f, _, _ := w.file(filter)
+		out := make([]string, 0, len(f.Decisions))
+		for _, d := range f.Decisions {
+			out = append(out, d.RequestID)
+		}
+		return out
+	}
+	// 正例：一次 org 导出把该组织下那个用户的判定取到，且**不混入别的组织**。
+	if got := ids(org); len(got) != 1 || got[0] != "a-1" {
+		t.Fatalf("按 organization 过滤应只拿 a-1，实际 %v", got)
+	}
+	// 项目级同理：链上有它就算命中，不需要运维先知道这属于哪个人。
+	if got := ids(proj); len(got) != 1 || got[0] != "a-1" {
+		t.Fatalf("按 project 过滤应只拿 a-1，实际 %v", got)
+	}
+	// 键相等那一路照旧成立（它管的是「这次判定就是为这个范围做的」）。
+	if got := ids(alice); len(got) != 1 || got[0] != "a-1" {
+		t.Fatalf("按 user:alice 过滤不对: %v", got)
+	}
+	if got := ids(other); len(got) != 1 || got[0] != "b-1" {
+		t.Fatalf("按另一个 organization 过滤串了范围: %v", got)
+	}
+	if got := ids(policy.ScopeRef{}); len(got) != 2 {
+		t.Fatalf("零值过滤应当导全窗，实际 %v", got)
+	}
+
+	// 采集侧用同一条规则：管理员把过滤设成某个 org 时，该 org 链上的多个用户都要被采到，
+	// 链外的不采。两处各写一遍就会各认各的。
+	orgFilter := org
+	w.configure(nil, nil, &orgFilter, nil)
+	if !w.shouldCapture(alice, aliceChain, "a-2") {
+		t.Errorf("alice 的链上有这个 org，该采")
+	}
+	if w.shouldCapture(bob, bobChain, "b-2") {
+		t.Errorf("bob 的链上没有这个 org，不该采")
+	}
+	// 链里没有、但请求范围本身就是这个 org（例如将来把 org 当作用户范围传进来）：也命中。
+	if !w.shouldCapture(org, policy.MustScopeChain(org), "o-1") {
+		t.Errorf("请求范围等于过滤时应命中")
+	}
+	// 链为 nil（记录没带链，或窗口层直接喂的最小记录）时退回比键：不能因为链缺就全采。
+	if w.shouldCapture(bob, nil, "b-3") {
+		t.Errorf("链缺失时不该按 org 采别人")
 	}
 }
 
@@ -476,12 +597,12 @@ func TestReplay30WindowEvictsOldestAndCountsDrops(t *testing.T) {
 	on := true
 	full := replayPermilleFull
 	capacity := 2
-	who := "alice"
+	who := policy.MustScope(policy.ScopeUser, "alice")
 	w.configure(&on, &full, &who, &capacity)
 
 	for i := 0; i < 5; i++ {
 		w.add(replayEntry{
-			scope:    "alice",
+			key:      who,
 			decision: replay.DecisionRecord{RequestID: fmt.Sprintf("r-%d", i)},
 		})
 	}
@@ -490,7 +611,7 @@ func TestReplay30WindowEvictsOldestAndCountsDrops(t *testing.T) {
 		t.Fatalf("淘汰与计数不对: %+v", st)
 	}
 	// 留的是最新的两条，而不是随机两条。
-	f, dropped, failed := w.file("")
+	f, dropped, failed := w.file(policy.ScopeRef{})
 	if len(f.Decisions) != 2 || f.Decisions[0].RequestID != "r-3" || f.Decisions[1].RequestID != "r-4" {
 		t.Fatalf("窗口留错了记录: %+v", f.Decisions)
 	}
@@ -510,7 +631,7 @@ func TestReplay30WindowEvictsOldestAndCountsDrops(t *testing.T) {
 		t.Fatalf("clear 之后计数没归零: %+v", st)
 	}
 	// clear 只动记录与计数，开关与过滤保留（那由 sampling 那一条通道管）。
-	if st := w.stats(); st["enabled"] != true || st["scope_filter"] != "alice" {
+	if st := w.stats(); st["enabled"] != true || st["scope_filter"] != "user:alice" {
 		t.Fatalf("clear 动了开关或过滤: %+v", st)
 	}
 }
@@ -584,14 +705,14 @@ func TestReplay30AdminSurfaceAuthArgsAndAudit(t *testing.T) {
 	// 指针语义：只调比例时，已开的开关与已设的范围过滤都不动。
 	enabled := true
 	permille := 50
-	scope := "alice"
+	scope := policy.MustScope(policy.ScopeUser, "alice")
 	h.srv.replayWin.configure(&enabled, &permille, &scope, nil)
 	if code, body := adminPostRaw(t, h, "/v1/_admin/replay/sampling",
 		map[string]any{"sample_permille": 70}); code != http.StatusOK {
 		t.Fatalf("改比例应 200，实际 %d: %v", code, body)
 	}
 	if st := h.srv.replayWin.stats(); st["enabled"] != true || st["sample_permille"] != 70 ||
-		st["scope_filter"] != "alice" {
+		st["scope_filter"] != "user:alice" {
 		t.Fatalf("只改比例却动了别的开关: %+v", st)
 	}
 

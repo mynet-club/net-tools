@@ -70,10 +70,34 @@ const replaySamplingAlgoOnline = routing.SamplingAlgoSeededSplitmix64V1
 // 有它才拿得到范围链，于是策略版本能按 Filter(chain) 复核、计划里每个候选也能
 // 重跑一次授权判定（§6「fallback 不绕过权限」）。窗口淘汰时把一对一起丢掉，
 // 否则留下的就是一堆「只能降级回放」的孤记录。
+//
+// key 是这次判定的**请求范围**（结构化 ScopeRef，不是裸用户名字符串 ——
+// 2026-10-04 裁决第 7 条 C）：DB 用户是 user:<名字>，静态 key 是 system:global。
+// 键型与导出过滤型同形，才谈得上「按范围导」；裸名字那种形态下，组织级过滤
+// 连要比什么都比不出来。键只到请求范围为止，组织与项目在 chain 里（下面那条注释）。
 type replayEntry struct {
-	scope    string
+	key      policy.ScopeRef
 	decision replay.DecisionRecord
 	routing  *replay.RoutingRecord // nil = 这次判定没有驱动选路（策略拒绝、回落 legacy）
+}
+
+// replayScopeMatch 报告一个精确范围是否覆盖这条记录。
+//
+// 两个条件按「或」用，缺一个都不完整：
+//   - key 相等 = 「这次判定就是为这个范围做的」（用户流量、网关自己的静态 key 流量）；
+//   - chain 命中 = 「这次判定被这个范围参与过」。组织级、项目级策略之所以可能，
+//     全靠这一条：请求范围永远是一个人（2.x 的路由作用域就是用户名），
+//     而一次判定同时落在 user / organization / project 上（§2.7 的 ScopeChain）。
+//     只比 key 的话，「把这次事故涉及的那个组织的全部判定导出来」仍然做不到 ——
+//     那正是这条裁决要解的问题。
+//
+// 只认精确范围、不认通配：通配按字符串相等会一个都匹配不上而静默空采，
+// 在证据里比报错更糟（校验在 parseScopeParam 那一层就已经挡住了）。
+func replayScopeMatch(filter, key policy.ScopeRef, chain policy.ScopeChain) bool {
+	if filter.Is(key) {
+		return true
+	}
+	return chain.Includes(filter)
 }
 
 // replayWindow 是有界的采集窗口。开关、千分率与范围过滤都由管理口改，缺省关闭。
@@ -84,7 +108,10 @@ type replayWindow struct {
 	mu       sync.Mutex
 	enabled  bool
 	permille int
-	scope    string // 精确范围过滤（2.x 的路由作用域名，即用户名）；空 = 全部
+	// filter 是采集侧的精确范围过滤，零值 = 全部。与导出侧同一个类型、同一条匹配
+	// 规则（replayScopeMatch）：两处各写一遍就会「开关只采 alice，导出却能把
+	// 整个组织取走」这种对不上的口径留在运维面上。
+	filter   policy.ScopeRef
 	capacity int
 
 	entries  []replayEntry
@@ -114,7 +141,10 @@ func replaySampleHit(requestID string, permille int) bool {
 }
 
 // shouldCapture 报告这次请求要不要采。纯判定，不留痕迹：计数只在真存下一条时加。
-func (w *replayWindow) shouldCapture(scope, requestID string) bool {
+//
+// chain 由调用方（判定现场）给，不在这里重算：窗口要回答的是「当时那次判定覆盖哪些范围」，
+// 而再问一遍活的策略拿到的已经是现在那份了。
+func (w *replayWindow) shouldCapture(key policy.ScopeRef, chain policy.ScopeChain, requestID string) bool {
 	if w == nil || requestID == "" {
 		return false
 	}
@@ -123,7 +153,7 @@ func (w *replayWindow) shouldCapture(scope, requestID string) bool {
 	if !w.enabled {
 		return false
 	}
-	if w.scope != "" && w.scope != scope {
+	if w.filter != (policy.ScopeRef{}) && !replayScopeMatch(w.filter, key, chain) {
 		return false
 	}
 	return replaySampleHit(requestID, w.permille)
@@ -153,17 +183,21 @@ func (w *replayWindow) countFailed() {
 	w.failed++
 }
 
-// file 把当前窗口落成记录文件。scope 非空时只导那一个范围（分范围出证据用）。
+// file 把当前窗口落成记录文件。filter 非零时只导那一个范围（分范围出证据用）：
+// 请求范围正好是它，**或**当时那次判定的范围链里有它。
 //
-// 返回的丢弃数与失败数是**整窗累计**，不按 scope 过滤：它们回答的是
+// 用 e.decision.Chain 而不是另存一份链：链本来就在记录里（回放要按它复核
+// Filter(chain)），再存一份就是两个真相，而且这两份会在记录构造失败时分开漂移。
+//
+// 返回的丢弃数与失败数是**整窗累计**，不按范围过滤：它们回答的是
 // 「这个开关开着期间丢了多少」，而不是「这个范围丢了多少」。
-func (w *replayWindow) file(scope string) (replay.File, int64, int64) {
+func (w *replayWindow) file(filter policy.ScopeRef) (replay.File, int64, int64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	decisions := make([]replay.DecisionRecord, 0, len(w.entries))
 	routings := make([]replay.RoutingRecord, 0, len(w.entries))
 	for _, e := range w.entries {
-		if scope != "" && e.scope != scope {
+		if filter != (policy.ScopeRef{}) && !replayScopeMatch(filter, e.key, e.decision.Chain) {
 			continue
 		}
 		decisions = append(decisions, e.decision)
@@ -176,6 +210,10 @@ func (w *replayWindow) file(scope string) (replay.File, int64, int64) {
 
 // stats 给状态视图（不含任何 subject —— 状态口要回答「采了多少」，
 // 谁被采到是导出那份文件的事，两个面的暴露程度不一样）。
+//
+// scope_filter 是 kind:id 的全串形态（user:alice / organization:university /
+// system:global），没设过滤时是空串：过滤条件是管理员自己写的，它属于 §2.9
+// 允许出现的「范围」，而记录级的归属只出现在导出那份文件里。
 func (w *replayWindow) stats() map[string]any {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -185,10 +223,14 @@ func (w *replayWindow) stats() map[string]any {
 			routings++
 		}
 	}
+	filter := ""
+	if w.filter != (policy.ScopeRef{}) {
+		filter = w.filter.Display()
+	}
 	return map[string]any{
 		"enabled":         w.enabled,
 		"sample_permille": w.permille,
-		"scope_filter":    w.scope,
+		"scope_filter":    filter,
 		"capacity":        w.capacity,
 		"entries":         len(w.entries),
 		"decisions":       len(w.entries),
@@ -201,7 +243,11 @@ func (w *replayWindow) stats() map[string]any {
 
 // configure 改采集开关。指针语义：缺省项不动 —— 一次「只把比例调到 50‰」的请求
 // 不该顺手关掉开关或清空范围过滤。返回改完之后的快照。
-func (w *replayWindow) configure(enabled *bool, permille *int, scope *string, capacity *int) map[string]any {
+//
+// scope 传的是**已校验的结构化范围**（nil = 不动；零值 ScopeRef = 清掉过滤）。
+// 解析与通配拒绝留在管理口那一层（parseScopeParam），窗口不参与语法判断 ——
+// 否则「400 说破」这件事就变成窗口里一个没人看的 error 分支。
+func (w *replayWindow) configure(enabled *bool, permille *int, scope *policy.ScopeRef, capacity *int) map[string]any {
 	w.mu.Lock()
 	if enabled != nil {
 		w.enabled = *enabled
@@ -210,7 +256,7 @@ func (w *replayWindow) configure(enabled *bool, permille *int, scope *string, ca
 		w.permille = *permille
 	}
 	if scope != nil {
-		w.scope = *scope
+		w.filter = *scope
 	}
 	if capacity != nil && *capacity > 0 {
 		w.capacity = *capacity
@@ -245,6 +291,10 @@ func (w *replayWindow) clear() {
 // 失败只 WARN、不改请求结果：采集是观测面，观测面出问题绝不能把用户的请求变差。
 // 但 WARN 里只带 request_id —— 错误文案可能含记录字段值，正文与密钥一律不许顺着
 // 这条路泄漏（§2.9 规则 6）。
+//
+// scope 是 2.x 传进来的路由作用域（用户名，静态 key 为空）。它**不**直接当窗口的键：
+// 键一律是结构化范围，由 requestAuditScope30 给（裁决 7=C；和 P6 那三类留痕同一个归属
+// 规则，一条规则只写一遍）。
 func (s *Server) captureReplay(rt *policyRuntime, scope, requestID string, shot *policyShot) {
 	w := s.replayWin
 	if rt == nil || shot == nil || w == nil {
@@ -259,7 +309,8 @@ func (s *Server) captureReplay(rt *policyRuntime, scope, requestID string, shot 
 	if shot.Version == "" || shot.res == nil {
 		return
 	}
-	if !w.shouldCapture(scope, requestID) {
+	key := requestAuditScope30(scope)
+	if !w.shouldCapture(key, shot.chain, requestID) {
 		return
 	}
 
@@ -289,7 +340,7 @@ func (s *Server) captureReplay(rt *policyRuntime, scope, requestID string, shot 
 		s.log.Warnf("回放记录采集失败（判定）request_id=%s: %v", requestID, err)
 		return
 	}
-	entry := replayEntry{scope: scope, decision: decision}
+	entry := replayEntry{key: key, decision: decision}
 
 	// 选路记录只在计划真的作用到本请求时才写（理由见文件头纪律 2）。
 	if shot.Applied {

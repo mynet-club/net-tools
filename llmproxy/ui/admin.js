@@ -1511,10 +1511,12 @@ async function rpExport() {
       throw new Error(msg);
     }
     let counted = '';
+    // 导出文件里的键是 routing（见 internal/replay/codec.go），状态接口才用 routings；
+    // 按状态接口的键名读这份文件，选路条数会永远是 0。
     try {
       const f = JSON.parse(text);
       counted = ' ' + ((f.decisions || []).length) + ' 条判定 / '
-        + ((f.routings || []).length) + ' 条选路，' + new Blob([text]).size + ' 字节';
+        + ((f.routing || []).length) + ' 条选路，' + new Blob([text]).size + ' 字节';
     } catch { counted = ' （这份文件读不出结构，仍按原样交付）'; }
     const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
     const a = h('a', { href: url, download: 'llmproxy-replay-records.json' });

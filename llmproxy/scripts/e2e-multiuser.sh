@@ -1033,6 +1033,79 @@ chk "legacy 下一类新留痕也不写（观察数据不冒充处置事实）" 
   "$(sqlite3 "$DB" "SELECT COUNT(*) FROM audit_log WHERE action IN ('policy.deny','egress.allow');")" "$AUDIT_BEFORE"
 echo "    取证留痕读数：$(sqlite3 "$DB" "SELECT group_concat(action||'@'||scope_kind||':'||scope_id, ' | ') FROM (SELECT action, scope_kind, scope_id FROM audit_log WHERE action IN ('policy.deny','egress.allow') ORDER BY id DESC LIMIT 6);")"
 
+# 23l 回放采集与导出的范围口径（2026-10-04 裁决第 7 条：C）。
+# 单元夹具锁得住匹配语义（键相等 or 链上命中），锁不住这三件只在接线上成立的事：
+#   - 状态口与过滤参数都是 **kind:id 全串**：管理员照回显写下一条命令，
+#     形态错了就是「开关看着开着却一条都没采」，而这句话今天得能自证。
+#   - 静态 key 那一路的判定第一次**可寻址**：旧形态下它的键是空串，按任何范围都导不到。
+#   - 按 org 导今天是 0 条（身份映射那条 claim→organization 没接进请求路径），
+#     而 0 条必须说破原因 —— 回一个看起来正常的空文件会让人去查窗口，那是错的方向。
+rec_ids() {
+  python3 -c 'import json,sys
+f=json.load(open(sys.argv[1]))
+print(",".join(sorted(d.get("request_id","") for d in f.get("decisions",[]))))' "$1"
+}
+LID_A="e2e-scope-alice-$$"
+LID_S="e2e-scope-static-$$"
+LID_S2="e2e-scope-static2-$$"
+ORG="e2e-org-$$"
+curl -s -o /dev/null -X POST "$GW/v1/_admin/replay/clear" -H "Authorization: Bearer $ADMIN"
+chk "为范围口径重新进入 enforce（public）" "$(POLICY_MODE '{"mode":"enforce","data_level":"public"}')" "200"
+sleep 2.5
+curl -s -o "$H/rpscope.json" -X POST "$GW/v1/_admin/replay/sampling" \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"enabled":true,"sample_permille":1000,"scope":"user:alice"}'
+chk "过滤按 kind:id 全串回显（不是裸用户名）" "$(jget "$H/rpscope.json" scope_filter)" "user:alice"
+alice_chat "deepseek-chat" -H "X-Request-Id: $LID_A" >/dev/null
+curl -s -o /dev/null -X POST "$GW/v1/chat/completions" -H "Authorization: Bearer sk-single-user" \
+  -H "X-Request-Id: $LID_S" -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}'
+curl -s -o "$H/rpstat.json" "$GW/v1/_admin/replay" -H "Authorization: Bearer $ADMIN"
+chk "采集侧过滤在真进程里生效：只有 alice 那条进窗口" "$(jget "$H/rpstat.json" entries)" "1"
+curl -s -o "$H/exp-alice.json" "$GW/v1/_admin/replay/export?scope=user:alice" -H "Authorization: Bearer $ADMIN"
+chk "按 user:alice 导出只拿到那一条" "$(rec_ids "$H/exp-alice.json")" "$LID_A"
+
+# 清掉过滤再放一发静态 key：这一条要能被 system:global 单独导出来。
+curl -s -o "$H/rpclear.json" -X POST "$GW/v1/_admin/replay/sampling" \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d '{"scope":""}'
+chk "显式传空 scope 是清过滤（不是保持原值）" "$(jget "$H/rpclear.json" scope_filter)" ""
+curl -s -o /dev/null -X POST "$GW/v1/chat/completions" -H "Authorization: Bearer sk-single-user" \
+  -H "X-Request-Id: $LID_S2" -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}'
+curl -s -o "$H/exp-sys.json" "$GW/v1/_admin/replay/export?scope=system:global" -H "Authorization: Bearer $ADMIN"
+chk "静态 key 那条按 system:global 导得出来（旧口径下它是不可寻址的空串）" \
+  "$(rec_ids "$H/exp-sys.json")" "$LID_S2"
+curl -s -o "$H/exp-alice2.json" "$GW/v1/_admin/replay/export?scope=user:alice" -H "Authorization: Bearer $ADMIN"
+chk "换范围导不会把别的范围的记录带出来" "$(rec_ids "$H/exp-alice2.json")" "$LID_A"
+
+# 0 命中要说破：org 级过滤今天合法但链上没有它，审计里那句原因才是运维要找的东西。
+curl -s -o "$H/exp-org.json" -w '%{http_code}' "$GW/v1/_admin/replay/export?scope=organization:$ORG" \
+  -H "Authorization: Bearer $ADMIN" > "$H/exp-org.code"
+chk "组织范围导出不再被 400 挡在门口" "$(cat "$H/exp-org.code")" "200"
+chk "导不到就明确是 0 条（而不是半集或错范围）" "$(rec_ids "$H/exp-org.json")" ""
+chk "org 级导出的审计指着那个 org 引用，并写明 0 命中的原因" \
+  "$(sqlite3 "$DB" "SELECT target FROM audit_log WHERE action='replay.export' AND target='organization:$ORG';")" \
+  "organization:$ORG"
+chk "同一条审计的 detail 说破「命中 0 条」" \
+  "$(sqlite3 "$DB" "SELECT CASE WHEN detail LIKE '%命中 0 条%' THEN 'yes' ELSE detail END FROM audit_log WHERE action='replay.export' AND target='organization:$ORG';")" \
+  "yes"
+# 通配仍然当场拒：它按相等匹配会一个都不命中，证据链里的静默空采比报错更糟。
+chk "通配范围仍拒在参数校验这一层" \
+  "$(curl -s -o /dev/null -w '%{http_code}' "$GW/v1/_admin/replay/export?scope=organization:*" -H "Authorization: Bearer $ADMIN")" \
+  "400"
+# 暴露面从一个人涨到一个组织，正文字段不能跟着涨：两份导出都按 23f 那张禁词表再过一遍。
+LEAK2=""
+for bad in '"body"' 'api_key' 'sk-alice-own' 'sk-single' 'Bearer ' 'base_url' '13800138000'; do
+  for file in "$H/exp-alice.json" "$H/exp-sys.json"; do
+    grep -q -- "$bad" "$file" && LEAK2="$LEAK2 $bad@$(basename "$file")"
+  done
+done
+[ -z "$LEAK2" ] && pass "范围放开没让导出多带正文或凭证" || fail "导出里翻出了不该有的东西：$LEAK2"
+"$BIN" replay off >/dev/null 2>&1 && pass "取完把采集关掉" || fail "replay off 失败"
+# 出口状态和 23k 之后一致：演练结束时网关回到 legacy，采集开关是关的。
+chk "回滚到 legacy 收尾" "$(POLICY_MODE '{"mode":"legacy"}')" "200"
+echo "    范围口径读数：$(sqlite3 "$DB" "SELECT group_concat(target||'='||substr(detail,1,24), ' | ') FROM (SELECT target, detail FROM audit_log WHERE action='replay.export' ORDER BY id DESC LIMIT 3);")"
+
 echo
 echo "================ 结果：通过 $PASS 项，失败 $FAIL 项 ================"
 [ "$FAIL" -eq 0 ] || exit 1

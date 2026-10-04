@@ -115,6 +115,17 @@ else
     "$(printf '%s' "$HB" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("providers"))')" \
     "$(printf '%s' "$HB" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("status"))')"
 fi
+# 优雅退出要证明的是「那个进程退了」，所以钉住它的 pid，而不是事后按命令行去搜进程：
+# pgrep -f "$BIN" 会匹配到任何把这个路径写进自己参数的进程 —— 包括在同一条 ssh 命令里
+# 接着跑 e2e 的那个 shell，于是脚本口径问题被标成 DRILL_FAIL(代码)，归因就错了。
+PID_FILE="$D/home/llmproxy.pid"
+if [ -f "$PID_FILE" ]; then
+  SRV_PID=$(tr -dc '0-9' < "$PID_FILE")
+  printf '  服务端 pid（读自 %s）：%s\n' "$PID_FILE" "$SRV_PID"
+else
+  SRV_PID=""
+  bad 代码 "start 之后没有 pid 文件，优雅退出这一项没法钉住具体进程"
+fi
 DB=$(ls "$D/home/data/"*.db 2>/dev/null | head -1)
 printf '  运行中的库文件：%s\n' "$(ls -la "$(dirname "$DB")" | tail -n +2 | awk '{printf "%s(%s) ", $9, $5}')"
 
@@ -126,7 +137,10 @@ sed 's/^/  stop 输出：/' "$D/home/stop1.log"
 sleep 0.5
 printf '  服务端收尾日志：\n'; tail -4 "$D/home/boot1.log" | sed 's/^/    /'
 curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1 && bad 代码 "stop 之后仍在应答"
-pgrep -f "$BIN" >/dev/null 2>&1 && bad 代码 "stop 之后进程还在"
+if [ -n "${SRV_PID:-}" ] && kill -0 "$SRV_PID" 2>/dev/null; then
+  bad 代码 "stop 之后 pid $SRV_PID 那个进程还在"
+fi
+[ -f "$PID_FILE" ] && bad 代码 "stop 之后 pid 文件还留着（$PID_FILE）"
 printf '  退出后 data/：%s\n' "$(ls -la "$(dirname "$DB")" | tail -n +2 | awk '{printf "%s(%s) ", $9, $5}')"
 if [ -f "$DB-wal" ] && [ "$(wc -c < "$DB-wal" | tr -d ' ')" -gt 100000 ]; then
   bad 代码 "优雅退出后 WAL 仍有 $(wc -c < "$DB-wal" | tr -d ' ') 字节，checkpoint 可能没做"

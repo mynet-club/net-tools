@@ -190,8 +190,14 @@
       <h3 class="sub-h">采集开关</h3>
       <p class="sub">四个字段各管各的：留空的<b>不动</b>（服务端是指针语义，不是整体覆盖），
         所以只想调比例时不必先把当前范围过滤抄一遍。千分率 1000 = 全采。
-        范围过滤只认 <code>user:&lt;用户名&gt;</code> 这种精确值 —— 通配在这里匹配不上任何范围，
-        那会是「开了采集却一条没收」这种最难查的形态。</p>
+        范围过滤只认<b>精确的 <code>kind:id</code></b>（<code>user:alice</code>、
+        <code>organization:university</code>、<code>system:global</code>……种类不限），
+        命中条件是「这次判定的请求范围<b>等于</b>它，<b>或</b>当时的范围链<b>里有</b>它」——
+        按组织导证据靠的是后一半。通配仍然当场拒：它按相等匹配会一条都不命中，
+        那是「开了采集却一条没收」这种最难查的形态。今天还得提醒一句：线上流量的链上只有
+        <code>user</code> 与 <code>system</code>（身份映射那条 <code>claim→organization</code>
+        没接进请求路径），所以按 org 过滤<b>会是明确的 0 条</b>，这不是过滤器坏了 ——
+        导出那份审计里会把原因一起写下来。</p>
       <div class="row">
         <label class="inline"><input type="checkbox" id="rp-enabled"> 开启采集</label>
         <input id="rp-permille" class="mono" inputmode="numeric" placeholder="千分率，如 50" autocomplete="off">
@@ -205,10 +211,13 @@
       <h3 class="sub-h">导出与清空</h3>
       <p class="sub">导出拿到的就是记录文件<b>本身</b>（<code>replay.File</code>，不加包装字段），
         所以浏览器存下来的那份可以直接交给另一个进程重跑；这里也刻意不做任何「下载后再拼一层」的处理。
-        空窗口导出的是一个只含 <code>schema_version</code> 的合法文件 ——
-        「没有记录」与「这个端点不存在」是两件事，回放侧会报前者。</p>
+        导出过滤与采集用<b>同一条命中规则</b>（等于它，或当时的范围链里有它），种类不限、通配仍拒。
+        空窗口导出的是一个只含 <code>schema_version</code> 的合法文件，
+        按某个范围导出但一条都没命中时同样是 200 + 空记录 ——
+        「没有记录」与「这个端点不存在」是两件事，回放侧会报前者，而这次导出记的审计会把
+        <b>命中 0 条</b>和它指着的范围一起留下。</p>
       <div class="row">
-        <input id="rp-export-scope" class="mono" placeholder="导出过滤，如 user:alice（留空=全窗口）" autocomplete="off">
+        <input id="rp-export-scope" class="mono" placeholder="导出过滤，如 user:alice（精确 kind:id；留空=全窗口）" autocomplete="off">
         <button type="button" id="rp-export" class="sm">导出记录文件</button>
         <button type="button" id="rp-clear" class="ghost sm">清空窗口</button>
         <span class="err" id="rp-exp-err" hidden></span>

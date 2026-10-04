@@ -37,12 +37,18 @@ const replayUsage = `llmproxy replay — 线上决策记录的导出与跨进程
   llmproxy replay on   [-permille N] [-scope kind:id] [-capacity N]
                                              开启采集（缺省全采 = 1000‰）
   llmproxy replay off                        关闭采集（已采到的记录留在窗口里）
-  llmproxy replay collect [-scope user:名字] [-out f.json]
+  llmproxy replay collect [-scope kind:id] [-out f.json]
                                              把窗口里的记录导出成文件
   llmproxy replay run -records f.json -now <RFC3339> [-strict-reasons] [-bundles 目录]
                                              用**当前磁盘上**的策略包重跑那份记录
 
 说明：
+  -scope 只认精确的 kind:id（user:alice、organization:university、project:lab-7、
+  system:global），通配当场拒。命中条件是「这次判定的请求范围等于它，**或**当时的
+  范围链里有它」—— 按组织导靠的是后一半。今天线上流量的链上只有 user 与 system
+  （身份映射那条 claim→organization 还没接进请求路径），所以按 org 导现在是明确 0 条，
+  审计与 CLI 都会把「命中 0 条」说出来，而不是回一个看起来正常的空文件。
+
   记录只在 policy.mode=enforce 且判定出了版本时才采集；影子的判定没有作用到任何
   请求上，不构成回放证据。选路记录另要求计划真的驱动了这次选路。
 
@@ -115,7 +121,7 @@ func replayOff(paths config.Paths) error {
 func replayOn(paths config.Paths, args []string) error {
 	fs := flag.NewFlagSet("replay on", flag.ContinueOnError)
 	permille := fs.Int("permille", -1, "千分率采样（0~1000，缺省 1000 = 全采）")
-	scope := fs.String("scope", "", "只采该范围（kind:id，如 user:alice；空 = 全部）")
+	scope := fs.String("scope", "", "只采该范围（精确 kind:id；请求范围等于它或当时的范围链含它才算命中。空 = 全部）")
 	capacity := fs.Int("capacity", -1, "窗口保留的请求数（1~4096，缺省不动）")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -211,7 +217,7 @@ func statValue(v any) string {
 
 func replayCollect(paths config.Paths, args []string) error {
 	fs := flag.NewFlagSet("replay collect", flag.ContinueOnError)
-	scope := fs.String("scope", "", "只导出该范围（user:名字；空 = 全部）")
+	scope := fs.String("scope", "", "只导出该范围（精确 kind:id，如 user:alice / organization:uni / project:p1 / system:global；空 = 全部）")
 	out := fs.String("out", "", "输出文件（省略 = 写到标准输出）")
 	if err := fs.Parse(args); err != nil {
 		return err

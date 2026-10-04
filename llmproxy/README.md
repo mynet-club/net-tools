@@ -554,8 +554,8 @@ shadow。热加载只看配置文件 mtime，因此「内存里还是上一次�
 | 方法 | 路径 | 用途 |
 |------|------|------|
 | GET | `/v1/_admin/replay` | 采集窗口的配置与计数（**不含任何 subject**），外加 mode、当前版本、两条抽样算法标识、记录结构版本，以及逐位复现三件套（`bit_exact_primary_order` / `bit_exact_algos` / `bit_exact_condition`） |
-| POST | `/v1/_admin/replay/sampling` | 改开关：`enabled` / `sample_permille`(0~1000) / `scope`(kind:id) / `capacity`(1~4096)，指针语义 —— 没带的字段不动 |
-| GET | `/v1/_admin/replay/export[?scope=user:名字]` | 导出记录文件本身（写出版本 schema v2，可读 v1+v2），**不加包装字段** |
+| POST | `/v1/_admin/replay/sampling` | 改开关：`enabled` / `sample_permille`(0~1000) / `scope`(精确 kind:id，空串=清掉) / `capacity`(1~4096)，指针语义 —— 没带的字段不动 |
+| GET | `/v1/_admin/replay/export[?scope=kind:id]` | 导出记录文件本身（写出版本 schema v2，可读 v1+v2），**不加包装字段**；范围种类不限（user / organization / project / system） |
 | POST | `/v1/_admin/replay/clear` | 清空记录与计数（开关与过滤条件保持） |
 
 管理台 `/admin/` 的「回放证据链」面板是同一组端点的界面版（窗口计数、开关、导出、清空），
@@ -571,7 +571,7 @@ llmproxy replay collect -out /tmp/rec.json   # 0600；解不开就当场报错
 llmproxy replay run -records /tmp/rec.json -now 2026-10-03T12:00:00Z
 ```
 
-三处不猜的地方：
+四处不猜的地方：
 
 - **`-now` 必填**。策略与身份的过期语义只有钉住回放时钟才能复现；用当前时间兜底会让
   「昨天拒绝的授权」在今天变成通过，而报告看起来完全正常。
@@ -585,6 +585,17 @@ llmproxy replay run -records /tmp/rec.json -now 2026-10-03T12:00:00Z
   `bit_exact_algos` 里）都退化成**解释性回放**，报告会明写这一条并把「首选逐位复现」计成 0 ——
   让人以为逐位复现了，比不复现更糟。`sampling_algo` 的写出值引用 `routing` 的常量而不是
   这里再抄一份字面量：「线上与回放是同一条实现」这句话得有证据。
+- **范围过滤只认精确 `kind:id`，而且采集侧与导出侧共用同一条命中规则**。窗口里的键是结构化
+  范围：DB 用户是 `user:<名字>`，静态 key 是 `system:global` —— 与 `policy.deny` 那几类留痕
+  共用同一条归属规则，一条规则只写一遍。命中条件是「这次判定的请求范围等于它，**或**当时
+  的范围链里有它」，按组织导证据靠的是后一半；通配仍然当场拒（相等匹配会一个都不命中）。
+  今天线上流量的链上只有 `user` 与 `system`（身份映射那条 `claim→organization` 没接进请求
+  路径），所以按 org 导是**明确 0 条** —— 审计会把「命中 0 条」和它指着的 org 引用一起留下，
+  而不是回一个看起来正常的空文件。放开的代价摊开说：一次导出的暴露面从一个人涨到一个组织，
+  今天的授权口径仍是管理凭证，要不要按范围再收一层归主线。
+  形态只留一处真相这件事本身是一条修复：过去管理口收 `user:alice` 而窗口比裸用户名 `alice`，
+  「设了过滤就等于一条都不采」在单元夹具里看不出来（夹具绕过管理口直接喂裸名）；
+  现在两侧都是同一个 `policy.ScopeRef`，这种写法通不过编译。
 
 窗口是**进程内**的有界缓冲：重启即空、溢出丢最旧并计入 `dropped`。所以流程是「要证据时
 打开 → 跑一批流量 → collect 取走 → off 或 clear」，而不是长期开着 —— 记录里带用户名，

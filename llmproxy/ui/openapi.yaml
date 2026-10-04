@@ -657,7 +657,10 @@ paths:
       description: |
         只回答「采了多少、按什么配置采」：enabled / sample_permille / scope_filter / capacity /
         entries / decisions / routings / captured / dropped / failed，外加 as_of、policy.mode、
-        当前策略版本、两条抽样算法标识（线上声明的与回放缺省的，二者不是同一算法），
+        当前策略版本、两条抽样算法标识（线上声明的与回放缺省的，二者不是同一算法）。
+        `scope_filter` 是 kind:id 的**全串**形态（user:alice / organization:university /
+        system:global），未设过滤时是空串 —— 它是管理员写过滤参数时照抄的那一串，
+        两种形态各写一处就会「开关看着开着却一条都不采」。
         `record_schema_version` / `record_schema_version_readable`，以及逐位复现三件套：
         `bit_exact_primary_order`（今天为 true）、`bit_exact_algos`（承诺逐位的算法封闭集合）、
         `bit_exact_condition`（**在什么条件下**才逐位 —— 仅 v2 且带 replay_snapshot 的记录；
@@ -673,8 +676,11 @@ paths:
       summary: 改回放记录采集开关（缺省关闭）
       description: |
         指针语义：只改随请求带来的字段，缺省字段保持原值。`sample_permille` 是千分率
-        （0~1000，1000 = 全采）；`scope` 是精确选择器 kind:id（通配直接 400 —— 窗口按字符串
-        相等匹配，带通配会一个都匹配不上而静默空采）；`capacity` 1~4096，缩小会挤掉最旧的
+        （0~1000，1000 = 全采）；`scope` 是精确选择器 kind:id（显式传空串 = 清掉过滤），
+        命中条件是「这次判定的请求范围等于它，或当时的范围链里有它」—— 与导出侧同一条规则，
+        所以「开关设成某个组织」采到的是该组织下所有用户的判定。通配仍然 400：它按相等匹配
+        会一个都匹配不上，而采集面的静默空采等于证据链当时就没开；
+        `capacity` 1~4096，缩小会挤掉最旧的
         记录并计入 dropped。窗口是**进程内**有界缓冲：重启即空，溢出丢最旧。
         记录只在 `policy.mode=enforce` 且判定出了策略版本时采集；选路记录另要求计划真的
         作用到本次选路。管理口的路由模拟**不**进窗口（证据里不许掺人为流量）。
@@ -708,19 +714,27 @@ paths:
         只是降级成解释性回放，报告里会明写这一条而不是静默通过。
         内容面由 `internal/replay` 的禁用词扫描把住：正文、密钥、端点这类字段名在解码期
         就被拒，导出侧写坏了会当场 500 而不是导出一份看起来正常的文件。
-        `?scope=user:<用户名>` 只导出那一个人的记录（窗口按 2.x 的路由作用域采集，
-        其它范围种类今天进不了窗口）。空窗口导出一份合法的空白记录文件而不是 404。
-        动作 `replay.export` 落审计，detail 只有条数与计数。
+        `?scope=<精确 kind:id>` 只导出命中该范围的记录（2026-10-04 裁决第 7 条 C）：
+        user / organization / project / system 都认，命中条件是「这次判定的请求范围等于它，
+        **或**当时的范围链里有它」。放开的代价摊开说：一次导出的暴露面从一个人涨到一个组织，
+        而响应体带 subject 与规则标识 —— 这是暴露等级变化，不是便利开关；授权口径今天与其它
+        管理口相同（管理凭证，不分范围），「要不要按范围再收一层」留给主线。
+        今天线上流量的链上只有 user 与 system（身份映射的 claim→organization 未接进请求路径），
+        所以按 org 导是**明确 0 条**：审计的 note 会写明「命中 0 条」及其原因，而不是回一个
+        看起来正常的空文件。采集侧过滤（下面的 `scope`）用同一条匹配规则。
+        空窗口导出一份合法的空白记录文件而不是 404。
+        动作 `replay.export` 落审计，target 是那个范围引用的 kind:id 全串（不是某个用户名），
+        不过滤时 target 是 `replay`；detail 只有条数与计数。
         CLI 等价入口：`llmproxy replay collect`。
       security: [{adminAuth: []}]
       parameters:
         - name: scope
           in: query
           required: false
-          schema: { type: string, example: user:alice }
+          schema: { type: string, example: organization:university }
       responses:
-        '200': { description: 'schema_version / decisions[] / routings[]（application/json 附件）' }
-        '400': { description: scope 不是精确的 user:<用户名> }
+        '200': { description: 'schema_version / decisions[] / routing[]（application/json 附件；命中 0 条也是 200）' }
+        '400': { description: scope 不是精确的 kind:id（通配、裸名字都拒） }
         '500': { description: 记录编码失败（采集侧缺陷，绝不下发半成品文件） }
   /v1/_admin/replay/clear:
     post:

@@ -128,18 +128,26 @@ func (s *Server) adminReplaySampling(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("capacity 是窗口保留的请求数（1~%d），当前 %d", replayWindowMaxCapacity, *body.Capacity))
 		return
 	}
-	// scope 过滤要精确：范围选择器带通配时窗口按字符串相等匹配，会一个都匹配不上而静默空采。
+	// scope 过滤要精确：范围选择器带通配时按字符串相等匹配，会一个都匹配不上而静默空采。
+	// 种类不再限制（裁决 7=C）：窗口与导出都用结构化范围，org/project 命中的是
+	// 当时那次判定的范围链，不是「请求范围等于它」。
+	var scopeRef *policy.ScopeRef
 	if body.Scope != nil {
 		raw := strings.TrimSpace(*body.Scope)
-		if raw != "" {
-			if _, err := parseScopeParam(raw); err != nil {
+		if raw == "" {
+			none := policy.ScopeRef{}
+			scopeRef = &none
+		} else {
+			ref, err := parseScopeParam(raw)
+			if err != nil {
 				writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "scope: "+err.Error())
 				return
 			}
+			scopeRef = &ref
 		}
 	}
 
-	stats := s.replayWin.configure(body.Enabled, body.Permille, body.Scope, body.Capacity)
+	stats := s.replayWin.configure(body.Enabled, body.Permille, scopeRef, body.Capacity)
 	note := fmt.Sprintf("回放记录采集开关已改：enabled=%v，sample_permille=%d，scope=%s，capacity=%d",
 		stats["enabled"], stats["sample_permille"], orDashAny(stats["scope_filter"]), stats["capacity"])
 	s.auditAt(policy.SystemScope, "admin", "replay.sampling.set", "replay", note)
@@ -156,24 +164,23 @@ func (s *Server) adminReplaySampling(w http.ResponseWriter, r *http.Request) {
 // 空窗口也导出一个只含 schema_version 的合法文件，而不是 404：
 // 「没有记录」与「这个端点不存在」是两件事，前者交给回放侧报「记录为空、拒绝判定」
 // （replay.Report.Empty 的既有口径），比在这里造一个只有管理台才懂的错误码好。
+//
+// scope 接受任意种类（2026-10-04 裁决第 7 条 C）：user / organization / project / system
+// 都认，命中条件是「这次判定的请求范围等于它，或当时的范围链里有它」。放开的代价要摊开说：
+// 一次导出的暴露面从一个人涨到一个组织，而响应体带 subject 与规则标识 —— 这是 §2.9
+// 规则 6 意义上的暴露等级变化。今天的授权口径与其它管理口相同（管理凭证，不分范围），
+// 「要不要按范围再收一层授权」留给主线，不在这包里自行加机制。
 func (s *Server) adminReplayExport(w http.ResponseWriter, r *http.Request) {
-	scope := strings.TrimSpace(r.URL.Query().Get("scope"))
-	if scope != "" {
-		ref, err := parseScopeParam(scope)
+	var filter policy.ScopeRef
+	if raw := strings.TrimSpace(r.URL.Query().Get("scope")); raw != "" {
+		ref, err := parseScopeParam(raw)
 		if err != nil {
 			writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "scope: "+err.Error())
 			return
 		}
-		// 窗口按 2.x 的路由作用域名（用户名）过滤，不是 kind:id 全串：
-		// 这里只认 user: 前缀那一段，其它种类今天还进不了窗口（旧链路的池子按用户分）。
-		if ref.Kind != policy.ScopeUser {
-			writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
-				fmt.Sprintf("导出过滤只认 user:<用户名>（窗口按 2.x 的路由作用域采集），当前是 %s", ref.Display()))
-			return
-		}
-		scope = ref.ID
+		filter = ref
 	}
-	f, dropped, failed := s.replayWin.file(scope)
+	f, dropped, failed := s.replayWin.file(filter)
 	data, err := replay.Encode(f)
 	if err != nil {
 		// 编码失败意味着记录里出现了被禁字段名 —— 那是采集侧的缺陷，必须当场说破，
@@ -181,13 +188,23 @@ func (s *Server) adminReplayExport(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "internal", "记录导出失败: "+err.Error())
 		return
 	}
-	note := fmt.Sprintf("导出 %d 条判定 / %d 条选路（过滤 %s，窗口累计丢弃 %d，采集失败 %d）",
-		len(f.Decisions), len(f.Routings), "无", dropped, failed)
-	if scope != "" {
-		note = fmt.Sprintf("导出 %d 条判定 / %d 条选路（范围 user:%s，窗口累计丢弃 %d，采集失败 %d）",
-			len(f.Decisions), len(f.Routings), scope, dropped, failed)
+	// 过滤条件进了审计而不是只进 note：事后查「这次事故当时导过什么范围」，
+	// 靠的是这一行的 target（kind:id 全串），不是某条日志文案。
+	target := "replay"
+	note := fmt.Sprintf("导出 %d 条判定 / %d 条选路（不过滤，窗口累计丢弃 %d，采集失败 %d）",
+		len(f.Decisions), len(f.Routings), dropped, failed)
+	if filter != (policy.ScopeRef{}) {
+		target = filter.Display()
+		note = fmt.Sprintf("导出 %d 条判定 / %d 条选路（范围 %s：请求范围等于它或当时的范围链含它；"+
+			"窗口累计丢弃 %d，采集失败 %d）",
+			len(f.Decisions), len(f.Routings), target, dropped, failed)
+		if len(f.Decisions) == 0 {
+			// 0 条要自己说破：按组织导的时候，「链里没有这个范围」和「窗口本来就是空的」
+			// 是两件完全不同的事，只回一个空文件会让人去查后者。
+			note += "；命中 0 条 —— 窗口里没有一条记录的请求范围或范围链是这个范围"
+		}
 	}
-	s.auditAt(policy.SystemScope, "admin", "replay.export", orDash(scope), note)
+	s.auditAt(policy.SystemScope, "admin", "replay.export", target, note)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="llmproxy-replay-records.json"`)
 	if _, err := w.Write(data); err != nil {
