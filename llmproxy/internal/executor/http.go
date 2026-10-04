@@ -40,7 +40,8 @@ type HTTPExecutor struct {
 
 // Options 构造 HTTPExecutor 的「怎么出去」部分。
 type Options struct {
-	// Name 是注册进 Registry 的稳定名（对应 policy.RouteCandidate.Executor）。
+	// Name 是这张通道表里的稳定名（对应 policy.RouteCandidate.Executor）：生产侧由
+	// server 的 executorRuntime 按（名字 × 归属 × 代理）持有实例，本包不再有注册表。
 	Name string
 	// Protocol 是该执行器的默认协议；Attempt.Protocol 非空时逐次覆盖。
 	Protocol Protocol

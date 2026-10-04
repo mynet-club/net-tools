@@ -72,8 +72,9 @@ const executorChannelMax = 64
 
 // executorChannel 是一条出网通道。同协议形态、同归属、同代理 = 同一条连接池，
 // 也才是同一个执行器实例：HTTPExecutor 把 transport 绑在实例上（Attempt 只带目标），
-// 所以一个名字在生产里对应多个实例 —— 这一点与 executor.Registry（名字→单实例）
-// 的假设冲突，已在 docs/3.0-stage-summary.md §4 登记为待裁决项。
+// 所以一个名字在生产里对应多个实例。executor 包原来那个「名字→单实例」的 Registry 与
+// 这条事实直接冲突，已按 2026-10-04 的裁决删除（docs/3.0-decision-packages.md 第 3 条）：
+// 生产入口只有本文件这张 (名字 × 归属 × 代理) 表，不留第二个「谁用什么执行器」的事实源。
 type executorChannel struct {
 	name       string
 	proto      executor.Protocol

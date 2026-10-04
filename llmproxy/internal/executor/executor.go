@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/config"
@@ -376,74 +375,4 @@ func AttemptFromPlan(plan policy.RoutingPlan, cand policy.RouteCandidate, base A
 	a.Model = cand.Model
 	a.UpstreamModel = cand.UpstreamModel
 	return a, nil
-}
-
-// Registry 是「名字 → 执行器」的并发安全注册表。
-//
-// 为什么要有它而不是让调用方 if/switch 选实现：计划里的候选带 Executor 字符串
-// （policy.RouteCandidate.Executor，§2.5），执行侧需要一个**纯查表**的落点；
-// 散在各处的 switch 会变成第二个「谁用什么执行器」的事实源。
-// 内部用 map 做键查找（不是遍历），List/Names 输出前排序 —— §2.8 禁的是
-// 依赖 map 遍历顺序做决策，查表不受遍历序影响。
-type Registry struct {
-	mu     sync.RWMutex
-	byName map[string]Executor
-}
-
-// NewRegistry 构造空注册表。
-func NewRegistry() *Registry {
-	return &Registry{byName: make(map[string]Executor)}
-}
-
-// Register 登记执行器。重名拒绝：静默覆盖会让「接线时登记的」与「实际跑的」
-// 不是同一个实现，这类漂移在 2.x 靠人肉排查过不止一次。
-func (r *Registry) Register(e Executor) error {
-	if e == nil {
-		return fmt.Errorf("%w: 注册了 nil 执行器", ErrAttempt)
-	}
-	name := e.Name()
-	if strings.TrimSpace(name) == "" {
-		return fmt.Errorf("%w: 执行器缺少 Name", ErrAttempt)
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if _, dup := r.byName[name]; dup {
-		return fmt.Errorf("%w: 执行器 %q 重复注册", ErrAttempt, name)
-	}
-	r.byName[name] = e
-	return nil
-}
-
-// Get 按名字取执行器。
-func (r *Registry) Get(name string) (Executor, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	e, ok := r.byName[name]
-	return e, ok
-}
-
-// Names 返回稳定排序的名字清单（供管理台/健康巡检列举，不参与任何决策）。
-func (r *Registry) Names() []string {
-	r.mu.RLock()
-	names := make([]string, 0, len(r.byName))
-	for n := range r.byName {
-		names = append(names, n)
-	}
-	r.mu.RUnlock()
-	sort.Strings(names)
-	return names
-}
-
-// ResolvePlanPrimary 按计划首选候选定位执行器。
-// 计划没有候选或执行器未注册时返回明确错误（fail_closed：宁可不跑也不猜一个）。
-func (r *Registry) ResolvePlanPrimary(plan policy.RoutingPlan) (Executor, policy.RouteCandidate, error) {
-	cand, ok := plan.Primary()
-	if !ok {
-		return nil, policy.RouteCandidate{}, fmt.Errorf("%w: 计划没有可执行候选", ErrAttempt)
-	}
-	e, ok := r.Get(cand.Executor)
-	if !ok {
-		return nil, cand, fmt.Errorf("%w: 执行器 %q 未注册", ErrAttempt, cand.Executor)
-	}
-	return e, cand, nil
 }

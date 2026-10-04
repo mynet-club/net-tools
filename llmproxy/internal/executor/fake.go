@@ -101,7 +101,7 @@ func NewFake(seed string, rules ...FakeRule) *Fake {
 
 var _ Executor = (*Fake)(nil)
 
-// Name 实现 Executor。默认实例名固定，方便 Registry 与 fake 对表。
+// Name 实现 Executor。默认实例名固定，方便测试与高校示例对表。
 func (f *Fake) Name() string { return "fake" }
 
 // Capabilities 实现 Executor：fake 声明它演示上必然用到的能力。
