@@ -382,6 +382,12 @@ type scanReader struct {
 	limitErr bool // 越限已发生：之后的 Read 恒返回截断错误
 }
 
+// newScanReader 造透传读取器。limit <= 0 是「不设字节上限」的显式形态（Attempt 侧
+// 只对流式开放这个取值）：逐段透传、永不因体积报错。
+//
+// 它**不等于**「整条流会被留在内存里」：本读取器不持有任何正文字节，累计的只有
+// 计数（seen）与观测器里的数字，而观测器的行缓冲有 maxLineBuffer 上限、处理完即弃。
+// 所以无上限改变的只是「什么时候断流」，不是「缓存多少」。
 func newScanReader(src io.ReadCloser, ob *observer, limit int64) *scanReader {
 	return &scanReader{src: src, ob: ob, limit: limit}
 }
@@ -390,15 +396,17 @@ func (r *scanReader) Read(p []byte) (int, error) {
 	if r.limitErr {
 		return 0, newError(ReasonBodyTooLarge, "", "响应体读取已因体积上限截断", ErrBodyLimit)
 	}
-	budget := r.limit - r.seen
-	if budget <= 0 {
-		r.limitErr = true
-		return 0, newError(ReasonBodyTooLarge, "", "响应体达到 Attempt.MaxResponseBytes 上限", ErrBodyLimit)
-	}
-	if int64(len(p)) > budget {
-		// 收缩本次读窗而不是直接报错：让下游先完整拿到限额内的最后一块字节，
-		// 越限信号留在下一次 Read。透传保真度优先。
-		p = p[:budget]
+	if r.limit > 0 {
+		budget := r.limit - r.seen
+		if budget <= 0 {
+			r.limitErr = true
+			return 0, newError(ReasonBodyTooLarge, "", "响应体达到 Attempt.MaxResponseBytes 上限", ErrBodyLimit)
+		}
+		if int64(len(p)) > budget {
+			// 收缩本次读窗而不是直接报错：让下游先完整拿到限额内的最后一块字节，
+			// 越限信号留在下一次 Read。透传保真度优先。
+			p = p[:budget]
+		}
 	}
 	n, err := r.src.Read(p)
 	if n > 0 {
@@ -408,7 +416,7 @@ func (r *scanReader) Read(p []byte) (int, error) {
 	if err == io.EOF {
 		r.finish()
 	}
-	if err == nil && r.seen >= r.limit {
+	if err == nil && r.limit > 0 && r.seen >= r.limit {
 		// 恰好读满限额且对端还活着：下一次 Read 才报截断 —— 这里如果直接报
 		// EOF，「读满限额」与「干净收尾」就分不开了。
 		return n, nil

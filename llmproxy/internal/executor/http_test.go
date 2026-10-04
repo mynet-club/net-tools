@@ -175,9 +175,12 @@ func TestHttpExecuteFailsClosedBeforeEgress(t *testing.T) {
 		{"基址带查询串", func(a *Attempt) { a.BaseURL = "http://127.0.0.1:1?x=zz" }, ReasonTargetRejected},
 		{"路径穿越", func(a *Attempt) { a.Path = "/v1/../../etc/passwd" }, ReasonTargetRejected},
 		{"路径带定界符", func(a *Attempt) { a.Path = "/v1/chat%2Fcompletions" }, ReasonTargetRejected},
-		{"超时为零", func(a *Attempt) { a.Timeout = 0 }, ReasonAttemptInvalid},
-		{"超时为负", func(a *Attempt) { a.Timeout = -time.Second }, ReasonAttemptInvalid},
-		{"响应体上限为零", func(a *Attempt) { a.MaxResponseBytes = 0 }, ReasonAttemptInvalid},
+		// 零值的闸门是 IsStream：非流式拿到 0 仍是入参非法（那条读法留给流式，
+		// 见 TestHttpExecuteStreamDeclaredWithoutDeadlineOrCap），负数则两边都不行。
+		{"非流式超时为零", func(a *Attempt) { a.IsStream = false; a.Timeout = 0 }, ReasonAttemptInvalid},
+		{"非流式上限为零", func(a *Attempt) { a.IsStream = false; a.MaxResponseBytes = 0 }, ReasonAttemptInvalid},
+		{"超时为负（流式也不行）", func(a *Attempt) { a.Timeout = -time.Second }, ReasonAttemptInvalid},
+		{"上限为负（流式也不行）", func(a *Attempt) { a.MaxResponseBytes = -1 }, ReasonAttemptInvalid},
 		{"协议未知", func(a *Attempt) { a.Protocol = "openai_chat_v2" }, ReasonAttemptInvalid},
 		{"正文为空", func(a *Attempt) { a.Body = nil }, ReasonRequestShapeInvalid},
 		{"正文不是 JSON 对象", func(a *Attempt) { a.Body = []byte("<html>zzhello</html>") }, ReasonRequestShapeInvalid},
@@ -317,4 +320,115 @@ func TestHttpProbeSemantics(t *testing.T) {
 			t.Fatalf("入参 %s 的探活结论 = %+v，期望 %s", c.tgt.BaseURL, got.Err, c.want)
 		}
 	}
+}
+
+// TestHttpExecuteStreamDeclaredWithoutDeadlineOrCap 锁 2026-10-04 裁决第 2 条落进 F 包后的
+// 三件事：0 是**显式声明**而不是默认值（闸门在 IsStream 上）、流式的时限真的只握在调用方
+// ctx 里（执行器不包第二层 deadline）、正数时限与 0 必须在同一份输入上给出不同的码。
+//
+// 判定门槛是裁决原话：「放宽后必须有测试证明 0 不是忘了填」。下面这一组就是那个证明。
+func TestHttpExecuteStreamDeclaredWithoutDeadlineOrCap(t *testing.T) {
+	t.Run("0 的闸门是 IsStream", func(t *testing.T) {
+		a := httpExAttempt("http://127.0.0.1:1")
+		a.Timeout, a.MaxResponseBytes = 0, 0
+		if err := a.Validate(); err != nil {
+			t.Fatalf("流式声明 0/0 必须合法（那是「以调用方 ctx 为准 / 逐段透传」）: %v", err)
+		}
+		a.IsStream = false
+		for _, tc := range []struct {
+			field  string
+			mutate func(*Attempt)
+		}{
+			{"Timeout", func(x *Attempt) { x.Timeout = 0; x.MaxResponseBytes = 1 << 20 }},
+			{"MaxResponseBytes", func(x *Attempt) { x.Timeout = 5 * time.Second; x.MaxResponseBytes = 0 }},
+		} {
+			b := a
+			tc.mutate(&b)
+			err := b.Validate()
+			if err == nil {
+				t.Fatalf("非流式拿到 %s=0 必须仍然非法，否则接线层会重新长出猜默认值的分支", tc.field)
+			}
+			if !errors.Is(err, ErrAttempt) {
+				t.Errorf("%s 的闸门要落在 ErrAttempt 上（fail_closed 的同一族），实际 %v", tc.field, err)
+			}
+			// 报错必须点名是哪一位：两位都为 0 时不该让人去猜。
+			if !strings.Contains(err.Error(), tc.field) {
+				t.Errorf("校验错误没点名字段 %s: %v", tc.field, err)
+			}
+		}
+		// 只填一位 0 也要各自放行（流式那一栏两位都免检）。
+		b := a
+		b.IsStream, b.Timeout, b.MaxResponseBytes = true, 5*time.Second, 0
+		if err := b.Validate(); err != nil {
+			t.Errorf("流式 + 正时限 + 上限 0 是合法组合: %v", err)
+		}
+	})
+
+	// 同一条挂住不返响应头的上游：时限为正 → 本包掐表报 timeout；
+	// 时限为 0 → 只有调用方 ctx 到期，必须报 caller_canceled 而不是 timeout。
+	// 两个码之所以要紧：它们是「执行器包了一层 deadline」与「没有」的唯一可观测差别。
+	hangRT := func() *httpExRT { return &httpExRT{hang: true} }
+	t.Run("正时限由执行器掐表", func(t *testing.T) {
+		a := httpExAttempt("http://127.0.0.1:1")
+		a.Timeout, a.MaxResponseBytes = 40*time.Millisecond, 0
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		_, err := httpExNew(t, Options{Transport: hangRT()}).Execute(ctx, a)
+		httpExCode(t, err, ReasonTimeout)
+	})
+	t.Run("时限为 0 时调用方 ctx 是唯一时限", func(t *testing.T) {
+		a := httpExAttempt("http://127.0.0.1:1")
+		a.Timeout, a.MaxResponseBytes = 0, 0
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancel()
+		_, err := httpExNew(t, Options{Transport: hangRT()}).Execute(ctx, a)
+		httpExCode(t, err, ReasonCallerCanceled)
+	})
+
+	// 限额为 0 的端到端形态：一份比正数限额大得多的 SSE 流必须整条交给下游，
+	// 且是逐段（首段在流收尾前就到达）。同一条 attempt 换成小正数限额时必须在限额处
+	// 报越限 —— 这一对才证明 0 真的解除了执法，而不是两条路都恰好读到底。
+	slowFrames := func(n int) string {
+		var b strings.Builder
+		for i := 0; i < n; i++ {
+			fmt.Fprintf(&b, "data: {\"choices\":[{\"delta\":{\"content\":\"zz%04d\"}}]}\n\n", i)
+		}
+		b.WriteString("data: [DONE]\n\n")
+		return b.String()
+	}
+	payload := slowFrames(2000) // 约 145 KiB，刻意大于下面那个 16 KiB 限额
+	rec := &httpExRecorder{}
+	up := httpExUpstream(t, rec, http.StatusOK, payload)
+
+	t.Run("限额 0 整条透传", func(t *testing.T) {
+		a := httpExAttempt(up.URL)
+		a.Timeout, a.MaxResponseBytes = 0, 0
+		out, err := httpExNew(t, Options{}).Execute(context.Background(), a)
+		if err != nil {
+			t.Fatalf("流式声明不限时执行失败: %v", err)
+		}
+		body, snap := consumeOutcome(t, out)
+		obs := out.Observed()
+		if body != payload || !obs.SawDone || obs.ContentBytes != 2000*6 {
+			t.Fatalf("透传或观测错误: got %d 字节 want %d, obs=%+v", len(body), len(payload), obs)
+		}
+		// 快照里不许出现任何正文字节（这条在不限形态下更要紧：读过的字节更多）。
+		if strings.Contains(snap, "zz0001") || strings.Contains(snap, httpExKey) {
+			t.Fatalf("快照泄漏了正文或密钥: %s", snap)
+		}
+	})
+	t.Run("同一份输入换成小限额必须越限", func(t *testing.T) {
+		a := httpExAttempt(up.URL)
+		a.Timeout, a.MaxResponseBytes = 0, 16<<10
+		out, err := httpExNew(t, Options{}).Execute(context.Background(), a)
+		if err != nil {
+			t.Fatalf("拿到响应头就不是执行器故障: %v", err)
+		}
+		_, err = io.ReadAll(out.Body)
+		var ee *ExecutionError
+		if !asExecutionError(err, &ee) || ee.Code != ReasonBodyTooLarge || !errors.Is(err, ErrBodyLimit) {
+			t.Fatalf("正数限额必须在限额处报显式越限（否则上面那条「0 = 不限」没有对照组）: %v", err)
+		}
+		_ = out.Body.Close()
+	})
 }

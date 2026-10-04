@@ -3,7 +3,7 @@ package server
 // 本文件是 §3.F 的接线层：把「计划里声明的执行器」变成实际承载一次上游交换的对象。
 //
 // 打通的是哪一段：配置修订 → 执行器装配（按出网通道惰性构造） → 计划候选的执行器名
-// 解析 → Attempt 构造（目标 / 凭证 / 正文 / 超时 / 上限全显式） → 一次交换 → 既有 relay。
+// 解析 → Attempt 构造（目标 / 凭证 / 正文 / 时限 / 上限全显式） → 一次交换 → 既有 relay。
 // 此前 `internal/executor` 在 internal/server 里没有任何调用点，线上请求一律不经过它。
 //
 // 三条边界，逐条都有「不这么做会怎样」：
@@ -14,11 +14,12 @@ package server
 //  2. **只有 enforce 且计划确实生效（shot.Applied）才委托**。legacy / shadow 下
 //     2.x 传输原样跑（§3.0 线 2）。影子一旦能换传输层，差异报告里就掺进了
 //     被观测者自己的改动。
-//  3. **流式不委托**。F 的 Attempt 契约强制 Timeout 与 MaxResponseBytes 为正
-//     （executor.Attempt.Validate），而现网流式刻意「无总时限」（idle.go：长回答
-//     会被总时限正常掐断）且「边收边转发、不缓存全文、无字节上限」（§2.9 规则 7）。
-//     把这两样塞进流式是一次功能回退；要打通它得先让 F 能表达「以调用方 ctx 为准、
-//     不缓存」的通道 —— 那是接口裁决，不在接线里偷偷做。
+//  3. **时限与缓冲由调用方表达，不由执行器私设**（2026-10-04 裁决第 2 条：B 方案）。
+//     流式也委托，但 Attempt 写成 `Timeout = 0`（以调用方 ctx 为准）与
+//     `MaxResponseBytes = 0`（不缓存、逐段透传）—— 现网流式刻意「无总时限」，
+//     长回答会被总时限正常掐断，空闲看门狗（idle.go）留在 relay 侧不搬进来；
+//     把看门狗搬进执行器会同时存在两份「客户端走了 / 空闲超时 / 我们的时限到了」的
+//     归因，而那正是边界 1 的方向。非流式仍照原样带正时限与 relay 同源的上限。
 //
 // 失败方向：计划里有这个候选、但它声明的执行器名本网关注册不上 → **拒掉这个候选**，
 // 不出网也不回落到 2.x 通道。回落等于让「计划说用哪个执行器」变成一句装饰，
@@ -223,7 +224,7 @@ type executorCall struct {
 // executorCallFor 判定这一次候选交换是否交给 F 执行器，并给出调用现场。
 //
 // 三种结论必须分清楚，它们在日志里长得一样、在排障上完全不同：
-//   - (nil, nil)：这次不委托，2.x 传输原样跑（模式不对 / 流式 / 计划没描述这家 / 时限不可表达）；
+//   - (nil, nil)：这次不委托，2.x 传输原样跑（模式不对 / 计划没描述这家 / 非流式的时限不可表达）；
 //   - (nil, err)：这个候选**不能用**（计划声明了本网关注册不上的执行器名，或通道装不起来），
 //     调用方按「换下一家」处理，绝不出网；
 //   - (call, nil)：委托，调用方只该把 call 当黑盒用。
@@ -235,14 +236,12 @@ func (s *Server) executorCallFor(rt *policyRuntime, shot *policyShot, ask execut
 	if ask.prov == nil {
 		return nil, nil
 	}
-	// 边界 3：流式留在 2.x（文件头给了不可委托的理由）。
-	if ask.isStream {
-		return nil, nil
-	}
-	// 时限必须原样可表达：Attempt.Timeout 强制为正，而现网的 timeout 取自
+	// 边界 3 的非流式那一半：Attempt.Timeout 强制为正，而现网的 timeout 取自
 	// provider.timeout_ms（配置加载时兜到 120s）。0 或负值在这里就不是「不限」，
 	// 而是「这次交换没法交给 F 描述」，交回 2.x 跑它原来的行为。
-	if ask.timeout <= 0 {
+	// 流式不吃这一条：它的时限由 relay 那侧的 ctx（空闲看门狗，或无看门狗时的
+	// 总时限）持有，Attempt 用 0 如实表达「以调用方 ctx 为准」。
+	if !ask.isStream && ask.timeout <= 0 {
 		return nil, nil
 	}
 	// 计划没描述这家（没有候选、或候选没有执行器名）时不委托：委托要求
@@ -282,24 +281,38 @@ func (s *Server) executorCallFor(rt *policyRuntime, shot *policyShot, ask execut
 		return nil, err
 	}
 
+	// 边界 3：流式与不是流式，时限与缓冲的来源不同，且必须在 Attempt 上如实写出来。
+	//   - 流式：Timeout=0 表示「以调用方 ctx 为准」（那个 ctx 在 relay 侧带着空闲看门狗，
+	//     或无看门狗时带着总时限），执行器不包第二层；MaxResponseBytes=0 表示不缓存、
+	//     逐段透传。0 的合法性由 executor 的 Validate 把关，只与 IsStream 同时成立。
+	//   - 非流式：时限取自这一跳，上限与 relay 的缓冲上限同源 —— 两条上限必须同值，
+	//     否则「谁先拦」变成运气，报出来的归因也跟着变。
+	timeout := ask.timeout
+	maxResponseBytes := int64(maxUpstreamResponseBytes)
+	// WantUsage 与 2.x 的注入条件同形：rewriteModelBody 只在 stream 时补
+	// stream_options.include_usage（forwarder.go :1012-1014），而 Ollama 原生方言没有
+	// 这个字段（执行器会显式报形态矛盾）。计量是网关自己的需求，但改正文必须调用方点名。
+	wantUsage := false
+	if ask.isStream {
+		timeout = 0
+		maxResponseBytes = 0
+		wantUsage = proto == executor.ProtocolOpenAIChat
+	}
+
 	attempt := executor.Attempt{
-		RequestID:     ask.requestID,
-		Provider:      ask.prov.Name,
-		Protocol:      proto,
-		BaseURL:       ask.prov.BaseURL,
-		APIKey:        ask.prov.APIKey,
-		Path:          ask.path,
-		Model:         ask.model,
-		UpstreamModel: ask.upstreamModel,
-		Body:          ask.body,
-		IsStream:      false,
-		// WantUsage 留给流式：include_usage 只对 SSE 有意义，而流式不委托（边界 3）。
-		// 声明矛盾时执行器显式报错（prepareRequest），这里不制造那种矛盾。
-		WantUsage: false,
-		Timeout:   ask.timeout,
-		// 与 relay 的非流式缓冲上限同源：两条上限必须同值，否则「谁先拦」变成运气，
-		// 报出来的归因也跟着变。
-		MaxResponseBytes: maxUpstreamResponseBytes,
+		RequestID:        ask.requestID,
+		Provider:         ask.prov.Name,
+		Protocol:         proto,
+		BaseURL:          ask.prov.BaseURL,
+		APIKey:           ask.prov.APIKey,
+		Path:             ask.path,
+		Model:            ask.model,
+		UpstreamModel:    ask.upstreamModel,
+		Body:             ask.body,
+		IsStream:         ask.isStream,
+		WantUsage:        wantUsage,
+		Timeout:          timeout,
+		MaxResponseBytes: maxResponseBytes,
 		Headers:          ask.headers(),
 		Accept:           ask.accept,
 		ProxyURL:         ask.proxyURL,
@@ -404,11 +417,14 @@ func executorExchangeReason(err error, statusCode int) string {
 // （transport 直接返回 net/url 的错误，那里没有稳定码可用）。
 //
 // 调用方必须先排掉「客户端真的走了」再进这里（forwarder 的归因块就是这个次序）：
-// 委托时执行器把同一个 deadline 又包了一层（http.go :152），到点时先动的是哪个
-// ctx 没有保证，于是「我们的时限到了」在执行器侧可能报成 caller_canceled。
-// 次序保证了 parent ctx 还活着 —— 那 caller_canceled 只可能是那个派生时限，
-// 归因与 2.x 同形；反过来若把它当「客户端断开」放行，一次正常超时就会变成
-// 不给这家记失败的 499，而熔断口径跟着抖。
+// **非流式**委托时执行器把同一个 deadline 又包了一层，到点时先动的是哪个 ctx 没有保证，
+// 于是「我们的时限到了」在执行器侧可能报成 caller_canceled。次序保证了 parent ctx
+// 还活着 —— 那 caller_canceled 只可能是那个派生时限，归因与 2.x 同形；反过来若把它当
+// 「客户端断开」放行，一次正常超时就会变成不给这家记失败的 499，而熔断口径跟着抖。
+//
+// 流式委托不吃这段：Attempt.Timeout=0，执行器不包第二层 deadline，因此它报出的
+// caller_canceled 只可能来自调用方 ctx（看门狗或客户端断开），而那两种都由前面两个
+// 分支先判掉了。
 func upstreamFailMessage(err error, provider string, timeout time.Duration) (string, bool) {
 	var ee *executor.ExecutionError
 	if errors.As(err, &ee) {

@@ -318,3 +318,61 @@ func TestScanExConcurrentReadersIndependent(t *testing.T) {
 		}
 	}
 }
+
+// TestScanExZeroLimitMeansNoCap 锁 Attempt.MaxResponseBytes=0 的读法（2026-10-04 裁决
+// 第 2 条：0 只与 IsStream 同时合法，含义是「不设字节上限、逐段透传」）。
+//
+// 两个方向都要钉住，缺一个就会退化成另一种事故：
+//   - 读满再多也不许报越限（否则「不限」被实现成「第一字节就超限」，长回答全断）；
+//   - 「不限」不等于「整条流留在内存里」（否则一次超大响应就是一次 OOM）——
+//     所以顺手量出观测器行缓冲的峰值，它必须始终在防御上限之内。
+func TestScanExZeroLimitMeansNoCap(t *testing.T) {
+	const frames = 64
+	short := "data: {\"choices\":[{\"delta\":{\"content\":\"zzabcdefgh\"}}]}\n\n"
+	huge := "data: {\"x\":\"" + strings.Repeat("a", 3*maxLineBuffer) + "\"}\n" // 没有换行的巨帧：只有前缀
+	payload := huge + strings.Repeat(short, frames) + "data: [DONE]\n\n"
+
+	ob := newObserver(scanOpenAISSE)
+	r := newScanReader(&scanExSource{chunks: scanExChunks(payload, 4096)}, ob, 0)
+
+	buf := make([]byte, 512)
+	var (
+		got    strings.Builder
+		peak   int
+		reads  int
+		badErr error
+	)
+	for {
+		n, err := r.Read(buf)
+		got.Write(buf[:n])
+		reads++
+		if len(ob.lineBuf) > peak {
+			peak = len(ob.lineBuf)
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			badErr = err
+			break
+		}
+	}
+	if badErr != nil {
+		t.Fatalf("限额为 0 时任何一次 Read 都不该报错（越限尤其不许）: %v", badErr)
+	}
+	if got.String() != payload {
+		t.Fatalf("限额为 0 必须把整条流原样透传: got %d 字节 want %d 字节", got.Len(), len(payload))
+	}
+	if peak > maxLineBuffer {
+		t.Fatalf("「不设上限」被实现成缓存了：%d 字节的行缓冲越过了防御上限 %d", peak, maxLineBuffer)
+	}
+	if reads < 2 {
+		t.Fatalf("这条断言要的是「逐段读」，只读了 %d 段说明源没分片", reads)
+	}
+	// 观测照常从同一批字节里长出来：数字有，正文没有。
+	obs := ob.observation()
+	if !obs.SawDone || obs.ContentBytes != frames*10 || len(ob.jsonBuf) != 0 {
+		t.Fatalf("旁路观测错误: %+v lineBuf=%d jsonBuf=%d", obs, len(ob.lineBuf), len(ob.jsonBuf))
+	}
+	_ = r.Close()
+}

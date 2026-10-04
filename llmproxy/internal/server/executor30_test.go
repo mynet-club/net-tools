@@ -10,8 +10,13 @@ package server
 //     而这正是 §8 点名的绕过出网控制的快捷路径；
 //   - 装配失败不指名、或指名时把上游密钥端出来；
 //   - 一次正常超时被归因成「客户端走了」：那样既不给这家记失败，又让熔断口径跟着抖。
+//
+// 流式进来之后（2026-10-04 裁决第 2 条：B 方案），最后两类各多了一条同形用例：委托侧的
+// 流式既不能长出总时限，也不能把「看门狗掐的 / 客户端真的走了 / 我们的时限到了」这三行
+// 归因搅成一份 —— 那三分原来只有 2.x 覆盖，现在两条路都要能答。
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"math"
@@ -80,10 +85,22 @@ func (u *execUp) last(t *testing.T) (string, http.Header) {
 // 夹具应该跟着变，而不是在这里多养一份口径。
 func execYAML(t *testing.T, upstreamURL, mode string, timeoutMs int) string {
 	t.Helper()
+	return execYAMLIdle(t, upstreamURL, mode, timeoutMs, 0)
+}
+
+// execYAMLIdle 比 execYAML 多一项可选的 stream_idle_timeout_ms。
+// 它单独立一个入口是有原因的：流式委托的三分归因里「空闲看门狗掐的」那一支，
+// 只有配了空闲上限才会出现；不配（0）时流式仍受总时限管，那是另一种行为。
+func execYAMLIdle(t *testing.T, upstreamURL, mode string, timeoutMs, idleMs int) string {
+	t.Helper()
 	src := cfgYAML(map[string]string{"vendorA": upstreamURL}, []string{"sk-local"})
 	if timeoutMs > 0 {
 		src = strings.Replace(src, "    weight: 1\n",
 			fmt.Sprintf("    timeout_ms: %d\n    weight: 1\n", timeoutMs), 1)
+	}
+	if idleMs > 0 {
+		src = strings.Replace(src, "  port: 0\n",
+			fmt.Sprintf("  port: 0\n  stream_idle_timeout_ms: %d\n", idleMs), 1)
 	}
 	if mode != "" {
 		src += policySection(mode, "t-open", "system:gateway", 1)
@@ -95,7 +112,13 @@ func execYAML(t *testing.T, upstreamURL, mode string, timeoutMs int) string {
 // 「没委托」和「委托没生效」在断言里长得一模一样）。
 func execHarness(t *testing.T, upstreamURL, mode string, timeoutMs int) *harness {
 	t.Helper()
-	h := newHarness(t, execYAML(t, upstreamURL, mode, timeoutMs))
+	return execHarnessIdle(t, upstreamURL, mode, timeoutMs, 0)
+}
+
+// execHarnessIdle 同 execHarness，多带一个空闲看门狗上限（见 execYAMLIdle）。
+func execHarnessIdle(t *testing.T, upstreamURL, mode string, timeoutMs, idleMs int) *harness {
+	t.Helper()
+	h := newHarness(t, execYAMLIdle(t, upstreamURL, mode, timeoutMs, idleMs))
 	if mode != "" {
 		writePolicyBundle(t, h, policyBundleOpen)
 	}
@@ -305,11 +328,17 @@ func ptr64(v *int64) int64 {
 	return *v
 }
 
-// ---------------------------------------------------------------- 边界 3
+// ---------------------------------------------------------------- 边界 3（流式）
 
-// 流式必须留在 2.x 的逐段通道上。这条同时钉住两件「接线顺手会做错」的事：
-// 给流式加总时限、把流缓存住。
-func TestExecutor30StreamingStaysOnLegacyTransport(t *testing.T) {
+// 2026-10-04 裁决第 2 条走 B 方案后，流式也交给执行器承载，但 Attempt 用
+// `Timeout = 0` / `MaxResponseBytes = 0` 如实表达「时限在调用方 ctx 里 / 不缓存、
+// 逐段透传」。这条钉住换承载者之后流式的四件事实没被接线改坏：
+//   - 逐段透传还在（响应类型没变、[DONE] 没被吃掉）；
+//   - 计量照旧（usage 末帧仍由 relay 自己的扫描器从透传流里读出，边界 1）；
+//   - 上游收到的正文与 2.x 的改写结果同形（include_usage 由调用方点名才注入 ——
+//     少了它上游不回 usage 末帧，表现是「账全变 0」而不是报错）；
+//   - 那两个 0 落在执行记录上读得出（见 executorwiring_test.go）。
+func TestExecutor30StreamingDelegatesWithoutBuffering(t *testing.T) {
 	up := startExecUp(t, procSSE("alpha", " beta"))
 	h := execHarness(t, up.url(), "enforce", 0)
 
@@ -317,22 +346,224 @@ func TestExecutor30StreamingStaysOnLegacyTransport(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("流式应照常 200，实际 %d: %s", resp.StatusCode, truncateMsg(string(body), 200))
 	}
-	if got := resp.Header.Get("X-Llmproxy-Executor"); got != "" {
-		t.Errorf("流式不该被委托（Attempt 强制正时限与字节上限，塞进去就是功能回退），实际 %q", got)
+	if got := resp.Header.Get("X-Llmproxy-Executor"); got != policyExecutorOpenAI {
+		t.Errorf("流式也该由计划声明的执行器承载（裁决第 2 条：B 方案），实际委托头 %q", got)
 	}
 	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
 		t.Errorf("流式响应类型不该变，实际 %q", ct)
 	}
 	if !strings.Contains(string(body), "[DONE]") {
-		t.Errorf("流式收尾不该被吃掉: %s", truncateMsg(string(body), 200))
+		t.Errorf("流式收尾不该被吃掉（缓存整包再发就会吃在最后）: %s", truncateMsg(string(body), 200))
 	}
-	// usage 仍扫得到 = 走的还是原来那条逐段通道（scanner 在执行/包装链下游）。
+	for _, part := range []string{"alpha", "beta"} {
+		if !strings.Contains(string(body), part) {
+			t.Errorf("正文片段 %q 没原样透传到客户端: %s", part, truncateMsg(string(body), 200))
+		}
+	}
+
+	sent, _ := up.last(t)
+	if !strings.Contains(sent, `"stream":true`) || !strings.Contains(sent, `"include_usage":true`) {
+		t.Errorf("委托侧的流式正文必须与 2.x 改写后的形状同形，否则上游不回 usage 末帧: %s",
+			truncateMsg(sent, 300))
+	}
+
 	rec := recentRecord(t, h, "req-exec-stream")
+	// usage 仍扫得到 = 计量那条路一个字没动（relay 在读透传流时自己扫）。
 	if rec.TotalTokens == nil || *rec.TotalTokens != 33 {
 		t.Errorf("流式 usage 应仍被记账，实际 %+v", rec.TotalTokens)
 	}
 	if !rec.Stream {
 		t.Errorf("这条该记成流式请求")
+	}
+}
+
+// 委托不得把流式拉回「总时限掐断长回答」的旧行为 —— 那是 B 方案明确拒绝的功能回退。
+// 形状与 idle_test.go 那条「慢但活着」相同，差别在于这一发是执行器承载的：接线如果
+// 给流式填了正时限，执行器会在 provider.timeout_ms 处自己掐表，客户端拿到的是失败
+// 而不是跑完的流。
+func TestExecutor30StreamingKeepsNoExecutorDeadline(t *testing.T) {
+	const chunks = 10
+	up := startExecUp(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		f, _ := w.(http.Flusher)
+		for i := 0; i < chunks; i++ {
+			fmt.Fprintf(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"c%d\"}}]}\n\n", i)
+			if f != nil {
+				f.Flush()
+			}
+			time.Sleep(150 * time.Millisecond)
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		if f != nil {
+			f.Flush()
+		}
+	})
+	// 总时限 1000ms（配置下界）而整条约 1.5s：执行器一掐表就断，
+	// 空闲上限 5s 排除看门狗干扰（chunk 间隔 150ms 远小于它）。
+	h := execHarnessIdle(t, up.url(), "enforce", 1000, 5000)
+
+	resp, body := procChat(t, h, "req-exec-slow-stream", "hi", true)
+	if got := resp.Header.Get("X-Llmproxy-Executor"); got != policyExecutorOpenAI {
+		t.Fatalf("前提不成立：这条流式没走执行器（委托头 %q）", got)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("慢但一直有数据的流不该被委托侧掐断，实际 %d: %s",
+			resp.StatusCode, truncateMsg(string(body), 200))
+	}
+	for i := 0; i < chunks; i++ {
+		if !strings.Contains(string(body), fmt.Sprintf("c%d", i)) {
+			t.Fatalf("第 %d 个 chunk 没转发出去，流被提前掐断了（收到 %d 字节）", i, len(body))
+		}
+	}
+	if !strings.Contains(string(body), "[DONE]") {
+		t.Errorf("流没走完（缺 [DONE]，收到 %d 字节）", len(body))
+	}
+}
+
+// 空闲看门狗掐的流（委托侧）：执行器只会报「调用方 ctx 被取消」，而网关必须靠
+// wd.Fired() 认出这是空闲超时 —— 误判成客户端走了就不给这家记失败，熔断口径跟着抖。
+// 2.x 那条覆盖在 idle_test.go，这条把同一支归因在委托路径上重跑一遍。
+func TestExecutor30StreamingIdleAttributionStaysUpstreamIdle(t *testing.T) {
+	stall := make(chan struct{})
+	up := startExecUp(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		select {
+		case <-stall:
+		case <-r.Context().Done():
+		}
+	})
+	defer close(stall)
+
+	h := execHarnessIdle(t, up.url(), "enforce", 600000, 1000)
+	resp, _ := procChat(t, h, "req-exec-idle-del", "hi", true)
+	if got := resp.Header.Get("X-Llmproxy-Executor"); got != policyExecutorOpenAI {
+		t.Fatalf("前提不成立：这条卡死的流没走执行器（委托头 %q）", got)
+	}
+	rec := recentRecord(t, h, "req-exec-idle-del")
+	if rec.ErrorType != "upstream_idle" {
+		t.Errorf("委托侧空闲超时的错误类型应当是 upstream_idle，实际 %q（%s）", rec.ErrorType, rec.ErrorMsg)
+	}
+	if !strings.Contains(rec.ErrorMsg, "空闲") {
+		t.Errorf("错误信息该说清是空闲超时: %q", rec.ErrorMsg)
+	}
+	if strings.Contains(rec.ErrorMsg, "客户端") {
+		t.Errorf("看门狗掐的不该归因成客户端走了: %s", rec.ErrorMsg)
+	}
+	if rec.OK {
+		t.Errorf("卡死的流不该记成成功: %+v", rec)
+	}
+}
+
+// 客户端在上游返回前断开（委托侧，三分归因的第三支）：执行器报的是 caller_canceled，
+// 而 r.Context() 已经先一步到期 —— 那既不是供应商慢（不该说成超时），也不该给这家
+// 记连续失败，更不该换一家白打一次。
+func TestExecutor30ClientGoneIsNotBlamedOnProvider(t *testing.T) {
+	release := make(chan struct{})
+	up := startExecUp(t, func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+			procJSON("too late")(w, r)
+		case <-r.Context().Done():
+		}
+	})
+	defer close(release)
+	h := execHarness(t, up.url(), "enforce", 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		h.gateway.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sk-local")
+	req.Header.Set("X-Request-Id", "req-exec-clientgone")
+	done := make(chan error, 1)
+	go func() {
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			resp.Body.Close()
+		}
+		done <- err
+	}()
+
+	// 等上游确实收到这一发再断开，否则测的是「还没出网就取消」。
+	deadline := time.Now().Add(5 * time.Second)
+	for up.hits() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if up.hits() == 0 {
+		t.Fatal("上游没收到请求，委托路径的前提不成立")
+	}
+	cancel()
+	if err := <-done; err == nil {
+		t.Errorf("客户端已断开，客户端侧却拿到了成功响应")
+	}
+	time.Sleep(400 * time.Millisecond) // 给网关处理这次断开的时间
+
+	if n := up.hits(); n != 1 {
+		t.Errorf("客户端已经走了，不该再打第二家上游，实际 %d 次", n)
+	}
+	st := h.router.Snapshot()
+	if got := st["vendorA"].ConsecutiveFailures; got != 0 {
+		t.Errorf("客户端断开不该给 vendorA 记连续失败，实际 %d（cfgYAML 里 failure_threshold=3）", got)
+	}
+	rec := recentRecord(t, h, "req-exec-clientgone")
+	if rec.ErrorType != "client_gone" {
+		t.Errorf("错误类型应当是 client_gone，实际 %q（%s）", rec.ErrorType, rec.ErrorMsg)
+	}
+	if strings.Contains(rec.ErrorMsg, "请求超时") {
+		t.Errorf("客户端走了不该说成供应商超时: %s", rec.ErrorMsg)
+	}
+	if rec.OK {
+		t.Errorf("客户端断开的请求不该记成成功: %+v", rec)
+	}
+}
+
+// 流式委托的计量与 2.x 逐字段一致（边界 1 的流式版）。非流式那条
+// （TestExecutor30MeteringMatchesLegacyPath）已经证明「共用 relay 计量」不是纸面承诺，
+// 而流式才是风险所在：读上游的人换了，usage 末帧与首字节时刻都得原样到达 relay。
+func TestExecutor30StreamingMeteringMatchesLegacyPath(t *testing.T) {
+	up := startExecUp(t, procSSE("one", " two"))
+
+	delH := execHarness(t, up.url(), "enforce", 0)
+	legH := execHarness(t, up.url(), "", 0)
+	seedProviderPrice(t, delH)
+	seedProviderPrice(t, legH)
+	delResp, _ := procChat(t, delH, "req-exec-smeter-del", "meter stream", true)
+	legResp, _ := procChat(t, legH, "req-exec-smeter-leg", "meter stream", true)
+
+	if got := delResp.Header.Get("X-Llmproxy-Executor"); got != policyExecutorOpenAI {
+		t.Fatalf("前提不成立：这条流式没走执行器（委托头 %q）", got)
+	}
+	if got := legResp.Header.Get("X-Llmproxy-Executor"); got != "" {
+		t.Fatalf("前提不成立：legacy 侧不该委托，实际 %q", got)
+	}
+
+	del := recentRecord(t, delH, "req-exec-smeter-del")
+	leg := recentRecord(t, legH, "req-exec-smeter-leg")
+	mDel, mLeg := meterOf(del), meterOf(leg)
+	if mDel != mLeg {
+		t.Errorf("同一条流式请求在两条链路下的账不一致：\n委托 %+v\n2.x  %+v", mDel, mLeg)
+	}
+	if mDel.prompt != 11 || mDel.completion != 22 || mDel.total != 33 {
+		t.Errorf("流式 usage 应为 11/22/33，实际 %d/%d/%d —— 一致但一起错，等于两条路都没扫到",
+			mDel.prompt, mDel.completion, mDel.total)
+	}
+	if !mDel.stream || !mLeg.stream {
+		t.Errorf("两条链路都要记成流式: 委托 %v / 2.x %v", mDel.stream, mLeg.stream)
+	}
+	if del.TTFTMs == nil || *del.TTFTMs < 0 || leg.TTFTMs == nil || *leg.TTFTMs < 0 {
+		t.Errorf("两条链路都要记录 TTFT（可以为 0，不能没有）：委托 %+v / 2.x %+v", del.TTFTMs, leg.TTFTMs)
+	}
+	if cDel, cLeg := frozenCost(t, delH, "vendorA", "gpt-4o"), frozenCost(t, legH, "vendorA", "gpt-4o"); cDel != cLeg {
+		t.Errorf("冻结的上游成本不一致：委托 %v，2.x %v —— 出现了第二套计价", cDel, cLeg)
 	}
 }
 
@@ -446,6 +677,43 @@ func TestExecutor30DecisionBranches(t *testing.T) {
 		}
 	})
 
+	// 裁决第 2 条（B 方案）落进 Attempt 的那两个 0：判定要证明「0 是显式声明」而不是
+	// 「接线忘了填」。两个证据缺一不可 —— IsStream 必须同时为真，且这份 Attempt 要能
+	// 过执行器自家的 Validate（闸门在包里，不在注释里）；把 IsStream 摘掉后必须不过，
+	// 否则 0 就成了一条「忘了填也能跑」的通道。
+	t.Run("流式委托", func(t *testing.T) {
+		ask := base()
+		ask.isStream = true
+		ask.timeout = 0 // 流式的时限本来就在调用方 ctx 里，这一跳没配也不该挡委托
+		call, err := h.srv.executorCallFor(execRT(config.PolicyModeEnforce, nil), execShot(true, okPlan), ask)
+		if err != nil || call == nil {
+			t.Fatalf("enforce+Applied 下流式也该委托，实际 call=%v err=%v", call, err)
+		}
+		if !call.attempt.IsStream {
+			t.Fatalf("Attempt 要如实声明这是流式交换（0 的合法性靠它把关）")
+		}
+		if call.attempt.Timeout != 0 {
+			t.Errorf("流式委托不该带执行器侧总时限，实际 %v —— 长回答会被正常掐断", call.attempt.Timeout)
+		}
+		if call.attempt.MaxResponseBytes != 0 {
+			t.Errorf("流式委托不该设响应体上限，实际 %d —— 有上限就要缓存", call.attempt.MaxResponseBytes)
+		}
+		if !call.attempt.WantUsage {
+			t.Errorf("OpenAI 方言的流式委托要声明 usage 注入，否则上游不回 usage 末帧、计量集体归零")
+		}
+		if call.attempt.EgressCheck != nil {
+			t.Errorf("出网校验不该在 Attempt 里再填一份（两个校验点必然漂移）")
+		}
+		if err := call.attempt.Validate(); err != nil {
+			t.Fatalf("流式 Attempt 过不了自家校验，执行器会在出网前拒掉: %v", err)
+		}
+		notStream := call.attempt
+		notStream.IsStream = false
+		if err := notStream.Validate(); err == nil {
+			t.Errorf("摘掉 IsStream 后这两个 0 必须不合法，否则「忘了填」和「显式不限」分不开")
+		}
+	})
+
 	cases := []struct {
 		name   string
 		mutate func(rt *policyRuntime, shot *policyShot, ask *executorAsk)
@@ -453,8 +721,11 @@ func TestExecutor30DecisionBranches(t *testing.T) {
 		{"运行态缺失", func(rt *policyRuntime, _ *policyShot, _ *executorAsk) { rt.exec = nil }},
 		{"计划没生效", func(_ *policyRuntime, shot *policyShot, _ *executorAsk) { shot.Applied = false }},
 		{"shadow 模式", func(rt *policyRuntime, _ *policyShot, _ *executorAsk) { rt.mode = config.PolicyModeShadow }},
-		{"流式", func(_ *policyRuntime, _ *policyShot, ask *executorAsk) { ask.isStream = true }},
-		{"时限不可表达", func(_ *policyRuntime, _ *policyShot, ask *executorAsk) { ask.timeout = 0 }},
+		// 这条只钉非流式：流式的时限由调用方 ctx 持有，Attempt 用 0 如实表达，
+		// 不吃「时限不可表达」这一票（见下面的「流式委托」子用例）。
+		{"非流式时限不可表达", func(_ *policyRuntime, _ *policyShot, ask *executorAsk) {
+			ask.timeout = 0
+		}},
 		{"计划没描述这家", func(_ *policyRuntime, shot *policyShot, _ *executorAsk) {
 			shot.Plan = execPlan("vendorZ", policyExecutorOpenAI, "gpt-4o")
 		}},

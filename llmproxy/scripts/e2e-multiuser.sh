@@ -783,6 +783,42 @@ if grep "event=executor_exchange" "$GWLOG" | grep -q "sk-alice-own-1234"; then
 else
   pass "执行记录不含上游密钥明文"
 fi
+
+# §3.F 流式委托（2026-10-04 裁决第 2 条：B 方案）：流式也交给执行器承载，但时限与缓冲
+# 由调用方表达，落到执行记录上就是那两个**显式**的 0。真进程上要一次读出四件事 ——
+# 承载者换了、流是逐段透传的（正文与 [DONE] 都到了客户端）、网关的正文改写真的到达了
+# 进程之外（include_usage）、以及账照旧。少任何一件，"0 是声明"就只是注释里的自律。
+STR_RID="e2e-exec-stream-$$"
+STRBODY=$(curl -s -N -D "$H/stream.head" -X POST "$GW/v1/chat/completions" \
+  -H "Authorization: Bearer $A_TOKEN" -H "X-Request-Id: $STR_RID" -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-chat","stream":true,"messages":[{"role":"user","content":"hi"}]}')
+STR_EXEC=$(tr -d '\r' < "$H/stream.head" | sed -n 's/^[Xx]-[Ll]lmproxy-[Ee]xecutor: *//p')
+chk "流式那一段也换执行器承载（裁决 2：B 方案）" "$STR_EXEC" "http-openai"
+echo "$STRBODY" | grep -q "served-by:" \
+  && pass "流式正文透传到客户端" || fail "流式正文没透传：$STRBODY"
+# 逐段的直接证据是**帧数**：两个内容分片 + usage 末帧至少三帧，客户端只会看到一帧就说明
+# 有人在中间缓存了整包（那是裁决 2 明确不要的形状）。
+STR_FRAMES=$(printf '%s' "$STRBODY" | grep -c '^data: {')
+if [ "${STR_FRAMES:-0}" -ge 3 ]; then
+  pass "流式按 $STR_FRAMES 帧逐段到达（缓在一起就只剩一帧）"
+else
+  fail "流式没逐段透传，只收到 ${STR_FRAMES:-0} 帧：$STRBODY"
+fi
+echo "$STRBODY" | grep -q "\[DONE\]" \
+  && pass "流式收尾 [DONE] 没被吃掉（缓存整包再发就会丢在最后）" || fail "缺 [DONE]：$STRBODY"
+grep -q "stream=true include_usage=true" "$H/alice-up2.log" \
+  && pass "上游真实收到流式正文里的 include_usage（改正文由调用方点名才做）" \
+  || fail "上游没收到那个形态：$(tail -2 "$H/alice-up2.log" | tr '\n' ' ')"
+sleep 0.4
+STREAMLINE=$(grep "event=executor_exchange" "$GWLOG" | grep "$STR_RID" | tail -1)
+for f in "timeout_ms=0" "max_response_bytes=0" "status=200" "reason=-"; do
+  if [ -n "$STREAMLINE" ] && echo "$STREAMLINE" | grep -q "$f"; then pass "流式执行记录带 $f"
+  else fail "流式执行记录缺 $f：$STREAMLINE"; fi
+done
+# 同一个非流式 request 的记录已经证明那两个位置会写正数（上面 6 项里查过字段存在），
+# 这里的 0 才是「按形态显式声明」而不是「整条链路压根没填」。
+chk "流式委托的用量照旧入账（边界 1：relay 仍从透传流里扫 usage）" \
+  "$(sqlite3 "$DB" "SELECT COALESCE(total_tokens,0) FROM requests WHERE request_id='$STR_RID';")" "3"
 RID="e2e-trace-$$"
 curl -s -o /dev/null -X POST "$GW/v1/chat/completions" -H "Authorization: Bearer $A_TOKEN" \
   -H "X-Request-Id: $RID" -H 'Content-Type: application/json' \

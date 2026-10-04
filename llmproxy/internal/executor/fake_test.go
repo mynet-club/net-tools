@@ -218,6 +218,10 @@ func TestUnmatchedFailsClosed(t *testing.T) {
 }
 
 // TestAttemptValidationFailClosed 缺超时/缺上限/坏目标一律不出网。
+//
+// 零值这一栏的闸门是 IsStream（2026-10-04 裁决第 2 条）：非流式的 0 仍然是「缺」，
+// 流式的 0 是「显式声明不限」，两者都必须在出网**之前**分得清 —— 这里的用例所以都
+// 显式写成非流式，而放宽那一侧的正例见 http_test.go 的同名形态测试。
 func TestAttemptValidationFailClosed(t *testing.T) {
 	e, err := NewHTTPExecutor(Options{Name: "http"})
 	if err != nil {
@@ -226,15 +230,15 @@ func TestAttemptValidationFailClosed(t *testing.T) {
 	ctx := context.Background()
 
 	a := baseAttempt()
-	a.Timeout = 0
+	a.IsStream, a.Timeout = false, 0
 	if _, err := e.Execute(ctx, a); err == nil {
-		t.Fatalf("缺超时必须报错")
+		t.Fatalf("非流式缺超时必须报错")
 	}
 
 	a = baseAttempt()
-	a.MaxResponseBytes = 0
+	a.IsStream, a.MaxResponseBytes = false, 0
 	if _, err := e.Execute(ctx, a); err == nil {
-		t.Fatalf("缺响应体上限时必须报错")
+		t.Fatalf("非流式缺响应体上限时必须报错")
 	}
 
 	a = baseAttempt()
@@ -278,4 +282,28 @@ func int64p(p *int64) int64 {
 		return 0
 	}
 	return *p
+}
+
+// TestFakeZeroLimitMatchesRealExecutor 锁「同一处放宽在两个实现里同形」（裁决第 2 条）：
+// fake 与 HTTPExecutor 共用 Validate，但体积执法各写一处 —— 这里如果只改了真实侧，
+// 回放就会在限额为 0 的流式 Attempt 上报 body_too_large，而线上是好的。
+func TestFakeZeroLimitMatchesRealExecutor(t *testing.T) {
+	f := newScriptedFake()
+
+	a := baseAttempt()
+	a.MaxResponseBytes = 0
+	body, snap := consumeOutcome(t, mustExecute(t, f, context.Background(), a))
+	if body != sseScript || strings.Contains(snap, markSecret) {
+		t.Fatalf("限额为 0 必须整条交付脚本正文: got %d 字节 want %d 字节, snap=%s",
+			len(body), len(sseScript), snap)
+	}
+
+	// 对照组：限额小于脚本长度时仍然执法，「0 = 不限」不能顺手把正数限额也免掉。
+	b := baseAttempt()
+	b.MaxResponseBytes = int64(len(sseScript) - 1)
+	_, err := f.Execute(context.Background(), b)
+	var ee *ExecutionError
+	if !asExecutionError(err, &ee) || ee.Code != ReasonBodyTooLarge {
+		t.Fatalf("正数限额必须照常执法，got %v", err)
+	}
 }

@@ -215,6 +215,67 @@ func sortedLine(rec map[string]string) []string {
 	return out
 }
 
+// 流式那一发的执行记录：`timeout_ms=0 max_response_bytes=0` 是**显式声明**
+// 「时限在调用方 ctx 里 / 不缓存、逐段透传」（2026-10-04 裁决第 2 条：B 方案）。
+// 这条要证明的是运维面上读得出来：同一份配置、同一家上游，非流式那行带着正的时限与
+// 上限，流式那行才是两个 0 —— 否则「0 是声明」与「接线漏填」在日志里长得一模一样。
+// 字段形状与非流式那行刻意不变（§3.I 观测面稳定：不因裁决扩字段）。
+func TestExecutor30StreamingExecutionRecordDeclaresZeroes(t *testing.T) {
+	up := startExecUp(t, procSSE("one", " two"))
+	h := execHarness(t, up.url(), "enforce", 3000)
+	read := execLogFile(t, h)
+
+	nonStream, body := procChat(t, h, "req-wire-stream-off", "hello", false)
+	if nonStream.StatusCode != http.StatusOK {
+		t.Fatalf("非流式该 200，实际 %d: %s", nonStream.StatusCode, truncateMsg(string(body), 200))
+	}
+	off := execRecord(t, read(), "executor_exchange")
+	if off == nil {
+		t.Fatalf("非流式那发的执行记录缺席:\n%s", truncateMsg(read(), 800))
+	}
+	if off["timeout_ms"] != "3000" || off["max_response_bytes"] != fmt.Sprint(maxUpstreamResponseBytes) {
+		t.Fatalf("前提不成立：非流式那发的时限/上限就不是正数，后面的 0 无从对照（字段：%v）", off)
+	}
+
+	stream, body := procChat(t, h, "req-wire-stream-on", "hello", true)
+	if stream.StatusCode != http.StatusOK {
+		t.Fatalf("流式委托该 200，实际 %d: %s", stream.StatusCode, truncateMsg(string(body), 200))
+	}
+	if got := stream.Header.Get("X-Llmproxy-Executor"); got != executorNameOpenAI {
+		t.Fatalf("前提不成立：这条流式没走执行器（委托头 %q）", got)
+	}
+	on := execRecord(t, read(), "executor_exchange")
+	if on == nil {
+		t.Fatalf("日志里没有流式那发的 event=executor_exchange:\n%s", truncateMsg(read(), 800))
+	}
+	for _, c := range []struct{ field, want string }{
+		{"request_id", "req-wire-stream-on"},
+		{"executor", executorNameOpenAI},
+		{"provider", "vendorA"},
+		{"timeout_ms", "0"},
+		{"max_response_bytes", "0"},
+		{"status", "200"},
+		{"reason", exchangeReasonNone},
+	} {
+		if on[c.field] != c.want {
+			t.Errorf("流式执行记录 %s = %q，期望 %q（整行字段：%v）", c.field, on[c.field], c.want, on)
+		}
+	}
+	// 除那两个 0 以外，两行的字段面必须完全同形：观测面不能按请求形态长出新列。
+	if len(off) != len(on) {
+		t.Errorf("两条执行记录的字段数不一致（%d vs %d）：%v / %v", len(off), len(on), off, on)
+	}
+	for k := range off {
+		if _, ok := on[k]; !ok {
+			t.Errorf("流式那发少了字段 %s（观测面按请求形态变形，报表读法就散了）", k)
+		}
+	}
+	// 密钥与正文照旧不得跨出这一跳。
+	if line := strings.Join(sortedLine(on), " "); strings.Contains(line, "sk-vendorA") {
+		t.Errorf("执行记录里出现上游密钥明文: %s", line)
+	}
+}
+
 // 失败类型必须进执行记录：「有这一次交换」与「这一次交换成了没有」是排障时的两个不同问题。
 func TestExecutor30ExecutionRecordCarriesFailureType(t *testing.T) {
 	up := startExecUp(t, execUpStatus(http.StatusInternalServerError,

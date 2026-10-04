@@ -150,7 +150,16 @@ func (e *HTTPExecutor) Execute(ctx context.Context, a Attempt) (Outcome, error) 
 		return Outcome{}, newError(ReasonTargetRejected, a.Provider, "目标未通过安全约束", err)
 	}
 
-	callCtx, cancel := context.WithTimeout(ctx, a.Timeout)
+	// 时限的两种形态（Validate 保证 0 只出现在流式上）：正数由本包掐表，0 交给调用方 ctx。
+	// 两条都必须拿到 cancel：它挂在 Body.Close 上（cancelOnClose），流没关就不能释放连接，
+	// 所以「不限总时长」不等于「不派生 ctx」。
+	var callCtx context.Context
+	var cancel context.CancelFunc
+	if a.Timeout > 0 {
+		callCtx, cancel = context.WithTimeout(ctx, a.Timeout)
+	} else {
+		callCtx, cancel = context.WithCancel(ctx)
+	}
 	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, fullURL, bytes.NewReader(body))
 	if err != nil {
 		cancel()

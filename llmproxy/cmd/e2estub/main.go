@@ -29,11 +29,53 @@ func main() {
 	var hits int64
 	http.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&hits, 1)
+		// stream / stream_options 要逐字记下来：端到端那一头只有「上游真收到了什么」
+		// 能证明网关的正文改写（模型名、include_usage）真的到达了进程之外。
 		var probe struct {
-			Model string `json:"model"`
+			Model         string `json:"model"`
+			Stream        bool   `json:"stream"`
+			StreamOptions *struct {
+				IncludeUsage bool `json:"include_usage"`
+			} `json:"stream_options"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&probe)
-		_, _ = fmt.Fprintf(f, "%s %s\n", time.Now().Format("15:04:05"), *name)
+		_, _ = fmt.Fprintf(f, "%s %s model=%s stream=%t include_usage=%t\n",
+			time.Now().Format("15:04:05"), *name, probe.Model, probe.Stream,
+			probe.StreamOptions != nil && probe.StreamOptions.IncludeUsage)
+
+		if probe.Stream {
+			// 流式：逐段吐、每段都 flush，客户端据此判断网关有没有「缓存整包再发」。
+			w.Header().Set("Content-Type", "text/event-stream")
+			fl, _ := w.(http.Flusher)
+			chunk := func(o map[string]any) {
+				data, err := json.Marshal(o)
+				if err != nil {
+					return
+				}
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+				if fl != nil {
+					fl.Flush()
+				}
+			}
+			base := map[string]any{
+				"id": "chatcmpl-e2e", "object": "chat.completion.chunk",
+				"created": time.Now().Unix(), "model": probe.Model,
+			}
+			for _, part := range []string{"served-by:", *name} {
+				chunk(withBase(base, map[string]any{
+					"choices": []map[string]any{{"index": 0, "delta": map[string]string{"content": part}}},
+				}))
+			}
+			chunk(withBase(base, map[string]any{
+				"choices": []map[string]any{},
+				"usage":   map[string]int{"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+			}))
+			_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+			if fl != nil {
+				fl.Flush()
+			}
+			return
+		}
 
 		resp := map[string]any{
 			"id": "chatcmpl-e2e", "object": "chat.completion",
@@ -73,4 +115,16 @@ func main() {
 	if err := http.ListenAndServe(fmt.Sprintf("127.0.0.1:%d", *port), nil); err != nil {
 		panic(err)
 	}
+}
+
+// withBase 把公共字段与这一帧的字段合成一帧（不改 base，逐帧共用同一张底表）。
+func withBase(base map[string]any, extra map[string]any) map[string]any {
+	out := make(map[string]any, len(base)+len(extra))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range extra {
+		out[k] = v
+	}
+	return out
 }

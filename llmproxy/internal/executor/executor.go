@@ -127,13 +127,25 @@ type Attempt struct {
 	// 但注入这件事必须由调用方点名 —— 执行器不自作主张改正文。
 	WantUsage bool
 
-	// Timeout 是单次交换的总时限 (log-ok)。必填且为正（§5：所有外部调用必须设超时）。
-	// 流式的「空闲超时」不在本包：那是需要看门狗 goroutine 的策略（现网在
-	// forwarder 的 idleWatchdog），接线层可以用 ctx 自己实现。
+	// Timeout 是单次交换的总时限 (log-ok)。取值三种形态，**没有一种是默认值**：
+	//   - 正数：本包自己掐表（context.WithTimeout）。
+	//   - 0：以调用方 ctx 为准，本包不再包一层时限。**只与 IsStream 同时合法**
+	//     （2026-10-04 裁决，docs/3.0-decision-packages.md 第 2 条）：现网流式刻意
+	//     「无总时限」，长回答会被总时限正常掐断，看门狗按**空闲**掐才是不回退的形态。
+	//     调用方必须把那个时限或看门狗绑进 ctx —— 时限这件事只是换了持有者，没消失。
+	//   - 负数：一律非法。
+	//
+	// 流式的「空闲超时」仍不在本包：那是看门狗策略（现网在 forwarder 的 idleWatchdog），
+	// 接线层用 ctx 实现。把两份归因搬进来会出现「客户端走了 / 空闲超时 / 我们的时限到了」
+	// 两套判据，那是同一条裁决里被否掉的 D 方案。
 	Timeout time.Duration
 
-	// MaxResponseBytes 是响应体硬上限 (log-ok)。必填且为正（§5：body limit）。
-	// 流式与非流式同样受限；越限即断流并回报体积超限码，绝不「读到哪算哪」。
+	// MaxResponseBytes 是响应体硬上限 (log-ok)。形态与 Timeout 对称：
+	//   - 正数：越限即断流并回报体积超限码，绝不「读到哪算哪」。
+	//   - 0：不设字节上限、逐段透传，**只与 IsStream 同时合法**。它不等于「缓存全文」——
+	//     观测器只保留有界的行缓冲（scan.go 的 maxLineBuffer），读过即弃；
+	//     本包在非流式路径上仍然不允许这个取值，因为那里 relay 要整包缓冲。
+	//   - 负数：一律非法。
 	MaxResponseBytes int64
 
 	// Headers 是附加请求头 (secret-adjacent：可能含凭证)。绝不允许覆盖
@@ -165,6 +177,10 @@ var (
 )
 
 // Validate 做纯字段的入参校验（不碰 URL 语义，那些在 validateTarget 里做）。
+//
+// 「0」在这张表里只有一个读法：显式声明的「不限」，而且**只对流式开放**。放宽必须带闸门，
+// 否则接线层会重新长出「0 大概是忘了填」的猜测分支（同一条裁决写下的判定门槛）。
+// 非流式仍然强制正数 —— 那是 §5 的两条事故清单（挂死的连接池、无界的响应体读）。
 func (a Attempt) Validate() error {
 	if strings.TrimSpace(a.BaseURL) == "" {
 		return fmt.Errorf("%w: BaseURL 为空", ErrAttempt)
@@ -172,11 +188,17 @@ func (a Attempt) Validate() error {
 	if strings.TrimSpace(a.Path) == "" {
 		return fmt.Errorf("%w: Path 为空", ErrAttempt)
 	}
-	if a.Timeout <= 0 {
-		return fmt.Errorf("%w: Timeout 必须为正（缺超时的上游调用是一次挂起的连接池事故）", ErrAttempt)
+	if a.Timeout < 0 {
+		return fmt.Errorf("%w: Timeout 为负值", ErrAttempt)
 	}
-	if a.MaxResponseBytes <= 0 {
-		return fmt.Errorf("%w: MaxResponseBytes 必须为正（缺响应体上限的读取是一次 OOM 事故）", ErrAttempt)
+	if a.MaxResponseBytes < 0 {
+		return fmt.Errorf("%w: MaxResponseBytes 为负值", ErrAttempt)
+	}
+	if a.Timeout == 0 && !a.IsStream {
+		return fmt.Errorf("%w: Timeout=0（不限总时长、以调用方 ctx 为准）只允许与 IsStream 同时声明，非流式必须为正", ErrAttempt)
+	}
+	if a.MaxResponseBytes == 0 && !a.IsStream {
+		return fmt.Errorf("%w: MaxResponseBytes=0（不设字节上限、逐段透传）只允许与 IsStream 同时声明，非流式必须为正", ErrAttempt)
 	}
 	if a.Protocol != "" && !a.Protocol.valid() {
 		return fmt.Errorf("%w: 未知协议 %q", ErrAttempt, string(a.Protocol))
@@ -348,6 +370,8 @@ func AttemptFromProvider(p *config.Provider, model string, path string, proxies 
 	}
 	if a.Timeout <= 0 {
 		// 配置层没有兜底超时就直接报错，不在这里私设一个：默认值属于接线策略。
+		// 注意这与 Attempt.Timeout=0 的「显式声明不限」不是一回事 —— 这里是
+		// 「provider 段落里没写 timeout_ms」，那是一次配置缺项，而 0 是一次调用方决定。
 		return Attempt{}, fmt.Errorf("%w: provider %s 未配置 timeout_ms", ErrAttempt, p.Name)
 	}
 	return a, nil

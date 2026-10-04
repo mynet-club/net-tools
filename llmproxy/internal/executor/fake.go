@@ -168,9 +168,9 @@ func (f *Fake) Execute(_ context.Context, a Attempt) (Outcome, error) {
 	}
 
 	body := append([]byte(nil), rule.Body...)
-	if int64(len(body)) > a.MaxResponseBytes {
-		// 体积执法与真实执行器同一口径：超限是失败，不截断后照常交付；
-		// 且与 HTTPExecutor 一致，失败路径不交付半截 Outcome。
+	// 体积执法与真实执行器同一口径：上限为 0（流式的显式「不设上限」）时不判超限，
+	// 超限是失败而不是截断后照常交付；且与 HTTPExecutor 一致，失败路径不交付半截 Outcome。
+	if a.MaxResponseBytes > 0 && int64(len(body)) > a.MaxResponseBytes {
 		return Outcome{}, newError(ReasonBodyTooLarge, a.Provider, "脚本响应体超过 Attempt 上限", ErrBodyLimit)
 	}
 

@@ -451,6 +451,10 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 			// 「这一发到底用了什么时限」。落库是待裁决项（docs/3.0-decision-packages.md 第 4 条：
 			// 一张表 = store 三方言各一遍迁移），这里只做日志面。
 			//
+			// 流式那一发会记成 timeout_ms=0 max_response_bytes=0：那是**显式声明**的
+			// 「时限在调用方 ctx 里 / 不缓存逐段透传」（同一条文档的第 2 项裁决），
+			// 不是漏填 —— 字段形状刻意不变，两条路共用同一行日志的读法。
+			//
 			// attempt 里带着 APIKey 与 Body，它们不得跨出这一跳（§2.9），所以字段是逐个
 			// 点名取的，不是把 attempt 整个打出来。
 			reasonText := reason
