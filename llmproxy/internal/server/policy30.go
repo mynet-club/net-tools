@@ -275,6 +275,10 @@ type policyShot struct {
 	resource string
 	action   string
 	judgeNow time.Time
+	// replaySnapshot 是这次规划用过的完整回放输入（nil = 组不出，记录退化成解释性回放）。
+	// 它是「首选顺序逐位复现」唯一凭据的那一半（另一半是 sampling_algo），
+	// 也只被回放采集读：不进响应、不参与结论。
+	replaySnapshot *routing.ReplayInput
 }
 
 // excludedByPolicy 报告一个排除原因是否属于「策略说了算」的那一类。
@@ -413,7 +417,7 @@ func (s *Server) policyJudge(rt *policyRuntime, scope, model, requestID, path st
 			in.ProcessorChain = append(in.ProcessorChain, spec.Name)
 		}
 	}
-	plan, replay, err := rt.planner.PlanWithReplay(ctx, chain, in)
+	plan, snap, err := rt.planner.PlanWithReplay(ctx, chain, in)
 	if err != nil {
 		shot.PlanErr = err
 	} else {
@@ -422,8 +426,18 @@ func (s *Server) policyJudge(rt *policyRuntime, scope, model, requestID, path st
 		for _, c := range plan.Fallbacks {
 			shot.PlanOrder = append(shot.PlanOrder, c.Provider)
 		}
-		if digest, derr := replay.CandidatesDigest(); derr == nil {
+		if digest, derr := snap.CandidatesDigest(); derr == nil {
 			shot.CandidatesDigest = digest
+		}
+		// 完整现场快照留在 shot 上，供 §2.8 的记录采集直接带走（裁决 2026-10-04 第 5 条 B）：
+		// 它就是刚才那次规划**用过**的那份输入，采集时再问一遍活的策略得到的已经不是当时那次。
+		//
+		// 只带 D 自己吃得下去的那份：Validate 不通过（缺 seed、运行时事实不齐）时留 nil，
+		// 记录于是退化成解释性回放 —— 宁缺毋假。写进一份自相矛盾的快照，
+		// 换来的是「导出侧 500」或一条永远只能降级、却看起来证据齐全的记录。
+		if snap.Validate() == nil {
+			clone := snap
+			shot.replaySnapshot = &clone
 		}
 		// 排除结论取自计划的 Rejections：那里既有网关（授权）的结论，也有区域/分级
 		// 这类候选事实比对的结论，而计划的 ReasonCodes 混着技术性排除（能力、健康、

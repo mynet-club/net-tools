@@ -1,11 +1,13 @@
 package replay
 
 import (
+	"errors"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
+	"github.com/mynet-club/net-tools/llmproxy/internal/routing"
 )
 
 func seedFor(t *testing.T, requestID, version, epoch string) string {
@@ -186,5 +188,62 @@ func TestSamplerDoesNotUseGlobalRandom(t *testing.T) {
 	b, _ := s.Sequence(seed, shuffledCandidates(cands, 7), nil)
 	if strings.Join(a, ",") != strings.Join(b, ",") {
 		t.Fatalf("抽样依赖了额外状态: %v vs %v", a, b)
+	}
+}
+
+// 两个 sampling_algo 标识必须各自钉住一条**不同**的实现路径：
+// 本包的 replay-sampling-v1（sha256 计数流 + 不放回抽样）与 D 的
+// routing-seeded-splitmix64-v1（splitmix64 + 档序 + 权重累积扫描）。
+// 如果两个名字指的是同一件事，§2.8 那句「算法不同 ⇒ 只做解释性回放」就毫无内容。
+//
+// 比的是同一个 seed、同一个候选池、同一份排除集下的首选：输入全部固定，
+// 结论因此不会随运行次数变化，这条断言不是统计量的赌注。
+func TestReplaySamplerAndRoutingSamplerAreNotTheSameAlgorithm(t *testing.T) {
+	local := NewLocalSampler()
+	if local.Algo() != SamplingAlgoReplayV1 {
+		t.Fatalf("本包抽样器标识应是 %q，实际 %q", SamplingAlgoReplayV1, local.Algo())
+	}
+	if routing.AlgoSupportsBitExact(local.Algo()) {
+		t.Fatalf("本包抽样算法不该出现在 D 的逐位集合里（%v）：那会把解释性序列冒充成逐位结论",
+			routing.BitExactAlgos())
+	}
+
+	cands := poolOf()
+	rejected := map[string]bool{"p-demo": true}
+	diffs := 0
+	for i := 0; i < 200; i++ {
+		seed := seedFor(t, "req-algo-"+strconv.Itoa(i), "university-default@3", "epoch-7")
+		seq, err := local.Sequence(seed, cands, rejected)
+		if err != nil {
+			t.Fatalf("本包抽样失败: %v", err)
+		}
+		plan, err := routing.PlanFromReplay(replayInputFromCandidates(t, seed, cands, rejected, "gpt-mini"))
+		if err != nil {
+			t.Fatalf("D 重跑失败: %v", err)
+		}
+		if seq[0] != plan.Fallbacks[0].Provider {
+			diffs++
+		}
+	}
+	if diffs == 0 {
+		t.Fatal("200 个 seed 上两条路径的首选完全一致 —— 它们是同一个算法，两个标识里必有一个是编出来的")
+	}
+	t.Logf("同一批 seed 上两条实现路径的首选有 %d/200 次不同（算法标识因此不是装饰）", diffs)
+}
+
+// D 承诺逐位的算法集合必须封闭：新增实现要显式登记，不能靠「默认都算」
+// 把历史记录一律升级成可逐位复现。
+func TestBitExactAlgoSetIsClosed(t *testing.T) {
+	algos := routing.BitExactAlgos()
+	if len(algos) != 1 || algos[0] != routing.SamplingAlgoSeededSplitmix64V1 {
+		t.Fatalf("逐位集合当前只该有 D 的那条路径，实际 %+v", algos)
+	}
+	for _, algo := range []string{"", SamplingAlgoReplayV1, "splitmix64", "routing-seeded-splitmix64-v2"} {
+		if routing.AlgoSupportsBitExact(algo) {
+			t.Fatalf("未登记的算法标识 %q 不该被认成逐位可复现", algo)
+		}
+	}
+	if _, _, err := routing.ReplayWithAlgo(routing.ReplayInput{}, SamplingAlgoReplayV1); !errors.Is(err, routing.ErrNotBitExact) {
+		t.Fatalf("按不合规算法回放必须返回 ErrNotBitExact 而不是给出一份计划: %v", err)
 	}
 }

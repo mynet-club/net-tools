@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
@@ -350,6 +351,59 @@ func providerOrder(plan policy.RoutingPlan) string {
 		return "-"
 	}
 	return fmt.Sprint(out)
+}
+
+// SamplingAlgoSeededSplitmix64V1 是线上抽样与快照回放**共用**的那条算法标识。
+//
+// 它是这个字符串的唯一事实源（2026-10-04 裁决第 5 条 B）：接线侧往记录里写
+// sampling_algo 时引用这里的常量，回放侧也拿同一个常量判断能不能声称逐位。
+// 两个出处各写一份字面量，「线上与回放是同一个算法」这句话就没有证据可言 ——
+// 而它正是逐位复现唯一凭据的那一半（另一半是 ReplayInput 带得上当时的运行时事实）。
+//
+// 标识描述的是 source.go 的四个魔数 + weightedSample 的累积扫描 + Objective.less
+// 的次序这三件事**合起来**的那条路径，改其中任何一项都要新增 v2 标识并把旧值留在
+// bitExactAlgos 里，否则历史记录会被新实现误报成「可逐位复现」。
+const SamplingAlgoSeededSplitmix64V1 = "routing-seeded-splitmix64-v1"
+
+// ErrNotBitExact 表示记录声明的抽样算法不在本包能逐位复现的集合里。
+//
+// 拿到这个错误**不是**记录坏了：那是「这份输入只能做解释性回放」，
+// 而本包绝不返回一个不保证逐位的计划来冒充逐位结论。
+var ErrNotBitExact = errors.New("routing: 该抽样算法不承诺逐位复现")
+
+// bitExactAlgos 是逐位可复现算法的封闭集合 —— 只列**实现真的在本包里**的那些。
+var bitExactAlgos = map[string]bool{SamplingAlgoSeededSplitmix64V1: true}
+
+// AlgoSupportsBitExact 报告某个 sampling_algo 标识能不能声称首选逐位相同。
+func AlgoSupportsBitExact(algo string) bool { return bitExactAlgos[algo] }
+
+// BitExactAlgos 返回封闭集合的稳定顺序副本，供状态口把取值空间摊开而不是藏在注释里。
+func BitExactAlgos() []string {
+	out := make([]string, 0, len(bitExactAlgos))
+	for algo := range bitExactAlgos {
+		out = append(out, algo)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ReplayWithAlgo 按记录声明的算法重跑一次规划，并给出「逐位复现」这一层的结论。
+//
+// 这就是裁决第 5 条 B 要的那个窄接口，它只做两件事：
+//   - 算法核对：声明的标识不在 bitExactAlgos 里就返回 ErrNotBitExact，
+//     连计划都不给 —— 一个「看起来一样」的次序比不复现更坏，因为它会把
+//     「顺序本来就不同」这件事实消化成一条不存在的策略差异。
+//   - 一致时委托 Replay：与线上跑的是同一段代码（Planner.PlanWithReplay），
+//     复现性不靠两份实现互相同步，而靠它们本来就是同一个函数。
+//
+// 它**不**接受活的策略内核、时钟或随机源：全部现场都必须在 in 里自带，
+// 否则这个入口就退化成「用今天的配置解释昨天的决策」。
+func ReplayWithAlgo(in ReplayInput, algo string) (policy.RoutingPlan, string, error) {
+	if !AlgoSupportsBitExact(algo) {
+		return policy.RoutingPlan{}, "", fmt.Errorf("%w: 记录声明 %q，本包承诺逐位的算法只有 %v",
+			ErrNotBitExact, algo, BitExactAlgos())
+	}
+	return Replay(in)
 }
 
 // snapshotReplay 把一次线上规划落成可回放的输入（PlanWithReplay 内部使用）。

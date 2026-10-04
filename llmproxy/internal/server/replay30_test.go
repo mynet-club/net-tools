@@ -13,6 +13,7 @@ import (
 	"github.com/mynet-club/net-tools/llmproxy/internal/config"
 	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 	"github.com/mynet-club/net-tools/llmproxy/internal/replay"
+	"github.com/mynet-club/net-tools/llmproxy/internal/routing"
 )
 
 // §2.8 证据链的最后一段：线上真的跑过的判定，如何变成另一个进程能重跑的记录。
@@ -25,9 +26,12 @@ import (
 //  3. **不该采的绝不采**：影子、legacy、管理口的路由模拟都不进窗口；计划没真的
 //     驱动选路时不写选路记录。半个痕迹比没痕迹更坏，掺进人为流量的证据更坏。
 //
-// 另有一条诚实口径要钉住：线上抽样算法与回放缺省抽样器不同名，所以回放只做解释性
-// 回放、不比对首选顺序。如果哪天有人把两个标识合并成一个，首选顺序的 diff 会立刻
-// 冒出来 —— 所以这条也由断言看着。
+// 另有一条诚实口径要钉住，它分两段（2026-10-04 裁决第 5 条 B 落地前后两段都在测）：
+//   - 线上抽样算法与回放缺省抽样器**不同名**（routing-seeded-splitmix64-v1 vs
+//     replay-sampling-v1）。把两个标识合并成一个，首选顺序的 diff 会立刻冒出来。
+//   - 首选顺序能不能逐位复现，取决于记录带不带 replay_snapshot：带 ⇒ 报告必须报出
+//     逐位复现；把快照摘掉 ⇒ 同一份文件必须退回「只做解释性回放」并说出来。
+//     逐位的凭据来自现场，不来自文件里写了个像样的算法名。
 
 // openReplayWindow 把窗口打开并全采。
 //
@@ -113,6 +117,23 @@ func routingNotes(r replay.Report) string {
 	return strings.Join(parts, "｜")
 }
 
+// stripSnapshot 把导出文件里选路记录的 replay_snapshot 摘掉，其余字段一字不动。
+//
+// 走 Decode/Encode 而不是字符串删键：那会让「摘掉快照」这件事本身成为一次可能被
+// JSON 结构误导的操作（删错一层、删掉别人的字段），对照实验的自变量必须只有一个。
+func stripSnapshot(t *testing.T, data []byte) []byte {
+	t.Helper()
+	f := mustDecodeRecords(t, data)
+	for i := range f.Routings {
+		f.Routings[i].Replay = nil
+	}
+	out, err := replay.Encode(f)
+	if err != nil {
+		t.Fatalf("摘快照后重新编码失败: %v", err)
+	}
+	return out
+}
+
 // policyBundleDenyAllV2 是 t-open 的 v2：整池拒绝。
 // 引用与内容同时升版（加载器以引用为准，只改一边会直接报错），
 // 所以它就是「运维发了新版、策略真的变了」那个形态。
@@ -171,9 +192,23 @@ func TestReplay30ExportReplaysClosedLoop(t *testing.T) {
 		t.Errorf("无 body_raw 授权时不该记 external_plaintext_allowed=true")
 	}
 
+	if f.SchemaVersion != replay.SchemaVersion {
+		t.Errorf("导出的文件必须是当前写出版本 %d，实际 %d", replay.SchemaVersion, f.SchemaVersion)
+	}
 	rr := f.Routings[0]
 	if rr.SamplingAlgo != replaySamplingAlgoOnline {
 		t.Errorf("记录必须如实声明线上用的抽样算法，实际 %q", rr.SamplingAlgo)
+	}
+	if rr.SamplingAlgo != routing.SamplingAlgoSeededSplitmix64V1 {
+		t.Errorf("接线侧的算法标识必须就是 D 那个常量的取值，否则「线上与回放同一条实现」没有证据")
+	}
+	// 完整现场：裁决 2026-10-04 第 5 条 B 落地的直接证据 —— 采集侧把规划用过的
+	// 那份输入原样带走，导出文件里就得有它。
+	if rr.Replay == nil {
+		t.Fatalf("选路记录必须带 replay_snapshot（缺它首选顺序只能解释、不能复现）")
+	}
+	if _, _, err := rr.BitExactReplay(); err != nil {
+		t.Errorf("这条记录应有资格声称首选逐位复现，实际被拒: %v", err)
 	}
 	trace := traceOf(t, h.harness, "closed-1")
 	if rr.RoutingSeed != trace.RoutingSeed || rr.RoutingEpoch != trace.RoutingEpoch ||
@@ -188,6 +223,10 @@ func TestReplay30ExportReplaysClosedLoop(t *testing.T) {
 		t.Errorf("候选摘要对不上（记录里的权重不是有效权重？）: 记录 %s / 落库 %s",
 			rr.CandidatesDigest, trace.CandidatesDigest)
 	}
+	// 快照里的候选与记录顶层必须是同一个池子（跨字段核对在 Validate 里，这里对痕迹）。
+	if snapDigest, err := rr.Replay.CandidatesDigest(); err != nil || snapDigest != trace.CandidatesDigest {
+		t.Errorf("快照候选池与落库摘要不符: %v %s / %s", err, snapDigest, trace.CandidatesDigest)
+	}
 
 	report := replayFromDisk(t, mustBundles(t, h), raw, time.Now().UTC().Add(time.Minute))
 	if !report.Clean() {
@@ -196,9 +235,23 @@ func TestReplay30ExportReplaysClosedLoop(t *testing.T) {
 	if passed, mismatch, rejected := report.Counts(); passed != 2 || mismatch != 0 || rejected != 0 {
 		t.Errorf("1 条判定 + 1 条选路都应通过，实际 %d/%d/%d\n%s", passed, mismatch, rejected, report)
 	}
-	// 首选顺序今天**不**比对，而且必须在报告里说出来，不许静默降级。
-	if n := routingNotes(report); !strings.Contains(n, "只做解释性回放") {
-		t.Errorf("选路回放应声明降级为解释性回放，实际备注：%q", n)
+	// 首选顺序这次是**逐位比对过且一致**（§2.8 那句「不比对」从今天起只对旧文件成立）。
+	if n := report.BitExactCount(); n != 1 {
+		t.Errorf("带快照的选路记录回放应报 1 条逐位复现，实际 %d\n%s", n, report)
+	}
+	if n := routingNotes(report); strings.Contains(n, "只做解释性回放") {
+		t.Errorf("这条记录有逐位凭据，报告里不该出现降级备注：%q", n)
+	}
+
+	// A/B 对照：把同一份文件里的快照摘掉再回放，结论必须退回「解释性」并说出来。
+	// 这一条钉的是「逐位声称的来源是快照，不是文件里写了个像样的算法名」。
+	without := stripSnapshot(t, raw)
+	compare := replayFromDisk(t, mustBundles(t, h), without, time.Now().UTC().Add(time.Minute))
+	if got := compare.BitExactCount(); got != 0 {
+		t.Errorf("摘掉快照后仍报 %d 条逐位复现 —— 那等于用配置级投影冒充运行时事实", got)
+	}
+	if n := routingNotes(compare); !strings.Contains(n, "只做解释性回放") {
+		t.Errorf("缺快照必须在报告里明说降级，实际备注：%q", n)
 	}
 
 	// 导出面自己就是新的泄露面：密钥、上游地址、正文一个都不许出现。
@@ -563,12 +616,33 @@ func TestReplay30AdminSurfaceAuthArgsAndAudit(t *testing.T) {
 			t.Errorf("状态口暴露了记录级内容 %q: %s", banned, rawStatus)
 		}
 	}
-	if status["bit_exact_primary_order"] != false {
-		t.Errorf("状态口必须承认首选顺序不做逐位复现: %v", status["bit_exact_primary_order"])
+	if status["bit_exact_primary_order"] != true {
+		t.Errorf("带快照的记录已能逐位复现，状态口还声称不能: %v", status["bit_exact_primary_order"])
 	}
 	if status["sampling_algo_declared"] != replaySamplingAlgoOnline ||
 		status["sampling_algo_replay_default"] != replay.SamplingAlgoReplayV1 {
 		t.Errorf("两个抽样算法标识都要摊开: %s", rawStatus)
+	}
+	// 「能逐位」必须附条件：逐位只属于 v2 带快照的记录，窗口里混进 v1 或导入的老记录时
+	// 那一条照样只能解释性回放。只回一个 true 会比原来的 false 更误导。
+	cond, _ := status["bit_exact_condition"].(string)
+	for _, want := range []string{"schema_version", "replay_snapshot", "只做解释性回放", replaySamplingAlgoOnline} {
+		if !strings.Contains(cond, want) {
+			t.Errorf("逐位条件里少了 %q: %q", want, cond)
+		}
+	}
+	if algos, _ := status["bit_exact_algos"].([]any); len(algos) != 1 ||
+		algos[0] != replaySamplingAlgoOnline {
+		t.Errorf("逐位算法集合应当由 D 摊开且只含线上那条: %v", status["bit_exact_algos"])
+	}
+	// 版本口径：写出的是 v2，可读的是 v1+v2 —— 运维据此判断旧文件还能不能直接回放。
+	if status["record_schema_version"] != float64(replay.SchemaVersion) {
+		t.Errorf("写出版本应是 %d: %v", replay.SchemaVersion, status["record_schema_version"])
+	}
+	readable, _ := status["record_schema_version_readable"].([]any)
+	if len(readable) != len(replay.ReadableSchemaVersions()) {
+		t.Fatalf("可读版本清单和解码器口径不一致: %v vs %v",
+			readable, replay.ReadableSchemaVersions())
 	}
 
 	// 非 enforce 时状态口要说破「窗口不会采到东西」，而不是让运维盯着空窗口猜原因。

@@ -847,6 +847,11 @@ if [ -f "$H/records.json" ]; then
   RPERM=$(stat -f '%Lp' "$H/records.json" 2>/dev/null || stat -c '%a' "$H/records.json")
   chk "导出的记录文件权限收到 0600" "$RPERM" "600"
   grep -q '"schema_version"' "$H/records.json" && pass "导出的是记录文件本身" || fail "文件不像记录文件"
+  # v2 是「逐位凭据有地方放」的前提：写出版本还停在 v1，说明采集侧根本没带快照。
+  chk "导出的记录是 schema v2" "$(jget "$H/records.json" schema_version)" "2"
+  grep -q '"replay_snapshot"' "$H/records.json" \
+    && pass "选路记录带上了当时的完整回放输入（首选顺序有逐位凭据）" \
+    || fail "记录里没有 replay_snapshot：首选顺序只剩解释性回放"
   LEAK=""
   for bad in '"body"' 'api_key' 'sk-alice-own' 'Bearer ' 'base_url'; do
     grep -q -- "$bad" "$H/records.json" && LEAK="$LEAK $bad"
@@ -860,6 +865,31 @@ if [ -f "$H/records.json" ]; then
     sed -n '1,12p' "$H/replay.out" | sed 's/^/       /'
   fi
   grep -q '差异 0' "$H/replay.out" && pass "报告里差异为 0" || fail "报告不是干净的：$(head -1 "$H/replay.out")"
+  # 逐位这一层必须单独看得见：并进「通过」里就变成「解释性回放冒充逐位证据」（§2.8）。
+  grep -q '首选逐位复现 [1-9]' "$H/replay.out" \
+    && pass "报告报出首选顺序逐位复现的条数" \
+    || fail "报告没声称逐位复现（记录没带快照？）。$(head -1 "$H/replay.out")"
+  # 对照实验：把快照摘掉，同一条记录必须**降级且说出来**，而不是静算成复现成功。
+  # 这份「宁缺毋假」的口径只在真实文件上才验得出来——单元测试喂的是内存里的夹具。
+  python3 - "$H/records.json" "$H/records-nosnap.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+n = 0
+for r in d.get("routing", []):          # 记录文件里的键是 routing（单数），别写错成 routings
+    if r.pop("replay_snapshot", None) is not None:
+        n += 1
+print(n, file=sys.stderr)
+json.dump(d, open(sys.argv[2], "w"))
+PY
+  if grep -q '"replay_snapshot"' "$H/records-nosnap.json"; then
+    fail "摘快照这一步是空跑（新文件里还有 replay_snapshot），对照实验不成立"
+  elif ! "$BIN" replay run -records "$H/records-nosnap.json" -now "$NOW30" > "$H/replay-nosnap.out" 2>&1; then
+    fail "摘掉快照的记录应仍能解释性回放，却直接失败了：$(head -3 "$H/replay-nosnap.out")"
+  elif grep -q '只做解释性回放' "$H/replay-nosnap.out" && grep -q '首选逐位复现 0' "$H/replay-nosnap.out"; then
+    pass "摘掉快照后如实降级（报告明写只做解释性回放，逐位计数归 0）"
+  else
+    fail "摘掉快照后报告没说清降级：$(head -1 "$H/replay-nosnap.out")"
+  fi
 else
   fail "replay collect 没导出文件（窗口里应当有 enforce 的记录）"
 fi

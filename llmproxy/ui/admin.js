@@ -1407,9 +1407,17 @@ function renderReplay(d, keepMsg, forceEcho) {
     stat('累计丢弃', num(d.dropped), 'sm', '容量越界丢最旧：这个数字非零就说明窗口小了或取走得太晚'),
     stat('采集失败', num(d.failed), 'sm', '判定发生了但组不出记录（缺版本/缺分级），数字本身就是要查的东西'),
     stat('回放默认抽样', d.sampling_algo_replay_default || '—', 'sm',
-      '线上用 ' + (d.sampling_algo_declared || '—') + '，回放缺省用这个 —— 两者不同，所以记录默认只做解释性回放'),
-    stat('首选顺序逐位复现', d.bit_exact_primary_order ? '是' : '否', 'sm',
-      '否是当前事实，不是缺陷：逐位复现需要路由侧的重放入口，那是接口裁决'),
+      '线上用 ' + (d.sampling_algo_declared || '—') + '，回放缺省用这个 —— 两者是不同实现。' +
+      '逐位复现不靠缺省抽样器，而是按记录自己声明的算法重跑：今天承诺逐位的只有 ' +
+      ((d.bit_exact_algos || []).join('/') || '—')),
+    stat('首选顺序逐位复现', d.bit_exact_primary_order ? '是（有前提）' : '否', 'sm',
+      // 只回「是」会比回「否」更误导：窗口里混着导入的 v1 记录时那一条永远只能解释性回放，
+      // 前提由服务端一处给出，界面不自己拼条件。
+      d.bit_exact_condition || '状态口没报出前提，界面就不声称逐位'),
+    stat('记录结构版本', num(d.record_schema_version), 'sm',
+      '本进程写出的版本；可读版本 ' +
+      ((d.record_schema_version_readable || []).join('/') || '—') +
+      ' —— 逐位凭据（replay_snapshot）只存在于 v2 记录里'),
   );
   rpDirty = { permille: false, filter: false, capacity: false };
 }

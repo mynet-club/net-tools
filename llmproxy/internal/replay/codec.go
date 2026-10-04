@@ -11,12 +11,52 @@ import (
 	"time"
 )
 
-// SchemaVersion 是记录文件的结构版本。
+// SchemaVersion 是记录文件的结构版本（当前写出值：2，见下面的分层）。
 //
 // 它和 config_schema_version（配置文件结构版本）不是一回事，也和 policy bundle 的
 // id@version（策略内容版本，进决策与回放）无关：§3.0 要求这三种版本各管各的层，
 // 混用会让「改了记录字段」被误读成「改了策略」。
-const SchemaVersion = 1
+//
+// v2 承认（但不要求）每条选路记录带一份 `routing.ReplayInput` 快照，于是首选顺序
+// 有可能被逐位复现而不只是解释。版本号必须为此而变，因为「这份文件里没有那个字段」
+// 和「文件承认有、这条记录没写」是两种不同的证据状态 —— 让同一个版本号承载两代形状，
+// 回放侧就只能靠猜来决定能不能声称逐位。
+const SchemaVersion = 2
+
+// SchemaVersionRoutingOnly 是第一代记录文件的版本：只有候选池的配置级投影，
+// 没有任何运行时事实。它**仍然可读可回放**（判定回放和解释性选路回放都不需要 v2
+// 那几位），但本实现不再写出它 —— 写出去就等于少带一份能证明逐位的输入。
+const SchemaVersionRoutingOnly = 1
+
+// supportsSchemaVersion 报告某个文件版本是否可读。
+//
+// 只认 1 与 2 这两个**具体**版本，不写 `>= 1 && <= 2` 的区间判断：将来出 v3 时，
+// 区间写法会让「没实现的新版本」被静默当成可读，于是按 v2 的字段解释 v3 的内容 ——
+// 那正是 ErrSchemaVersion 存在的理由：宁可拒绝加载，也不要按猜测解析。
+func supportsSchemaVersion(v int) bool {
+	for _, got := range ReadableSchemaVersions() {
+		if got == v {
+			return true
+		}
+	}
+	return false
+}
+
+// ReadableSchemaVersions 返回本实现可读的文件版本，升序。
+//
+// 状态口和 CLI 都要摊开「哪些版本能读」，口径必须和 supportsSchemaVersion 是同一份：
+// 两个地方各写一遍字面量，将来加版本时就会出现「状态口说能读、解码器拒收」。
+func ReadableSchemaVersions() []int {
+	versions := []int{SchemaVersionRoutingOnly, SchemaVersion}
+	sort.Ints(versions)
+	return versions
+}
+
+// schemaVersionError 给出可读的版本错误文案。
+func schemaVersionError(got int) error {
+	return fmt.Errorf("%w: 文件声明 %d，本实现支持 %d 与 %d",
+		ErrSchemaVersion, got, SchemaVersionRoutingOnly, SchemaVersion)
+}
 
 // forbiddenFieldWords 是记录里绝不允许出现的字段名片段。
 //
@@ -66,8 +106,11 @@ func NewFile(decisions []DecisionRecord, routings []RoutingRecord) File {
 
 // Validate 校验文件结构版本与其中每条记录。now 是回放时钟，供计划 TTL 判定。
 func (f File) Validate(now time.Time) error {
-	if f.SchemaVersion != SchemaVersion {
-		return fmt.Errorf("%w: 文件声明 %d，本实现支持 %d", ErrSchemaVersion, f.SchemaVersion, SchemaVersion)
+	if !supportsSchemaVersion(f.SchemaVersion) {
+		return schemaVersionError(f.SchemaVersion)
+	}
+	if err := f.validateRecordShapes(); err != nil {
+		return err
 	}
 	for _, rec := range f.Decisions {
 		if err := rec.Validate(); err != nil {
@@ -82,9 +125,32 @@ func (f File) Validate(now time.Time) error {
 	return nil
 }
 
+// validateRecordShapes 是版本与记录内容之间的契约：v1 的文件里不可能有回放快照。
+//
+// 为什么要单独判这一条：一个写着 1 却带快照的文件要么是手工改过版本号，
+// 要么是采集侧版本串写错。两种情况下「按 v1 读、把快照丢掉」都会让一次本可声称
+// 逐位的回放降级成解释性回放，而没人知道降级发生过。
+func (f File) validateRecordShapes() error {
+	if f.SchemaVersion == SchemaVersion {
+		return nil
+	}
+	for _, rec := range f.Routings {
+		if rec.Replay != nil {
+			return fmt.Errorf("%w: %s: 文件声明版本 %d，却带着只有 v2 才承认的 replay_snapshot",
+				ErrRecordInvalid, rec.RequestID, f.SchemaVersion)
+		}
+	}
+	return nil
+}
+
 // Encode 输出缩进 JSON（键序由 encoding/json 按字段名稳定输出，因此产物可 diff）。
+//
+// 版本号**原样保留**而不是强制盖成当前值：把一份 v1 文件重新导出成 v2 却没有补上
+// 快照，等于给一份缺证据的文件贴上「证据齐全」的标签。
 func Encode(f File) ([]byte, error) {
-	f.SchemaVersion = SchemaVersion
+	if !supportsSchemaVersion(f.SchemaVersion) {
+		return nil, schemaVersionError(f.SchemaVersion)
+	}
 	data, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("replay: 记录序列化失败: %w", err)
@@ -125,8 +191,11 @@ func Decode(data []byte) (File, error) {
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return File{}, fmt.Errorf("replay: 记录文件末尾有多余内容: %v", err)
 	}
-	if f.SchemaVersion != SchemaVersion {
-		return File{}, fmt.Errorf("%w: 文件声明 %d，本实现支持 %d", ErrSchemaVersion, f.SchemaVersion, SchemaVersion)
+	if !supportsSchemaVersion(f.SchemaVersion) {
+		return File{}, schemaVersionError(f.SchemaVersion)
+	}
+	if err := f.validateRecordShapes(); err != nil {
+		return File{}, err
 	}
 	return f, nil
 }

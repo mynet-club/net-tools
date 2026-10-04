@@ -49,10 +49,10 @@ const replayUsage = `llmproxy replay — 线上决策记录的导出与跨进程
   采集窗口是**进程内**的有界缓冲：重启即空，溢出丢最旧并计入 dropped。所以流程是
   「要证据时打开 → 跑一批流量 → collect 取走 → off 或 clear」，而不是长期开着。
 
-  replay run 的判据是「逐字段复现」。首选顺序今天**不**比对：线上抽样用的是
-  routing 包的 seeded-splitmix64 随机源，回放侧的缺省抽样器是另一个算法，两者在同一条
-  seed 下会得出不同的尝试顺序。硬把它们算成同一个算法，回放就会把「顺序不同」报成
-  策略差异，或者更糟 —— 让人以为逐位复现了。
+  replay run 的判据是「逐字段复现」。首选顺序能不能逐位比，由**记录自己**决定，不由
+  CLI 猜：schema v2 且带 replay_snapshot 的选路记录，回放侧按记录声明的 sampling_algo
+  走 routing 包那条与线上同一实现的抽样算法，逐位比对尝试顺序；v1 或没带快照的记录
+  只能做解释性回放，报告会把这一条明写出来，不会静默降级成「看起来复现了」。
 
   凭据来自 config.yaml 的 server.admin_token。它是管理凭证，只在这里被读出来用一次，
   不会出现在命令输出或日志里。
@@ -164,7 +164,9 @@ func printReplayStats(raw []byte, withNote bool) error {
 		"enabled", "sample_permille", "scope_filter", "capacity",
 		"entries", "decisions", "routings", "captured", "dropped", "failed",
 		"as_of", "mode", "running", "policy_version",
-		"sampling_algo_declared", "sampling_algo_replay_default", "bit_exact_primary_order",
+		"record_schema_version", "record_schema_version_readable",
+		"sampling_algo_declared", "sampling_algo_replay_default",
+		"bit_exact_primary_order", "bit_exact_algos",
 	}
 	for _, k := range order {
 		v, ok := out[k]
@@ -172,6 +174,11 @@ func printReplayStats(raw []byte, withNote bool) error {
 			continue
 		}
 		fmt.Printf("%-28s %s\n", k, statValue(v))
+	}
+	// 逐位这一层是有条件的（老记录永远只能解释性回放），所以条件单独占一行全文输出：
+	// 挤在 true/false 后面让人以为「开着就逐位」，正好是这次裁决要消灭的误读。
+	if cond, ok := out["bit_exact_condition"].(string); ok && strings.TrimSpace(cond) != "" {
+		fmt.Printf("\n逐位复现的条件: %s\n", cond)
 	}
 	if withNote {
 		for _, k := range []string{"note", "warning"} {
@@ -310,7 +317,8 @@ func replayRun(paths config.Paths, args []string) error {
 	if !report.Clean() {
 		return fmt.Errorf("回放未通过：通过 %d，差异 %d，拒绝回放 %d", passed, mismatch, rejected)
 	}
-	fmt.Printf("\n全部逐字段复现（通过 %d 条）。\n", passed)
+	fmt.Printf("\n全部逐字段复现（通过 %d 条，其中首选顺序逐位复现 %d 条）。\n",
+		passed, report.BitExactCount())
 	return nil
 }
 

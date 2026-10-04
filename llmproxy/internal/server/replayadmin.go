@@ -20,6 +20,7 @@ import (
 	"github.com/mynet-club/net-tools/llmproxy/internal/config"
 	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 	"github.com/mynet-club/net-tools/llmproxy/internal/replay"
+	"github.com/mynet-club/net-tools/llmproxy/internal/routing"
 )
 
 // adminReplayRoute 分发 /v1/_admin/replay[/sampling|/export|/clear]。
@@ -79,7 +80,17 @@ func (s *Server) adminReplayStatus(w http.ResponseWriter) {
 	}
 	out["sampling_algo_declared"] = replaySamplingAlgoOnline
 	out["sampling_algo_replay_default"] = replay.SamplingAlgoReplayV1
-	out["bit_exact_primary_order"] = false
+	// 逐位这件事的口径必须说清「在什么条件下成立」，只回一个 true 会比 false 更误导：
+	// 窗口里既可能有 v2 带快照的新记录，也可能有导入的 v1 历史记录，
+	// 后者永远只能做解释性回放。条件写在这里，界面与 CLI 都不用各自猜。
+	out["bit_exact_primary_order"] = true
+	out["bit_exact_algos"] = routing.BitExactAlgos()
+	out["bit_exact_condition"] = fmt.Sprintf(
+		"仅对 schema_version>=%d、sampling_algo=%q 且带 replay_snapshot 的选路记录成立；"+
+			"v1 或无快照的记录只做解释性回放（§2.8）",
+		replay.SchemaVersion, replaySamplingAlgoOnline)
+	out["record_schema_version"] = replay.SchemaVersion
+	out["record_schema_version_readable"] = replay.ReadableSchemaVersions()
 	out["note"] = replayWiringModeNote()
 	if rt != nil && rt.mode != config.PolicyModeEnforce {
 		out["warning"] = fmt.Sprintf(

@@ -48,17 +48,21 @@ const (
 	replayWindowMaxCapacity     = 4096
 	// replayPermilleFull 是千分制的满值。
 	replayPermilleFull = 1000
-	// replaySamplingAlgoOnline 声明线上那次抽样用的是哪个随机源：
-	// internal/routing 的 SeededSource（sha256(seed) → splitmix64 → [0,1) 浮点），
-	// 抽样发生在档序/目标函数筛完之后的首选池里。
-	//
-	// 它必须与 internal/replay 缺省的 replay-sampling-v1（SHA-256 计数器整数流 +
-	// 不放回全池抽样）**不同名**：两个算法在同一条 seed 下会得出不同的尝试顺序，
-	// 把它们混成一个标识，回放就会把「首选顺序不同」报成策略差异，
-	// 或者更糟 —— 让人以为逐位复现了。声明成独立标识后，ReplayRouting 自动降级为
-	// 「只做解释性回放，不比对首选顺序」（§2.8 对不可比算法的口径）。
-	replaySamplingAlgoOnline = "routing-seeded-splitmix64-v1"
 )
+
+// replaySamplingAlgoOnline 声明线上那次抽样用的是哪个随机源，取值来自 D（唯一事实源）：
+// internal/routing 的 SeededSource（sha256(seed) → splitmix64 → [0,1) 浮点），
+// 抽样发生在档序/目标函数筛完之后的首选池里。
+//
+// 它必须与 internal/replay 缺省的 replay-sampling-v1（SHA-256 计数器整数流 +
+// 不放回全池抽样）**不同名**：两个算法在同一条 seed 下会得出不同的尝试顺序，
+// 把它们混成一个标识，回放就会把「首选顺序不同」报成策略差异，
+// 或者更糟 —— 让人以为逐位复现了。
+//
+// 名字以前在这里也写了一份字面量，现在不写了（2026-10-04 裁决第 5 条 B）：
+// 「线上抽样与回放重跑是同一条实现」这句话要有证据，而两份字面量互相「碰巧一致」
+// 不是证据。D 的 BitExactAlgos() 同时给出回放侧能不能声称逐位。
+const replaySamplingAlgoOnline = routing.SamplingAlgoSeededSplitmix64V1
 
 // replayEntry 是一条请求采到的记录对。
 //
@@ -299,6 +303,9 @@ func (s *Server) captureReplay(rt *policyRuntime, scope, requestID string, shot 
 			Candidates:    replayCandidatesOf(shot.Candidates),
 			Plan:          shot.Plan,
 			Rejections:    shot.Plan.Rejections,
+			// 完整现场：有它，导出那份文件的选路记录才有「首选顺序逐位复现」的凭据；
+			// 没有它（shot 上为 nil）记录照样导出，只是回放侧只能做解释性回放。
+			Replay: shot.replaySnapshot,
 		})
 		if rerr != nil {
 			w.countFailed()

@@ -32,6 +32,14 @@ var (
 
 	// ErrSamplerNil 注入了空的抽样器。
 	ErrSamplerNil = errors.New("replay: 抽样器为空")
+
+	// ErrNotBitExact 表示这条选路记录没有资格声称首选顺序逐位复现，只能做解释性回放。
+	//
+	// 它不是「回放失败」：解释性回放照样复核候选摘要、排除原因与授权（§2.8）。
+	// 它钉住的是另一件事 —— **不能**把一次没有逐位凭据的重跑说成逐位复现。
+	// 逐位的两个先决条件（带得上运行时事实的快照 + 算法可核对）由
+	// RoutingRecord.BitExactReplay 一次性判完，错误里带原因。
+	ErrNotBitExact = errors.New("replay: 这条记录不承诺首选逐位复现")
 )
 
 // WiringMode 是 §3.0 的接线阶段。它进记录，是因为差异报告必须能区分
@@ -55,9 +63,13 @@ func (m WiringMode) Valid() bool {
 }
 
 // SamplingAlgoReplayV1 是本包默认抽样器的算法标识（replay-sampling-v1）。
-// 记录显式带这个标识，replayer 才会逐位比对首选与尝试顺序；
-// 其它标识（例如 D 包自己的算法名）只做解释性回放 —— 对齐 §2.8
-// 「旧请求没有 seed 时只能做解释性回放，不能声称逐位相同」。
+// 记录显式带这个标识，replayer 才会用**本包的**抽样器逐位比对首选与尝试顺序。
+//
+// 它和 D 包那条路径是两件事：线上抽样走的是 internal/routing 的实现
+// （routing.SamplingAlgoSeededSplitmix64V1），那条路径的逐位复现要求记录带得上
+// replay_snapshot（裁决第 5 条 B），由 RoutingRecord.BitExactReplay 判定，
+// 与本常量无关。两者谁都不许冒充谁 —— 混成一个标识，回放就会把「顺序本来就不同」
+// 报成策略差异，或者更糟：让人以为逐位复现了。
 const SamplingAlgoReplayV1 = "replay-sampling-v1"
 
 // nowUTC 把时间归一到 UTC 并截到秒。

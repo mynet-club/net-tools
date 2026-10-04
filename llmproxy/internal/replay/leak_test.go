@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
+	"github.com/mynet-club/net-tools/llmproxy/internal/routing"
 )
 
 // 记录结构是审计表的行、是回放的输入，也是别人接手时最容易往里加字段的地方。
@@ -59,6 +60,15 @@ func TestRecordStructsCarryNoBodyOrCredentials(t *testing.T) {
 	for _, v := range []any{
 		policy.RoutingPlan{}, policy.RouteCandidate{}, policy.Rejection{},
 		policy.MatchedRule{}, policy.Decision{}, policy.PolicyContext{}, policy.Identity{},
+	} {
+		assertNoForbiddenFields(t, v)
+	}
+	// v2 起记录内嵌 D 的完整回放快照（RoutingRecord.Replay），它是记录的一部分，
+	// 审查口径必须跟着走：快照里除了运行时事实，一个正文/凭证类字段都不许出现。
+	// 这条断言同时也是那道窄接口的边界——有人想往里加个 *http.Client 或 provider 配置，
+	// 先在这里撞墙，而不是等到「这份快照不再能跨进程复现」时才被发现。
+	for _, v := range []any{
+		routing.ReplayInput{}, routing.ReplayOffer{}, routing.Requirement{}, routing.StickyState{},
 	} {
 		assertNoForbiddenFields(t, v)
 	}

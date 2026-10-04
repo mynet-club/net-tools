@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
+	"github.com/mynet-club/net-tools/llmproxy/internal/routing"
 )
 
 // 记录结构的字段命名纪律（§2.8 / §2.9 / §5）：
@@ -409,6 +410,17 @@ type RoutingRecord struct {
 
 	Plan       policy.RoutingPlan `json:"plan"`
 	Rejections []policy.Rejection `json:"rejections,omitempty"`
+
+	// Replay 是那次规划的**完整回放输入**（schema v2，2026-10-04 裁决第 5 条 B）。
+	//
+	// 为什么 Candidates 那份投影不够：它是配置级候选，没有当时的健康度、冷却截止、
+	// 观测延迟、价目可得性，也没有目标函数、能力要求、粘性、决策时刻与计划 TTL ——
+	// 而首选顺序恰恰由这些运行时事实决定。缺任何一位，重跑得出的都是「今天的池子」
+	// 的次序，不是当时那次的次序。
+	//
+	// nil = 这条记录采自 v1，或当时组不出快照：只能做解释性回放。
+	// 有值不等于能声称逐位 —— 还要过 sampling_algo 那一层核对，见 ReplayRouting。
+	Replay *routing.ReplayInput `json:"replay_snapshot,omitempty"`
 }
 
 // SamplingAlgoOrDefault 返回记录声明的抽样算法标识；空值按本包默认算法处理，
@@ -456,7 +468,78 @@ func (r RoutingRecord) Validate(now time.Time) error {
 	if err := r.validatePlan(now); err != nil {
 		return err
 	}
-	return r.validateRejections()
+	if err := r.validateRejections(); err != nil {
+		return err
+	}
+	return r.validateReplaySnapshot()
+}
+
+// validateReplaySnapshot 核对快照与记录顶层是不是**同一件事**的两个面。
+//
+// 这层核对存在的全部理由是：逐位复现这个声称一旦成立，「回放结论不同」就变成了
+// 缺陷报告。如果快照可以与顶层字段各说各话，那份缺陷报告描述的就不是当时那次决策，
+// 而是某份被改过或写错版本的输入。四项核对都指向同一个问题：
+//   - seed 不同 ⇒ 重跑的是另一次随机流；
+//   - 策略版本不同 ⇒ 声明的版本与被复现的那份不是同一个（§3.0 的版本来源）；
+//   - request_id 不同 ⇒ 配对错了请求；
+//   - 候选摘要不同 ⇒ 池子被换过，而摘要正是「同一个池子」的唯一凭据。
+//
+// 快照本身还必须是 D 认得的合法输入（Validate 要求 seed 与全部运行时事实齐全）。
+func (r RoutingRecord) validateReplaySnapshot() error {
+	if r.Replay == nil {
+		return nil
+	}
+	in := *r.Replay
+	if err := in.Validate(); err != nil {
+		return fmt.Errorf("%w: %s: replay_snapshot 不是合法的回放输入: %v", ErrRecordInvalid, r.RequestID, err)
+	}
+	if in.Seed != r.RoutingSeed {
+		return fmt.Errorf("%w: %s: replay_snapshot.seed 与记录 routing_seed 不一致（%q vs %q）",
+			ErrRecordInvalid, r.RequestID, in.Seed, r.RoutingSeed)
+	}
+	if in.PolicyVersion != r.PolicyVersion {
+		return fmt.Errorf("%w: %s: replay_snapshot.policy_version 与记录不一致（%q vs %q）",
+			ErrRecordInvalid, r.RequestID, in.PolicyVersion, r.PolicyVersion)
+	}
+	if in.RequestID != "" && in.RequestID != r.RequestID {
+		return fmt.Errorf("%w: %s: replay_snapshot.request_id 是 %q，配不上这条记录",
+			ErrRecordInvalid, r.RequestID, in.RequestID)
+	}
+	digest, err := in.CandidatesDigest()
+	if err != nil {
+		return fmt.Errorf("%w: %s: replay_snapshot 的候选摘要算不出来: %v", ErrRecordInvalid, r.RequestID, err)
+	}
+	if digest != r.CandidatesDigest {
+		return fmt.Errorf("%w: %s: replay_snapshot 的候选池与记录顶层 candidates_digest 不是同一个池子",
+			ErrRecordInvalid, r.RequestID)
+	}
+	return nil
+}
+
+// BitExactReplay 交出「有资格声称首选逐位复现」的那份输入与它声明的算法。
+//
+// 不够格时返回**错误**而不是 false：调用方必须把原因写进报告或状态口，
+// 静默降级正是 §2.8 最怕的那种回放 —— 一份看起来通过、其实什么也没证明的报告。
+//
+// 三个门槛一个都不能少：
+//  1. 记录带得上 replay_snapshot（v1 记录没有当时的运行时事实）；
+//  2. 声明的算法在 D 的逐位集合里（否则重跑用的是另一个算法）；
+//  3. 快照与记录顶层自洽（validateReplaySnapshot；否则复现的是另一份输入）。
+func (r RoutingRecord) BitExactReplay() (routing.ReplayInput, string, error) {
+	algo := r.SamplingAlgoOrDefault()
+	if r.Replay == nil {
+		return routing.ReplayInput{}, algo, fmt.Errorf(
+			"%w: 记录不带 replay_snapshot（采自 schema v1，或采集时组不出完整快照）", ErrNotBitExact)
+	}
+	if !routing.AlgoSupportsBitExact(algo) {
+		return routing.ReplayInput{}, algo, fmt.Errorf(
+			"%w: 记录声明抽样算法 %q，而路由侧只对 %v 承诺逐位；快照与声明不是同一条实现路径",
+			ErrNotBitExact, algo, routing.BitExactAlgos())
+	}
+	if err := r.validateReplaySnapshot(); err != nil {
+		return routing.ReplayInput{}, algo, err
+	}
+	return *r.Replay, algo, nil
 }
 
 // candidatesNormalized 断言候选池已按稳定顺序排列且 provider 唯一。
@@ -585,6 +668,12 @@ type RoutingCapture struct {
 	Candidates    []policy.RouteCandidate
 	Plan          policy.RoutingPlan
 	Rejections    []policy.Rejection
+
+	// Replay 是 PlanWithReplay 当场产出的那份回放输入。
+	//
+	// nil 时记录退化成 v1 形态（只有配置级候选投影）：判定回放照做，选路只做解释性
+	// 回放。它不是可选装饰 —— 首选顺序的逐位复现没有它就无从谈起（裁决第 5 条 B）。
+	Replay *routing.ReplayInput
 }
 
 // RoutingRecordFrom 把一次在线选路落成回放记录。
@@ -603,8 +692,22 @@ func RoutingRecordFrom(c RoutingCapture) (RoutingRecord, error) {
 		return RoutingRecord{}, fmt.Errorf("%w: %s: %v", ErrRecordInvalid, c.RequestID, err)
 	}
 	algo := c.SamplingAlgo
-	if algo == "" {
+	switch {
+	case algo != "":
+	case c.Replay != nil:
+		// 带了 D 产出的快照却没声明算法：按快照的来源补上，而不是让它落到本包默认值
+		// replay-sampling-v1 上 —— 那会让一条本来能声称逐位的记录自降成解释性回放，
+		// 而没人会去查一个「看起来正常」的备注。
+		algo = routing.SamplingAlgoSeededSplitmix64V1
+	default:
 		algo = SamplingAlgoReplayV1
+	}
+	if c.Replay != nil && !routing.AlgoSupportsBitExact(algo) {
+		// 快照与算法声明互相矛盾：那是采集侧写错了标识，必须当场失败。
+		// 留下去只会得到一条自相矛盾的记录，而文件级校验会把整份导出一起拒掉。
+		return RoutingRecord{}, fmt.Errorf(
+			"%w: %s: 带着 replay_snapshot 却声明抽样算法 %q（D 只承诺逐位 %v）",
+			ErrRecordInvalid, c.RequestID, algo, routing.BitExactAlgos())
 	}
 	rec := RoutingRecord{
 		RequestID:     c.RequestID,
@@ -616,6 +719,12 @@ func RoutingRecordFrom(c RoutingCapture) (RoutingRecord, error) {
 		Candidates:    policy.SortCandidates(c.Candidates),
 		Plan:          c.Plan,
 		Rejections:    sortRejections(c.Rejections),
+	}
+	if c.Replay != nil {
+		// 存副本而不是转发调用方的指针：记录一旦落成就是**当时那份**，
+		// 而 shot 上的快照随请求结束还会被读几次，谁都不该在导出前改它。
+		clone := *c.Replay
+		rec.Replay = &clone
 	}
 	digest, err := policy.CandidatesDigest(rec.Candidates)
 	if err != nil {

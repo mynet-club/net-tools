@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
+	"github.com/mynet-club/net-tools/llmproxy/internal/routing"
 )
 
 // 测试基线：全部用合成值（alice / hospital-a / university），不含任何真实密钥或真实个人信息（§5）。
@@ -212,6 +213,184 @@ func routingFixture(t *testing.T, requestID, policyVersion string, now time.Time
 	return rec
 }
 
+// bitExactReplayInput 造一份「D 重跑就能得出那次决策」的完整回放输入（schema v2）。
+//
+// 现场一律由构造给出、由 routing 侧算结论：如果测试里手搓一份 plan 再配一份快照，
+// 断言就只是在和测试自己的期望值对齐，逐位复现这件事一点证据都没留下。
+func bitExactReplayInput(t *testing.T, requestID, policyVersion string, now time.Time) routing.ReplayInput {
+	t.Helper()
+	seed, err := policy.DeriveRoutingSeed(requestID, policyVersion, "epoch-7")
+	if err != nil {
+		t.Fatalf("派生 seed 失败: %v", err)
+	}
+	chain := chainOf(t, "alice", "university", "")
+	offer := func(provider string, weight float64, gateAllows bool, gateReason policy.Reason) routing.ReplayOffer {
+		return routing.ReplayOffer{
+			Provider:       provider,
+			Executor:       "openai-http",
+			Model:          "gpt-mini",
+			UpstreamModel:  "gpt-mini",
+			Weight:         weight,
+			Tier:           0,
+			Healthy:        true,
+			Region:         "cn-north",
+			MaxDataLevel:   policy.LevelConfidential,
+			CostPer1KIn:    0.5,
+			CostPer1KOut:   1.5,
+			CostKnown:      true,
+			DeclaredModels: []string{"gpt-mini"},
+			GateAllows:     gateAllows,
+			GateReason:     gateReason,
+		}
+	}
+	in := routing.ReplayInput{
+		RequestID:      requestID,
+		PolicyVersion:  policyVersion,
+		Seed:           seed,
+		Now:            now,
+		TTL:            time.Hour,
+		Objective:      routing.ObjectiveFixedOrder,
+		MaxRetries:     1,
+		Requirement:    routing.Requirement{Model: "gpt-mini"},
+		Subject:        "alice",
+		SubjectSource:  "oidc:university",
+		Purpose:        "qa",
+		Organization:   "university",
+		DataLevel:      policy.LevelInternal,
+		AllowedRegions: []string{"cn-north"},
+		Scopes:         []policy.ScopeRef(chain),
+		Offers: []routing.ReplayOffer{
+			offer("gpt-mini", 1, true, policy.ReasonExplicitAllow),
+			// 权重 3 的那家最容易在乱序里被误当成首选，留它在池子里正是为了比对次序。
+			offer("gpt-5", 3, true, policy.ReasonGroupAllow),
+			offer("public-demo", 1, false, policy.ReasonCandidatePolicyExcluded),
+		},
+	}
+	if err := in.Validate(); err != nil {
+		t.Fatalf("回放输入不合法: %v", err)
+	}
+	return in
+}
+
+// replayInputFromCandidates 把「本包抽样器看到的候选池」原样搬进 D 的回放进料。
+//
+// 两侧必须看到同一个池子、同一份排除集，比出来的首选差异才归因到抽样算法本身 ——
+// 否则是能力筛或权限门在替我们改池子，测到的就不是「两个算法」。
+func replayInputFromCandidates(t *testing.T, seed string, cands []policy.RouteCandidate,
+	rejected map[string]bool, model string) routing.ReplayInput {
+	t.Helper()
+	offers := make([]routing.ReplayOffer, 0, len(cands))
+	for _, c := range cands {
+		weight := c.Weight
+		if weight <= 0 {
+			weight = 1
+		}
+		allow := !rejected[c.Provider]
+		reason := policy.ReasonExplicitAllow
+		if !allow {
+			reason = policy.ReasonCandidatePolicyExcluded
+		}
+		offers = append(offers, routing.ReplayOffer{
+			Provider:       c.Provider,
+			Executor:       c.Executor,
+			Model:          c.Model,
+			UpstreamModel:  c.UpstreamModel,
+			Weight:         weight,
+			Healthy:        true,
+			Region:         c.Region,
+			MaxDataLevel:   c.MaxDataLevel,
+			CostPer1KIn:    0.5,
+			CostPer1KOut:   1.5,
+			CostKnown:      true,
+			DeclaredModels: []string{"*"},
+			GateAllows:     allow,
+			GateReason:     reason,
+		})
+	}
+	in := routing.ReplayInput{
+		PolicyVersion:  "university-default@3",
+		Seed:           seed,
+		Now:            baseNow,
+		TTL:            time.Hour,
+		Objective:      routing.ObjectiveFixedOrder,
+		MaxRetries:     1,
+		Requirement:    routing.Requirement{Model: model},
+		Subject:        "alice",
+		SubjectSource:  "oidc:university",
+		Purpose:        "qa",
+		Organization:   "university",
+		DataLevel:      policy.LevelInternal,
+		AllowedRegions: []string{"cn-north"},
+		Scopes:         []policy.ScopeRef(chainOf(t, "alice", "university", "")),
+		Offers:         offers,
+	}
+	if err := in.Validate(); err != nil {
+		t.Fatalf("回放输入不合法: %v", err)
+	}
+	return in
+}
+
+// replayOfferProjections 把快照里的候选压回记录顶层的配置级投影。
+// Weight 照抄：ReplayOffer 里已经是有效权重，两侧必须是同一个数（digest 才核得上）。
+func replayOfferProjections(os []routing.ReplayOffer) []policy.RouteCandidate {
+	out := make([]policy.RouteCandidate, 0, len(os))
+	for _, o := range os {
+		out = append(out, policy.RouteCandidate{
+			Executor:      o.Executor,
+			Provider:      o.Provider,
+			Model:         o.Model,
+			UpstreamModel: o.UpstreamModel,
+			Weight:        o.Weight,
+			Region:        o.Region,
+			MaxDataLevel:  o.MaxDataLevel,
+		})
+	}
+	return out
+}
+
+// routingFixtureWithSnapshot 造一条 v2 形态的路由记录：计划由 D 现场算出，
+// 记录带着算出它的那份输入。SamplingAlgo 刻意留空，由 RoutingRecordFrom 按快照来源补，
+// 这样「带快照没声明算法」那条补值规则也是被测路径的一部分。
+func routingFixtureWithSnapshot(t *testing.T, requestID, policyVersion string, now time.Time) RoutingRecord {
+	t.Helper()
+	in := bitExactReplayInput(t, requestID, policyVersion, now)
+	plan, _, err := routing.ReplayWithAlgo(in, routing.SamplingAlgoSeededSplitmix64V1)
+	if err != nil {
+		t.Fatalf("按声明算法重跑失败: %v", err)
+	}
+	rec, err := RoutingRecordFrom(RoutingCapture{
+		RequestID:     requestID,
+		RecordedAt:    now,
+		PolicyVersion: policyVersion,
+		RoutingSeed:   in.Seed,
+		RoutingEpoch:  "epoch-7",
+		Candidates:    replayOfferProjections(in.Offers),
+		Plan:          plan,
+		Rejections:    plan.Rejections,
+		Replay:        &in,
+	})
+	if err != nil {
+		t.Fatalf("构造带快照的路由记录失败: %v", err)
+	}
+	return rec
+}
+
+// baselineFileWithSnapshot 是一份 v2 记录集：判定记录 + 一条带完整现场的路由记录。
+func baselineFileWithSnapshot(t *testing.T) File {
+	t.Helper()
+	set := testBundles(t)
+	chain := chainOf(t, "alice", "university", "")
+	id := identityOf(t, "alice", []string{"student"}, []string{"cs"})
+	ctx := ctxOf(t, id, "university", policy.LevelInternal)
+	allowed := captureDecision(t, set, "req-bit-exact", baseNow, chain, id, ctx, "model:gpt-mini", policy.ActionUse)
+	if allowed.Effect != policy.EffectAllow {
+		t.Fatalf("gpt-mini 对 student 应放行，实际 %+v", allowed)
+	}
+	return NewFile([]DecisionRecord{allowed}, []RoutingRecord{
+		routingFixtureWithSnapshot(t, "req-bit-exact", allowed.PolicyVersion, baseNow),
+	})
+}
+
 // shuffledFile 把记录顺序打乱：确定性回放的报告摘要必须与输入顺序无关。
 func shuffledFile(t *testing.T, f File, seed int64) File {
 	t.Helper()
@@ -258,4 +437,17 @@ func hasNoteContaining(o Outcome, needle string) bool {
 		}
 	}
 	return false
+}
+
+// routingOutcomeOf 从报告里取那条选路结果：报告按 (kind, request_id) 稳定排序，
+// 判定记录总是排在前面，用下标取会拿到错的那条。
+func routingOutcomeOf(t *testing.T, r Report) Outcome {
+	t.Helper()
+	for _, o := range r.Outcomes {
+		if o.Kind == KindRouting {
+			return o
+		}
+	}
+	t.Fatalf("报告里没有选路结果:\n%s", r.String())
+	return Outcome{}
 }

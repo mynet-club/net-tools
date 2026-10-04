@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
+	"github.com/mynet-club/net-tools/llmproxy/internal/routing"
 )
 
 // ReplayRouting 重跑一次选路决策。
@@ -13,9 +14,14 @@ import (
 // §2.8 的分工在这里落成可执行的断言：
 //   - 在线模式的权重随机不受影响，本函数不碰任何全局随机源；
 //   - 回放必须显式用记录里的 seed 建立独立确定性随机源 —— seed 缺失或非法时
-//     直接拒绝回放（fail_closed），绝不退回随机再假装复现了；
+//     直接拒绝回放（fail-closed），绝不退回随机再假装复现了；
 //   - 记录声明的 sampling_algo 与当前抽样器不一致时，只能做「解释性回放」：
 //     仍校验候选摘要、排除原因与权限，但不声称首选逐位相同（§2.8 对旧请求的口径）。
+//
+// 首选逐位那条路（2026-10-04 裁决第 5 条 B）只认记录自带的 replay_snapshot：
+// 有快照且算法在 D 的逐位集合里，就交给 internal/routing 的窄接口重跑并逐字段比对；
+// 二者缺一律退回解释性回放，并把「为什么不能声称逐位」的原因写进 Notes ——
+// 一份看起来通过、其实什么也没证明的报告，比一份差异报告更坏。
 //
 // pair 是同 request_id 的判定记录：有它才能拿到范围集合与上下文，
 // 于是版本来源可以按 Filter(chain) 复核，计划里每个候选也都能重跑一次授权判定
@@ -61,11 +67,14 @@ func (r *Replayer) ReplayRouting(rec RoutingRecord, pair DecisionRecord, hasPair
 	addDiff(&o, "candidates_digest", rec.CandidatesDigest, digest)
 
 	algo := rec.SamplingAlgoOrDefault()
-	if algo != r.sampler.Algo() {
+	switch {
+	case rec.Replay != nil:
+		r.collectBitExactDiffs(&o, rec, rejected)
+	case algo != r.sampler.Algo():
 		o.Notes = append(o.Notes, fmt.Sprintf(
 			"记录声明抽样算法 %q，当前抽样器 %q：只做解释性回放，不比对首选顺序（§2.8）",
 			algo, r.sampler.Algo()))
-	} else {
+	default:
 		r.collectSequenceDiffs(&o, rec, rejected)
 	}
 
@@ -168,6 +177,59 @@ func (r *Replayer) collectSequenceDiffs(o *Outcome, rec RoutingRecord, rejected 
 	for i := 0; i < limit; i++ {
 		addDiff(o, fmt.Sprintf("plan.attempts/%d", i), expected[i], actual[i])
 	}
+}
+
+// collectBitExactDiffs 用记录自带的完整快照重跑规划，逐字段比对首选与次序。
+//
+// 与 collectSequenceDiffs 的区别不是「比得严一点」，而是**比的是不同的东西**：
+// 那条重跑的是本包抽样器（replay-sampling-v1）在配置级候选投影上的序列，
+// 这一条重跑的是 D 的规划器在当时那份运行时事实上的计划。
+// 后者才是「首选顺序逐位复现」这句话的证据（裁决第 5 条 B）。
+//
+// 逐位的判定刻意取「这一段的差异数为 0」而不是「整体 passed」：
+// 授权还在不在（collectCandidateGrantDiffs）与顺序复现不复现是两件独立的事，
+// 混成一个布尔会让「策略收紧了但顺序没变」被报成回放失败。
+func (r *Replayer) collectBitExactDiffs(o *Outcome, rec RoutingRecord, rejected map[string]bool) {
+	in, algo, err := rec.BitExactReplay()
+	if err != nil {
+		// 快照在、算法对不上（或快照与顶层自相矛盾，那已在 Validate 里拒过）：
+		// 退回解释性回放，但把拒绝声称逐位的**原因**留在报告里。
+		o.Notes = append(o.Notes, fmt.Sprintf("%v：只做解释性回放，不声称首选逐位复现（§2.8）", err))
+		if rec.SamplingAlgoOrDefault() == r.sampler.Algo() {
+			r.collectSequenceDiffs(o, rec, rejected)
+		}
+		return
+	}
+
+	plan, digest, err := routing.ReplayWithAlgo(in, algo)
+	if err != nil {
+		*o = reject(*o, policy.ReasonContextInvalid,
+			fmt.Sprintf("按记录声明的算法 %q 重跑规划失败: %v", algo, err))
+		return
+	}
+
+	before := len(o.Diffs)
+	recordedDigest, derr := rec.Plan.Digest()
+	if derr != nil {
+		*o = reject(*o, policy.ReasonContextInvalid, derr.Error())
+		return
+	}
+	addDiff(o, "bit_exact/plan_digest", recordedDigest, digest)
+	addDiff(o, "bit_exact/routing_seed", rec.Plan.RoutingSeed, plan.RoutingSeed)
+	addDiff(o, "bit_exact/fallbacks_count", fmt.Sprintf("%d", len(rec.Plan.Fallbacks)), fmt.Sprintf("%d", len(plan.Fallbacks)))
+	for i := 0; i < len(rec.Plan.Fallbacks) && i < len(plan.Fallbacks); i++ {
+		addDiff(o, fmt.Sprintf("bit_exact/order/%d", i),
+			candidateSignature(rec.Plan.Fallbacks[i]), candidateSignature(plan.Fallbacks[i]))
+	}
+	o.BitExact = len(o.Diffs) == before
+}
+
+// candidateSignature 把一个候选压成一行可比的字段串。
+// 次序比对必须逐字段而不是只比 provider：计划里「同一家换了上游模型或有效权重」
+// 也是结论变了，只看 provider 会把它报成复现。
+func candidateSignature(c policy.RouteCandidate) string {
+	return fmt.Sprintf("%s|model=%s|upstream=%s|executor=%s|weight=%v|region=%s|level=%s",
+		c.Provider, c.Model, c.UpstreamModel, c.Executor, c.Weight, c.Region, c.MaxDataLevel.String())
 }
 
 // collectCandidateGrantDiffs 用配对判定记录的范围与上下文，重跑计划里每个候选的授权判定。

@@ -657,7 +657,11 @@ paths:
       description: |
         只回答「采了多少、按什么配置采」：enabled / sample_permille / scope_filter / capacity /
         entries / decisions / routings / captured / dropped / failed，外加 as_of、policy.mode、
-        当前策略版本，以及两条抽样算法标识与 `bit_exact_primary_order: false`。
+        当前策略版本、两条抽样算法标识（线上声明的与回放缺省的，二者不是同一算法），
+        `record_schema_version` / `record_schema_version_readable`，以及逐位复现三件套：
+        `bit_exact_primary_order`（今天为 true）、`bit_exact_algos`（承诺逐位的算法封闭集合）、
+        `bit_exact_condition`（**在什么条件下**才逐位 —— 仅 v2 且带 replay_snapshot 的记录；
+        v1 或无快照只做解释性回放）。只回一个 true 而不带条件，会比回 false 更误导。
         **不含任何 subject**：谁被采到只出现在导出那份文件里（§2.9 规则 6）。
         非 enforce 时带 `warning` —— 开关已开但窗口不会采集，这必须看得见。
       security: [{adminAuth: []}]
@@ -695,9 +699,13 @@ paths:
       tags: [admin]
       summary: 导出采集窗口里的回放记录
       description: |
-        响应体是记录文件本身的 JSON（`replay.File`，schema v1），**不加任何包装字段** ——
+        响应体是记录文件本身的 JSON（`replay.File`，写出版本 schema v2），**不加任何包装字段** ——
         另一个进程拿这份文件 + 当时那套策略包就能重跑判定；包一层就等于造出
         「界面里的记录」与「文件里的记录」两份真相。
+        v2 相对 v1 只多一样东西：每条选路记录承认（但不强制）带一份 `replay_snapshot`，
+        即当时那份完整的 `routing.ReplayInput`。有它且 `sampling_algo` 落在
+        `bit_exact_algos` 里，回放才能声称首选顺序逐位相同；v1 与无快照的记录照样能回放，
+        只是降级成解释性回放，报告里会明写这一条而不是静默通过。
         内容面由 `internal/replay` 的禁用词扫描把住：正文、密钥、端点这类字段名在解码期
         就被拒，导出侧写坏了会当场 500 而不是导出一份看起来正常的文件。
         `?scope=user:<用户名>` 只导出那一个人的记录（窗口按 2.x 的路由作用域采集，

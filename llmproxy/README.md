@@ -553,9 +553,9 @@ shadow。热加载只看配置文件 mtime，因此「内存里还是上一次�
 
 | 方法 | 路径 | 用途 |
 |------|------|------|
-| GET | `/v1/_admin/replay` | 采集窗口的配置与计数（**不含任何 subject**），外加 mode、当前版本、两条抽样算法标识与 `bit_exact_primary_order` |
+| GET | `/v1/_admin/replay` | 采集窗口的配置与计数（**不含任何 subject**），外加 mode、当前版本、两条抽样算法标识、记录结构版本，以及逐位复现三件套（`bit_exact_primary_order` / `bit_exact_algos` / `bit_exact_condition`） |
 | POST | `/v1/_admin/replay/sampling` | 改开关：`enabled` / `sample_permille`(0~1000) / `scope`(kind:id) / `capacity`(1~4096)，指针语义 —— 没带的字段不动 |
-| GET | `/v1/_admin/replay/export[?scope=user:名字]` | 导出记录文件本身（schema v1），**不加包装字段** |
+| GET | `/v1/_admin/replay/export[?scope=user:名字]` | 导出记录文件本身（写出版本 schema v2，可读 v1+v2），**不加包装字段** |
 | POST | `/v1/_admin/replay/clear` | 清空记录与计数（开关与过滤条件保持） |
 
 管理台 `/admin/` 的「回放证据链」面板是同一组端点的界面版（窗口计数、开关、导出、清空），
@@ -578,9 +578,13 @@ llmproxy replay run -records /tmp/rec.json -now 2026-10-03T12:00:00Z
 - **只采 `policy.mode=enforce` 且判定出了版本的请求**，选路记录另要求计划真的作用到本次
   选路。影子的判定没作用到任何请求上，不构成证据；管理口的路由模拟**不**进窗口，
   否则证据里掺的是人为流量。
-- **首选顺序今天不比对**。线上抽样是 `routing-seeded-splitmix64-v1`，回放缺省抽样器是
-  另一个算法，所以回放降级为**解释性回放**（仍复核候选摘要、排除原因与授权），状态口把
-  `bit_exact_primary_order: false` 明写出来 —— 让人以为逐位复现了，比不复现更糟。
+- **首选顺序的逐位复现由记录自己声明，不由回放侧猜**。线上写出的每条选路记录带一份
+  `replay_snapshot`（当时那份完整的 `routing.ReplayInput`）加 `sampling_algo`；回放侧按记录
+  声明的算法走 `routing` 包那条**与线上同一实现**的入口，于是候选摘要、排除原因、授权之外
+  还逐位比对尝试顺序。缺任何一件（v1 的历史文件、这条记录没带快照、算法不在
+  `bit_exact_algos` 里）都退化成**解释性回放**，报告会明写这一条并把「首选逐位复现」计成 0 ——
+  让人以为逐位复现了，比不复现更糟。`sampling_algo` 的写出值引用 `routing` 的常量而不是
+  这里再抄一份字面量：「线上与回放是同一条实现」这句话得有证据。
 
 窗口是**进程内**的有界缓冲：重启即空、溢出丢最旧并计入 `dropped`。所以流程是「要证据时
 打开 → 跑一批流量 → collect 取走 → off 或 clear」，而不是长期开着 —— 记录里带用户名，

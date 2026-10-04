@@ -57,6 +57,15 @@ type Outcome struct {
 	Reason    policy.Reason `json:"reason,omitempty"`
 	Diffs     []FieldDiff   `json:"diffs,omitempty"`
 	Notes     []string      `json:"notes,omitempty"`
+
+	// BitExact 表示首选逐位复现**被声称过且成立了**：记录带得上当时的完整现场
+	// （replay_snapshot）、算法在 D 承诺逐位的集合里、重跑的计划与记录逐字段相同。
+	// 缺任何一个条件都不置位 —— 它是「这条记录证明了首选顺序可复现」，
+	// 不是「这次回放没报错」（那看 Status）。
+	//
+	// omitempty 不只是省字节：报告摘要把这个字段算进去，历史基线（v1 记录）全是
+	// false，写出来就是每行多一个字段、每份基线摘要都变。
+	BitExact bool `json:"bit_exact,omitempty"`
 }
 
 // Passed 报告这条记录是否逐字段复现了。
@@ -101,6 +110,11 @@ func (o *Outcome) normalize() {
 func (o Outcome) String() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s/%s %s", o.Kind, o.RequestID, o.Status)
+	// 逐位标记只在真的成立时出现：解释性回放通过的那行如果不加区分，
+	// 读报告的人会把「通过」当成「首选顺序复现了」。
+	if o.BitExact {
+		fmt.Fprintf(&b, " [首选逐位]")
+	}
 	if o.Reason != "" {
 		fmt.Fprintf(&b, " reason=%s", string(o.Reason))
 	}
@@ -185,11 +199,26 @@ func (r Report) Digest() (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
+// BitExactCount 给出「首选顺序逐位复现成立」的选路记录条数。
+//
+// 这个数字必须单独报，不能并进 passed：一条只做解释性回放的记录照样可以 passed，
+// 而它证明的是「结论没变」，不是「顺序能逐位复现」。把两者混在一个计数里，
+// 就是拿解释性回放冒充逐位证据 —— §2.8 明确禁止的那种读法。
+func (r Report) BitExactCount() int {
+	n := 0
+	for _, o := range r.Outcomes {
+		if o.BitExact {
+			n++
+		}
+	}
+	return n
+}
+
 // Summary 给人看的统计行。
 func (r Report) Summary() string {
 	passed, mismatch, rejected := r.Counts()
-	return fmt.Sprintf("时钟 %s｜记录 %d 条：通过 %d，差异 %d，拒绝回放 %d",
-		nowUTC(r.Clock).Format(time.RFC3339), len(r.Outcomes), passed, mismatch, rejected)
+	return fmt.Sprintf("时钟 %s｜记录 %d 条：通过 %d，差异 %d，拒绝回放 %d｜首选逐位复现 %d",
+		nowUTC(r.Clock).Format(time.RFC3339), len(r.Outcomes), passed, mismatch, rejected, r.BitExactCount())
 }
 
 // String 给出可直接打进 CI 日志的多行输出（按稳定顺序）。

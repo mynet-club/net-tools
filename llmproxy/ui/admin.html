@@ -180,7 +180,10 @@
         记录里带<b>用户名</b>（谁在什么时候被授权用了哪个模型），所以缺省是关的 ——
         运维口径是「要证据时打开 → 跑一批流量 → 导出取走 → 关掉或清空」，而不是长期开着。
         回放本身不在这里跑：那份文件要在<b>另一个进程</b>里配合当时那套策略包重跑
-        （<code>llmproxy replay run -records … -now …</code>），这屏给出的每一条数字都只是窗口的计数。</p>
+        （<code>llmproxy replay run -records … -now …</code>），这屏给出的每一条数字都只是窗口的计数。
+        首选顺序能不能<b>逐位</b>复现，取决于记录里有没有带上当时那份完整回放输入
+        （<code>schema_version=2</code> 的 <code>replay_snapshot</code>）；导入的旧记录照样能回放，
+        只是报告会明写它<b>只做解释性回放</b>，不会静默算成复现成功。</p>
       <p class="banner" id="rp-status" hidden></p>
       <div id="rp-stats" class="gridn"></div>
 

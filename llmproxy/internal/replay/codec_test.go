@@ -172,7 +172,9 @@ func TestDecodeRejectsUnknownFieldsAndBadSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 未知字段必须拒绝：多出来的键意味着有人在记录里塞没被契约承认的东西（最典型是正文）。
-	withExtra := bytes.Replace(data, []byte(`"schema_version": 1,`), []byte(`"schema_version": 1, "note": "x",`), 1)
+	anchor := []byte(`"schema_version": 2,`)
+	withExtra := bytes.Replace(data, anchor,
+		[]byte(`"schema_version": 2, "note": "x",`), 1)
 	if bytes.Equal(withExtra, data) {
 		t.Fatal("测试注入失败：没找到 schema_version 锚点")
 	}
@@ -180,13 +182,70 @@ func TestDecodeRejectsUnknownFieldsAndBadSchema(t *testing.T) {
 		t.Fatal("未知字段必须被拒绝")
 	}
 
-	for _, bad := range []string{`{"schema_version": 2, "decisions": []}`, `{"schema_version": 0}`, `not json`} {
+	// 版本 3 与 0 都必须拒绝：3 是「本实现还没承认的形状」，按 v2 的字段解释它就是猜。
+	for _, bad := range []string{`{"schema_version": 3, "decisions": []}`, `{"schema_version": 0}`, `not json`} {
 		if _, err := Decode([]byte(bad)); err == nil {
 			t.Fatalf("必须拒绝: %s", bad)
 		}
 	}
 	if _, err := Decode(nil); err == nil {
 		t.Fatal("空文件必须报错，不能被当成「零条记录，回放全绿」")
+	}
+}
+
+// v1 文件（第一代：只有配置级候选投影）必须仍然可读可回放 —— 现网已经导出的记录
+// 不会因为 schema 升到 v2 就变成废纸，那等于销毁别人手里的证据。
+// 但它一律只能做解释性回放：逐位复现要的运行时事实压根不在文件里。
+func TestV1FileStillDecodesAndReplaysExplanatory(t *testing.T) {
+	data, err := Encode(baselineFile(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1 := bytes.Replace(data, []byte(`"schema_version": 2,`), []byte(`"schema_version": 1,`), 1)
+	if bytes.Equal(v1, data) {
+		t.Fatal("测试注入失败：没找到 schema_version 锚点")
+	}
+	f, err := Decode(v1)
+	if err != nil {
+		t.Fatalf("v1 文件必须可读: %v", err)
+	}
+	if f.SchemaVersion != SchemaVersionRoutingOnly {
+		t.Fatalf("版本号不能被改写成当前值，实际 %d", f.SchemaVersion)
+	}
+	r, err := New(testBundles(t), Options{Now: baseNow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := r.Run(f)
+	if err != nil {
+		t.Fatalf("v1 记录回放失败: %v", err)
+	}
+	if report.BitExactCount() != 0 {
+		t.Fatalf("v1 记录没有任何逐位凭据，报告却声称复现了 %d 条", report.BitExactCount())
+	}
+	for _, o := range report.Outcomes {
+		if o.Kind == KindRouting && o.BitExact {
+			t.Fatalf("v1 的选路记录不得标记 bit_exact: %+v", o)
+		}
+	}
+}
+
+// 写着 v1 却带 replay_snapshot 的文件必须被拒：那是版本号与内容互相矛盾，
+// 按 v1 读要把快照丢掉（本可声称逐位却被降级，且没人知道），按 v2 读等于承认版本号是假的。
+func TestV1FileCarryingSnapshotIsRejected(t *testing.T) {
+	f := baselineFileWithSnapshot(t)
+	data, err := Encode(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1 := bytes.Replace(data, []byte(`"schema_version": 2,`), []byte(`"schema_version": 1,`), 1)
+	if bytes.Equal(v1, data) {
+		t.Fatal("测试注入失败：没找到 schema_version 锚点")
+	}
+	if _, err := Decode(v1); err == nil {
+		t.Fatal("v1 版本 + replay_snapshot 的组合必须被拒绝")
+	} else if !strings.Contains(err.Error(), "replay_snapshot") {
+		t.Fatalf("拒因必须点名快照字段: %v", err)
 	}
 }
 

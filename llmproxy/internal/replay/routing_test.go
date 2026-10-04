@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
+	"github.com/mynet-club/net-tools/llmproxy/internal/routing"
 )
 
 // routingCase 造一对配对的判定 + 路由记录：路由回放要靠判定记录拿范围与上下文。
@@ -51,6 +52,180 @@ func assertRoutingPassed(t *testing.T, r *Replayer, rec RoutingRecord, pair Deci
 	o := r.ReplayRouting(rec, pair, hasPair)
 	if !o.Passed() {
 		t.Fatalf("基线路由回放应通过:\n%s", o.String())
+	}
+}
+
+// P4（2026-10-04 裁决第 5 条 B）：带 replay_snapshot 的 v2 记录必须能声称逐位复现，
+// 而声称的前提是快照齐全、算法可核对、快照与记录自洽 —— 三者缺一律退回解释性回放，
+// 并把「为什么不能声称」写在报告里。
+func TestReplayRoutingBitExactFromSnapshot(t *testing.T) {
+	f := baselineFileWithSnapshot(t)
+	r := newReplayer(t, testBundles(t), baseNow, false)
+	report, err := r.Run(f)
+	if err != nil {
+		t.Fatalf("v2 记录回放失败: %v\n%s", err, report.String())
+	}
+	if !report.Clean() {
+		t.Fatalf("D 现场算出的计划换到回放侧必须逐字段复现:\n%s", report.String())
+	}
+	if got := report.BitExactCount(); got != 1 {
+		t.Fatalf("带完整快照的记录必须报 1 条逐位复现，实际 %d:\n%s", got, report.String())
+	}
+	o := routingOutcomeOf(t, report)
+	if !o.BitExact {
+		t.Fatalf("带完整快照的记录应标记 bit_exact: %+v", o)
+	}
+	if hasNoteContaining(o, "只做解释性回放") {
+		t.Fatalf("这条记录有逐位凭据，报告里不该出现解释性回放的降级备注: %+v", o.Notes)
+	}
+	if !strings.Contains(o.String(), "首选逐位") {
+		t.Fatalf("打印行要看得见逐位标记: %s", o.String())
+	}
+}
+
+// 记录必须能穿过文件格式再被**另一个进程**复现：内存里相等只证明规划器是纯函数，
+// 证明不了快照经 JSON 往返后还是那份输入（时间戳精度、omitempty 字段缺席都可能是坑）。
+func TestBitExactSurvivesEncodeDecode(t *testing.T) {
+	f := baselineFileWithSnapshot(t)
+	data, err := Encode(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"replay_snapshot"`) {
+		t.Fatal("v2 导出必须带上 replay_snapshot，否则这份文件没有逐位凭据")
+	}
+	got, err := Decode(data)
+	if err != nil {
+		t.Fatalf("往返导入失败: %v", err)
+	}
+	r := newReplayer(t, testBundles(t), baseNow, false)
+	before, err := r.Run(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := r.Run(got)
+	if err != nil {
+		t.Fatalf("导入的记录回放失败: %v", err)
+	}
+	if before.BitExactCount() != 1 || after.BitExactCount() != 1 {
+		t.Fatalf("往返前后都该报 1 条逐位，实际 %d / %d:\n%s", before.BitExactCount(), after.BitExactCount(), after.String())
+	}
+	d1, _ := before.Digest()
+	d2, _ := after.Digest()
+	if d1 != d2 {
+		t.Fatalf("序列化往返改变了回放结论:\n%s\n%s", before.String(), after.String())
+	}
+}
+
+// 打乱快照里的候选顺序不得改变逐位结论：D 的比较器是全序（provider →
+// upstream_model → executor），否则「同一个池子两次遍历顺序不同」就会报成策略差异。
+func TestBitExactOrderIsStableUnderOfferShuffle(t *testing.T) {
+	in := bitExactReplayInput(t, "req-shuffle", "university-default@3", baseNow)
+	plan, _, err := routing.ReplayWithAlgo(in, routing.SamplingAlgoSeededSplitmix64V1)
+	if err != nil {
+		t.Fatalf("首次重跑失败: %v", err)
+	}
+	reversed := in
+	reversed.Offers = make([]routing.ReplayOffer, len(in.Offers))
+	for i := range in.Offers {
+		reversed.Offers[i] = in.Offers[len(in.Offers)-1-i]
+	}
+	plan2, _, err := routing.ReplayWithAlgo(reversed, routing.SamplingAlgoSeededSplitmix64V1)
+	if err != nil {
+		t.Fatalf("乱序重跑失败: %v", err)
+	}
+	if len(plan.Fallbacks) != len(plan2.Fallbacks) {
+		t.Fatalf("候选数变了: %d vs %d", len(plan.Fallbacks), len(plan2.Fallbacks))
+	}
+	for i := range plan.Fallbacks {
+		if plan.Fallbacks[i].Provider != plan2.Fallbacks[i].Provider {
+			t.Fatalf("第 %d 位次序随输入顺序变了: %s vs %s",
+				i, plan.Fallbacks[i].Provider, plan2.Fallbacks[i].Provider)
+		}
+	}
+}
+
+// 算法标识与快照互相矛盾时，只能拒绝**声称逐位**，不能拒绝回放本身：
+// 解释性回放照样要复核候选摘要、排除原因与授权（§2.8）。
+func TestBitExactRefusesWhenAlgoMismatch(t *testing.T) {
+	f := baselineFileWithSnapshot(t)
+	rec := f.Routings[0]
+	rec.SamplingAlgo = SamplingAlgoReplayV1
+	pair := f.Decisions[0]
+	r := newReplayer(t, testBundles(t), baseNow, false)
+	o := r.ReplayRouting(rec, pair, true)
+	if o.BitExact {
+		t.Fatalf("算法声明不在逐位集合里，报告却声称复现了首选顺序: %+v", o)
+	}
+	if !hasNoteContaining(o, "不声称首选逐位复现") {
+		t.Fatalf("必须看得见拒绝声称逐位的原因: %+v（status=%s）", o.Notes, o.Status)
+	}
+	if !hasNoteContaining(o, SamplingAlgoReplayV1) {
+		t.Fatalf("备注要点名是哪个算法标识不合规: %+v", o.Notes)
+	}
+}
+
+// 快照与记录顶层各说各话 ⇒ 结构校验就失败：复现出来的结论描述的不是那次决策。
+func TestSnapshotContradictingRecordIsRejected(t *testing.T) {
+	f := baselineFileWithSnapshot(t)
+	tamperedSeeds := []struct {
+		name string
+		mut  func(*RoutingRecord)
+		need string
+	}{
+		{"seed", func(r *RoutingRecord) { r.Replay.Seed = strings.Repeat("0", len(r.Replay.Seed)) }, "routing_seed"},
+		{"policy_version", func(r *RoutingRecord) { r.Replay.PolicyVersion = "other@9" }, "policy_version"},
+		{"候选池", func(r *RoutingRecord) { r.Replay.Offers[1].Weight = 99 }, "候选池"},
+	}
+	for _, tc := range tamperedSeeds {
+		rec := f.Routings[0]
+		clone := *rec.Replay
+		rec.Replay = &clone
+		tc.mut(&rec)
+		err := rec.Validate(baseNow)
+		if err == nil {
+			t.Fatalf("%s 被改过却仍通过校验（逐位声称的前提没了）", tc.name)
+		}
+		if !strings.Contains(err.Error(), tc.need) {
+			t.Fatalf("%s 的拒因要点名被改的字段，需要包含 %q，实际: %v", tc.name, tc.need, err)
+		}
+	}
+}
+
+// 采集侧的两个口径：带快照没声明算法要按快照来源补；带快照却声明了不合规的算法要当场拒。
+func TestRoutingRecordFromAlgoWithSnapshot(t *testing.T) {
+	in := bitExactReplayInput(t, "req-algo", "university-default@3", baseNow)
+	plan, _, err := routing.ReplayWithAlgo(in, routing.SamplingAlgoSeededSplitmix64V1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	build := func(algo string) (RoutingRecord, error) {
+		snapshot := in
+		return RoutingRecordFrom(RoutingCapture{
+			RequestID:     "req-algo",
+			RecordedAt:    baseNow,
+			PolicyVersion: in.PolicyVersion,
+			RoutingSeed:   in.Seed,
+			RoutingEpoch:  "epoch-7",
+			SamplingAlgo:  algo,
+			Candidates:    replayOfferProjections(in.Offers),
+			Plan:          plan,
+			Rejections:    plan.Rejections,
+			Replay:        &snapshot,
+		})
+	}
+	rec, err := build("")
+	if err != nil {
+		t.Fatalf("带快照没声明算法必须能落成记录: %v", err)
+	}
+	if rec.SamplingAlgo != routing.SamplingAlgoSeededSplitmix64V1 {
+		t.Fatalf("算法标识应由快照来源补成 %q，实际 %q（落到本包默认值等于自降成解释性回放）",
+			routing.SamplingAlgoSeededSplitmix64V1, rec.SamplingAlgo)
+	}
+	if _, err := build(SamplingAlgoReplayV1); err == nil {
+		t.Fatal("带快照却声明解释性抽样算法的记录必须构造失败，不能留下一条自相矛盾的证据")
+	} else if !strings.Contains(err.Error(), SamplingAlgoReplayV1) {
+		t.Fatalf("拒因要点名冲突的算法标识: %v", err)
 	}
 }
 
