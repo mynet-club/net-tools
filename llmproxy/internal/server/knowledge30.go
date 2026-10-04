@@ -82,6 +82,17 @@ type knowledgeSource struct {
 	// err 非空 = 这个源装配不起来。检索命中它时指名报错，而不是静默跳过：
 	// 「配了却从来没生效」是知识源这一侧最难查的故障形态。
 	err string
+	// endpoint 是检索委托入口（配置原值）。正文注入要多问一次检索，所以它和
+	// contentEndpoint 一起构成本条通道的出网面，两者都必须在声明的白名单里。
+	endpoint string
+	// contentEndpoint 非空 = 这个源开了正文交付（return_raw_body）且交付入口装配成功。
+	// 它是「哪些源会往网关内存里放正文」的唯一判据，正文通道的出网端点枚举全靠它。
+	contentEndpoint string
+	// deliverer 是同一个委托客户端的正文交付面（与 contentEndpoint 同时装配，只可能
+	// 在 return_raw_body: true 时非空）。正文通道要的是 DelegatedContentDeliverer，
+	// 而 retriever 那个字段是 DelegatedRetriever —— 分开放是为了让「能不能交付」
+	// 在类型上就看得见，而不是靠读配置注释推断。
+	deliverer knowledge.DelegatedContentDeliverer
 }
 
 // knowledgeRuntime 是一份配置修订对应的知识源装配态，挂在 policyRuntime 上
@@ -105,7 +116,8 @@ func (s *Server) buildKnowledgeRuntime(cfg *config.Config, rt *policyRuntime) *k
 	tr, trErr := s.Transports().Get("")
 	for i := range cfg.KnowledgeSources {
 		d := &cfg.KnowledgeSources[i]
-		src := &knowledgeSource{name: strings.TrimSpace(d.Name), budget: kbBudgetOf(d.TimeoutMs)}
+		src := &knowledgeSource{name: strings.TrimSpace(d.Name), budget: kbBudgetOf(d.TimeoutMs),
+			endpoint: strings.TrimSpace(d.Endpoint)}
 		for _, raw := range d.KnowledgeBases {
 			if kb := strings.TrimSpace(raw); kb != "" {
 				src.bases = append(src.bases, kb)
@@ -127,6 +139,20 @@ func (s *Server) buildKnowledgeRuntime(cfg *config.Config, rt *policyRuntime) *k
 				// 名字落在 AuditEvent.Retriever 上：审计里区分多个委托入口靠的就是它，
 				// 而端点地址不进审计也不进用户面回话。
 				r.Name = src.name
+				// 正文交付入口只在平台开关打开时挂上（决策包 §8.1 的第一道锁）。
+				// 留空就是「这个源不做正文交付」：检索那条链一个字段都没动，
+				// 而 kb-context-inject 会在注册期因为报不出端点而装配失败 ——
+				// 比「声明写着取正文、运行时悄悄什么都不取」诚实。
+				if d.ReturnRawBody {
+					r.DeliveryEndpoint = strings.TrimSpace(d.DeliveryEndpoint)
+					src.contentEndpoint = r.DeliveryEndpoint
+					// 只有真的挂上了入口才算「能交付」：入口为空时宁可让这个源不参与正文通道
+					// （装配期就是「报不出端点即拒绝注册」），也不要等到第一次取正文时
+					// 才由 DeliverContent 报一个「未配置正文交付端点」。
+					if src.contentEndpoint != "" {
+						src.deliverer = r
+					}
+				}
 				src.retriever = r
 			}
 		}
@@ -299,14 +325,43 @@ func kbFailureMetric(m *runtimeMetrics, source string, reason knowledge.Reason) 
 	m.noteKnowledgeFailure(source, string(reason))
 }
 
-// kbSearch 对每个被准入的源发一次委托，逐源留审计。
+// kbSourceHit 是一个源这次检索留下的「还能继续索取正文」的那份现场。
 //
-// 总预算取各源预算之和并以 MaxBudget 为顶，每个源再按「此刻还剩多少」收窄截止时间：
-// 只允许收窄不允许放宽（WithDeadline 的既有约定），否则一个慢源会替整条链路续期。
+// 三样都是正文交付请求的必需输入，而且必须在检索那一刻取：
+//   - rc：交付委托要沿用同一次检索的 request_id、期限与预算收窄口径（同一个 rc 两次
+//     装配出不同期限，回放就对不上）；
+//   - scope：本次可问的库与分级上限；
+//   - docs：源侧**本次真的判过可读**、给了摘要与到期时刻的那几篇。
+//     BuildContentRequest 只接受它做申请依据 —— 凭空报一个 source_id 等于让网关
+//     替源侧做一次它没做过的判定。
+type kbSourceHit struct {
+	source *knowledgeSource
+	rc     knowledge.RequestContext
+	scope  knowledge.KnowledgeScope
+	docs   []knowledge.ReturnedDocument
+}
+
+// kbSearch 是自助检索口的薄壳：检索词一律只传摘要，也不索取正文。
 func (s *Server) kbSearch(ctx context.Context, kc *knowledgeCall, allowed []string,
 	terms string, maxResults int, sink kbSearchSink) (*kbOutcome, error) {
 
+	out, _, err := s.kbSearchRun(ctx, kc, allowed, knowledge.Query{Terms: terms}, maxResults, sink)
+	return out, err
+}
+
+// kbSearchRun 对每个被准入的源发一次委托，逐源留审计，并留下可继续索取正文的现场。
+//
+// q.AllowRawTerms 由调用方按 A 包授权设定（正文通道），自助检索恒为 false。
+// 装配那一关（BuildRequest）只管「授权位为真才写原文」，不在这里再判一次权限：
+// 判权限的真值源只有 A 一个，而调用点各自都已经问过（见 knowledgecontent30.go）。
+//
+// 总预算取各源预算之和并以 MaxBudget 为顶，每个源再按「此刻还剩多少」收窄截止时间：
+// 只允许收窄不允许放宽（WithDeadline 的既有约定），否则一个慢源会替整条链路续期。
+func (s *Server) kbSearchRun(ctx context.Context, kc *knowledgeCall, allowed []string,
+	q knowledge.Query, maxResults int, sink kbSearchSink) (*kbOutcome, []kbSourceHit, error) {
+
 	out := &kbOutcome{Citations: []knowledge.Citation{}, KnowledgeLevel: policy.LevelPublic}
+	var hits []kbSourceHit
 	grouped := map[*knowledgeSource][]string{}
 	for _, kb := range allowed {
 		if src, ok := kc.kr.byKB[kb]; ok {
@@ -320,7 +375,7 @@ func (s *Server) kbSearch(ctx context.Context, kc *knowledgeCall, allowed []stri
 		}
 	}
 	if total <= 0 {
-		return out, nil
+		return out, nil, nil
 	}
 	if total > knowledge.MaxBudget {
 		total = knowledge.MaxBudget
@@ -329,13 +384,12 @@ func (s *Server) kbSearch(ctx context.Context, kc *knowledgeCall, allowed []stri
 
 	base, err := knowledge.NewRequestContext(kc.requestID, kc.subject, kc.chain, kbPurpose, kc.maxLevel, kc.version, kc.now)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", errKnowledgeNoIdentity, err)
+		return nil, nil, fmt.Errorf("%w: %v", errKnowledgeNoIdentity, err)
 	}
 	base, err = base.WithMaxResults(maxResults)
 	if err != nil {
-		return nil, fmt.Errorf("结果数上限不合法: %v", err)
+		return nil, nil, fmt.Errorf("结果数上限不合法: %v", err)
 	}
-	q := knowledge.Query{Terms: terms}
 
 	// 按声明顺序发请求：同一份输入两次运行的顺序必须一致，否则回话与审计没法逐位比对。
 	for _, src := range kc.kr.sources {
@@ -361,20 +415,20 @@ func (s *Server) kbSearch(ctx context.Context, kc *knowledgeCall, allowed []stri
 		scope, err := knowledge.NewKnowledgeScope(kc.chain, kc.maxLevel, kbs)
 		if err != nil {
 			if gerr := gatewayFailure(knowledge.ReasonProtocolInvalid, "知识范围不合法: "+err.Error()); gerr != nil {
-				return nil, gerr
+				return nil, nil, gerr
 			}
 			continue
 		}
 		rc, err := base.WithDeadline(deadline, time.Now().UTC())
 		if err != nil {
 			if gerr := gatewayFailure(knowledge.ReasonContextExpired, "剩余预算已用尽: "+err.Error()); gerr != nil {
-				return nil, gerr
+				return nil, nil, gerr
 			}
 			continue
 		}
 		if src.retriever == nil {
 			if gerr := gatewayFailure(knowledge.ReasonTransportNotConfigured, src.err); gerr != nil {
-				return nil, gerr
+				return nil, nil, gerr
 			}
 			continue
 		}
@@ -382,12 +436,12 @@ func (s *Server) kbSearch(ctx context.Context, kc *knowledgeCall, allowed []stri
 		if outcome == nil {
 			// Resolve 的前置校验失败（上下文/范围/检索器）不产出事件，同样走最小留痕。
 			if gerr := gatewayFailure(knowledge.ReasonUnavailable, errText(rerr)); gerr != nil {
-				return nil, gerr
+				return nil, nil, gerr
 			}
 			continue
 		}
 		if err := sink(outcome.Audit, src.name); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		// §3.I 指标：耗时/命中/截断一律取审计事件里的源侧事实，不在接线侧另算一份
 		// （自己掐表会得到「含落库的耗时」，那与源侧响应慢不是一回事）。
@@ -405,6 +459,9 @@ func (s *Server) kbSearch(ctx context.Context, kc *knowledgeCall, allowed []stri
 		if outcome.KnowledgeLevel.Exceeds(out.KnowledgeLevel) {
 			out.KnowledgeLevel = outcome.KnowledgeLevel
 		}
+		if len(outcome.Documents) > 0 {
+			hits = append(hits, kbSourceHit{source: src, rc: rc, scope: scope, docs: outcome.Documents})
+		}
 	}
 
 	knowledge.SortCitations(out.Citations)
@@ -413,7 +470,7 @@ func (s *Server) kbSearch(ctx context.Context, kc *knowledgeCall, allowed []stri
 		out.Citations = out.Citations[:maxResults]
 		out.Truncated = true
 	}
-	return out, nil
+	return out, hits, nil
 }
 
 // minKBAudit 给「Resolve 连事件都没产出」的路径造一条最小留痕。
@@ -543,6 +600,9 @@ func (s *Server) knowledgeList(w http.ResponseWriter, e *userEntry, scope policy
 			"status":          status,
 			"knowledge_bases": src.bases,
 			"budget_ms":       src.budget.Milliseconds(),
+			// 正文交付面的现状：管理员要能一眼看出「这个源会不会往网关内存里放正文」，
+			// 而不是去翻 YAML 猜开关。这里只报布尔值，不报入口地址（端点不进用户面回话）。
+			"return_raw_body": src.contentEndpoint != "",
 		}
 		if src.err != "" {
 			item["error"] = src.err

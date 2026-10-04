@@ -15,8 +15,12 @@ import (
 // citations 与 dropped 是未导出字段：只由 Filter 填充，
 // 免得外部手构出一个「HitCount=5 但引用为空」的自相矛盾结果进审计。
 type FilterResult struct {
-	citations    []Citation
-	dropped      []DropRecord
+	citations []Citation
+	dropped   []DropRecord
+	// accepted 是与 citations **一一对齐**的源侧原始文档条目（同序、同截断）。
+	// 只由 Filter 填充，理由与 citations 相同：外部手构一份「引用与文档对不上」的
+	// 结果，正文交付就会拿一个不存在的准入结论去申请原文。
+	accepted     []ReturnedDocument
 	HitCount     int              `json:"hit_count"`
 	MaxDataLevel policy.DataLevel `json:"max_data_level"`
 	Truncated    bool             `json:"truncated,omitempty"`
@@ -25,6 +29,16 @@ type FilterResult struct {
 
 // Citations 返回引用的副本（调用方改动不会影响审计记录）。
 func (r FilterResult) Citations() []Citation { return append([]Citation(nil), r.citations...) }
+
+// Accepted 返回**兜底过滤后仍然留下**的那些文档条目（副本，顺序与 Citations 一致）。
+//
+// 它是正文交付的唯一合法输入（content.go 的 BuildContentRequest）：交付申请必须建立在
+// 「源侧本次真的判过可读、并且带着 expires_at 与 digest」的事实上，而不是从引用反推 ——
+// Citation 结构上没有 Allowed/ExpiresAt，反推等于替源侧编造一个它没给过的到期时刻。
+// 返回副本是为了让调用方改不动过滤结果本身（同一份结果还要落审计）。
+func (r FilterResult) Accepted() []ReturnedDocument {
+	return append([]ReturnedDocument(nil), r.accepted...)
+}
 
 // Dropped 返回丢弃记录的副本。
 func (r FilterResult) Dropped() []DropRecord { return append([]DropRecord(nil), r.dropped...) }
@@ -113,6 +127,10 @@ func Filter(resp RetrieveResponse, req RetrieveRequest, now time.Time) (FilterRe
 
 	stamp := chooseStamp(resp.EvaluatedAt, now)
 	candidates := make([]Citation, 0, len(docs))
+	// byDoc 是「引用 → 源侧条目」的回查表，供 Accepted 用。
+	// 键与 Citation.Key() 同形：dedupeCitations 正是按这个键判重复的，
+	// 两处用同一个键才能保证引用与条目不会因为「哪一处先算重」而错位。
+	byDoc := map[string]ReturnedDocument{}
 	for _, doc := range docs {
 		// 先按协议形态自检，坏数据逐条丢弃并给出稳定码：
 		// 一条坏文档不该废掉整次检索，但更不能带着可疑形态进入引用集合。
@@ -130,6 +148,7 @@ func Filter(resp RetrieveResponse, req RetrieveRequest, now time.Time) (FilterRe
 			continue
 		}
 		candidates = append(candidates, citation)
+		byDoc[citation.Key()] = doc
 	}
 
 	// 引用集合内部再收一道：同一篇文档重复出现只留一条；
@@ -149,6 +168,15 @@ func Filter(resp RetrieveResponse, req RetrieveRequest, now time.Time) (FilterRe
 	}
 
 	result.citations = citations
+	// accepted 与 citations 一一对齐（同序、同去重、同截断），正文交付据此申请。
+	// 缺一条回查到的条目就跳过那一篇而不是塞一个零值进去：零值 ExpiresAt 会被
+	// 交付侧读成「这条准入没有到期时刻」，那是一次凭空放宽。
+	result.accepted = make([]ReturnedDocument, 0, len(citations))
+	for _, c := range citations {
+		if doc, ok := byDoc[c.Key()]; ok {
+			result.accepted = append(result.accepted, doc)
+		}
+	}
 	result.HitCount = len(citations)
 	result.MaxDataLevel = MaxKnowledgeLevel(citations)
 	result.dropped = drops.records

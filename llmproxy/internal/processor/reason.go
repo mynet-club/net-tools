@@ -55,6 +55,18 @@ const (
 	ReasonContentBlocked  Reason = "content_blocked"
 	ReasonLimitExceeded   Reason = "limit_exceeded"
 
+	// 正文注入的四种「什么都没做」结论（kb-context-inject）。
+	//
+	// 它们都是**结论码**而不是故障码：正文逐字节不变、请求继续正常转发。分成四个码
+	// 而不是一个 knowledge_skipped，是因为这四件事的处置人完全不同 ——
+	// grant_missing 归管理员（没授权）、no_query 归接入方（形态不适用）、
+	// no_content 归知识源运营（库里没查到）、level_dropped 归合规（越级内容被兜住）。
+	// 合成一个码，面板就只能回答「注入没生效」而不能回答「该找谁」。
+	ReasonKnowledgeGrantMissing Reason = "knowledge_grant_missing"
+	ReasonKnowledgeNoQuery      Reason = "knowledge_no_query"
+	ReasonKnowledgeNoContent    Reason = "knowledge_no_content"
+	ReasonKnowledgeLevelDropped Reason = "knowledge_level_dropped"
+
 	// fail_open 跳过留痕：正文保持不变，但审计必须能看到「这次没处理」。
 	ReasonFailOpenSkipped Reason = "fail_open_skipped"
 )
@@ -70,6 +82,7 @@ func init() {
 		ReasonTimeout, ReasonFailed, ReasonEndpointDenied, ReasonGrantMissing,
 		ReasonGrantCheckerBlank, ReasonRetryExhausted, ReasonSidecarReject,
 		ReasonSchemaViolation, ReasonInvalidInput, ReasonContentBlocked, ReasonLimitExceeded,
+		ReasonKnowledgeGrantMissing, ReasonKnowledgeNoQuery, ReasonKnowledgeNoContent, ReasonKnowledgeLevelDropped,
 		ReasonFailOpenSkipped,
 	} {
 		allReasons[r] = true
@@ -203,6 +216,12 @@ func classify(err error) (Reason, failureClass) {
 	case errors.Is(err, ErrNoBody):
 		return ReasonNoInput, classViolation
 	case errors.Is(err, ErrRetryExhausted), errors.Is(err, ErrSidecarFailed), errors.Is(err, ErrProcessFailed):
+		return ReasonFailed, classInfrastructure
+	case errors.Is(err, ErrContentDeliveryFailed):
+		// 知识源挂了是**依赖故障**：注入是增强能力，不是安全检查，
+		// 所以它归 infrastructure 类、由声明里的 fail_closed 决定拒还是放行原正文。
+		// 不能归 violation —— 那会让「知识库暂时不可用」变成用户可见的 4xx/403，
+		// 而真正该动的是运营（去查对端），不是客户端（改内容没用）。
 		return ReasonFailed, classInfrastructure
 	}
 	return ReasonFailed, classInfrastructure

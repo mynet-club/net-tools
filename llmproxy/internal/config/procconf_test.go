@@ -321,6 +321,198 @@ func TestKnowledgeSourceValidation(t *testing.T) {
 	}
 }
 
+// TestKnowledgeContentSwitchValidation 钉住正文开关的四格（决策包 §8.1）：
+// 开关与交付入口的任意组合里，只有「都关」与「都开、入口独立且合法」两种形态能加载。
+//
+// 为什么四格里两格要报错而不是运行期再说：「开了开关却没有入口」如果等到第一次
+// 正文交付才发现，现场是「注入处理器抱怨没有正文」，根因却在磁盘上的一行 YAML；
+// 「配了入口却没开开关」更坏 —— 读配置的人会以为开关是开的。
+func TestKnowledgeContentSwitchValidation(t *testing.T) {
+	newOne := func(mutate func(*KnowledgeSourceDef)) []KnowledgeSourceDef {
+		s := goodSource("campus-rag", "https://rag.internal/retrieve", "campus-policy")
+		if mutate != nil {
+			mutate(&s)
+		}
+		return []KnowledgeSourceDef{s}
+	}
+	for _, tc := range []struct {
+		why    string
+		mutate func(*KnowledgeSourceDef)
+	}{
+		{"缺省即最严形态：不写开关、没有入口", nil},
+		{"显式关：写了 false 也不必填入口", func(s *KnowledgeSourceDef) { s.ReturnRawBody = false }},
+		{"开且入口独立", func(s *KnowledgeSourceDef) {
+			s.ReturnRawBody = true
+			s.DeliveryEndpoint = "https://rag.internal/deliver"
+		}},
+	} {
+		if err := (&Config{KnowledgeSources: newOne(tc.mutate)}).normalizeKnowledgeSources(); err != nil {
+			t.Errorf("%s 不该报错: %v", tc.why, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		why    string
+		mutate func(*KnowledgeSourceDef)
+		want   string
+	}{
+		{"关着却配了入口", func(s *KnowledgeSourceDef) {
+			s.DeliveryEndpoint = "https://rag.internal/deliver"
+		}, "没打开 return_raw_body"},
+		{"开着却没入口", func(s *KnowledgeSourceDef) { s.ReturnRawBody = true }, "必须同时写 delivery_endpoint"},
+		{"开着但入口空白", func(s *KnowledgeSourceDef) {
+			s.ReturnRawBody = true
+			s.DeliveryEndpoint = "   "
+		}, "必须同时写 delivery_endpoint"},
+		{"入口形态非法", func(s *KnowledgeSourceDef) {
+			s.ReturnRawBody = true
+			s.DeliveryEndpoint = "https://tok:sk-xxx@rag.internal/deliver"
+		}, "凭证"},
+		{"入口与检索入口同一扇门", func(s *KnowledgeSourceDef) {
+			s.ReturnRawBody = true
+			s.DeliveryEndpoint = "https://rag.internal/retrieve"
+		}, "不能与 endpoint 相同"},
+		{"同一个入口只是末尾多了斜杠", func(s *KnowledgeSourceDef) {
+			s.ReturnRawBody = true
+			s.DeliveryEndpoint = "https://rag.internal/retrieve/"
+		}, "不能与 endpoint 相同"},
+		{"同一个入口只是末尾多了空查询串", func(s *KnowledgeSourceDef) {
+			s.ReturnRawBody = true
+			s.DeliveryEndpoint = "https://rag.internal/retrieve?"
+		}, "不能与 endpoint 相同"},
+	} {
+		err := (&Config{KnowledgeSources: newOne(tc.mutate)}).normalizeKnowledgeSources()
+		if err == nil {
+			t.Errorf("%s：本该报错", tc.why)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s 的错误该含 %q，实际: %v", tc.why, tc.want, err)
+		}
+		if !strings.Contains(err.Error(), "campus-rag") {
+			t.Errorf("%s 的错误该指认是哪一条: %v", tc.why, err)
+		}
+	}
+}
+
+// TestKnowledgeContentSwitchLoadThroughConfig 确认整份加载通道也认这两个键
+// （KnownFields(true) 那一关会把未登记的键直接拒掉，光测 normalize 发现不了）。
+func TestKnowledgeContentSwitchLoadThroughConfig(t *testing.T) {
+	cfg, err := loadSrc(t, procYAML("knowledge_sources:\n"+
+		"  - name: campus-rag\n    endpoint: https://rag.internal/retrieve\n"+
+		"    knowledge_bases:\n      - campus-policy\n    timeout_ms: 1500\n    max_response_bytes: 1048576\n"+
+		"    return_raw_body: true\n    delivery_endpoint: https://rag.internal/deliver\n"))
+	if err != nil {
+		t.Fatalf("整份配置加载失败: %v", err)
+	}
+	view := cfg.KnowledgeSourcesView()
+	if len(view) != 1 || !view[0].ReturnRawBody || view[0].DeliveryEndpoint != "https://rag.internal/deliver" {
+		t.Fatalf("开关没进视图: %+v", view)
+	}
+}
+
+// TestKnowledgeContentSwitchRoundTrip 是编辑层的守恒：开关能写、能读回、幂等，
+// 而默认形态（关）不会在文件里留下任何 `false` 摊平的行。
+func TestKnowledgeContentSwitchRoundTrip(t *testing.T) {
+	list := []KnowledgeSourceDef{
+		goodSource("open-rag", "https://rag.internal/retrieve", "kb-open"),
+		goodSource("closed-rag", "https://other.internal/retrieve", "kb-closed"),
+	}
+	list[0].ReturnRawBody = true
+	list[0].DeliveryEndpoint = "https://rag.internal/deliver"
+
+	src := []byte(procYAML("knowledge_sources: []\n"))
+	out, err := EditKnowledgeSources(src, list)
+	if err != nil {
+		t.Fatalf("写回失败: %v", err)
+	}
+	text := string(out)
+	if !strings.Contains(text, "return_raw_body: true") || !strings.Contains(text, "https://rag.internal/deliver") {
+		t.Fatalf("开关没写进文件:\n%s", text)
+	}
+	// 关着的那条不该出现开关行，也不该出现 `return_raw_body: false` 那种摊平的默认值。
+	if strings.Contains(text, "return_raw_body: false") {
+		t.Errorf("默认形态被摊成显式 false，真正那一条会被淹没:\n%s", text)
+	}
+	// 段说明注释里也提到了键名，所以数的是「以它开头的键行」而不是出现次数。
+	if n := strings.Count(text, "\n      return_raw_body"); n != 1 {
+		t.Errorf("开关行数量不符（期望 1，实际 %d）:\n%s", n, text)
+	}
+	back, err := RawKnowledgeSources(out)
+	if err != nil {
+		t.Fatalf("读回失败: %v\n%s", err, out)
+	}
+	if len(back) != 2 || !back[0].ReturnRawBody || back[1].ReturnRawBody || back[1].DeliveryEndpoint != "" {
+		t.Fatalf("读回不符: %+v", back)
+	}
+	again, err := EditKnowledgeSources(out, back)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(again) != text {
+		t.Errorf("同一意图写出两份文本:\n%s\n---\n%s", text, again)
+	}
+	if _, err := loadSrc(t, string(out)); err != nil {
+		t.Errorf("写出来的段在整份配置里加载失败: %v", err)
+	}
+}
+
+// TestEditKnowledgeRejectsSwitchWithoutEndpoint 确认写侧不会把「开关开着却没有入口」
+// 落盘：那是一条启动时才发现的 fail_closed 配置。
+func TestEditKnowledgeRejectsSwitchWithoutEndpoint(t *testing.T) {
+	bad := goodSource("s", "https://a.internal/retrieve", "kb")
+	bad.ReturnRawBody = true
+	src := []byte("knowledge_sources: []\nrouting:\n  retry: 2\n")
+	out, err := EditKnowledgeSources(src, []KnowledgeSourceDef{bad})
+	if err == nil || !strings.Contains(err.Error(), "delivery_endpoint") {
+		t.Fatalf("缺入口的开关必须在写之前被拒: %v", err)
+	}
+	if out != nil {
+		t.Errorf("拒绝写回时不该返回内容: %q", out)
+	}
+	// 同理：读侧的编辑基线也不能把这种形态原样回到界面上。
+	readSrc := []byte("knowledge_sources:\n  - name: s\n    endpoint: https://a.internal/retrieve\n" +
+		"    knowledge_bases: [kb]\n    timeout_ms: 1500\n    max_response_bytes: 4096\n    return_raw_body: true\n")
+	if _, err := RawKnowledgeSources(readSrc); err == nil {
+		t.Fatal("基线里「开关开着却没有入口」必须报错")
+	}
+}
+
+// TestConfigEqualSeesContentSwitch 钉住热更新比较：正文开关是一次出网暴露面变更，
+// 漏比会让它被当成「没变」，调用方继续拿着只给摘要的旧委托器。
+func TestConfigEqualSeesContentSwitch(t *testing.T) {
+	const seg = "knowledge_sources:\n" +
+		"  - name: campus-rag\n    endpoint: https://rag.internal/retrieve\n" +
+		"    knowledge_bases:\n      - campus-policy\n    timeout_ms: 1500\n    max_response_bytes: 1048576\n"
+	off, err := loadSrc(t, procYAML(seg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	explicitOff, err := loadSrc(t, procYAML(seg+"    return_raw_body: false\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	on, err := loadSrc(t, procYAML(seg+"    return_raw_body: true\n    delivery_endpoint: https://rag.internal/deliver\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !configEqual(off, explicitOff) {
+		t.Error("「没写开关」与「显式 false」行为一致，不该判为变更（那会白白重置连接池）")
+	}
+	if configEqual(off, on) {
+		t.Error("打开正文开关必须判为变更：它新增一条独立协议出网通路")
+	}
+	// 只挪入口地址也是变更（交付打到哪一家是审计要能归因的事实）。
+	otherEndpoint, err := loadSrc(t, procYAML(seg+"    return_raw_body: true\n    delivery_endpoint: https://rag2.internal/deliver\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configEqual(on, otherEndpoint) {
+		t.Error("交付入口换了一家必须判为变更")
+	}
+}
+
+// TestKnowledgeBaseCannotBeServedByTwoSources 保留原文：同一库被两个源声明必须报错。
 func TestKnowledgeBaseCannotBeServedByTwoSources(t *testing.T) {
 	list := []KnowledgeSourceDef{
 		goodSource("a", "https://a.internal/retrieve", "shared-kb"),

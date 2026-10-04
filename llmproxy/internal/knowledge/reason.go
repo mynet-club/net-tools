@@ -51,6 +51,22 @@ const (
 	ReasonOverResultLimit     Reason = "document_over_result_limit"
 	ReasonDigestInvalid       Reason = "document_digest_invalid"
 	ReasonProtocolMissing     Reason = "document_protocol_field_missing"
+
+	// 正文交付通道档位（决策包 §8.1；与检索档位分开，因为值班要能单独统计
+	// 「原文进过网关」这件事，而不是把它混进检索量里）。
+	ReasonContentOK Reason = "content_ok"
+	// ReasonContentNone 是「交付成功但一篇都没留下」：所有申请项都被兜底丢掉。
+	// 它不是失败——源侧正常响应、协议合格，只是没有一篇通过网关侧校验。
+	ReasonContentNone            Reason = "content_none"
+	ReasonContentNothingAdmitted Reason = "content_nothing_admitted"
+	ReasonContentProtocolInvalid Reason = "content_protocol_invalid"
+	// 逐篇丢弃档位。
+	ReasonContentFieldMissing    Reason = "content_field_missing"
+	ReasonContentEvidenceMissing Reason = "content_evidence_missing"
+	ReasonContentNotRequested    Reason = "content_document_not_requested"
+	ReasonContentDigestMismatch  Reason = "content_digest_mismatch"
+	ReasonContentTooLarge        Reason = "content_too_large"
+	ReasonContentExpired         Reason = "content_expired"
 )
 
 // reasonRegistry 是注册表。未注册的原因码在构造审计时直接失败，
@@ -65,6 +81,9 @@ func init() {
 		ReasonNotReadableAtSource, ReasonEvidenceMissing, ReasonKBNotAllowed,
 		ReasonLevelExceeded, ReasonLevelUnknown, ReasonCrossOrg, ReasonSubjectMismatch, ReasonACLExpired,
 		ReasonDuplicate, ReasonOverResultLimit, ReasonDigestInvalid, ReasonProtocolMissing,
+		ReasonContentOK, ReasonContentNone, ReasonContentNothingAdmitted, ReasonContentProtocolInvalid,
+		ReasonContentFieldMissing, ReasonContentEvidenceMissing, ReasonContentNotRequested,
+		ReasonContentDigestMismatch, ReasonContentTooLarge, ReasonContentExpired,
 	} {
 		reasonRegistry[r] = true
 	}

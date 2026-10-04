@@ -2,8 +2,10 @@ package knowledge
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -557,6 +559,144 @@ func TestResolveStaysEmptyWhenSourceReturnsNothing(t *testing.T) {
 	}
 	if len(outcome.Audit.QueriedBases) != 1 {
 		t.Fatalf("零命中也要记实际查询过的库，用来和「没授权」区分: %v", outcome.Audit.QueriedBases)
+	}
+}
+
+// TestOutcomeDocumentsCarryAdmissionForContentDelivery 钉死正文交付的输入来源：
+// Outcome.Documents 是与 Citations 一一对齐的**源侧本次判定**，因此可以直接装配成
+// 交付请求；被兜底丢弃的篇目绝不以任何形态留在这里。
+func TestOutcomeDocumentsCarryAdmissionForContentDelivery(t *testing.T) {
+	fake := fixtureRetriever().WithACLVersion("example-acl@7")
+	rc, now := liveContext(t, subjectAlice, orgExample, policy.LevelInternal)
+	scope := mustScope(t, rc.Chain, policy.LevelInternal, kbHandbook, kbHR)
+
+	outcome := mustResolve(t, fake, rc, scope, Query{Terms: "报销"}, now)
+	if len(outcome.Documents) == 0 || len(outcome.Documents) != len(outcome.Citations) {
+		t.Fatalf("准入条目必须与引用一一对齐: %d vs %d", len(outcome.Documents), len(outcome.Citations))
+	}
+	for i, c := range outcome.Citations {
+		doc := outcome.Documents[i]
+		if doc.SourceID != c.SourceID || doc.KnowledgeBase != c.KnowledgeBase {
+			t.Fatalf("第 %d 篇指向不同文档: %s/%s ≠ %s/%s", i, doc.KnowledgeBase, doc.SourceID, c.KnowledgeBase, c.SourceID)
+		}
+		if strings.ToLower(doc.Digest) != c.Digest {
+			t.Fatalf("第 %d 篇摘要与引用不符: %s ≠ %s", i, doc.Digest, c.Digest)
+		}
+		if !doc.Allowed || strings.TrimSpace(doc.RuleID) == "" {
+			t.Fatalf("进准入集合的条目必须带着源侧本次的可读判定与依据: %+v", doc)
+		}
+		// 分级越界的那篇（doc-2 是 confidential）在引用里已经被丢了，
+		// 如果它的条目还留在 Documents 里，正文交付就能凭它申请一篇不该申请的原文。
+		if doc.SourceID == "doc-2" {
+			t.Fatal("越界篇目留下了准入依据")
+		}
+	}
+
+	req, err := BuildContentRequest(rc, scope, outcome.Documents, DefaultContentPassages, DefaultContentBytes, now)
+	if err != nil {
+		t.Fatalf("一次成功检索的准入集合应能装配出交付请求: %v", err)
+	}
+	if len(req.Documents) != len(outcome.Documents) {
+		t.Fatalf("申请项条数应等于准入条数: %d vs %d", len(req.Documents), len(outcome.Documents))
+	}
+	for _, ask := range req.Documents {
+		if ask.ExpectedDigest == "" {
+			t.Fatalf("申请项缺少准入摘要: %+v", ask)
+		}
+	}
+}
+
+// TestOutcomeDocumentsEmptyOnEveryNoContentPath：失败、短路、零命中三条路径都不能留下
+// 准入依据 —— 「一次失败的检索」拿去申请原文，就是 §3.C 明令禁止的那条路。
+func TestOutcomeDocumentsEmptyOnEveryNoContentPath(t *testing.T) {
+	rc, now := liveContext(t, subjectAlice, orgExample, policy.LevelInternal)
+	scope := mustScope(t, rc.Chain, policy.LevelInternal, kbHandbook)
+
+	t.Run("检索失败", func(t *testing.T) {
+		outcome, err := Resolve(context.Background(), fixtureRetriever().WithFault(errors.New("connection refused")),
+			rc, scope, Query{Terms: "报销"}, now)
+		if err == nil {
+			t.Fatal("失败必须返回错误")
+		}
+		if outcome == nil {
+			t.Fatal("失败也要给 Outcome（审计要能落库）")
+		}
+		if len(outcome.Documents) != 0 {
+			t.Fatalf("失败路径不得留下准入依据: %+v", outcome.Documents)
+		}
+	})
+
+	t.Run("没有准入知识库", func(t *testing.T) {
+		emptyScope, err := NewKnowledgeScope(rc.Chain, policy.LevelInternal, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		outcome, err := Resolve(context.Background(), fixtureRetriever(), rc, emptyScope, Query{Terms: "报销"}, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(outcome.Documents) != 0 {
+			t.Fatalf("短路路径不得留下准入依据: %+v", outcome.Documents)
+		}
+	})
+
+	t.Run("零命中", func(t *testing.T) {
+		outcome := mustResolve(t, NewFakeRetriever(), rc, scope, Query{Terms: "没有的东西"}, now)
+		if len(outcome.Documents) != 0 {
+			t.Fatalf("零命中不得留下准入依据: %+v", outcome.Documents)
+		}
+	})
+
+	t.Run("全部被兜底丢弃", func(t *testing.T) {
+		fake := NewFakeRetriever(fakeDoc("doc-1", kbHandbook, ownerOrg(), policy.LevelInternal, "可读")).
+			WithSimulation(FakeOmitEvidence)
+		outcome := mustResolve(t, fake, rc, scope, Query{Terms: "报销"}, now)
+		if len(outcome.Citations) != 0 || len(outcome.Documents) != 0 {
+			t.Fatalf("没有判定依据就没有准入: %+v", outcome.Documents)
+		}
+	})
+}
+
+// TestOutcomeDocumentsNeverSurviveSerialization：Documents 是 `json:"-"`。
+// 这不只是「别把字段带进审计」——审计与回放那条链反序列化出来的 Outcome
+// 因此结构上没有准入依据，拿它去装配交付请求只会得到一个空申请集合，
+// 而空申请集合在协议层不合法。原文申请必须发生在同一次请求的内存里。
+func TestOutcomeDocumentsNeverSurviveSerialization(t *testing.T) {
+	fake := fixtureRetriever().WithACLVersion("example-acl@7")
+	rc, now := liveContext(t, subjectAlice, orgExample, policy.LevelInternal)
+	scope := mustScope(t, rc.Chain, policy.LevelInternal, kbHandbook, kbHR)
+	outcome := mustResolve(t, fake, rc, scope, Query{Terms: "报销"}, now)
+	if len(outcome.Documents) == 0 {
+		t.Fatal("用例前提：这次检索应留下准入条目")
+	}
+
+	data, err := json.Marshal(outcome)
+	if err != nil {
+		t.Fatalf("Outcome 必须可序列化（审计与回放依赖它）: %v", err)
+	}
+	if strings.Contains(string(data), `"documents"`) {
+		t.Fatalf("准入条目序列化进了审计形态: %s", string(data))
+	}
+
+	var revived Outcome
+	if err := json.Unmarshal(data, &revived); err != nil {
+		t.Fatal(err)
+	}
+	if len(revived.Citations) == 0 {
+		t.Fatal("用例前提：引用应能序列化往返")
+	}
+	if len(revived.Documents) != 0 {
+		t.Fatalf("反序列化产物不得携带准入依据: %+v", revived.Documents)
+	}
+	req, err := BuildContentRequest(rc, scope, revived.Documents, DefaultContentPassages, DefaultContentBytes, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(req.Documents) != 0 {
+		t.Fatalf("凭反序列化产物申请到了正文: %+v", req.Documents)
+	}
+	if err := req.Validate(); err == nil {
+		t.Fatal("空申请集合必须不合法，调用方必须短路而不是把空集合发给知识源")
 	}
 }
 

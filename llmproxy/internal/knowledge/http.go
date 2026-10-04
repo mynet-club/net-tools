@@ -50,6 +50,15 @@ type HTTPRetriever struct {
 	FallbackBudget time.Duration
 	// Name 是审计里的实现标识。
 	Name string
+	// DeliveryEndpoint 是正文交付（决策包 §8.1）的独立入口；为空表示这个源不做正文交付。
+	//
+	// 为什么单独一个 URL 而不是在检索入口上按 protocol_version 分发：
+	// 正文交付是**另一套授权面**（平台开关 + 管理员 knowledge.content 授权 + 源侧逐篇再判），
+	// 共用入口就没法在网络层把「只开检索」的部署里那条正文通路单独关掉，
+	// 也没法在出网白名单上把两种暴露面分开。
+	// 名字刻意不带 content 一词：本包的禁词扫描（leak_test.go）对 content 一律判红，
+	// 这条守卫的价值就在「见即红、不开特例」，与其给它登记例外不如换个同样准确的名字。
+	DeliveryEndpoint string
 }
 
 var (
@@ -114,6 +123,12 @@ func (c *HTTPRetriever) RetrieverName() string {
 		return "http"
 	}
 	return c.Name
+}
+
+// ContentDelivererName 实现 NamedContentDeliverer：交付审计里标注是哪一路实现。
+// 与 RetrieverName 同一限制：只报名字，不报端点与凭证（端点属于配置面，不进审计行）。
+func (c *HTTPRetriever) ContentDelivererName() string {
+	return c.RetrieverName()
 }
 
 // Validate 校验配置（构造后可能被逐字段修改，接线启动时调用一次）。
@@ -240,6 +255,10 @@ func (c *HTTPRetriever) Retrieve(ctx context.Context, req RetrieveRequest) (Retr
 // 为什么还要再夹一次：req.Deadline 是对端可读的字段，
 // 一个被改坏（或故意拖时间）的 deadline 不应该让本地请求无限存活。
 func (c *HTTPRetriever) budgetFor(req RetrieveRequest) time.Duration {
+	return c.budgetForDeadline(req.Deadline)
+}
+
+func (c *HTTPRetriever) budgetForDeadline(deadline time.Time) time.Duration {
 	fallback := c.FallbackBudget
 	if fallback <= 0 {
 		fallback = DefaultBudget
@@ -247,10 +266,10 @@ func (c *HTTPRetriever) budgetFor(req RetrieveRequest) time.Duration {
 	if fallback > MaxBudget {
 		fallback = MaxBudget
 	}
-	if req.Deadline.IsZero() {
+	if deadline.IsZero() {
 		return fallback
 	}
-	left := time.Until(req.Deadline)
+	left := time.Until(deadline)
 	if left <= 0 {
 		return 0
 	}
@@ -272,7 +291,11 @@ func (c *HTTPRetriever) effectiveLimit() int64 {
 // 底层错误只挂在 Cause 上：http 的报错会带 URL、端口甚至响应字节片段，
 // 这些进了 Error() 就会顺着日志外流（见 delegation.go 的 RetrievalError）。
 func (c *HTTPRetriever) classifyTransportError(err error, req RetrieveRequest) error {
-	kbs := append([]string(nil), req.KnowledgeBases...)
+	return classifyTransport(err, append([]string(nil), req.KnowledgeBases...))
+}
+
+// classifyTransport 是检索与正文交付共用的一套传输层归因（两套协议对底层失败的读法一致）。
+func classifyTransport(err error, kbs []string) error {
 	fail := func(reason Reason, detail string) error {
 		return &RetrievalError{Reason: reason, KB: kbs, Detail: detail, Cause: err}
 	}
@@ -359,3 +382,130 @@ func validateEndpoint(endpoint string) (string, error) {
 
 var _ DelegatedRetriever = (*HTTPRetriever)(nil)
 var _ NamedRetriever = (*HTTPRetriever)(nil)
+
+// ValidateContent 校验正文交付方向的可工作性（配置开关打开时由接线层在启动阶段调用）。
+//
+// 为什么单独一个校验而不是塞进 Validate：检索入口在开关关着时也必须能独立成立
+// ——正文端点是**可选**的第二入口，把它做成 Validate 的必填项会让所有现存部署在
+// 升级后启动失败，而那正好违反 §8.1「开关关着时行为与裁决前逐字节相同」的验收。
+func (c *HTTPRetriever) ValidateContent() error {
+	if err := c.Validate(); err != nil {
+		return err
+	}
+	if c.DeliveryEndpoint == "" {
+		return fmt.Errorf("%w: 未配置正文交付端点（配置里 return_raw_body 打开后必须有独立入口）", ErrEndpoint)
+	}
+	if _, err := validateEndpoint(c.DeliveryEndpoint); err != nil {
+		return err
+	}
+	return nil
+}
+
+// contentLimit 给出本次交付响应允许读取的字节上限。
+//
+// 取「配置上限」与「本次字节预算 + 协议外壳」的较大值：只按配置判会把一份合法交付
+// 误读成超限（每篇正文外面还套着 JSON 字段），而字节预算本身已被
+// AbsoluteMaxContentBytes 钉死，所以这里不会因此放开无限内存。
+func (c *HTTPRetriever) contentLimit(req ContentRequest) int64 {
+	limit := c.effectiveLimit()
+	need := int64(req.MaxTotalBytes) + int64(len(req.Documents)+1)*1024
+	if need > limit {
+		return need
+	}
+	return limit
+}
+
+// DeliverContent 实现 DelegatedContentDeliverer：向源侧的正文交付入口发一次请求。
+//
+// 与 Retrieve 同一条纪律：错误一律收敛成稳定原因码，日志与返回值里没有响应字节、
+// 没有检索词、没有主体明文。这里**比检索多一条**清理义务：解码失败时
+// ContentResponse 里可能已经躺着部分正文（encoding/json 出错前会写入已完成的字段），
+// 所以每条解码后的失败路径都先 clearPassages 再返回（§2.9 规则 2）。
+func (c *HTTPRetriever) DeliverContent(ctx context.Context, req ContentRequest) (ContentResponse, error) {
+	kbs := append([]string(nil), req.KnowledgeBases...)
+	fail := func(reason Reason, detail string) (ContentResponse, error) {
+		return ContentResponse{}, &RetrievalError{Reason: reason, KB: kbs, Detail: detail}
+	}
+	if err := c.ValidateContent(); err != nil {
+		return ContentResponse{}, err
+	}
+	if err := req.Validate(); err != nil {
+		return fail(ReasonContentProtocolInvalid, "交付请求字段不符")
+	}
+
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return fail(ReasonContentProtocolInvalid, "交付请求序列化失败")
+	}
+	budget := c.budgetForDeadline(req.Deadline)
+	if budget <= 0 {
+		// 预算已花完：不出网。正文方向的「不出网」同样是硬结论而不是降级。
+		return fail(ReasonTimeout, "剩余预算为零")
+	}
+	callCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(callCtx, http.MethodPost, c.DeliveryEndpoint, bytes.NewReader(payload))
+	if err != nil {
+		return fail(ReasonContentProtocolInvalid, "交付请求构造失败")
+	}
+	httpReq.Header.Set("Content-Type", contentTypeJSON)
+	httpReq.Header.Set("Accept", contentTypeJSON)
+	httpReq.Header.Set("X-Request-Id", req.RequestID)
+	// 与检索同一条：凭证属于注入的 transport，本结构里不存任何认证材料。
+
+	resp, err := c.Do(httpReq)
+	if err != nil {
+		return ContentResponse{}, classifyTransport(err, kbs)
+	}
+	if resp == nil {
+		return fail(ReasonUnavailable, "transport 返回空响应")
+	}
+	limit := c.contentLimit(req)
+	defer drainAndClose(resp, limit)
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// 非 2xx（含 3xx）一律失败：状态码要进审计做归因，响应体一个字节都不采纳 ——
+		// 知识源的 403 页面上常写着文档标题甚至正文片段。（体只为连接复用丢弃，不进任何返回值。）
+		return ContentResponse{}, &RetrievalError{
+			Reason:     ReasonUpstreamStatus,
+			StatusCode: resp.StatusCode,
+			KB:         kbs,
+			Detail:     "非 2xx 状态",
+		}
+	}
+	mediaType, err := mimeMainType(resp)
+	if err != nil {
+		return fail(ReasonContentProtocolInvalid, "响应媒体类型头不合法")
+	}
+	if mediaType != contentTypeJSON {
+		return fail(ReasonContentProtocolInvalid, "响应不是 application/json（多半是中间代理返回了登录页或错误页）")
+	}
+
+	data, readErr := io.ReadAll(io.LimitReader(resp.Body, limit+maxReadOverhead))
+	if readErr != nil {
+		return ContentResponse{}, classifyTransport(readErr, kbs)
+	}
+	if int64(len(data)) > limit {
+		return fail(ReasonResponseTooLarge, fmt.Sprintf("交付响应超过上限 %d 字节", limit))
+	}
+
+	var decoded ContentResponse
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		// 解码错误不带原文：json 的报错会带上下文字节，那正是刚交付进来的正文。
+		clearPassages(decoded.Passages)
+		return fail(ReasonContentProtocolInvalid, "交付响应不是合法协议 JSON")
+	}
+	if envErr := decoded.ValidateEnvelope(req); envErr != nil {
+		// 外壳不合格：这份响应里已经反序列化进内存的正文必须清零后再交回去，
+		// 且返回**零值载荷** —— 调用方接手一个长度非零的切片就会把半成品读成结果。
+		clearPassages(decoded.Passages)
+		return fail(ReasonContentProtocolInvalid, "交付响应外壳校验失败")
+	}
+	return decoded, nil
+}
+
+var (
+	_ DelegatedContentDeliverer = (*HTTPRetriever)(nil)
+	_ NamedContentDeliverer     = (*HTTPRetriever)(nil)
+)

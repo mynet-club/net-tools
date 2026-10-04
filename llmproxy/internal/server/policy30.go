@@ -168,11 +168,14 @@ func (s *Server) policyFor(cfg *config.Config) *policyRuntime {
 	} else {
 		s.log.Infof("3.0 策略链路就绪（模式 %s，修订 %d，策略版本 %s，代 %s）", rt.mode, rev, rt.version, rt.epoch)
 	}
+	// 知识源先装配：kb-context-inject 的正文交付器在**注册期**就要枚举得出网端点
+	// （E 那道「报不出端点即拒绝注册」的门），而端点来自这一版的 knowledge_sources。
+	// 反过来装配就会出现「声明写得完全正确，注册表说交付端点不可枚举」这种指错方向的错。
+	// 坏端点仍然不丢掉策略运行态：原因记在源上，命中它的检索请求据此报错。
+	rt.kb = s.buildKnowledgeRuntime(cfg, rt)
 	// 处理器声明跟着这一版配置装配（同一修订、同一生命周期）。装配失败不丢掉运行态：
 	// 策略判定仍然有效，而坏声明的错误文案要在命中它的那条请求上原样端出来。
 	rt.proc = s.buildProcRuntime(cfg, rt)
-	// 知识源同理：坏端点不丢掉策略运行态，原因记在源上，命中它的检索请求据此报错。
-	rt.kb = s.buildKnowledgeRuntime(cfg, rt)
 	// 执行器声明表跟着同一版配置换：新修订下注册不上的执行器名必须立刻变成
 	// 「拒候选」，而不是继续用旧修订那张表。
 	rt.exec = s.buildExecutorRuntime()

@@ -45,6 +45,7 @@
 | 不转发下游 Authorization | 上游收到的永远是**该供应商自己的** `api_key` |
 | 不记录请求/响应正文 | 只落模型名、延迟、token 数、状态码、错误类型。**例外**：上游报错时响应体前 300 字节会进日志与 `provider_stats.last_error`（排障要用），但只下发给静态 key 与 BYO 用户，**消费用户拿不到** —— 见下面「已知例外」 |
 | 下游 POST 只放行推理端点 | `chat/completions`、`completions`、`embeddings` 三条；其余一律 404。否则任何持有效 token 的用户都能让网关带着**你的上游密钥**去 POST 上游主机的任意路径（`/v1/files`、`/v1/fine_tuning/jobs`…），而且完全不进计量 |
+| 知识库正文默认不进网关进程 | `knowledge_sources[].return_raw_body` 缺省 `false`（只给引用与摘要）。打开它必须同时给独立的 `delivery_endpoint`（与检索入口只差末尾斜杠也算同一扇门，被加载期拒掉），且正文进上下文还要策略里 `knowledge.content` 与 `body.raw` 两道**各带到期时刻**的授权，外加源侧逐篇复核摘要；正文只在单次请求的内存里活着、用完清零，不落库 / 不进日志 / 不进回放。详见 `docs/3.0-knowledge-delegation.md` §4.8 |
 | `base_url` 不许带 query / 锚点 | 转发时上游 URL 是 `base_url + 下游路径` 直接拼的，一个 `?` 就能把路径吃进 query，从而绕过上面那条白名单 |
 | 用户自配上游做出网校验 | link-local（含云元数据 `169.254.169.254`）与未指定地址**一律拒绝**；回环与私网段由 `server.block_local_upstream` 控制（默认放行，见配置一节）。系统池是你自己写的，不受限 |
 | 配置/数据库文件 0600 | 权限过宽会在启动时警告 |

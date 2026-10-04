@@ -208,4 +208,19 @@ type Config struct {
 	// Idempotent 声明该调用可安全重放。false 时**一次都不重试**：
 	// 一个非幂等的 sidecar（比如已经落了一次判定结果）重试会产生重复副作用。
 	Idempotent bool
+
+	// --- kb-context-inject ---
+	// KnowledgeContent 是正文获取的实现，由接线方注入且必须走受出网策略管的那条路。
+	// 本包绝不自己连知识源：缺了就拒绝注册（理由同 HTTPClient ——
+	// 目标白名单必须在传输层执行，否则一次重绑定就把 allowed_endpoints 变成装饰）。
+	KnowledgeContent KnowledgeContentDeliverer
+	// ContentGrants 是「文档正文能否进上下文」的管理员授权判定器（knowledge.content + read）。
+	// 它与 Grants 是**两道独立**的门：前者管取回内容、后者管送出去检索词。
+	// 缺一半的注册等于「声明说这条会取正文，运行时没人能回答管理员授没授权」，
+	// 所以两者都在构造期校验（ErrGrantCheckerBlank）。
+	ContentGrants KnowledgeContentGrantChecker
+	// ContentMaxPassages / ContentMaxBytes 是这条声明愿意带进 prompt 的篇数与字节上限。
+	// 越界或留空回落到保守缺省，不存在「不限」这种取值（见 content.go 的 clampContentInt）。
+	ContentMaxPassages int
+	ContentMaxBytes    int
 }

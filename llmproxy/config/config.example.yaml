@@ -153,20 +153,27 @@ log:
 #   processor_params/pii-cn.json          →  {"pii_types":["email","phone"]}
 #   processor_params/schema-check.json    →  {"schema":{…}}
 #   processor_params/rewrite.json         →  {"endpoint":"https://…","headers":{…}}
+#   processor_params/kb-inject.json       →  {"max_passages":4,"max_total_bytes":32768}
 #
 # 每条声明可写的键按类型固定（写错类型或多余的键都在**启动期**报错，不会静默忽略 ——
 # 「配了 schema 而它从来没跑过」在界面上看着像两条声明都在）。可用键：
-#   pii-mask        pii_types
-#   field-replace   rules、max_path_depth
-#   json-schema     schema
-#   result-filter   filter_rules、filter_mode、filter_replacement、max_line_bytes
-#   http-sidecar    endpoint、headers、max_retries、idempotent
-# 只有 pii-mask 可以没有文件（用内置词表 + 每请求随机 salt）；其余类型缺文件即拒绝启动。
+#   pii-mask             pii_types
+#   field-replace        rules、max_path_depth
+#   json-schema          schema
+#   result-filter        filter_rules、filter_mode、filter_replacement、max_line_bytes
+#   http-sidecar         endpoint、headers、max_retries、idempotent
+#   kb-context-inject    max_passages、max_total_bytes（都可省；缺省 8 篇 / 65536 字节，
+#                        越界或写 0 一律回落缺省而不是「放到最大」，上限 100 篇 / 1MiB）
+# 只有 pii-mask 与 kb-context-inject 可以没有文件：前者用内置词表 + 每请求随机 salt，
+# 后者的必填件（正文交付器与两道授权判定器）本来就只能由网关注入。其余类型缺文件即拒绝启动。
 #
 # 为什么单独一个目录：让这些进 config.yaml 就有两个真值来源，而 sidecar 的请求头常带令牌 ——
-# 那是把密钥拉进一份会被备份、被同步的文件里。HTTP 客户端、「原文出网」授权判定器与
-# pseudonym key 因此**不接受文件注入**：前两个由 server 侧按出网策略与生效策略包注入
-# （见 internal/server/procruntime.go），第三个是密钥。
+# 那是把密钥拉进一份会被备份、被同步的文件里。HTTP 客户端、正文交付器、「原文出网」与
+# 「正文进上下文」两道授权判定器与 pseudonym key 因此**不接受文件注入**：中间四件由 server 侧
+# 按出网策略与生效策略包注入（见 internal/server/procruntime.go），最后一个是密钥。
+# 参数文件里能写端点的只有 http-sidecar，而它写的只是 sidecar 自己的地址；
+# kb-context-inject 给出一个交付端点等于绕过出网策略，给出一个判定器等于在策略内核之外
+# 再造一个授权真值源 —— 这两个键不存在，写了会在启动期被拒。
 #
 # 只有 policy.mode=enforce 才允许这些声明参与判定（§3.0 规则 2）；
 # shadow / legacy 下声明了也不会跑，加载时会出一条 warning 说破这件事 ——
@@ -175,7 +182,8 @@ log:
 # processors:
 #   - name: pii-cn                   # 名字是注册表的键：字母数字与 -_.:/，≤128，不可重复
 #     type: pii-mask                 # 内置：pii-mask / field-replace / json-schema /
-#                                    # result-filter / http-sidecar；自定义类型要注册期注入
+#                                    # result-filter / http-sidecar / kb-context-inject；
+#                                    # 自定义类型要注册期注入
 #     phase: before-upstream         # 闭集五个值：before-classify / before-route /
 #                                    # before-upstream / after-upstream / audit
 #     scope: organization:university # **必填**：不限范围要写成 *，留空会被读成漏配
@@ -186,11 +194,35 @@ log:
 #     timeout_ms: 800                # 必须为正（禁止 0 = 不限），上限 120000
 #     max_input_bytes: 1048576       # 必须落在 (0, 33554432]
 #     max_output_bytes: 2097152      # 同上；且不得小于 max_input_bytes/4（脱敏后通常略长）
-#     # allow_raw_body / allowed_endpoints 只有 http-sidecar 这类真会把字节发出去的类型才用：
+#     # allow_raw_body / allowed_endpoints 只有真会把字节发出去的类型才用：
 #     # allow_raw_body: true 必须同时给出 allowed_endpoints（原文流向要可枚举、可审），
 #     # 且档位不能是 metadata-only。端点禁通配、禁 userinfo、只允许 http/https。
 #     # allowed_endpoints:
 #     #   - https://sidecar.internal/v1/rewrite
+#     #
+#     # kb-context-inject 的硬约束（缺任一条都在加载期被拒，不会等到第一次请求才发现）：
+#     #   phase 只能是 before-upstream；body_access 至少 transform-body（它要改写 prompt）；
+#     #   allow_raw_body 必须为 true；allowed_endpoints 不能为空。
+#     #   allowed_endpoints 还要**同时**覆盖检索入口与正文交付入口：请求期会逐个复查交付器
+#     #   此刻报出的端点（知识源段可热更新），少列一个就是那一发在白名单里找不到落点、
+#     #   整条链以「配置漂移」拒绝出网 —— 那一发同样是出网，没有只算一半的道理。
+#     #   scope **不能留空也不能写 ***：正文能不能进上下文是按主体判的，一条全局命中的
+#     #   注入声明等于替所有人问一次「有没有授权」。要覆盖全员就逐范围声明（kind:* 放过）。
+#     # 例：
+#     # - name: kb-inject
+#     #   type: kb-context-inject
+#     #   phase: before-upstream
+#     #   scope: organization:university
+#     #   version: "1"
+#     #   body_access: transform-body
+#     #   fail_closed: true
+#     #   timeout_ms: 3000
+#     #   max_input_bytes: 1048576
+#     #   max_output_bytes: 1048576
+#     #   allow_raw_body: true
+#     #   allowed_endpoints:
+#     #     - https://rag.internal/retrieve
+#     #     - https://rag.internal/deliver
 
 # ============================ 知识检索委托入口（§3.C / §3.H）============================
 # 网关不做文档级权限判断（ACL 的事实只有知识源那一侧完整），这里只固定
@@ -211,3 +243,21 @@ log:
 #                                    # 引用与审计分不清是哪一篇来的）
 #     timeout_ms: 1500               # 必须为正，上限 30000（超上限会把连接池拖住）
 #     max_response_bytes: 1048576    # 必须为正：0 不是「不限」
+#
+#     # 正文交付开关（决策包 §8.1，主线 2026-10-04 裁决：配置开关，默认关）。
+#     # 不写这两行 = 这个源只给引用与摘要，网关进程里不会出现一个正文字节；
+#     # 行为与裁决前逐字节相同，检索那条链一个字段都没动。
+#     # 打开后正文仍然进不了上下文 —— 这是三道锁里的第一道，只管方向不管篇：
+#     #   ② 策略里 knowledge.content + read 与 body.raw + read 两道授权都要**显式或组级
+#     #      allow**（通配 subject:"*" 走 default allow 不算授权）且各自带 expires_at；
+#     #   ③ 源侧逐篇再判定（每篇必须带 rule_id，摘要对不上就整篇丢弃）。
+#     # 缺 ② 的表现是处理器报 knowledge_content_grant_missing 并**跳过**（零出网），
+#     # 不是 500 —— 「没授权」不该长成「服务坏了」。
+#     # return_raw_body: true
+#     # delivery_endpoint: https://rag.internal/deliver   # 开关为真时必填，且不能与
+#     #                                                   # endpoint 相同（含只差斜杠或
+#     #                                                   # 查询串这种归一化后重合）：
+#     #                                                   # 共用一扇门就没法在网络层把只开
+#     #                                                   # 检索的部署单独关掉正文通路。
+#     #                                                   # 反过来说，写了入口却没开开关同样
+#     #                                                   # 被拒 —— 那会让读配置的人以为开关是开的。

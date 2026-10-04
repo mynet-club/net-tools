@@ -59,6 +59,15 @@ func (a BodyAccess) CanReplaceBody() bool { return a == BodyTransform }
 // Resource=body.raw、Action=read 的显式 allow Entitlement，带 Conditions 和 ExpiresAt。
 const (
 	ResourceBodyRaw = "body.raw"
+	// ResourceKnowledgeContent 是「知识源把文档正文交回网关进程」的授权位
+	// （决策包 §8.1）。它与 body.raw **刻意不合并**：
+	//   - body.raw 回答「客户端的原文能不能出网给第三方」；
+	//   - 这一位回答「源侧的原文能不能进网关进程、进而进将要出网的正文」。
+	// 合并成一个位会让「给 sidecar 开原文」顺手买到「把知识库正文塞进 prompt」，
+	// 而这两件事的暴露面对象完全不同（前者是对一个第三方，后者是跨出网边界）。
+	// 命名走裸点分而不是 `knowledge:<id>`：后者是知识库准入的形态
+	// （scope.go 的 ResourceForKB），同名空间会让一条 `knowledge:*` 通配覆盖两件事。
+	ResourceKnowledgeContent = "knowledge.content"
 )
 
 // 资源命名空间（§2.4）：Entitlement.Resource 一律写成 `<命名空间>:<标识>`，

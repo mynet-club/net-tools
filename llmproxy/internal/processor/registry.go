@@ -30,7 +30,7 @@ type Registry struct {
 	entries map[string]registration // key = 处理器名
 }
 
-// NewRegistry 返回带四个内置处理器 + sidecar 工厂的注册表。
+// NewRegistry 返回带五个内置处理器 + sidecar 工厂的注册表。
 func NewRegistry() *Registry {
 	r := &Registry{
 		types:   map[string]Factory{},
@@ -46,6 +46,7 @@ func NewRegistry() *Registry {
 		{TypeJSONSchema, newSchemaValidator},
 		{TypeResultFilter, newResultFilter},
 		{TypeSidecar, newSidecar},
+		{TypeKnowledgeContextInject, newKnowledgeContextInject},
 	} {
 		if err := r.RegisterType(item.typ, item.factory); err != nil {
 			panic(err) // 编程错误，不是运行期输入

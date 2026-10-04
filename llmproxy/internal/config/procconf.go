@@ -67,6 +67,21 @@ type KnowledgeSourceDef struct {
 	KnowledgeBases   []string `yaml:"knowledge_bases" json:"knowledge_bases"`
 	TimeoutMs        int      `yaml:"timeout_ms" json:"timeout_ms"`
 	MaxResponseBytes int64    `yaml:"max_response_bytes" json:"max_response_bytes"`
+	// ReturnRawBody 是「这个源可以把文档正文交回网关进程」的平台配置开关
+	// （决策包 §8.1，主线 2026-10-04 裁决：做成配置开关，默认关）。
+	//
+	// 它只放开**方向**，不放开任何一篇：每一篇仍要同时满足
+	// 管理员的 knowledge.content 授权（带到期时刻）与源侧的逐篇再判定。
+	// 三道锁缺任何一道，网关都不会拿到正文 —— 这也是它可以按源整体打开的前提。
+	//
+	// 缺省（不写）就是 false，行为与裁决前逐字节相同：正文交付走的是独立协议版本
+	// 与独立入口，检索那条链一个字段都没动。
+	ReturnRawBody bool `yaml:"return_raw_body" json:"return_raw_body,omitempty"`
+	// DeliveryEndpoint 是正文交付的独立入口；ReturnRawBody 为 true 时必填。
+	//
+	// 为什么必须与 endpoint 分开：正文是**另一套授权面**，共用入口就没法在网络层
+	// 把「只开检索」的部署里那条正文通路单独关掉，出网白名单也分不开两种暴露面。
+	DeliveryEndpoint string `yaml:"delivery_endpoint" json:"delivery_endpoint,omitempty"`
 }
 
 // Spec 把配置条目还原成领域对象，并当场跑一遍领域校验。
@@ -207,7 +222,8 @@ func (c *Config) normalizeKnowledgeSources() error {
 		}
 		seenName[name] = true
 
-		if _, err := knowledge.ValidateEndpoint(src.Endpoint); err != nil {
+		searchEndpoint, err := knowledge.ValidateEndpoint(src.Endpoint)
+		if err != nil {
 			return fmt.Errorf("%s（name=%s）: endpoint: %w", label, name, err)
 		}
 		if len(src.KnowledgeBases) == 0 {
@@ -236,6 +252,38 @@ func (c *Config) normalizeKnowledgeSources() error {
 		}
 		if src.MaxResponseBytes <= 0 {
 			return fmt.Errorf("%s（name=%s）: max_response_bytes 必须为正（§5 要求外部调用都有体积上限，0 不是不限）", label, name)
+		}
+
+		// 正文开关（决策包 §8.1）。这里判的是「开关与入口是否自相矛盾」，
+		// 不判「这次请求有没有授权」——那是策略内核与源侧的事（手册 §3.C：检索准入
+		// 只有策略内核一个真值源，配置层不能替它开绿灯）。
+		// 校验落在加载期，是因为一个「开了开关却没有入口」的源如果等到第一次交付才发现，
+		// 现场会变成「处理器抱怨没有正文」，而那条抱怨的根因在磁盘上的一行 YAML 里。
+		delivery := strings.TrimSpace(src.DeliveryEndpoint)
+		if !src.ReturnRawBody {
+			if delivery != "" {
+				return fmt.Errorf("%s（name=%s）: 配了 delivery_endpoint 却没打开 return_raw_body —— "+
+					"正文通路关着时这个入口永远不会有请求，留着只会让人以为开关是开的"+
+					"（要开就把 return_raw_body: true 一起写上）", label, name)
+			}
+			continue
+		}
+		if delivery == "" {
+			return fmt.Errorf("%s（name=%s）: return_raw_body: true 必须同时写 delivery_endpoint —— "+
+				"正文交付走独立协议与独立入口，没有入口时交付一律失败（fail_closed），"+
+				"不如在启动时就报出来", label, name)
+		}
+		normalized, err := knowledge.ValidateEndpoint(delivery)
+		if err != nil {
+			return fmt.Errorf("%s（name=%s）: delivery_endpoint: %w", label, name, err)
+		}
+		// 比「去掉末尾斜杠之后是不是同一个入口」，不是比字符串相等：`/retrieve` 与
+		// `/retrieve/` 在多数路由与按前缀匹配的出网白名单下就是同一扇门 —— 只按字符串判，
+		// 这条禁令就成了改一个字符能绕过的形式，而它要防的是「正文通路撤不掉」。
+		if strings.TrimRight(normalized, "/") == strings.TrimRight(searchEndpoint, "/") {
+			return fmt.Errorf("%s（name=%s）: delivery_endpoint 不能与 endpoint 相同（忽略末尾斜杠后仍相同也算相同）—— "+
+				"两条通路共用入口就没法在网络层单独关掉正文通路，出网白名单也分不开两种暴露面"+
+				"（正文是另一套授权面，要能单独撤）", label, name)
 		}
 	}
 	return nil

@@ -407,8 +407,9 @@ func TestEndpointAllowedPrefixBoundary(t *testing.T) {
 
 func TestRegistryRegistrationLifecycle(t *testing.T) {
 	reg := NewRegistry()
-	// 五个内置类型 + 排序稳定（管理台按字典序展示）。
-	wantTypes := []string{TypeFieldReplace, TypeSidecar, TypeJSONSchema, TypePIIMask, TypeResultFilter}
+	// 六个内置类型 + 排序稳定（管理台按字典序展示）。
+	wantTypes := []string{TypeFieldReplace, TypeSidecar, TypeJSONSchema,
+		TypeKnowledgeContextInject, TypePIIMask, TypeResultFilter}
 	if fmt.Sprint(reg.KnownTypes()) != fmt.Sprint(wantTypes) {
 		t.Fatalf("KnownTypes() = %v，期望按字典序 %v", reg.KnownTypes(), wantTypes)
 	}

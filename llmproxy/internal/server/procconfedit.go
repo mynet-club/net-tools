@@ -53,9 +53,7 @@ func (s *Server) adminShowDeclarations(w http.ResponseWriter, section string) {
 		"applies":    mode == config.PolicyModeEnforce,
 		"vocabulary": config.Vocabulary(),
 		"warnings":   cfg.Warnings,
-		"boundary": "这一段声明的是约束（阶段/档位/上限/失败策略/出网白名单）；" +
-			"运行参数在配置文件同级的 processor_params/<声明名>.json，" +
-			"HTTP 客户端与原文出网授权判定器由网关按出网策略和生效策略包注入，两处都不在这里配",
+		"boundary":   declarationBoundary(section),
 	}
 	if st, statErr := os.Stat(path); statErr == nil {
 		info["mtime"] = st.ModTime().Format("2006-01-02T15:04:05Z07:00")
@@ -167,6 +165,25 @@ func (s *Server) adminSaveDeclarations(w http.ResponseWriter, r *http.Request, s
 // 缺键与空数组在语义上差了一整个段的声明，不能让调用方靠猜。
 func declarationBodyHint(section string) string {
 	return fmt.Sprintf("请求体需要且只需要 %s 字段（整段提交；清空请显式传 []，缺字段不会被当成清空）", section)
+}
+
+// declarationBoundary 说明「这一段的边界在哪里」—— 哪些事不由这一段决定。
+//
+// 分两段写而不是一句通用话：处理器那侧要交代的是运行参数在外部、出网白名单必须
+// 覆盖全部入口；知识源这侧要交代的是正文交付那道开关及其前置条件。把两段话合成
+// 一句，管理员在知识源屏上会看到「运行参数在 processor_params」这种与他无关的指引，
+// 而他真正要判断的「开了开关还少什么」反而被埋掉。
+func declarationBoundary(section string) string {
+	if section == sectionKnowledge {
+		return "这一段声明的是委托入口的约束（地址、库 ID、超时、响应上限）；" +
+			"正文交付由 return_raw_body 控制且默认关，打开它必须同时给独立的 delivery_endpoint。" +
+			"开关只放开方向、不放开任何一篇：正文进上下文还要策略里 knowledge.content 与 body.raw 两道授权" +
+			"各自带到期时刻，缺任一道就不会有正文进来 —— 那些授权在「策略与路由」里配，不在这里"
+	}
+	return "这一段声明的是约束（阶段/档位/上限/失败策略/出网白名单）；" +
+		"运行参数在配置文件同级的 processor_params/<声明名>.json，" +
+		"HTTP 客户端、正文交付器与出网授权判定器由网关按出网策略和生效策略包注入，三处都不在这里配。" +
+		"allowed_endpoints 要同时覆盖检索与正文交付两个入口 —— 那一发同样是出网"
 }
 
 // declarationGuard 给这两段补上「加载之外」的答复：模式与是否生效。

@@ -9,7 +9,7 @@ import (
 	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 )
 
-// 处理器类型（内置四种 + HTTP sidecar）。
+// 处理器类型（内置五种 + HTTP sidecar）。
 //
 // 这个集合**不封闭**：注册表允许通过 RegisterType 追加自定义类型（主线/后续工作包），
 // 封闭的是阶段集合（见 Phase）—— 阶段是 Pipeline 的执行次序，扩充它等于改运行时语义。
@@ -19,6 +19,10 @@ const (
 	TypeJSONSchema   = "json-schema"   // Schema 校验：metadata-only 或 inspect-body
 	TypeResultFilter = "result-filter" // 结果过滤：after-upstream
 	TypeSidecar      = "http-sidecar"  // 外部 HTTP sidecar
+	// TypeKnowledgeContextInject 把知识库正文注入将出网的 prompt（决策包 §8.1 的正文通道）。
+	// 它和 TypeSidecar 都碰「内容离开网关」这条线，方向相反：sidecar 送出去让第三方判定，
+	// 这一类从第三方取回来塞进请求体，因此约束比 sidecar 更严（见 validateType）。
+	TypeKnowledgeContextInject = "kb-context-inject"
 )
 
 // Phase 是处理器运行的阶段（§2.6 的固定五个值）。
@@ -266,6 +270,51 @@ func (s Spec) validateType() error {
 			return Errorf(ErrSpec,
 				"%s: %s 必须给出 allowed_endpoints —— 出网目标必须可枚举、可审，注册期注入的 endpoint 不能是唯一凭据",
 				s.Name, s.Type)
+		}
+	case TypeKnowledgeContextInject:
+		// 正文注入的五条硬约束，逐条都是「少一条会留下什么」的形状：
+		//
+		//  1. 阶段只能是 before-upstream。注入块里是知识库原文（含人名、电话、内部编号），
+		//     排在它前面的处理器（pii-mask、sidecar）会把这段内容当作用户正文一起处理 ——
+		//     前者会打码掉本来要作为依据交付的内容，后者会把第三方文档整份送到外部端点。
+		//     放在最后一条请求侧阶段，才等于「取回的内容只进上游，不进其它处理器」。
+		//  2. 档位必须能替换正文（不替换就无处注入）。
+		//  3. 必须显式声明 allow_raw_body。委托协议只在 allow_raw_terms 为真时才带上检索词
+		//     （docs/3.0-knowledge-delegation.md），没有「送脱敏检索词」这种形态。
+		//     不声明就是这条链必然取不到正文，而它看起来像"知识库里没查到"。
+		//  4. 必须给出 allowed_endpoints（出网目标可枚举、可审）。
+		//  5. Scope 不能留空也不能写 *（不允许全局命中）。见下。
+		if s.Phase != PhaseBeforeUpstream {
+			return Errorf(ErrPhaseNotForType, "%s: %s 只能跑在 before-upstream（注入内容不该被链上其它处理器当正文处理），当前 %s",
+				s.Name, s.Type, s.Phase)
+		}
+		if !s.BodyAccess.CanReplaceBody() {
+			return Errorf(ErrBodyAccessNotForType, "%s: %s 必须能替换正文，档位至少是 %s，当前 %s",
+				s.Name, s.Type, policy.BodyTransform, s.BodyAccess)
+		}
+		if !s.AllowRawBody {
+			return Errorf(ErrSpec,
+				"%s: %s 必须声明 allow_raw_body —— 检索词取自用户正文且只在原文授权下才会离开网关，缺了这条声明就是永远取不到内容",
+				s.Name, s.Type)
+		}
+		if len(s.AllowedEndpoints) == 0 {
+			return Errorf(ErrSpec, "%s: %s 必须给出 allowed_endpoints（正文通道的出网端点必须可枚举）", s.Name, s.Type)
+		}
+		// 禁「全局命中」的理由不是「范围太大」，而是这条声明的**每次命中**都会做三件事：
+		// 一次正文准入判定、一次可能出网的检索委托、一条 egress.allow 留痕。
+		// scope 留空或写 * 会把它们变成全局默认行为，而 §8.1 的平台开关只是总闸 ——
+		// 「哪些范围默认带内容进上下文」是运营逐条决定的粒度。
+		// kind 级通配（如 project:*）仍然算显式圈定了一类范围，放过：它对应的是一条
+		// 能写进策略文本、也能被人读出来的运营决定。
+		// 顺带一条 §6 的账：被全局命中的授权请求会把审计表养成第二张流量表。
+		sel, err := policy.ParseScopeSelector(s.Scope)
+		if err != nil {
+			return Errorf(ErrSpec, "%s: %s 的 scope %q 不合法（写成 kind:id 或 kind:*）", s.Name, s.Type, s.Scope)
+		}
+		if sel.All {
+			return Errorf(ErrSpec,
+				"%s: %s 的 scope 不能留空或写 %q —— 正文注入的命中面要在策略文本里可枚举（可用 kind:id 或 kind:*）",
+				s.Name, s.Type, "*")
 		}
 	}
 	return nil

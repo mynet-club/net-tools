@@ -124,8 +124,8 @@
       <p class="sub">这里配的是<b>约束</b>（处理器挂在哪个范围、能读正文吗、失败时放行还是拒、
         出网白名单、体积与超时上限；知识源委托给哪个入口、服务哪几个库）。
         运行参数（脱敏类型、规则表、JSON Schema、sidecar 端点与请求头）在配置文件同级的
-        <code>processor_params/&lt;声明名&gt;.json</code>，不在这个文件里；HTTP 客户端与
-        原文出网授权判定器由网关按出网策略和生效策略包注入，两处都不接受文件给出 ——
+        <code>processor_params/&lt;声明名&gt;.json</code>，不在这个文件里；HTTP 客户端、
+        正文交付器与出网授权判定器由网关按出网策略和生效策略包注入，三处都不接受文件给出 ——
         所有判据由服务端领域校验给出，界面不复算权限。</p>
       <p class="banner" id="pc-status" hidden></p>
       <div id="pc-stats" class="gridn"></div>
@@ -134,7 +134,9 @@
       <p class="sub">整段提交：改一条也要把整个数组发回来，服务端把这一段整体替换进
         <code>config.yaml</code>（改前自动备份，段外内容与注释原样）。
         <b>清空请显式保存 <code>[]</code></b> —— 少带字段不会被当成清空。
-        取值域见下方对照表，写坏的声明只会退回错误、磁盘不动。</p>
+        取值域见下方对照表，写坏的声明只会退回错误、磁盘不动。
+        要装知识库正文注入（<code>kb-context-inject</code>）时，<code>allowed_endpoints</code>
+        必须同时列出检索入口与正文交付入口 —— 那一发同样是出网。</p>
       <textarea id="pc-p-json" class="pl-rules" rows="12" spellcheck="false"
         placeholder="[{&quot;name&quot;:…}] —— 点「填入最小示例」拿形状"></textarea>
       <div class="row">
@@ -150,6 +152,12 @@
       <p class="sub">网关不自己实现检索：这一段声明「哪个知识库 ID 交给哪个内部入口」，
         请求侧只带知识库 ID，出网目标与预算由这里钉死。同一个库不能让两家入口同时服务
         （否则「谁答的」在审计里就成了事后猜）。</p>
+      <p class="sub">正文交付<b>默认关</b>：<code>return_raw_body</code> 不写就是关着，
+        这一屏的默认形态只给引用不给正文。打开它必须同时写独立的
+        <code>delivery_endpoint</code>（与 <code>endpoint</code> 相同会被拒），
+        而且这放开的是<b>方向</b>不是某一篇：正文要进上下文还得策略里
+        <code>knowledge.content</code> 与 <code>body.raw</code> 两道授权各自带到期时刻，
+        缺任何一道就不会有正文进来。那两道在「策略与路由」配，不在这里。</p>
       <textarea id="pc-kn-json" class="pl-rules" rows="10" spellcheck="false"
         placeholder="[{&quot;name&quot;:…}] —— 点「填入最小示例」拿形状"></textarea>
       <div class="row">

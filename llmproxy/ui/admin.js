@@ -1175,6 +1175,12 @@ const DECL = [
 
 // 最小示例只给形状：它用的是内置类型 pii-mask（合法组合：请求侧阶段 + transform-body）。
 // 换类型时按下面的取值域表改阶段与档位，最终判据仍以服务端为准。
+//
+// 两处刻意留在最严形态，别"顺手补全"：
+//  1. 知识源示例不写 return_raw_body —— 不写就是关着，示例不该一发出去就多一条正文出网通路。
+//     要打开得同时补独立的 delivery_endpoint，而那两个字段合起来是一次暴露面变更，由人判断。
+//  2. 处理器示例的 scope 是 * —— kb-context-inject 不允许全局命中（它要按主体判授权），
+//     照抄示例改类型会撞上服务端校验，那是有意的。
 const DECL_EXAMPLE = {
   p: [{
     name: 'pii-request', type: 'pii-mask', phase: 'before-upstream', scope: '*',
@@ -1264,7 +1270,12 @@ function renderVocab(v) {
     h('th', { text: k }),
     h('td', null, h('code', { class: 'k', text: (list || []).join('、') || '—' }),
       h('span', { class: 'hint', text: note || '' })));
-  const boundary = ((ADM.decl || {}).p || {}).boundary || '';
+  // 两段各自有一条 boundary：处理器那侧讲运行参数在外部、白名单要覆盖全部入口，
+  // 知识源那侧讲正文开关及其前置条件。合成一条会指错屏，所以按段各印一行。
+  const bounds = DECL.map((s) => h('p', {
+    class: 'hint',
+    text: s.noun + '：' + (((ADM.decl || {})[s.which] || {}).boundary || '（这一屏没拿到边界说明）'),
+  }));
   box.replaceChildren(
     h('div', { class: 'tablewrap' }, h('table', null, h('tbody', null,
       row('处理器类型', v.processor_types, '类型集合不封闭：自定义类型由部署在注册期 RegisterType 注入。写了没注入的类型会告警并在装配期失败。'),
@@ -1277,7 +1288,7 @@ function renderVocab(v) {
       + ' 字节（且输出不得小于输入的 1/4）；name ≤ ' + num(v.max_name_len) + ' 字符；allowed_endpoints ≤ '
       + num(v.max_allowed_endpoints) + ' 条；知识源预算默认 ' + num(v.default_budget_ms)
       + ' ms、上限 ' + num(v.max_knowledge_budget_ms) + ' ms。' }),
-    h('p', { class: 'hint', text: boundary }),
+    ...bounds,
   );
 }
 

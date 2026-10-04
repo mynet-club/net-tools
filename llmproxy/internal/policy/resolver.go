@@ -233,6 +233,34 @@ func (r *Resolver) AllowsRawBody(ctx PolicyContext, chain ScopeChain, now time.T
 	return false, ReasonRawBodyGrantMissing
 }
 
+// AllowsKnowledgeContent 判定能否向知识源索取文档正文（决策包 §8.1）。
+//
+// 门槛与 AllowsRawBody 完全同形，因为要防的是同一类错：
+//  1. 只认显式或组级 allow —— 通配 default_allow 不算授权，否则一条全局兜底放行
+//     就把「正文进网关」发给了所有人；
+//  2. 授权本身必须带 ExpiresAt（不能用 Decision.ExpiresAt 代替，理由同 AllowsRawBody）。
+//
+// 这里**不**检查「平台配置有没有打开正文开关」：配置位在接线侧（server），
+// A 包只回答「这个人、这个范围，凭什么可以拿到正文」。两道门各由一侧持有，
+// 缺任何一道都不交付正文（见 docs/3.0-decision-packages.md §8.1 的开关形状）。
+func (r *Resolver) AllowsKnowledgeContent(ctx PolicyContext, chain ScopeChain, now time.Time) (bool, Reason) {
+	d := r.Evaluate(ctx, chain, ResourceKnowledgeContent, ActionRead, now)
+	if !d.Allowed {
+		return false, d.Reason
+	}
+	switch d.Reason {
+	case ReasonExplicitAllow, ReasonGroupAllow:
+		if len(d.Matched) == 0 {
+			return false, ReasonKnowledgeContentGrantMissing
+		}
+		if d.Matched[0].ExpiresAt.IsZero() {
+			return false, ReasonKnowledgeContentGrantMissing
+		}
+		return true, d.Reason
+	}
+	return false, ReasonKnowledgeContentGrantMissing
+}
+
 func (e Entitlement) matchedRule(p Precedence) MatchedRule {
 	return MatchedRule{
 		Subject:    e.Subject,

@@ -336,7 +336,7 @@ paths:
                       allowed_endpoints:
                         type: array
                         items: { type: string, example: https://sidecar.internal/v1/scan }
-                        description: '出网白名单，必须可枚举（含通配、userinfo、非 http(s) 一律拒）'
+                        description: '出网白名单，必须可枚举（含通配、userinfo、非 http(s) 一律拒）；kb-context-inject 要同时列检索入口与正文交付入口 —— 那一发同样是出网'
                       version: { type: string, example: '1' }
       responses:
         '200': { description: 'written / applied / backup / strict_ok / count / mode / applies / note' }
@@ -346,9 +346,10 @@ paths:
       tags: [admin]
       summary: 读知识源委托入口段（knowledge_sources）+ 取值域
       description: 与 `/v1/_admin/config/processors` 同一条读侧通道（原文视图、空段回 `[]`、`baseline_error`、`mode`/`applies`）。
+        `boundary` 是按段发的：这一段说清正文开关的默认值与前置条件，处理器那段说运行参数与注入面在哪。
       security: [{adminAuth: []}]
       responses:
-        '200': { description: 'section / path / revision / mode / applies / vocabulary / warnings / knowledge_sources[]' }
+        '200': { description: 'section / path / revision / mode / applies / vocabulary / warnings / knowledge_sources[] / boundary' }
     put:
       tags: [admin]
       summary: 整段保存知识源委托入口
@@ -359,6 +360,13 @@ paths:
         而**两个源不许声明同一个库** —— 一次检索打到两家入口，引用与审计就分不清是哪一篇来的。
         网关不在这里实现检索，也不接受检索服务的密钥：这一段只声明约束（谁能被委托、预算多少），
         transport 由接线方从出网策略注入。
+        **正文交付是三道锁**，这一段只管第一道：
+        ① `return_raw_body`（缺省 false = 关）打开时**必须**给独立的 `delivery_endpoint`，
+        与 `endpoint` 相同（含只差斜杠/查询串这类归一化后重合）一律拒 —— 共用一扇门就没法在
+        网络层单独关掉只开检索的部署；写了入口却没开开关也拒，因为那会让人以为开关是开的。
+        ② 策略里 `knowledge.content` 与 `body.raw` 两道授权都要**显式或组级 allow** 且带
+        `expires_at`（通配 default allow 不算授权）。③ 源侧逐篇再判定。
+        缺任何一道，网关不会拿到一个字节正文 —— 开关放开的是方向，不是某一篇。
       security: [{adminAuth: []}]
       requestBody:
         required: true
@@ -384,6 +392,8 @@ paths:
                         description: '不能为空（不服务任何库的源是死配置，却仍占着一个委托端点）'
                       timeout_ms: { type: integer, example: 3000, description: '上限见 vocabulary.max_knowledge_budget_ms' }
                       max_response_bytes: { type: integer, format: int64, description: '必须为正，0 不是不限' }
+                      return_raw_body: { type: boolean, default: false, description: '正文交付开关：缺省关（不写就不会有正文进网关进程）。为 true 时 delivery_endpoint 必填' }
+                      delivery_endpoint: { type: string, example: https://rag.internal.example/v1/deliver, description: '正文交付的独立入口；必须与 endpoint 不同（同一扇门会被拒），形态同检索端点那一关' }
       responses:
         '200': { description: 'written / applied / backup / strict_ok / count / mode / applies / note' }
         '400': { description: 请求体形状不对或声明不合法，原文件未改动 }

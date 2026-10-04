@@ -223,7 +223,14 @@ func knowledgeSourcesEqual(a, b []KnowledgeSourceDef) bool {
 	}
 	for i := range a {
 		x, y := a[i], b[i]
-		if strings.TrimSpace(x.Name) != strings.TrimSpace(y.Name) ||
+		// 正文开关与交付入口必须参与比较：把 return_raw_body 从关到开是一次**出网暴露面
+		// 变更**（多一条独立协议通路、多一套授权判定），漏比就会让它在热更新里被当成没变，
+		// 而调用方拿到的还是那份「只给摘要」的旧委托器。
+		if strings.TrimSpace(x.DeliveryEndpoint) != strings.TrimSpace(y.DeliveryEndpoint) {
+			return false
+		}
+		if x.ReturnRawBody != y.ReturnRawBody ||
+			strings.TrimSpace(x.Name) != strings.TrimSpace(y.Name) ||
 			strings.TrimSpace(x.Endpoint) != strings.TrimSpace(y.Endpoint) ||
 			x.TimeoutMs != y.TimeoutMs || x.MaxResponseBytes != y.MaxResponseBytes ||
 			len(x.KnowledgeBases) != len(y.KnowledgeBases) {

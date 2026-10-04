@@ -25,14 +25,19 @@ import (
 // 漏一个键名的后果是「新加的键在控制台路径上被误报成未知键」，
 // 那比静默丢掉一个安全字段（body_access、fail_closed）早暴露得多。
 var (
-	processorKeys       = []string{"name", "type", "phase", "scope", "timeout_ms", "max_input_bytes", "max_output_bytes", "fail_closed", "body_access", "allow_raw_body", "allowed_endpoints", "version"}
-	knowledgeSourceKeys = []string{"name", "endpoint", "knowledge_bases", "timeout_ms", "max_response_bytes"}
+	processorKeys = []string{"name", "type", "phase", "scope", "timeout_ms", "max_input_bytes", "max_output_bytes", "fail_closed", "body_access", "allow_raw_body", "allowed_endpoints", "version"}
+	// return_raw_body / delivery_endpoint 必须在这里登记：漏掉一个键名，控制台的读侧
+	// 会把「已经能写的正文开关」报成未知键，而写侧会静默丢掉它（等于把开关关掉）。
+	knowledgeSourceKeys = []string{"name", "endpoint", "knowledge_bases", "timeout_ms", "max_response_bytes", "return_raw_body", "delivery_endpoint"}
 )
 
 const (
 	processorsSectionComment = "  # 本段是处理器的声明表（阶段/档位/上限/失败策略/出网白名单）；\n" +
-		"  # 运行参数在同级 processor_params/<声明名>.json，HTTP 客户端与原文授权判定器由网关注入，都不在这里。\n"
-	knowledgeSectionComment = "  # 本段是知识检索的委托入口；transport 由接线方从出网策略注入，凭证不进 URL。\n"
+		"  # 运行参数在同级 processor_params/<声明名>.json（kb-context-inject 只需可选的预算键），\n" +
+		"  # HTTP 客户端、正文交付器与两道授权判定器由网关注入，都不在这里。\n"
+	knowledgeSectionComment = "  # 本段是知识检索的委托入口；transport 由接线方从出网策略注入，凭证不进 URL。\n" +
+		"  # 正文交付（return_raw_body）默认关；打开必须同时写独立的 delivery_endpoint，\n" +
+		"  # 且逐篇仍要管理员的 knowledge.content 授权与源侧再判定，三道锁缺一道都不交正文。\n"
 )
 
 // RawProcessors 从配置文件**原文**读出 processors 段并逐条过领域校验。
@@ -254,6 +259,21 @@ func renderKnowledgeSources(list []KnowledgeSourceDef) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("知识源 %s 的 endpoint %w", d.Name, err)
 		}
+		// 交付入口同样只写归一化后的形态，理由与 endpoint 相同（审计按字符串认入口）。
+		// 这里的报错不只是「渲染失败」：EditKnowledgeSources 已经跑过领域校验，
+		// 走到这一步还失败说明两个校验点口径不一致，那种不一致必须红着暴露。
+		deliveryVal := ""
+		if strings.TrimSpace(d.DeliveryEndpoint) != "" {
+			dv, err := knowledge.ValidateEndpoint(d.DeliveryEndpoint)
+			if err != nil {
+				return nil, fmt.Errorf("知识源 %s 的 delivery_endpoint %w", d.Name, err)
+			}
+			v, err := yamlScalar(dv)
+			if err != nil {
+				return nil, fmt.Errorf("知识源 %s 的 delivery_endpoint %w", d.Name, err)
+			}
+			deliveryVal = v
+		}
 		fmt.Fprintf(&b, "    - name: %s\n      endpoint: %s\n", name, epVal)
 		b.WriteString("      knowledge_bases:\n")
 		for _, kb := range d.KnowledgeBases {
@@ -265,6 +285,14 @@ func renderKnowledgeSources(list []KnowledgeSourceDef) ([]byte, error) {
 		}
 		fmt.Fprintf(&b, "      timeout_ms: %d\n      max_response_bytes: %d\n",
 			d.TimeoutMs, d.MaxResponseBytes)
+		// 正文开关写在段尾，且只在为真/非空时落盘：默认形态就是最严形态
+		// （不交正文、没有第二条出网入口），把 `false` 摊在每一条上都一样。
+		if d.ReturnRawBody {
+			b.WriteString("      return_raw_body: true\n")
+		}
+		if deliveryVal != "" {
+			fmt.Fprintf(&b, "      delivery_endpoint: %s\n", deliveryVal)
+		}
 	}
 	return b.Bytes(), nil
 }

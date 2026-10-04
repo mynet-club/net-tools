@@ -373,6 +373,151 @@ func TestFilterDeduplicatesCitations(t *testing.T) {
 	}
 }
 
+// TestFilterAcceptedAlignsWithCitations 钉死正文交付的唯一合法输入：
+// accepted 必须与 citations **同序、同条数、同摘要**，并且带的是源侧本次给的那份条目
+// （不是从引用反推的 reconstructed 数据 —— Allowed/ExpiresAt 在 Citation 里根本不存在）。
+func TestFilterAcceptedAlignsWithCitations(t *testing.T) {
+	rc := mustContext(t, subjectAlice, orgExample, policy.LevelInternal)
+	rc, err := rc.WithMaxResults(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := BuildRequest(rc, mustScope(t, rc.Chain, policy.LevelInternal, kbHandbook), Query{Terms: "报销"}, baseNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	admitTTL := after(time.Minute)
+	own := docForFilter("doc-1", kbHandbook, policy.LevelInternal, ownerOrg())
+	own.ExpiresAt = admitTTL
+	pub := docForFilter("doc-2", kbHandbook, policy.LevelPublic, ownerOrg())
+	tail := docForFilter("doc-3", kbHandbook, policy.LevelInternal, ownerOrg())
+	// 三条不该出现的：分级越界、跨组织、与 doc-1 完全相同的重复条目
+	overCeiling := docForFilter("doc-4", kbHandbook, policy.LevelConfidential, ownerOrg())
+	overCeiling.Digest = DigestString(secretBody)
+	rival := docForFilter("doc-9", kbHandbook, policy.LevelPublic, policy.MustScope(policy.ScopeOrganization, orgRival))
+	rival.Digest = DigestString(rivalBody)
+	dup := own
+
+	resp := RetrieveResponse{
+		ProtocolVersion: ProtocolVersion, RequestID: req.RequestID,
+		EvaluatedAt: baseNow, ExpiresAt: after(time.Minute),
+		Documents: []ReturnedDocument{rival, overCeiling, own, pub, tail, dup},
+	}
+	got, err := Filter(resp, req, baseNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cites, accepted := got.Citations(), got.Accepted()
+	if len(accepted) != len(cites) || len(accepted) != got.HitCount {
+		t.Fatalf("accepted 必须与 citations 一一对齐: %d vs %d vs %d", len(accepted), len(cites), got.HitCount)
+	}
+	for i, c := range cites {
+		a := accepted[i]
+		if a.SourceID != c.SourceID || a.KnowledgeBase != c.KnowledgeBase {
+			t.Fatalf("第 %d 篇指向不同的文档: %s/%s ≠ %s/%s", i, a.KnowledgeBase, a.SourceID, c.KnowledgeBase, c.SourceID)
+		}
+		if strings.ToLower(a.Digest) != c.Digest {
+			t.Fatalf("第 %d 篇摘要与引用不符: %s ≠ %s", i, a.Digest, c.Digest)
+		}
+		// 这两项是「源侧本次真的判过」的证据，也是正文交付唯一依据的来源。
+		if !a.Allowed {
+			t.Fatalf("第 %d 篇没有被源侧判为可读，却进了准入集合: %+v", i, a)
+		}
+		if a.SourceID == "doc-1" && !a.ExpiresAt.Equal(admitTTL) {
+			t.Fatalf("准入到期时刻必须来自源侧条目本身（不是零值，也不是引用上的 retrieved_at）: %v", a.ExpiresAt)
+		}
+	}
+	for _, a := range accepted {
+		switch a.SourceID {
+		case "doc-3", "doc-4", "doc-9":
+			t.Fatalf("被兜底丢弃或截断的篇目进了准入集合: %s", a.SourceID)
+		}
+	}
+	if !got.Truncated {
+		t.Fatal("max_results=2 面对 3 篇合法结果必须留截断标志")
+	}
+
+	// Accepted 给的是副本：调用方（处理器链）改不动过滤结果本身，同一份还要落审计。
+	accepted[0].SourceID = "被改过"
+	accepted[0].Digest = DigestString("被换掉的正文")
+	if got.Accepted()[0].SourceID != "doc-1" || got.Accepted()[0].Digest != cites[0].Digest {
+		t.Fatal("Accepted 返回的必须是副本")
+	}
+}
+
+// TestFilterAcceptedEmptyWhenWholeEnvelopeExpired：结果级 TTL 一过，整份判定作废，
+// 准入集合必须是空的 —— 否则正文交付会拿一份「当初判过、现在已撤」的结论去申请原文。
+func TestFilterAcceptedEmptyWhenWholeEnvelopeExpired(t *testing.T) {
+	req := mustRequest(t)
+	resp := RetrieveResponse{
+		ProtocolVersion: ProtocolVersion, RequestID: req.RequestID,
+		ExpiresAt: after(-time.Minute),
+		Documents: []ReturnedDocument{
+			docForFilter("doc-1", kbHandbook, policy.LevelInternal, ownerOrg()),
+			docForFilter("doc-2", kbHandbook, policy.LevelInternal, ownerOrg()),
+		},
+	}
+	got, err := Filter(resp, req, baseNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Accepted()) != 0 {
+		t.Fatalf("整份判定过期时不得留下准入依据: %+v", got.Accepted())
+	}
+	if len(got.Dropped()) != 2 {
+		t.Fatalf("两条都要有丢弃记录: %+v", got.Dropped())
+	}
+}
+
+// TestFilterAcceptedEmptyOnConflictingVersions：同一来源 ID 出现两个摘要时两篇一起丢。
+// 正文方向这条更要紧 —— 网关无从判断哪一版才是准入那篇，申请原文就是猜。
+func TestFilterAcceptedEmptyOnConflictingVersions(t *testing.T) {
+	req := mustRequest(t)
+	a := docForFilter("doc-1", kbHandbook, policy.LevelInternal, ownerOrg())
+	conflict := a
+	conflict.Digest = DigestString("另一个版本")
+	got, err := Filter(RetrieveResponse{
+		ProtocolVersion: ProtocolVersion, RequestID: req.RequestID,
+		Documents: []ReturnedDocument{a, conflict},
+	}, req, baseNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.HitCount != 0 || len(got.Accepted()) != 0 {
+		t.Fatalf("同来源两版本必须一起退出准入集合: %d %+v", got.HitCount, got.Accepted())
+	}
+}
+
+// TestZeroValueFilterResultCarriesNoAdmission：citations/accepted 都是未导出字段，
+// 外部只能拿到零值结果 —— 手构一份「引用与文档对不上」的结果去申请原文这条路根本不存在。
+func TestZeroValueFilterResultCarriesNoAdmission(t *testing.T) {
+	var zero FilterResult
+	if len(zero.Citations()) != 0 || len(zero.Accepted()) != 0 || len(zero.Dropped()) != 0 {
+		t.Fatalf("零值结果必须三样都空: %+v", zero)
+	}
+	if zero.HitCount != 0 || zero.Truncated || len(zero.Reasons) != 0 {
+		t.Fatalf("零值结果不该被读成命中: %+v", zero)
+	}
+	// 零值没有命中集，分级只能停在「未判定」或 public，绝不虚报成更高的档
+	if zero.MaxDataLevel.Exceeds(policy.LevelPublic) {
+		t.Fatalf("零值结果虚报了分级: %s", zero.MaxDataLevel)
+	}
+	// 零值准入拿去装配交付请求必须报错（而不是发出一次「全部可读」的空集合请求）。
+	rc := mustContext(t, subjectAlice, orgExample, policy.LevelInternal)
+	scope := mustScope(t, rc.Chain, policy.LevelInternal, kbHandbook)
+	req, err := BuildContentRequest(rc, scope, zero.Accepted(), DefaultContentPassages, DefaultContentBytes, baseNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(req.Documents) != 0 {
+		t.Fatalf("没有准入条目就不该有申请项: %+v", req.Documents)
+	}
+	if err := req.Validate(); err == nil {
+		t.Fatal("空申请集合的交付请求必须不合法：调用方必须短路而不是发出去")
+	}
+}
+
 func TestFilterIsDeterministicRegardlessOfInputOrder(t *testing.T) {
 	req := mustRequest(t)
 	docs := []ReturnedDocument{

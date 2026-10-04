@@ -20,20 +20,24 @@ const (
 	ReasonDefaultAllow  Reason = "default_allow"
 
 	// 拒绝方向。
-	ReasonDenyRule             Reason = "deny_rule"
-	ReasonNoMatchingRule       Reason = "no_matching_rule"
-	ReasonModelNotAllowed      Reason = "model_not_allowed"
-	ReasonIdentityMissing      Reason = "identity_missing"
-	ReasonIdentityExpired      Reason = "identity_expired"
-	ReasonIdentityNotYet       Reason = "identity_not_yet"
-	ReasonContextInvalid       Reason = "context_invalid"
-	ReasonEntitlementExpired   Reason = "entitlement_expired"
-	ReasonConditionUnmet       Reason = "condition_unmet"
-	ReasonScopeMismatch        Reason = "scope_mismatch"
-	ReasonDataLevelDenied      Reason = "data_level_denied"
-	ReasonRegionDenied         Reason = "region_denied"
-	ReasonRawBodyGrantMissing  Reason = "raw_body_grant_missing"
-	ReasonPolicyVersionMissing Reason = "policy_version_missing"
+	ReasonDenyRule            Reason = "deny_rule"
+	ReasonNoMatchingRule      Reason = "no_matching_rule"
+	ReasonModelNotAllowed     Reason = "model_not_allowed"
+	ReasonIdentityMissing     Reason = "identity_missing"
+	ReasonIdentityExpired     Reason = "identity_expired"
+	ReasonIdentityNotYet      Reason = "identity_not_yet"
+	ReasonContextInvalid      Reason = "context_invalid"
+	ReasonEntitlementExpired  Reason = "entitlement_expired"
+	ReasonConditionUnmet      Reason = "condition_unmet"
+	ReasonScopeMismatch       Reason = "scope_mismatch"
+	ReasonDataLevelDenied     Reason = "data_level_denied"
+	ReasonRegionDenied        Reason = "region_denied"
+	ReasonRawBodyGrantMissing Reason = "raw_body_grant_missing"
+	// ReasonKnowledgeContentGrantMissing 是「正文进网关」这一侧缺授权（决策包 §8.1）。
+	// 与 raw_body_grant_missing 分开是因为排查方向相反：那个是「客户端原文要出网」，
+	// 这个是「源侧正文要进来」，同一句话盖不住两种合规事件。
+	ReasonKnowledgeContentGrantMissing Reason = "knowledge_content_grant_missing"
+	ReasonPolicyVersionMissing         Reason = "policy_version_missing"
 
 	// 路由方向（由 internal/routing 产生，枚举在此登记以保证跨包一致）。
 	ReasonNoCandidate             Reason = "no_candidate"
@@ -64,7 +68,8 @@ func init() {
 		ReasonIdentityMissing, ReasonIdentityExpired, ReasonIdentityNotYet,
 		ReasonContextInvalid, ReasonEntitlementExpired,
 		ReasonConditionUnmet, ReasonScopeMismatch, ReasonDataLevelDenied,
-		ReasonRegionDenied, ReasonRawBodyGrantMissing, ReasonPolicyVersionMissing,
+		ReasonRegionDenied, ReasonRawBodyGrantMissing, ReasonKnowledgeContentGrantMissing,
+		ReasonPolicyVersionMissing,
 		ReasonNoCandidate, ReasonCandidateUnhealthy, ReasonCandidatePolicyExcluded,
 		ReasonCandidateRegionExcluded, ReasonCandidateLevelExcluded,
 		ReasonCandidateCostUnknown, ReasonCandidateCapabilityUnmatched,

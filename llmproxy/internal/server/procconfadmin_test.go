@@ -133,7 +133,9 @@ func TestAdminDeclarationShowVocabulary(t *testing.T) {
 		t.Fatalf("取值域没下发: %+v", out)
 	}
 	for key, want := range map[string]int{
-		"processor_types": 5, "phases": 5, "body_accesses": 3, "scope_kinds": 4,
+		// 类型数跟着注册表走：内置类型从 5 个变成 6 个（加了 kb-context-inject），
+		// 这里必须与 processor.NewRegistry().KnownTypes() 同步，否则界面词表与运行时脱节。
+		"processor_types": 6, "phases": 5, "body_accesses": 3, "scope_kinds": 4,
 	} {
 		if got, _ := vocab[key].([]any); len(got) != want {
 			t.Errorf("取值域 %s 应有 %d 项，实际 %+v", key, want, vocab[key])
@@ -150,7 +152,7 @@ func TestAdminDeclarationShowVocabulary(t *testing.T) {
 		t.Errorf("max_knowledge_budget_ms = %v", vocab["max_knowledge_budget_ms"])
 	}
 	types := strings.ToLower(fmt.Sprint(vocab["processor_types"]))
-	for _, want := range []string{"pii-mask", "http-sidecar", "result-filter"} {
+	for _, want := range []string{"pii-mask", "http-sidecar", "result-filter", "kb-context-inject"} {
 		if !strings.Contains(types, want) {
 			t.Errorf("类型词表缺 %s: %s", want, types)
 		}

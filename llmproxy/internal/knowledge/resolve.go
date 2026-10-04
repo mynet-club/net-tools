@@ -26,6 +26,14 @@ type Outcome struct {
 	DurationMS     int64            `json:"duration_ms"`
 	Failure        *RetrievalError  `json:"failure,omitempty"`
 	Audit          AuditEvent       `json:"audit"`
+	// Documents 是**兜底过滤后仍留下**的源侧条目（与 Citations 一一对齐），
+	// 正文交付（content.go 的 BuildContentRequest）只能以它为依据：
+	// 申请原文必须建立在「源侧本次真的判过这篇可读、并给了 digest 与 expires_at」之上。
+	//
+	// 它不参与序列化（`json:"-"`）：Outcome 与 AuditEvent 的序列化形态是审计与回放的
+	// 既有契约，加一个字段就等于改那份契约。ReturnedDocument 结构上没有正文与标题明文
+	// （leak_test.go 逐字段守着），所以留在内存里不构成新的暴露面。
+	Documents []ReturnedDocument `json:"-"`
 }
 
 // IsReadable 报告这次检索是否产出了「可读」的文档。
@@ -147,6 +155,9 @@ func Resolve(
 		resultCode = ReasonOK
 	}
 	outcome.Citations = filtered.Citations()
+	// 只有成功路径填 Documents：失败时 Citations 必空，条目集合也必须跟着空，
+	// 否则「一次失败的检索」也能被拿去申请原文，那正是 §3.C 明令禁止的形态。
+	outcome.Documents = filtered.Accepted()
 	outcome.Dropped = filtered.Dropped()
 	outcome.HitCount = filtered.HitCount
 	outcome.KnowledgeLevel = filtered.MaxDataLevel
