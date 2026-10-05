@@ -1177,6 +1177,99 @@ else
 fi
 echo "    审计规模读数：/healthz rows=${AUDIT_ROWS} bytes=${AUDIT_BYTES} | 库内 rows=${DB_ROWS} bytes=${DB_BYTES} chars=${DB_CHARS}"
 
+# 23n 装配红灯（2026-10-05 裁决 17′：状态接口现返每条声明的装配结果，不落库）。
+# 单元用例能证明函数返回什么，证不了的是这两件只在真进程上成立的事：
+#   - 保存一段**过了配置校验**的声明之后，热加载那条腿真的把装不起来的点名出来
+#     （界面只读磁盘上那一段的话，永远看不见这一层）；
+#   - 读数跟着「进程真的重装配过」走，不跟着磁盘上多出来的一个文件走 ——
+#     运行参数不在配置里，只补它不换配置修订，红灯必须不灭。
+# 用 shadow 而不是 enforce：红灯与模式无关这句话，得能在不碰请求流量的前提下先读出来。
+chk "切到 shadow" "$(POLICY_MODE '{"mode":"shadow"}')" "200"
+sleep 2.5
+PUTPROC() {
+  curl -s -o "$H/putproc.json" -w '%{http_code}' -X PUT "$GW/v1/_admin/config/processors" \
+    -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' --data @/tmp/putproc.json
+}
+cat > /tmp/putproc.json <<'JSON'
+{"processors":[
+  {"name":"e2e-pii","type":"pii-mask","phase":"before-upstream","scope":"*","version":"1",
+   "body_access":"transform-body","fail_closed":true,"timeout_ms":800,
+   "max_input_bytes":4096,"max_output_bytes":8192},
+  {"name":"e2e-sidecar","type":"http-sidecar","phase":"before-upstream","scope":"*","version":"1",
+   "body_access":"inspect-body","fail_closed":true,"timeout_ms":1200,
+   "max_input_bytes":65536,"max_output_bytes":65536,
+   "allowed_endpoints":["https://sidecar.e2e.internal/v1/rewrite"]}
+]}
+JSON
+chk "保存两条合法声明（其中一条的运行参数文件不存在）" "$(PUTPROC)" "200"
+sleep 2.5
+curl -s -o "$H/asm1.json" "$GW/v1/_admin/policy" -H "Authorization: Bearer $ADMIN"
+# 一行读数里放五件事：整段有没有在装配、声明几条、坏几条、坏的是**哪一条**、
+# 拒因有没有指到能动手的那个文件。合起来比五条 chk 更难被「改一半」蒙过去。
+asmread() {
+  python3 -c '
+import json,sys
+a=json.load(open(sys.argv[1]))["assembly"]
+p=a["processors"]
+bad=[d for d in p.get("declarations") or [] if d.get("status")=="failed"]
+print("running=%s declared=%s assembled=%s failed=%s names=%s points_at_param_file=%s" % (
+    a["running"], p["declared"], p["assembled"], p["failed"],
+    ",".join(d["name"] for d in bad) or "-",
+    any("e2e-sidecar.json" in (d.get("reason") or "") for d in bad)))' "$1"
+}
+chk "装不起来的那条被点名（e2e-pii 不受牵连，拒因带着缺的那个文件名）" \
+  "$(asmread "$H/asm1.json")" \
+  "running=True declared=2 assembled=1 failed=1 names=e2e-sidecar points_at_param_file=True"
+
+mkdir -p "$H/processor_params"
+cat > "$H/processor_params/e2e-sidecar.json" <<'JSON'
+{"endpoint":"https://sidecar.e2e.internal/v1/rewrite"}
+JSON
+sleep 2.5
+curl -s -o "$H/asm2.json" "$GW/v1/_admin/policy" -H "Authorization: Bearer $ADMIN"
+chk "只补参数文件、配置修订没换 ⇒ 红灯不灭（读数不猜，只报真的装配过的那一次）" \
+  "$(asmread "$H/asm2.json")" \
+  "running=True declared=2 assembled=1 failed=1 names=e2e-sidecar points_at_param_file=True"
+
+python3 - <<'PY'
+import json
+p = "/tmp/putproc.json"
+d = json.load(open(p))
+for item in d["processors"]:
+    if item["name"] == "e2e-sidecar":
+        item["timeout_ms"] = 1300   # 只是要让配置换一代修订，触发重装配
+json.dump(d, open(p, "w"), ensure_ascii=False)
+PY
+chk "改一次配置（同一批声明）" "$(PUTPROC)" "200"
+sleep 2.5
+curl -s -o "$H/asm3.json" "$GW/v1/_admin/policy" -H "Authorization: Bearer $ADMIN"
+chk "重装配后同一个位置变绿（不是多出一条历史记录）" \
+  "$(asmread "$H/asm3.json")" \
+  "running=True declared=2 assembled=2 failed=0 names=- points_at_param_file=False"
+
+# legacy 下**不给每条声明盖失败**：那是段级原因。这一句必须在磁盘上还留着声明时读，
+# 否则它只是空跑 —— 所以顺序是「先切模式、最后才清空」。
+chk "切回 legacy" "$(POLICY_MODE '{"mode":"legacy"}')" "200"
+sleep 2.5
+curl -s -o "$H/asm4.json" "$GW/v1/_admin/policy" -H "Authorization: Bearer $ADMIN"
+chk "legacy 下只有段级原因，没有逐条结论（磁盘上仍留着 2 条声明）" \
+  "$(python3 -c '
+import json,sys
+a=json.load(open(sys.argv[1]))["assembly"]
+p=a["processors"]
+print("running=%s reason=%s declared=%s per_decl=%s" % (
+    a["running"], a.get("reason"), p["declared"], "declarations" in p))' "$H/asm4.json")" \
+  "running=False reason=policy_mode_legacy declared=2 per_decl=False"
+
+# 收尾：清空这一段并把模式留在 legacy —— 红灯这一节不该把声明留在现网配置里传给后面的读法。
+cat > /tmp/putproc.json <<'JSON'
+{"processors":[]}
+JSON
+chk "清空处理器声明（显式保存 []）" "$(PUTPROC)" "200"
+sleep 2.5
+curl -s -o "$H/asm5.json" "$GW/v1/_admin/policy" -H "Authorization: Bearer $ADMIN"
+chk "清空后读数是空而不是报错" "$(jget "$H/asm5.json" assembly.processors.declared)" "0"
+
 echo
 echo "================ 结果：通过 $PASS 项，失败 $FAIL 项 ================"
 [ "$FAIL" -eq 0 ] || exit 1

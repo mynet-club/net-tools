@@ -140,6 +140,10 @@ td.dim { color: var(--muted); }
 .gridn .k { color: var(--muted); font-size: 11px; }
 .gridn .v { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .gridn .v.sm { font-size: 13px; font-weight: 500; }
+/* 运行态读数格（裁决 17′ 的装配红灯）：状态色只在数值上，标签保持灰，
+   否则一格红的统计卡会把整排读数都带成告警样子。 */
+.grid4 .v.sm.bad, .gridn .v.sm.bad { color: var(--danger); font-weight: 600; }
+.grid4 .v.sm.ok, .gridn .v.sm.ok { color: var(--ok); font-weight: 600; }
 
 /* ── 表格 ─────────────────────────────────────────────────────────── */
 .tablewrap { overflow-x: auto; margin-top: 12px; }

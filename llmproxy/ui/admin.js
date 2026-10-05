@@ -1220,7 +1220,75 @@ async function loadDeclarations(keepMsg) {
     // 编辑过的那一侧不覆盖：一次刷新抹掉刚填的声明，比多一个按钮糟得多。
     if (!ADM.declDirty[s.which]) ADM.declDraft[s.which] = disk;
   }
+  // 运行态红灯（裁决 17′）：装起来没有，只有本进程知道 —— 读状态接口的 assembly 视图。
+  // 单独一次 try：这一格读不到不该让人连声明都改不了，但必须显示成「读不到」，
+  // 绝不能因为读不到就画成「没问题」。
+  try {
+    const { data } = await adminApi('/v1/_admin/policy');
+    ADM.assembly = data.assembly || null;
+    ADM.assemblyErr = '';
+  } catch (e) {
+    ADM.assembly = null;
+    ADM.assemblyErr = e.message;
+  }
   renderDeclarations(keepMsg);
+}
+
+// assemblyLight 把状态接口的 assembly 视图折成一格读数的文案、颜色与详情。
+//
+// 只有两种装配结果（已装配 / 装配失败），没有第三种：答不出来的原因是
+// 「这个修订根本没装配」（legacy 或策略包加载失败），那是段级的一句话，
+// 不复制成每条声明各自的拒因。
+function assemblyLight(asm, errText) {
+  // 计数一律先归成数字：num() 是给展示用的（空值变「—」），拿它做加法会把两个
+  // 「—」拼成「——」再显示成一条读数。
+  const cnt = (v) => Number(v || 0);
+  if (!asm) {
+    return {
+      text: '读不到', cls: 'sm bad',
+      title: '装配状态读不到：' + (errText || '未知原因')
+        + '\n这一格是运行态读数，读不到时不画成「正常」。',
+      banner: '读不到装配状态：' + (errText || '未知原因')
+        + '\n这条声明到底装起来没有，只有网关进程知道；界面不复算，读不到就明说读不到。',
+    };
+  }
+  const proc = asm.processors || {}, kn = asm.knowledge_sources || {};
+  const decl = cnt(proc.declared) + cnt(kn.declared);
+  const failed = cnt(proc.failed) + cnt(kn.failed);
+  const bad = [];
+  [['处理器', proc], ['知识源', kn]].forEach(([noun, sec]) => {
+    (sec.declarations || []).forEach((d) => {
+      if (d.status === 'failed') bad.push(noun + ' ' + d.name + '：' + (d.reason || '（未给出拒因）'));
+    });
+  });
+  const note = asm.note || '运行态读数，不落库；重启后只反映重启之后的状态。';
+  if (!asm.running) {
+    if (!decl) {
+      return { text: '无声明', cls: 'sm', title: '没有任何声明需要装配。\n' + note, banner: '' };
+    }
+    const why = (asm.reason || '3.0 运行态未建立') + (asm.load_error ? '（' + asm.load_error + '）' : '');
+    return {
+      text: '未装配 ' + decl + ' 条', cls: 'sm bad',
+      title: why + '\n' + decl + ' 条声明没有装配结果：\n' + note,
+      banner: '3.0 运行态未建立，' + decl + ' 条声明没有装配（' + why
+        + '）。\n这是段级原因，不是每条声明各自有毛病。\n' + note,
+    };
+  }
+  if (failed) {
+    return {
+      text: failed + ' 条装不起来', cls: 'sm bad',
+      title: bad.join('\n') + '\n' + note,
+      banner: bad.length + ' 条声明装配失败（enforce 下命中它们的请求会被拒，不放行未处理正文）：\n'
+        + bad.join('\n') + '\n' + note,
+    };
+  }
+  if (!decl) return { text: '无声明', cls: 'sm', title: '没有任何声明需要装配。\n' + note, banner: '' };
+  return {
+    text: '全部装配 ' + cnt(proc.assembled) + '+' + cnt(kn.assembled), cls: 'sm ok',
+    title: '处理器 ' + cnt(proc.assembled) + '/' + cnt(proc.declared)
+      + ' · 知识源 ' + cnt(kn.assembled) + '/' + cnt(kn.declared) + '\n' + note,
+    banner: '',
+  };
 }
 
 function renderDeclarations(keepMsg) {
@@ -1228,6 +1296,7 @@ function renderDeclarations(keepMsg) {
   const p = d.p || {};
   const k = d.kn || {};
   const v = p.vocabulary || k.vocabulary || {};
+  const light = assemblyLight(ADM.assembly, ADM.assemblyErr);
   $('pc-rev').textContent = '配置修订 ' + num(p.revision) + ' · ' + (p.path || 'config.yaml');
   $('pc-stats').replaceChildren(
     // 「保存成功」与「正在生效」是两件事：§3.0 规则 2 只让 enforce 影响路由与处理器，
@@ -1236,6 +1305,10 @@ function renderDeclarations(keepMsg) {
       '只有 enforce 允许 3.0 影响路由与处理器。legacy / shadow 下这两段是提前备好的配置，不碰正文。'),
     stat('处理器', num((p.processors || []).length) + ' 条', 'sm'),
     stat('知识源', num((k.knowledge_sources || []).length) + ' 条', 'sm'),
+    // 运行态红灯（裁决 17′）：磁盘上有这几条 ≠ 网关装起了这几条。
+    // 装配失败的声明过去只留一行 ERROR 日志，要到第一次命中它的请求才被拒 ——
+    // 这一格把那段时间挪到保存的那一瞬间。
+    stat('装配', light.text, light.cls, light.title),
     stat('磁盘时间', p.mtime || '—', 'sm',
       '文件大小 ' + num(p.size) + ' 字节 · 每次写回先备份再原子改名，段外内容与注释原样'),
   );
@@ -1253,6 +1326,10 @@ function renderDeclarations(keepMsg) {
     // 而列表显示的是服务当前加载着的那一份 —— 整段保存合法声明就能修好它。
     showPcStatus('磁盘上的这一版读不回来：' + be
       + '\n上面的条数列显示的是服务当前加载着的那一份。修好它的办法是整段保存一份合法声明 —— 在校验通过之前原文件一个字节都不会动。', 'err');
+  } else if (light.banner) {
+    // 拒因要点名到声明名，所以整段摊开在横幅上而不是只挂在格子的 title 里：
+    // 「有 N 条装不起来」这一眼不足以让人动手，动手要的是那一条为什么。
+    showPcStatus(light.banner, 'err');
   } else if (!keepMsg) {
     const w = p.warnings || [];
     showPcStatus(w.length ? '提示：' + w.join('；') : '');

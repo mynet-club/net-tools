@@ -109,6 +109,8 @@ func (s *Server) adminPolicyInspect(w http.ResponseWriter) {
 		"declared_bundles":    bundleRefViews(pc.BundleRefs()),
 		"running":             rt != nil,
 		"shadow":              s.metrics.shadowSnapshot(),
+		// 运行态红灯（裁决 17′）：每条处理器/知识源声明到底装配起来没有。
+		"assembly": s.assemblyInspect(cfg, rt),
 	}
 	if rt == nil {
 		out["policy_version"] = ""
@@ -126,6 +128,121 @@ func (s *Server) adminPolicyInspect(w http.ResponseWriter) {
 	out["routing_epoch"] = rt.epoch
 	out["bundles"] = bundleViews(rt.set)
 	writeJSON(w, http.StatusOK, out)
+}
+
+// assemblyStatus* 是每条声明仅有的两种装配结果。
+//
+// 刻意没有「部分装配」「未知」这类第三种话：这个读数的全部价值在于它来自本进程
+// 真的跑过的那段装配代码，而不是对配置文件的推测。答不出来就不摆出来。
+const (
+	assemblyAssembled = "assembled"
+	assemblyFailed    = "failed"
+)
+
+// assemblyDecl 是一条声明的装配结果。
+type assemblyDecl struct {
+	Name   string `json:"name"`
+	Type   string `json:"type,omitempty"`
+	Scope  string `json:"scope,omitempty"`
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// assemblySection 是一段声明（processors 或 knowledge_sources）的装配汇总。
+//
+// declarations 在这个修订根本没装配时**缺席**（而不是给每条都盖一个「失败」）：
+// 策略运行态没建立时「为什么没跑」只有一句话，而且是段级的，
+// 把它复制成 N 条声明级结论，等于让界面把「整个 3.0 没在跑」说成「这 N 条各自有毛病」。
+type assemblySection struct {
+	Declared     int            `json:"declared"`
+	Assembled    int            `json:"assembled"`
+	Failed       int            `json:"failed"`
+	Declarations []assemblyDecl `json:"declarations,omitempty"`
+}
+
+// assemblyInspect 端出「这个配置修订上，每条声明到底装起来没有」。
+//
+// 为什么要有这个面（裁决 17′ 冲着的那个故障形态）：一条声明装配失败时，
+// 装配代码只把它记在 procRuntime 上并打一行 ERROR 日志，命中它的请求要到**请求期**才拒。
+// 于是运营者会看到「配置文件里有这四条、界面也列出了这四条，而正文根本没被脱敏」——
+// 最省事的破法就是让这条缺口永远只在日志里。
+//
+// 三条边界：
+//  1. **不落库**：这是运行态读数，不是历史。重启后只反映重启后的装配结果，
+//     note 字段把这句写在接口上，而不是只写在面板文案里。
+//  2. **不新建真值源**：全部字段取装配已经算出来的东西（procRuntime.regErrs、
+//     knowledgeSource.err），一个判据都不在这里重算。写坏的 scope 之类根本进不到这里 ——
+//     配置加载期就按 processor.Spec.Validate 拒掉了，能进到运行态的声明只剩
+//     「形状合法但装不起来」那一种（参数文件缺失、类型没注册、委托端点建不起来）。
+//  3. **不含密钥与正文**：只有声明名、类型、范围与拒因文本。
+func (s *Server) assemblyInspect(cfg *config.Config, rt *policyRuntime) map[string]any {
+	out := map[string]any{
+		"running": rt != nil,
+		"note": "运行态读数：只反映本进程当前配置修订的装配结果，不落库；重启后只反映重启之后的状态。" +
+			"运行参数文件不在配置里，只补 processor_params/<声明名>.json 不会换配置修订、也就不会重装配 —— " +
+			"要改一次配置或重启，这一格的读数才跟着变。",
+		"processors":        procAssemblySection(cfg, rt),
+		"knowledge_sources": knowledgeAssemblySection(cfg, rt),
+	}
+	if rt == nil {
+		if reason, why := s.policyInactiveReason(cfg); reason != "" {
+			out["reason"] = reason
+			if why != "" {
+				out["load_error"] = why
+			}
+		}
+	}
+	return out
+}
+
+// procAssemblySection 汇总 processors 段。
+func procAssemblySection(cfg *config.Config, rt *policyRuntime) assemblySection {
+	if rt == nil {
+		return assemblySection{Declared: len(cfg.ProcessorSpecs)}
+	}
+	pr := rt.proc
+	if pr == nil {
+		return assemblySection{}
+	}
+	sec := assemblySection{Declared: len(pr.specs), Declarations: make([]assemblyDecl, 0, len(pr.specs))}
+	for _, spec := range pr.specs {
+		d := assemblyDecl{Name: spec.Name, Type: string(spec.Type), Scope: spec.Scope, Status: assemblyAssembled}
+		// 拒因直接取装配当时记下的那句话：请求期据此拒绝，界面据此点名，
+		// 两边是同一个字符串，不会出现「日志里一套、面板上一套」。
+		if reason, bad := pr.regErrs[spec.Name]; bad {
+			d.Status, d.Reason = assemblyFailed, reason
+		}
+		if d.Status == assemblyFailed {
+			sec.Failed++
+		} else {
+			sec.Assembled++
+		}
+		sec.Declarations = append(sec.Declarations, d)
+	}
+	return sec
+}
+
+// knowledgeAssemblySection 汇总 knowledge_sources 段。
+func knowledgeAssemblySection(cfg *config.Config, rt *policyRuntime) assemblySection {
+	if rt == nil {
+		return assemblySection{Declared: len(cfg.KnowledgeSources)}
+	}
+	kr := rt.kb
+	if kr == nil {
+		return assemblySection{}
+	}
+	sec := assemblySection{Declared: len(kr.sources), Declarations: make([]assemblyDecl, 0, len(kr.sources))}
+	for _, src := range kr.sources {
+		d := assemblyDecl{Name: src.name, Status: assemblyAssembled}
+		if src.err != "" {
+			d.Status, d.Reason = assemblyFailed, src.err
+			sec.Failed++
+		} else {
+			sec.Assembled++
+		}
+		sec.Declarations = append(sec.Declarations, d)
+	}
+	return sec
 }
 
 // policyInactiveReason 区分「没启用 3.0」与「启用了但这一版加载失败」。
