@@ -43,6 +43,13 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	pf("llmproxy_affinity_entries", "粘性表条目", "gauge", float64(s.affinity.Len()), "")
 	pf("llmproxy_transport_cache", "Transport 缓存", "gauge", float64(s.transports.Len()), "")
 	pf("llmproxy_persist_failures", "落库失败（账在丢）", "counter", float64(s.persistFailures.Load()), "")
+	// 审计表规模（2026-10-05 裁决 15′）。这张表**没有清理器**，所以这两条的斜率就是
+	// 「永久保留」这份代价的实际大小；读不到时两条都不出现（口径同 /healthz，
+	// 一个凭空的 0 会被读成「审计表是空的」）。
+	if v, ok := s.auditVolumeSnapshot(); ok {
+		pf("llmproxy_audit_rows", "审计表行数（永久保留，无清理器）", "gauge", float64(v.Rows), "")
+		pf("llmproxy_audit_bytes", "审计表文本列字节总数（非磁盘占用）", "gauge", float64(v.Bytes), "")
+	}
 	if lat != nil {
 		for _, q := range []string{"p50", "p95", "p99", "max"} {
 			pf("llmproxy_latency_ms", "转发延迟分位", "gauge", float64(lat[q]), `{q="`+q+`"}`)

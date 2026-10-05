@@ -714,6 +714,11 @@ ON CONFLICT(day, provider, model) DO UPDATE SET
 }
 
 // Prune 删除 retainDays 天前的请求明细；usage_daily 保留（体积很小，且是长期消耗视图）。
+//
+// audit_log **不在这条路上**，也不是漏掉：2026-10-05 裁决（决策包 §0.1 第 15′ 行）认审计
+// 留痕永久保留，代价改为「行数与体积进 /healthz + /metrics」这条可数的承诺 ——
+// 这张表记的是「谁在什么时候被哪条规则拒了」「凭什么这份内容能出网」，清不清是合规决定，
+// 不由一个只管明细的天数参数顺带替它做主。
 func (s *Store) Prune(retainDays int) (int64, error) {
 	if retainDays <= 0 {
 		return 0, nil

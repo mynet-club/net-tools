@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 	"github.com/mynet-club/net-tools/llmproxy/internal/processor"
@@ -474,4 +475,152 @@ func TestAudit30DenyStaysDeniedWhenAuditFails(t *testing.T) {
 	if n := up.count(); n != 0 {
 		t.Errorf("被拒的请求不该打到上游，实际 %d 次", n)
 	}
+}
+
+// ---------------------------------------------------------------- 审计表规模（裁决 15′）
+
+// healthzAuditBlock 取 /healthz 的 metrics.audit 段；缺省时返回 ok=false。
+func healthzAuditBlock(t *testing.T, raw []byte) (rows, bytes int64, ok bool) {
+	t.Helper()
+	var out struct {
+		Metrics map[string]any `json:"metrics"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("解析 healthz: %v (%s)", err, raw)
+	}
+	block, present := out.Metrics["audit"].(map[string]any)
+	if !present {
+		return 0, 0, false
+	}
+	r, _ := block["rows"].(float64)
+	b, _ := block["bytes"].(float64)
+	return int64(r), int64(b), true
+}
+
+// 「永久保留」那份代价要可数：同一份库的读数在两个面上指同一个值，且 TTL 内不重算。
+//
+// 三面各钉一件事：
+//   - 读数等于库里那次聚合的**真实**结果（不是常量，也不是写死的期望行数）；
+//   - TTL 内新写的不出现 —— 全表聚合不能被抓取频率打穿；
+//   - /healthz 与 /metrics 出自同一次读数，否则两条序列会在同一时刻报两个数。
+func TestAuditVolumeGaugeOnHealthzAndMetrics(t *testing.T) {
+	up := startMockUpstream(t, &mockUpstream{name: "a", apiKey: "sk-a"})
+	h := newHarness(t, cfgYAML(map[string]string{"a": up.baseURL}, []string{"sk-local"}))
+
+	writeAudit := func(n int) {
+		t.Helper()
+		for i := 0; i < n; i++ {
+			// detail 带中文：这一位同时穿过「字节 not 字符」那条方言口径。
+			if err := h.db.AuditScope(policy.SystemScope, "admin", "policy.deny",
+				fmt.Sprintf("model:m%d", i), `{"说明":"中文按字节算"}`); err != nil {
+				t.Fatalf("AuditScope: %v", err)
+			}
+		}
+	}
+	writeAudit(2)
+	want, err := h.db.AuditVolume()
+	if err != nil {
+		t.Fatalf("库侧 AuditVolume: %v", err)
+	}
+
+	_, raw := h.get(t, "/healthz", "")
+	rows, bytes, ok := healthzAuditBlock(t, raw)
+	if !ok {
+		t.Fatalf("healthz 的 metrics 里应有 audit 段: %s", raw)
+	}
+	if rows != want.Rows || bytes != want.Bytes {
+		t.Errorf("healthz audit = %d/%d，库侧 %+v", rows, bytes, want)
+	}
+
+	// 再写三条：缓存没到期就不该重算（这条同时是「聚合不跟抓取次数走」的锁）。
+	writeAudit(3)
+	if later, err := h.db.AuditVolume(); err != nil || later.Rows <= want.Rows {
+		t.Fatalf("库侧读数没跟着写增长: %+v (%v)", later, err)
+	}
+	_, raw = h.get(t, "/healthz", "")
+	if rows2, _, _ := healthzAuditBlock(t, raw); rows2 != want.Rows {
+		t.Errorf("TTL 内读数重算了：%d → %d（全表聚合不能每次抓取都打穿库）", want.Rows, rows2)
+	}
+
+	// 强制到期：两个面必须报同一个（新）值。
+	h.srv.auditVolume.until = time.Time{}
+	_, raw = h.get(t, "/healthz", "")
+	fresh, err := h.db.AuditVolume()
+	if err != nil {
+		t.Fatalf("库侧 AuditVolume(到期后): %v", err)
+	}
+	rows3, bytes3, ok := healthzAuditBlock(t, raw)
+	if !ok || rows3 != fresh.Rows || bytes3 != fresh.Bytes {
+		t.Errorf("到期后 healthz = %d/%d (ok=%v)，库侧 %+v", rows3, bytes3, ok, fresh)
+	}
+
+	_, text := h.get(t, "/metrics", "")
+	wantRows := fmt.Sprintf("\nllmproxy_audit_rows %d\n", fresh.Rows)
+	wantBytes := fmt.Sprintf("\nllmproxy_audit_bytes %d\n", fresh.Bytes)
+	if !strings.Contains(string(text), wantRows) || !strings.Contains(string(text), wantBytes) {
+		t.Errorf("抓取面缺审计规模两条序列（要含 %q 与 %q）:\n%s",
+			strings.TrimSpace(wantRows), strings.TrimSpace(wantBytes), text)
+	}
+}
+
+// 读不到时的两种正确形态：**从没读过过就整段缺席，读过就留着旧值**。
+//
+// 为什么值得单独立一条：这张表的读数是「永久保留的代价现在多大」的唯一对外出处，
+// 把「没读过」压成 0 等于凭空宣称「审计表是空的」，把「读失败」压成 0 等于宣称代价归零 ——
+// 两种误读都比少一条序列更糟。
+func TestAuditVolumeReadFailureShapes(t *testing.T) {
+	up := startMockUpstream(t, &mockUpstream{name: "a", apiKey: "sk-a"})
+	h := newHarness(t, cfgYAML(map[string]string{"a": up.baseURL}, []string{"sk-local"}))
+	// 先攒出非零读数：一张干净的库读数本来就该是 0/0，那种 0 分不清「旧值被清零」
+	// 与「库本来就空」，也就证不了「失败时保留旧读数」这一条。
+	for i := 0; i < 3; i++ {
+		if err := h.db.AuditScope(policy.SystemScope, "admin", "policy.deny",
+			fmt.Sprintf("model:m%d", i), `{"说明":"旧读数"}`); err != nil {
+			t.Fatalf("AuditScope: %v", err)
+		}
+	}
+	rows0, bytes0, ok := healthzAuditBlock(t, mustHealthz(t, h))
+	if !ok || rows0 != 3 {
+		t.Fatalf("健康库时 audit 段该读出 3 行，实际 %d/%d (ok=%v)", rows0, bytes0, ok)
+	}
+
+	if err := h.db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		// 每次都强制到期去读：连续两次读失败都不该把旧读数清掉，也不该 panic。
+		// （「失败也按 TTL 退避、不被每次抓取重打」由上一条用例的 TTL 断言锁住 ——
+		// 库里没坏时那条断言才分得出重算与没重算。）
+		h.srv.auditVolume.until = time.Time{}
+		rows, bytes, ok := healthzAuditBlock(t, mustHealthz(t, h))
+		// 有旧读数：继续报旧值（滞后由 TTL 界定），不清零、也不整段消失。
+		if !ok {
+			t.Fatalf("第 %d 次：已有成功读数时不该整段消失", i+1)
+		}
+		if rows != rows0 || bytes != bytes0 {
+			t.Errorf("第 %d 次：失败后旧读数没保留，%d/%d → %d/%d", i+1, rows0, bytes0, rows, bytes)
+		}
+	}
+
+	// 从没成功读过的库（db 为 nil）：两个面都不该出现这一位。
+	h2 := newHarness(t, cfgYAML(map[string]string{"a": up.baseURL}, []string{"sk-local"}))
+	h2.srv.db = nil
+	if _, _, ok := healthzAuditBlock(t, mustHealthz(t, h2)); ok {
+		t.Errorf("没有审计库时不该报出一个 audit 段")
+	}
+	_, rawText := h2.get(t, "/metrics", "")
+	text := string(rawText)
+	if strings.Contains(text, "llmproxy_audit_rows") || strings.Contains(text, "llmproxy_audit_bytes") {
+		t.Errorf("没有审计库时不该建出审计规模序列:\n%s", text)
+	}
+}
+
+// mustHealthz 取 /healthz 原文（审计规模那两条用例要用同一个面两次）。
+func mustHealthz(t *testing.T, h *harness) []byte {
+	t.Helper()
+	resp, raw := h.get(t, "/healthz", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("healthz = %d %s", resp.StatusCode, raw)
+	}
+	return raw
 }

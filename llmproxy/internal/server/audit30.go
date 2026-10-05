@@ -15,8 +15,11 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
+	"github.com/mynet-club/net-tools/llmproxy/internal/store"
 )
 
 const (
@@ -206,4 +209,50 @@ func requestAuditScope30(scope string) policy.ScopeRef {
 		return policy.SystemScope
 	}
 	return ref
+}
+
+// ---------------------------------------------------------------- 审计表的规模（裁决 15′）
+
+// auditVolumeTTL30 是审计规模聚合的缓存时长。
+//
+// 聚合本身是全表扫（见 store.AuditVolume），而 audit_log 恰好是那张设计上只增不减的表：
+// 抓取间隔可以远短于 30s（Prometheus 缺省 15s，健康检查可能更密），每次抓取都重算一次
+// 等于让「盯住承诺的成本」自己变成成本。行数是单调递增的，30 秒滞后不影响增长速率读数。
+const auditVolumeTTL30 = 30 * time.Second
+
+// auditVolumeCache 缓存最近一次成功的聚合读数。零值可用，New 不需要认识它。
+type auditVolumeCache struct {
+	mu    sync.Mutex
+	until time.Time
+	value store.AuditVolume
+	// read 报告是否至少成功读过一次 —— 它决定对外那两条序列出不出现。
+	read bool
+}
+
+// auditVolumeSnapshot 给出审计表的行数与体积；**从没读成功过时返回 false**。
+//
+// 为什么不报 0：/healthz 与 /metrics 都不鉴权、都被测试和面板当事实读，凭空一个 0 会被读成
+// 「审计表是空的」，而这一位正是「永久保留的代价现在多大」的唯一出处。读不到就让序列缺席，
+// 失败原因进日志（`event=audit_volume_read_failed`）—— 缺席与 0 是两种状态，不能压成一个。
+func (s *Server) auditVolumeSnapshot() (store.AuditVolume, bool) {
+	if s.db == nil {
+		return store.AuditVolume{}, false
+	}
+	c := &s.auditVolume
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if s.now().Before(c.until) {
+		return c.value, c.read
+	}
+	v, err := s.db.AuditVolume()
+	// 失败也推进到同一个 TTL：一个坏掉的审计库不该被每一次抓取重打一遍。
+	c.until = s.now().Add(auditVolumeTTL30)
+	if err != nil {
+		s.log.Errorf("event=audit_volume_read_failed err=%v", err)
+		// 有旧读数就继续报旧的（滞后由 TTL 界定，不会无限旧）；一次都没有就省略。
+		return c.value, c.read
+	}
+	c.value = v
+	c.read = true
+	return c.value, true
 }

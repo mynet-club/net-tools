@@ -103,6 +103,9 @@ type Server struct {
 	// 门禁（enforce + 版本非空）读的是当次请求那份运行态。热加载换修订不该把
 	// 「刚采到的证据」清掉 —— 运维恰恰是在改配置前后各采一批来对比的。
 	replayWin *replayWindow
+
+	// auditVolume 是审计表规模读数的缓存（见 audit30.go 的 auditVolumeSnapshot）。
+	auditVolume auditVolumeCache
 }
 
 // now 返回当前时刻；测试可以通过 nowFn 固定它。
@@ -472,6 +475,11 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.discoverGate != nil {
 		m["discover_inflight"] = s.discoverGate.Inflight()
+	}
+	// 审计表的规模（2026-10-05 裁决 15′：永久保留是承诺，代价必须可数）。
+	// 读不到时**整段省略**而不是报 0 —— 「没读过」与「审计表是空的」是两回事。
+	if v, ok := s.auditVolumeSnapshot(); ok {
+		m["audit"] = map[string]any{"rows": v.Rows, "bytes": v.Bytes}
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(map[string]any{

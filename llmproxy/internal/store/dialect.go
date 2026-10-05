@@ -30,6 +30,12 @@ type Dialect interface {
 	HasTable(db *sql.DB, table string) (bool, error)
 	// HasColumn 报告列是否存在（迁移用）。
 	HasColumn(db *sql.DB, table, column string) (bool, error)
+	// TextBytes 生成「这一列占多少字节」的 SQL 表达式（体积类统计用）。
+	//
+	// 三家对「文本长度」的缺省语义不同：SQLite 与 PostgreSQL 的 length() 数的是
+	// **字符**，MySQL 的 length() 数的是**字节**。体积指标要的是字节（磁盘按字节长，
+	// 而审计 detail 里中文占比高，按字符数会把体积低估三倍），差异关在这一层。
+	TextBytes(column string) string
 }
 
 // SQLiteDialect 是默认实现：单文件、零依赖、CGO_ENABLED=0 可交叉编译。
@@ -82,6 +88,12 @@ func (SQLiteDialect) HasColumn(db *sql.DB, table, column string) (bool, error) {
 	var n int
 	err := db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM pragma_table_info('%s') WHERE name = ?`, table), column).Scan(&n)
 	return n > 0, err
+}
+
+// TextBytes 要先 CAST 成 BLOB 再数：SQLite 的 length() 对文本数的是**字符**，
+// 直接用它会把一串中文审计正文低估三倍（字节才是磁盘按着长的单位）。
+func (SQLiteDialect) TextBytes(column string) string {
+	return "LENGTH(CAST(" + column + " AS BLOB))"
 }
 
 // placeholders 生成 ?,?,? —— n 个。

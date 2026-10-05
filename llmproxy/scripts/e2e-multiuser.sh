@@ -1132,6 +1132,51 @@ done
 chk "回滚到 legacy 收尾" "$(POLICY_MODE '{"mode":"legacy"}')" "200"
 echo "    范围口径读数：$(sqlite3 "$DB" "SELECT group_concat(target||'='||substr(detail,1,24), ' | ') FROM (SELECT target, detail FROM audit_log WHERE action='replay.export' ORDER BY id DESC LIMIT 3);")"
 
+# 23m 审计表规模读数（2026-10-05 裁决 15′：认审计永久保留、不新增清理器）。
+# 「无界增长是承诺」这句话只有在运维读得到代价时才是承诺，否则它只是文档里的一句口号。
+# 这一节锁三件只在真进程上成立的事：
+#   - 两个**不鉴权**的面（/healthz 与 /metrics）说的是同一个数。面板读一半、抓取读另一半，
+#     出现两个版本的「代价」比出现一个滞后的数更糟。
+#   - 读数不是凭空的 0：本次演练写过策略写侧审计、拒绝证据与出网授权，审计表不可能为空。
+#     读不到时那两条序列必须**缺席**，而缺席在这里是可测的 —— 缺了就是没连上库。
+#   - 对外读数永远 ≤ 库内读数：audit_log 只追加，所以「视图比库大」只有一种成因，
+#     就是有人在被测的清理路径上删了审计行。裁决 15′ 最省事也最危险的破法正是那一句
+#     DELETE FROM audit —— 这条断言是它在这个进程里的哨兵。
+HZ=$(curl -s "$GW/healthz")
+AUDIT_ROWS=$(printf '%s' "$HZ" | python3 -c 'import json,sys;a=json.load(sys.stdin)["metrics"]["audit"];print(a["rows"])')
+AUDIT_BYTES=$(printf '%s' "$HZ" | python3 -c 'import json,sys;a=json.load(sys.stdin)["metrics"]["audit"];print(a["bytes"])')
+MET_ROWS=$(curl -s "$GW/metrics" | sed -n 's/^llmproxy_audit_rows *//p')
+MET_BYTES=$(curl -s "$GW/metrics" | sed -n 's/^llmproxy_audit_bytes *//p')
+# 两侧都先归一成整数再比：/metrics 用 %g 写值，位数一多会变成 1.23457e+06 那种形态，
+# 直接拿字符串对会在一场跑了很久的演练里飘成假红。缺席（序列没写出来）归一成 absent，
+# 于是「没读数」和「读数不一样」在失败信息里是分开的两件事。
+num() { [ -n "$1" ] && python3 -c 'import sys;print(int(float(sys.argv[1])))' "$1" || echo absent; }
+chk "/healthz 与 /metrics 报同一个审计行数" "$(num "$MET_ROWS")" "$(num "$AUDIT_ROWS")"
+chk "/healthz 与 /metrics 报同一个审计字节数" "$(num "$MET_BYTES")" "$(num "$AUDIT_BYTES")"
+DB_ROWS=$(sqlite3 "$DB" "SELECT COUNT(*) FROM audit_log;")
+DB_BYTES=$(sqlite3 "$DB" "SELECT COALESCE(SUM(LENGTH(CAST(scope_kind AS BLOB))+LENGTH(CAST(scope_id AS BLOB))+LENGTH(CAST(actor AS BLOB))+LENGTH(CAST(action AS BLOB))+LENGTH(CAST(target AS BLOB))+LENGTH(CAST(detail AS BLOB))),0) FROM audit_log;")
+# 体积口径要的是字节：SQLite 的 length(text) 数**字符**，同一列按 BLOB 数才是字节。
+# 这一句先自证夹具里真的有多字节内容（按字符算会低估），否则下面两行只是拿 0 比 0。
+DB_CHARS=$(sqlite3 "$DB" "SELECT COALESCE(SUM(LENGTH(scope_kind)+LENGTH(scope_id)+LENGTH(actor)+LENGTH(action)+LENGTH(target)+LENGTH(detail)),0) FROM audit_log;")
+if [ "${DB_BYTES:-0}" -gt "${DB_CHARS:-0}" ]; then
+  pass "库内体积按字节算而非字符（${DB_BYTES} > ${DB_CHARS}，审计 detail 里有中文）"
+else
+  fail "字节口径没咬住：按字节 ${DB_BYTES} 不高于按字符 ${DB_CHARS}"
+fi
+if [ "${AUDIT_ROWS:-0}" -ge 1 ]; then pass "/healthz 的审计行数非 0（承诺有出处）"; else fail "/healthz 审计行数 = ${AUDIT_ROWS}，本次演练不可能为空"; fi
+if [ "${AUDIT_BYTES:-0}" -ge 1 ]; then pass "/healthz 的审计字节数非 0"; else fail "/healthz 审计字节数 = ${AUDIT_BYTES}"; fi
+if [ "${AUDIT_ROWS:-0}" -le "${DB_ROWS:-0}" ]; then
+  pass "对外行数不高于库内（${AUDIT_ROWS} ≤ ${DB_ROWS}；缓存滞后可以，反过来就是审计被删过）"
+else
+  fail "对外行数 ${AUDIT_ROWS} 高于库内 ${DB_ROWS} —— 清理路径动了 audit_log"
+fi
+if [ "${AUDIT_BYTES:-0}" -le "${DB_BYTES:-0}" ]; then
+  pass "对外字节数不高于库内（${AUDIT_BYTES} ≤ ${DB_BYTES}）"
+else
+  fail "对外字节数 ${AUDIT_BYTES} 高于库内 ${DB_BYTES}"
+fi
+echo "    审计规模读数：/healthz rows=${AUDIT_ROWS} bytes=${AUDIT_BYTES} | 库内 rows=${DB_ROWS} bytes=${DB_BYTES} chars=${DB_CHARS}"
+
 echo
 echo "================ 结果：通过 $PASS 项，失败 $FAIL 项 ================"
 [ "$FAIL" -eq 0 ] || exit 1

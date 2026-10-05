@@ -121,3 +121,6 @@ func (MySQLDialect) HasColumn(db *sql.DB, table, column string) (bool, error) {
 		WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`, table, column).Scan(&n)
 	return n > 0, err
 }
+
+// TextBytes：MySQL 的 length() 数的就是**字节**（字符数另有 char_length()），方向正合。
+func (MySQLDialect) TextBytes(column string) string { return "LENGTH(" + column + ")" }

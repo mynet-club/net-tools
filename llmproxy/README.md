@@ -108,7 +108,7 @@ llmproxy-v1.2.3-linux-amd64.tar.gz
 SHA256SUMS
 ```
 
-四点值得说明：
+五点值得说明：
 
 - **不需要交叉工具链**：`CGO_ENABLED=0`，因为 SQLite 用的是 `modernc.org/sqlite`（纯 Go 实现）。
   一条命令就能出四个平台，脚本还会把 `GOOS/GOARCH/CGO_ENABLED` 从二进制里读回来核对一遍。
@@ -123,6 +123,12 @@ SHA256SUMS
   回放 → 回滚 → legacy 拒切）跑在**将要发出去的那个文件**上，而不是 `go build` 的等价物 ——
   管理台是 `go:embed` 编进二进制的，只有跑产物才能证明它随包发出去了。假上游仍从源码编译，
   它是夹具不是被测对象。
+- **可复现构建的口径只到「同机同源码」这一格**（2026-10-05 裁决 21′）：能立的说法是
+  同一台机器、同一份源码、同一个 Go 工具链，两次 `./scripts/build.sh` 产出的**二进制**逐字节相同；
+  加上发行件跑的是同一套端到端。**`.tar.gz` 整包与跨机器、跨工具链的构建都不在这个口径里**
+  ——tar 里有 mtime 与打包顺序，Go 的构建缓存与路径也会进产物。
+  `SHA256SUMS` 因此**不是**可复现凭证：它证的是「你拿到的这个文件没被传输改动」，
+  证不了「这个文件是从这份源码复现出来的」。别拿它对账来判定源码与产物一致。
 
 ### 发布
 
@@ -215,7 +221,7 @@ providers:
 
 database:
   path: ""                # 留空 = 运行时目录下 data/llmproxy.db
-  retain_days: 90         # 请求明细保留天数；**显式 0 = 永久**，留空 = 90 天
+  retain_days: 90         # 请求明细保留天数；**显式 0 = 永久**，留空 = 90 天。只管 requests 表：审计表没有清理器（裁决 15′，见「审计表的保留」一节）
                           # 这张表就是计价冻结账本，要长期对账就设成 0
 
 log:
@@ -626,6 +632,30 @@ llmproxy replay run -records /tmp/rec.json -now 2026-10-03T12:00:00Z
   `503 audit_unavailable`，一个字节都不离开网关 —— 「审计失败」不能变成「原文照常出网」。
   拒绝那一类不是：它本来就打算拦掉，留痕写失败只记一条
   `event=policy_deny_audit_failed` 日志，客户端照旧拿 403。
+
+#### 审计表的保留：无界增长是承诺，不是缺陷（3.0）
+
+2026-10-05 裁决 15′：**`audit_log` 永久保留，不新增清理器。** 这里要说破，因为它的形状
+很容易被读成一个 bug：
+
+- `database.retain_days`（以及 `llmproxy` 里那条周期清理）**只管 `requests` 明细**。
+  把它当成「数据库的保留策略」是误读：审计行一条都不动，`internal/` 里
+  `DELETE FROM audit` 至今为空 —— 那句话就是裁决本身。
+- 承诺得付得出账，所以代价是可数的，两个不鉴权的面各给一份同一个数：
+  `/healthz` 的 `metrics.audit.rows` / `metrics.audit.bytes`，
+  `/metrics` 的 `llmproxy_audit_rows` / `llmproxy_audit_bytes`（都是 gauge）。
+  `rows` 是审计表行数；`bytes` 是六列文本列的**字节**总数，不是磁盘占用 ——
+  按字符数会把中文占比高的 `detail` 低估约三倍，所以三家方言各自走
+  `LENGTH(CAST(x AS BLOB))` / `OCTET_LENGTH(x)` / `LENGTH(x)`，差异关在
+  `Dialect.TextBytes` 一处。
+- 这两条是**全表聚合**，所以读数走 30 秒 TTL 缓存：抓取频率不该打穿数据库。
+  读不到时两条序列**缺席**而不是报 0 —— 「没读过」和「审计表是空的」是两种状态，
+  后者会被仪表盘当成事实；失败原因进日志（`event=audit_volume_read_failed`），
+  已有旧读数则继续报旧值（滞后由 TTL 界定）。
+- 真要收这条代价，那是一个合规决定，不是顺手加一句 `DELETE`：要么明确按范围归档/导出后
+  清理并同步改掉本节口径，要么就承认它只长不缩并给它配容量。判据落在测试里
+  （`TestPruneDoesNotTouchAudit`）而不是落在 grep 结果里 —— 事实会变成缺陷，
+  最省事的写法就是在 `Prune` 里顺手加一句。
 
 ### 两条要么想清楚、要么别动的规则
 

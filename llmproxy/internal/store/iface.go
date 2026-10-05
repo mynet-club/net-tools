@@ -43,6 +43,9 @@ type DB interface {
 	// ── 请求账本与用量 ─────────────────────────────────────────
 	InsertRequest(rec RequestRecord) error
 	Stats(since time.Time, recentLimit int) (*Stats, error)
+	// Prune 按 database.retain_days 清**请求明细**（requests 表）。
+	//
+	// 审计表不在这条路上：audit_log 没有清理器，2026-10-05 裁决认永久保留。
 	Prune(retainDays int) (int64, error)
 
 	// ── 价目（上游成本 / 分发价，都带历史） ────────────────────
@@ -114,6 +117,11 @@ type DB interface {
 	AuditRecentAll(n int) ([]ScopedAuditEntry, error)
 	AuditRecentByScope(scope policy.ScopeRef, n int) ([]ScopedAuditEntry, error)
 	AuditRecentForScopes(scopes []policy.ScopeRef, n int) ([]ScopedAuditEntry, error)
+	// AuditVolume 是审计表的规模读数（全表聚合，只给低频观测面用）。
+	//
+	// Prune 不清这张表：retain_days 只管请求明细，审计行是 2026-10-05 裁决的
+	// 「永久保留」承诺，代价由这两位数在 /healthz 与 /metrics 上兑现。
+	AuditVolume() (AuditVolume, error)
 
 	// 在线请求的路由痕迹（§2.8）
 	RoutingTraceForRequest(requestID string) (*RoutingTrace, error)

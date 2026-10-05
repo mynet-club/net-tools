@@ -69,3 +69,6 @@ func (PostgresDialect) HasColumn(db *sql.DB, table, column string) (bool, error)
 		table, column).Scan(&n)
 	return n > 0, err
 }
+
+// TextBytes：PostgreSQL 的 length() 数的是**字符**，字节数在 octet_length() 那一档。
+func (PostgresDialect) TextBytes(column string) string { return "OCTET_LENGTH(" + column + ")" }
