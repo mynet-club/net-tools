@@ -148,3 +148,90 @@ func TestMask(t *testing.T) {
 		}
 	}
 }
+
+// TestDeriveStableAcrossReload 是「跨请求稳定假名」与「检索词摘要带密钥位」这两件事的根：
+// 派生只依赖主密钥 + 用途域 + 版本串，所以同一个部署进程内两次调用、
+// 以及重启后重新读同一个 master.key，拿到的都必须是同一个串。
+// 这里换任何一条（改成随机、改成按时间、把 purpose 拼错），下游那两条「同一个人
+// 两个请求拿到同一个假名」的断言会当场失效 —— 而那正是裁决 18′ 要买的东西。
+func TestDeriveStableAcrossReload(t *testing.T) {
+	dir := t.TempDir()
+	c1, err := LoadOrCreate(dir)
+	if err != nil {
+		t.Fatalf("首次加载失败: %v", err)
+	}
+	c2, err := LoadOrCreate(dir)
+	if err != nil {
+		t.Fatalf("二次加载失败: %v", err)
+	}
+
+	k1 := c1.Derive(PurposePIIPseudonym, DeriveVersionV1)
+	k2 := c1.Derive(PurposePIIPseudonym, DeriveVersionV1)
+	k3 := c2.Derive(PurposePIIPseudonym, DeriveVersionV1)
+	if len(k1) != 32 {
+		t.Fatalf("派生长度 = %d，应为 32（SHA-256 全宽）", len(k1))
+	}
+	if string(k1) != string(k2) {
+		t.Error("同一 Cipher 两次派生不同：跨请求稳定的前提当场没了")
+	}
+	if string(k1) != string(k3) {
+		t.Error("同一 master.key 重启后派生不同：假名与摘要会在每次重启后全变")
+	}
+	if string(k1) == string(c1.key) {
+		t.Error("派生值就是主密钥原值：那等于把主密钥递给可被外部观察的两个使用面")
+	}
+}
+
+// TestDeriveDomainsAreIndependent 锁住「一把钥匙、多个互不相干的使用面」这条设计：
+// 用途域或版本串任何一位不同都必须派生出差得远的值，否则「轮换 pii 假名不影响检索摘要」
+// 这种承诺就是假的；而长度前缀缺失时 (ab, c) 与 (a, bc) 会撞成同一路字节流，
+// 那是边界挪动造成的跨域碰撞。
+func TestDeriveDomainsAreIndependent(t *testing.T) {
+	c, err := LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pii := c.Derive(PurposePIIPseudonym, DeriveVersionV1)
+	kb := c.Derive(PurposeKBQueryDigest, DeriveVersionV1)
+	if string(pii) == string(kb) {
+		t.Error("pii 假名与检索摘要拿到了同一个子密钥：一处使用面就摊开了另一处")
+	}
+	if v2 := c.Derive(PurposePIIPseudonym, "v2"); string(v2) == string(pii) {
+		t.Error("版本串不参与派生：那 v2 这个轮转把手是装饰")
+	}
+	// 边界挪动：两个 (purpose, version) 组合的裸拼接相同，长度前缀必须让它们分开。
+	if shifted := c.Derive("ab", "c"); string(shifted) == string(c.Derive("a", "bc")) {
+		t.Error("域分隔缺长度前缀：不同用途与版本会撞成同一个派生值")
+	}
+}
+
+// TestDeriveRotatesWithMasterKey 是 README 里那句轮转代价的可执行版本：
+// 换主密钥会**同时**改变所有派生子密钥，所以历史假名与历史摘要一起失效，
+// 而且没有「新旧并存对比」这条路（要留就得为每个派生值另存一列，那是另一件事）。
+func TestDeriveRotatesWithMasterKey(t *testing.T) {
+	c1, err := LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2, err := LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, purpose := range []string{PurposePIIPseudonym, PurposeKBQueryDigest} {
+		if string(c1.Derive(purpose, DeriveVersionV1)) == string(c2.Derive(purpose, DeriveVersionV1)) {
+			t.Errorf("%s：两把不同的主密钥派生出同一个子密钥", purpose)
+		}
+	}
+}
+
+// TestDeriveNilCipher 锁住「没密钥就说没密钥」：返回全零串会让调用方以为自己拿到了
+// pepper，从而安静地把假名与摘要做成可离线穷举的形态。
+func TestDeriveNilCipher(t *testing.T) {
+	var c *Cipher
+	if got := c.Derive(PurposePIIPseudonym, DeriveVersionV1); got != nil {
+		t.Errorf("nil Cipher 派生 = %v，应为 nil", got)
+	}
+	if got := (&Cipher{}).Derive(PurposePIIPseudonym, DeriveVersionV1); got != nil {
+		t.Errorf("空密钥的 Cipher 派生 = %v，应为 nil", got)
+	}
+}

@@ -31,6 +31,7 @@ import (
 	"github.com/mynet-club/net-tools/llmproxy/internal/config"
 	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
 	"github.com/mynet-club/net-tools/llmproxy/internal/processor"
+	"github.com/mynet-club/net-tools/llmproxy/internal/secrets"
 )
 
 // procParamDirName 是运行参数目录名，相对配置文件所在目录（与 policy.bundle_dir 同基准）。
@@ -131,6 +132,7 @@ func (s *Server) buildProcRuntime(cfg *config.Config, rt *policyRuntime) *procRu
 			pr.regErrs[spec.Name] = err.Error()
 			continue
 		}
+		params = pr.withSecrets(spec, params, s)
 		if err := pr.reg.Register(spec, params); err != nil {
 			pr.regErrs[spec.Name] = fmt.Sprintf("%v（运行参数：%s/%s.json；除 pii-mask 与 kb-context-inject 外，每个类型都必须有这个文件）",
 				err, pr.dir, spec.Name)
@@ -143,6 +145,14 @@ func (s *Server) buildProcRuntime(cfg *config.Config, rt *policyRuntime) *procRu
 			continue
 		}
 		names = append(names, spec.Name)
+	}
+	// 假名密钥只在这一个装配点注入，所以「没有主密钥可派生」也只在这里点名一次：
+	// pii-mask 会退回每请求随机 salt（占位只在单次请求内稳定），那不是错误、是本包
+	// 一直以来的默认。但运营者以为两个请求能对上同一个人时，只看文档不够 ——
+	// 必须有一条启动日志说出「这次没对上」。
+	if s.secrets == nil && pr.declaresPIIMask() {
+		s.log.Warnf("主密钥不可用：pii-mask 的假名只在同一次请求内稳定（换请求就换值），" +
+			"需要跨请求关联时请配置 master.key 并重启")
 	}
 	if len(pr.regErrs) > 0 {
 		bad := make([]string, 0, len(pr.regErrs))
@@ -229,6 +239,45 @@ func (pr *procRuntime) loadParams(spec processor.Spec, s *Server) (*processor.Co
 		cfgP.ContentMaxBytes = pf.MaxTotalBytes
 	}
 	return cfgP, nil
+}
+
+// withSecrets 把「只能由接线注入、且来源是主密钥」的参数绑到 Config 上。
+//
+// 目前只有一件：pii-mask 的假名密钥（从 master.key 派生的专用子密钥，裁决 18′）。
+// 它**不是**主密钥本身，而是一段域分隔的 HMAC 输出：假名会出现在转发出去的正文里，
+// 等于一个可观测的使用面，用主密钥原值做这件事会把那条面摊给任何看得到请求体的人。
+// 派生因此同时满足两条原本冲突的要求 —— 跨请求稳定（同一个主密钥、同一个域 ⇒ 同一个值）
+// 和不给主密钥开可反推的使用面（子密钥无法反推主密钥，也不与凭证加解密同键）。
+//
+// 为什么挂在 loadParams 的调用点上而不是写进去：那个函数的职责是「读并校验磁盘上的
+// 运行参数」，而密钥必须在**有参数文件和没有参数文件两条路径上完全一致** ——
+// 写进去就要在两个 return 各补一次，漏一个就是「补了 pii_types 反而丢了稳定假名」。
+//
+// 派不出来（主密钥不可用）时保持原样：E 包按每请求随机 salt 跑，那正是密钥位存在
+// 之前的行为，不是错误。差别由 buildProcRuntime 那条 WARN 说出，不在这里静默。
+func (pr *procRuntime) withSecrets(spec processor.Spec, params *processor.Config, s *Server) *processor.Config {
+	if spec.Type != processor.TypePIIMask {
+		return params
+	}
+	key := s.secrets.Derive(secrets.PurposePIIPseudonym, secrets.DeriveVersionV1)
+	if len(key) == 0 {
+		return params
+	}
+	if params == nil {
+		params = &processor.Config{}
+	}
+	params.PseudonymKey = key
+	return params
+}
+
+// declaresPIIMask 报告这一版有没有 pii-mask 声明（决定要不要说那句主密钥 WARN）。
+func (pr *procRuntime) declaresPIIMask() bool {
+	for _, spec := range pr.specs {
+		if spec.Type == processor.TypePIIMask {
+			return true
+		}
+	}
+	return false
 }
 
 // kbInjectConfig 给 kb-context-inject 装上三件只能由接线注入的东西：

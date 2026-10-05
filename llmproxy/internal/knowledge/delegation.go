@@ -41,17 +41,34 @@ var (
 type Query struct {
 	Terms         string
 	AllowRawTerms bool
+	// Pepper 是给检索词摘要用的密钥位（由网关注入，见 Server.kbQuery）。
+	// 它是**网关的秘密**，绝不进委托请求体、不进审计、不进日志 ——
+	// 请求体里只有摘要结果本身。
+	//
+	// 留空 = 退回无密钥的域分隔摘要，也就是本字段存在之前的行为：低熵检索词
+	// （「张三 绩效」这类）又能被离线穷举还原出明文。之所以留这条路而不是 fail closed，
+	// 是因为主密钥面对本包不可见（拿不到 secrets.Cipher 的嵌入式用法与测试都直接构造 Query），
+	// 在这里拒绝会把「接线忘了注入」伪装成「协议不合法」。
+	// 因此这条不变量由接线侧守住：Server.kbQuery 是唯一的构造入口，pepper 来自 master.key。
+	Pepper []byte
 }
 
-// Digest 返回检索词的域分隔摘要；空检索词也有摘要（对空串取摘要），
+// Digest 返回检索词的摘要；空检索词也有摘要（对空串取摘要），
 // 这样审计里「没检索词」和「摘要没算」是可区分的两件事。
 //
 // 域前缀与标题摘要同一口径（见 citation.go 的 queryDigestDomain）：裸 sha256 会让
 // 同一个短语出现在 query 位和 title 位时产出同一个值，审计里就等于把「这个人搜过
 // 这个词」和「存在这么一份文档」并成一条可离线命中的证据。
+//
+// **有 Pepper 时它是 HMAC 的密钥，不只是前缀**：用户会搜「张三 绩效」这种低熵短语，
+// 不带密钥的摘要可以被穷举字典离线还原出检索词明文（审计表就是那本字典的语料）。
 // 截断展示一律走 ShortDigest，等值判定才比完整摘要。
 func (q Query) Digest() string {
-	return domainDigest(queryDigestDomain, strings.TrimSpace(q.Terms))
+	normalized := strings.TrimSpace(q.Terms)
+	if len(q.Pepper) == 0 {
+		return domainDigest(queryDigestDomain, normalized)
+	}
+	return keyedDomainDigest(queryDigestDomain, q.Pepper, normalized)
 }
 
 // RetrieveRequest 是委托检索的请求体。

@@ -1,6 +1,7 @@
 package knowledge
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -39,6 +40,10 @@ const titleDigestDomain = "llmproxy-kb-title-v1"
 // 检索词与标题是同一类风险面：用户会搜「张三 绩效」这种低熵短语。更要紧的是
 // 口径必须与标题一致 —— 一个裸 sha256、一个带域前缀，跨字段撞库时反而看不出哪个
 // 摘要对应哪种输入，审计里同一串明文在 query 位和 title 位会产出两个可辨认的形态。
+//
+// 与标题那一节不同的是：这一位**还有一把 pepper**（见 Query.Digest 与
+// keyedDomainDigest）。标题摘要在知识源侧算，网关无从加密钥；检索词在网关这一侧算，
+// 所以低熵短语的离线还原可以在这里被真正挡住，而不只是靠域前缀换一条彩虹表。
 const queryDigestDomain = "llmproxy-kb-query-v1"
 
 // domainDigest 产出「域前缀 + 内容」的长度前缀摘要。
@@ -49,6 +54,20 @@ func domainDigest(domain, normalized string) string {
 	h := sha256.New()
 	_, _ = fmt.Fprintf(h, "%d:%s;%d:%s;", len(domain), domain, len(normalized), normalized)
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// keyedDomainDigest 是 domainDigest 的带密钥版本（HMAC-SHA256）。
+//
+// 域前缀仍然写进消息而不是当密钥用：这样「同一个检索词、两把不同的 pepper」
+// 与「同一个 pepper、两个不同的域」都能产出互不相干的值，而摘要是 64 位十六进制
+// 这件事不变 —— 对端与审计都不需要知道它现在是个 keyed MAC。
+//
+// 只有检索词摘要用它（见 Query.Digest）。标题摘要不用：标题由知识源侧摘要化，
+// 网关拿不到明文，也就没有在这里加 pepper 的机会。
+func keyedDomainDigest(domain string, key []byte, normalized string) string {
+	mac := hmac.New(sha256.New, key)
+	_, _ = fmt.Fprintf(mac, "%d:%s;%d:%s;", len(domain), domain, len(normalized), normalized)
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // Digest 返回入参的 sha256 摘要（小写十六进制，64 位）。

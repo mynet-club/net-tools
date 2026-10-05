@@ -176,7 +176,7 @@ func (d *kbContentDeliverer) FetchKnowledgeContent(ctx context.Context,
 	// 与自助检索口同一形状（正文通道不另开一份检索留痕，也不省掉那一条）。
 	// 返回的 kbOutcome 这里用不上 —— 引用已经化成 hits 里的篇目，回话不是本层的产物。
 	_, hits, err := d.s.kbSearchRun(ctx, kc, allowed,
-		knowledge.Query{Terms: req.Terms, AllowRawTerms: true},
+		d.s.kbQuery(req.Terms, true),
 		kbContentMaxResults(req.MaxPassages),
 		d.s.kbAuditSink(user.ID, scope))
 	if err != nil {

@@ -2,9 +2,11 @@ package processor
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"regexp"
 	"sort"
 	"strings"
@@ -40,7 +42,10 @@ const (
 	// 同时它不含引号与反斜杠，插进 JSON 字符串值里不会破坏语法。
 	piiPlaceholderPrefix = "<masked:"
 	// piiHashLen 是占位符里摘要的十六进制长度（48 bit）。
-	// 同一次请求内碰撞概率可忽略；跨请求不承诺不碰撞，因为默认 salt 每次随机。
+	// 单请求内（随机 salt）碰撞概率可忽略。注入派生子密钥后占位跨请求稳定，
+	// 于是碰撞变成「同一组织内两个不同原值显示成同一个假名」：按生日界算，
+	// 100 万个不同值时约 0.2%，1000 个时约 2e-12 —— 对一个内部网关的语料量级够用。
+	// 要更严就加长占位符（那是对外可见形态的变更，得走手册 §9），不是在这里悄悄换一个哈希。
 	piiHashLen = 12
 )
 
@@ -119,9 +124,11 @@ func (m *piiMask) Process(ctx context.Context, in *Input) (*Output, error) {
 	if err != nil {
 		return nil, err
 	}
-	// salt：注入了密钥就用注入的；否则每次请求随机。
-	// 不用主密钥（Config 的注释解释了为什么），也不固定成常量 ——
+	// salt：注入了密钥就用注入的（派生子密钥，见 Config.PseudonymKey）；否则每次请求随机。
+	// 不用主密钥**原值**（Config 的注释解释了为什么），也不固定成常量 ——
 	// 固定 salt 让占位符变成可离线穷举的 HMAC 表，等于给身份证号建了字典。
+	// 两条路径算的是同一个 HMAC，只是密钥来源不同：这正是「同一个人两个请求拿到同一个
+	// 假名」与「每次请求换一批假名」之间唯一的差别，没有第二种算法要对齐。
 	salt := m.key
 	if len(salt) == 0 {
 		buf := make([]byte, 16)
@@ -294,16 +301,22 @@ func (st *piiState) placeholder(sp piiSpan) string {
 }
 
 // pseudonym = 前缀 + 类型 + keyed-hash 摘要。
-// 用 keyed hash（salt 前置）而不是裸 sha256：裸摘要可以被离线穷举反查原值
+//
+// 用 keyed hash 而不是裸 sha256：裸摘要可以被离线穷举反查原值
 // —— 身份证号的取值空间小到可以直接遍历，那会让「脱敏后的正文」仍可复原敏感信息。
+//
+// 密钥位走 **HMAC**，不是「把 salt 拼在消息前面再哈希」：SHA-2 系列允许长度扩展，
+// 拿到一条占位符的人可以在不知道 salt 的情况下算出「同一条消息后面再贴一段」的摘要，
+// 于是占位表变成一台可以对已知前缀做预言机的机器。HMAC 把这条彻底关掉，
+// 而注入的派生子密钥与每请求随机 salt 因此走完全同一条代码路径 ——
+// 少一个「两种 salt 两种算法」的分叉，就少一处能静默错用的地方。
+//
+// 类型名同时进 MAC 的密钥派生域与占位符明文：所以同一个手机号在 email 位上
+// 不会撞出另一个类型的值，跨类型的等值关联本来就不成立。
 func (st *piiState) pseudonym(kind, value string) string {
-	h := sha256.New()
-	h.Write(st.salt)
-	h.Write([]byte{0})
-	h.Write([]byte(kind))
-	h.Write([]byte{0})
-	h.Write([]byte(value))
-	sum := h.Sum(nil)
+	mac := hmac.New(sha256.New, st.salt)
+	_, _ = fmt.Fprintf(mac, "%d:%s;%d:%s;", len(kind), kind, len(value), value)
+	sum := mac.Sum(nil)
 	return piiPlaceholderPrefix + kind + ":" + hex.EncodeToString(sum[:])[:piiHashLen] + ">"
 }
 

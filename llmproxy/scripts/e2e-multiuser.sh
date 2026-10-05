@@ -1270,6 +1270,182 @@ sleep 2.5
 curl -s -o "$H/asm5.json" "$GW/v1/_admin/policy" -H "Authorization: Bearer $ADMIN"
 chk "清空后读数是空而不是报错" "$(jget "$H/asm5.json" assembly.processors.declared)" "0"
 
+# 23o 跨请求稳定假名（2026-10-05 裁决 18′：复用 master.key 派生 HMAC pepper，不新增密钥面）。
+# 单元用例锁得住 Derive 的域分隔、注入点与「参数文件里写密钥键被拒」，锁不住这四件
+# 只在真进程上成立的事：
+#   - 派生用的就是实例已有的那份主密钥，而且运行时目录里没多出第二个密钥文件 ——
+#     「不新增密钥面」这句话的判据是磁盘上的文件数，不是代码里的注释；
+#   - 改写真的到了进程之外：回话是**上游复述它收到的最后一条消息**（cmd/e2estub 的
+#     e2e-echo），所以「网关只在本地改了一份、发出去仍带原文」这种形态会被直接读出来；
+#   - 占位符跟着主密钥走：换一把再换回来，两边都必须如实测所说 —— 写死 salt 的实现
+#     对「换密钥」不敏感，会在换那一格露出来，而 README 里的轮转代价验的也是同一格；
+#   - 运营者把密钥写进运行参数文件这条路在现网实例上同样走不通（红灯点名 + 请求被拒，
+#     而不是「参数文件读失败就当没读」把原文发出去）。
+# 只在 enforce 下测：影子不读正文（procexec.go 文件头决定 1），占位符根本不会出现在出网正文里。
+MK="$H/master.key"
+[ -f "$MK" ] && pass "假名密钥复用运行时目录里已有的 master.key" || fail "实例里没有 master.key：$MK"
+chk "master.key 权限收到 0600" "$(fileperm "$MK")" "600"
+chk "运行时目录里只有这一份 *.key（不新增密钥面的实测）" \
+  "$(find "$H" -maxdepth 1 -name '*.key' | wc -l | tr -d ' ')" "1"
+
+PII_PHONE="13800138000"
+PII_MAIL="e2e-pii-person@example.com"
+ECHOREQ() { # $1=存哪一份响应 $2=request-id；把上游复述回来的正文与结果码分开存
+  curl -s -o "$H/echo-$1.json" -w '%{http_code}' -X POST "$GW/v1/chat/completions" \
+    -H "Authorization: Bearer sk-single-user" -H "X-Request-Id: e2e-pepper-$2-$$" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"e2e-echo\",\"messages\":[{\"role\":\"user\",\"content\":\"联系 ${PII_PHONE} 或 ${PII_MAIL}\"}]}" \
+    > "$H/echo-$1.code"
+}
+# 上游复述的那句同时回答两件事：占位符长什么样、原文有没有跟着出网关。
+ETEXT() {
+  python3 -c '
+import json,sys
+print(json.load(open(sys.argv[1]))["choices"][0]["message"]["content"])' "$1"
+}
+MASKED() { # $1=正文 $2=类型 → 该类型占位符里的摘要段（没有就给 "-"）
+  python3 -c '
+import re,sys
+m=re.search(r"<masked:%s:([0-9a-f]{12})>" % sys.argv[2], sys.argv[1])
+print(m.group(1) if m else "-")' "$1" "$2"
+}
+NOLEAK() { # $1=文本：原文一个都不许出现
+  case "$1" in
+    *"$PII_PHONE"*|*"$PII_MAIL"*) fail "原文出了网关：$1" ;;
+    *) pass "上游收到的正文里没有手机号也没有邮箱" ;;
+  esac
+}
+GWRESTART() { # $1=新日志名（不带目录）；停启一次并把 GWLOG 指过去，退出码=healthz 是否恢复
+  "$BIN" stop >/dev/null 2>&1
+  sleep 0.4
+  GWLOG="$H/$1.log"
+  "$BIN" start > "$GWLOG" 2>&1 &
+  for _ in $(seq 1 40); do
+    curl -sf "$GW/healthz" >/dev/null 2>&1 && break
+    sleep 0.25
+  done
+  curl -sf "$GW/healthz" >/dev/null 2>&1
+}
+
+cat > /tmp/putproc.json <<'JSON'
+{"processors":[
+  {"name":"e2e-pii","type":"pii-mask","phase":"before-upstream","scope":"*","version":"1",
+   "body_access":"transform-body","fail_closed":true,"timeout_ms":800,
+   "max_input_bytes":4096,"max_output_bytes":8192}
+]}
+JSON
+chk "只声明一条 pii-mask（不给运行参数文件）" "$(PUTPROC)" "200"
+chk "带着 pii-mask 声明进入 enforce（public 档）" \
+  "$(POLICY_MODE '{"mode":"enforce","data_level":"public"}')" "200"
+sleep 2.5
+
+# 23o-1 稳定假名的主干
+ECHOREQ a 1
+chk "第一发正常转发（改写发生在出网之前）" "$(cat "$H/echo-a.code")" "200"
+E1=$(ETEXT "$H/echo-a.json")
+echo "    上游复述回来的正文：${E1}"
+case "$E1" in *"<masked:phone:"*) pass "出网正文里手机号变成了占位符";; *) fail "上游收到的还是原文：$E1";; esac
+NOLEAK "$E1"
+ECHOREQ b 2
+E2=$(ETEXT "$H/echo-b.json")
+# 整句逐字节相同：只比占位符会漏掉「第二次根本没脱敏」这种形态（第二次带原文，
+# 而两次占位符可能碰巧都缺一位）。
+chk "同一个人两个请求得到同一个假名（整句逐字节相同）" "$E2" "$E1"
+P1=$(MASKED "$E1" phone)
+M1=$(MASKED "$E1" email)
+if [ "$P1" != "-" ] && [ "$M1" != "-" ] && [ "$P1" != "$M1" ]; then
+  pass "两个占位符形状合法且互不相干（phone=${P1} email=${M1}）"
+else
+  fail "占位符不对：phone=${P1} email=${M1} 正文=$E1"
+fi
+
+# 23o-2 运营者把密钥写进运行参数文件：现网实例上这条路同样走不通。
+# 为什么值得在真进程上再来一遍：单测里挡它的是同一张键表，但「编辑着配好、只在新版本
+# 上炸」这条最费时间的形态，只有热加载那条腿能验（声明没换修订就不会重装配，§23n）。
+cat > "$H/processor_params/e2e-pii.json" <<'JSON'
+{"pii_types":["email"],"pseudonym_key":"deadbeefdeadbeefdeadbeefdeadbeef"}
+JSON
+python3 - <<'PY'
+import json
+p = "/tmp/putproc.json"
+d = json.load(open(p))
+d["processors"][0]["timeout_ms"] = 900   # 只是要让配置换一代修订，触发重装配
+json.dump(d, open(p, "w"), ensure_ascii=False)
+PY
+chk "改一次配置（参数文件里现在写着密钥键）" "$(PUTPROC)" "200"
+sleep 2.5
+curl -s -o "$H/asm6.json" "$GW/v1/_admin/policy" -H "Authorization: Bearer $ADMIN"
+chk "红灯点名那条声明，拒因指着那个密钥键名" \
+  "$(python3 -c '
+import json,sys
+p=json.load(open(sys.argv[1]))["assembly"]["processors"]
+bad=[d for d in p.get("declarations") or [] if d.get("status")=="failed"]
+print("declared=%s failed=%s names=%s names_key=%s" % (
+    p["declared"], p["failed"], ",".join(d["name"] for d in bad) or "-",
+    any("pseudonym_key" in (d.get("reason") or "") for d in bad)))' "$H/asm6.json")" \
+  "declared=1 failed=1 names=e2e-pii names_key=True"
+HITS_BEFORE=$(curl -s "http://127.0.0.1:$GPORT/hits")
+ECHOREQ c 3
+chk "装不起来的声明让这一发被拒而不是原文出网" "$(cat "$H/echo-c.code")" "503"
+grep -q 'processor_unavailable' "$H/echo-c.json" \
+  && pass "回话说清是处理器不可用" || fail "回话没说清失败原因：$(cat "$H/echo-c.json")"
+chk "被拒这一发没有打到上游（fail closed 的实况）" \
+  "$(curl -s "http://127.0.0.1:$GPORT/hits")" "$HITS_BEFORE"
+
+rm -f "$H/processor_params/e2e-pii.json"
+python3 - <<'PY'
+import json
+p = "/tmp/putproc.json"
+d = json.load(open(p))
+d["processors"][0]["timeout_ms"] = 1000
+json.dump(d, open(p, "w"), ensure_ascii=False)
+PY
+chk "删掉那个文件后再换一代修订" "$(PUTPROC)" "200"
+sleep 2.5
+curl -s -o "$H/asm7.json" "$GW/v1/_admin/policy" -H "Authorization: Bearer $ADMIN"
+chk "同一个位置变绿（密钥键那条结论没有留在历史上冒充现状）" \
+  "$(python3 -c '
+import json,sys
+p=json.load(open(sys.argv[1]))["assembly"]["processors"]
+print("declared=%s assembled=%s failed=%s" % (p["declared"], p["assembled"], p["failed"]))' "$H/asm7.json")" \
+  "declared=1 assembled=1 failed=0"
+
+# 23o-3 占位符跟着主密钥走：换掉 → 变；换回来 → 与原来逐字节相同。
+# 后一半才是「派生自这把密钥」的证据 —— 只看前一格，一个每次启动换随机 salt 的实现
+# 也能过（它对换密钥同样敏感）。
+cp "$MK" "$H/master.key.orig"
+python3 -c 'import os;print(os.urandom(32).hex())' > "$MK"
+if GWRESTART svc-pepper-rotated; then pass "换了主密钥之后实例仍能起"
+else fail "换了主密钥之后起不来：$(sed -n '1,6p' "$GWLOG" | tr '\n' ' ')"; fi
+ECHOREQ d 4
+chk "换密钥后请求仍正常（占位符变了但链路没断）" "$(cat "$H/echo-d.code")" "200"
+E3=$(ETEXT "$H/echo-d.json")
+NOLEAK "$E3"
+P2=$(MASKED "$E3" phone)
+if [ -n "$P2" ] && [ "$P2" != "-" ] && [ "$P2" != "$P1" ]; then
+  pass "换主密钥后占位符变了（${P1} → ${P2}，历史假名不能新旧并存对比）"
+else
+  fail "占位符没跟着主密钥变（${P1} vs ${P2}）—— 那就是写死的 salt：$E3"
+fi
+
+cat "$H/master.key.orig" > "$MK"
+rm -f "$H/master.key.orig"
+if GWRESTART svc-pepper-restored; then pass "换回原主密钥之后实例仍能起"
+else fail "换回原主密钥之后起不来：$(sed -n '1,6p' "$GWLOG" | tr '\n' ' ')"; fi
+ECHOREQ e 5
+E4=$(ETEXT "$H/echo-e.json")
+chk "换回原密钥后占位符与原值逐字节相同（派生确实是确定性的）" "$(MASKED "$E4" phone)" "$P1"
+chk "master.key 仍然是那一份 0600 的密钥文件" "$(fileperm "$MK")" "600"
+
+# 收尾：清声明、回 legacy —— 与 §23n 出口一致，演练结束时 3.0 不在跑。
+cat > /tmp/putproc.json <<'JSON'
+{"processors":[]}
+JSON
+chk "清空处理器声明（显式保存 []）" "$(PUTPROC)" "200"
+chk "回滚到 legacy 收尾" "$(POLICY_MODE '{"mode":"legacy"}')" "200"
+sleep 2.5
+echo "    假名读数：${P1} / ${M1}（换密钥后 ${P2}）"
+
 echo
 echo "================ 结果：通过 $PASS 项，失败 $FAIL 项 ================"
 [ "$FAIL" -eq 0 ] || exit 1

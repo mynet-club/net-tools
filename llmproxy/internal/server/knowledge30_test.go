@@ -23,6 +23,7 @@ import (
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/knowledge"
 	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
+	"github.com/mynet-club/net-tools/llmproxy/internal/secrets"
 	"github.com/mynet-club/net-tools/llmproxy/internal/store"
 )
 
@@ -332,8 +333,18 @@ func TestKnowledgeSearchSendsDigestOnlyAndAuditsIt(t *testing.T) {
 	if req.AllowRawTerms || req.SearchTerms != "" {
 		t.Errorf("检索词原文出网了：allow=%t terms=%q", req.AllowRawTerms, req.SearchTerms)
 	}
-	if want := (knowledge.Query{Terms: terms}).Digest(); req.QueryDigest != want {
-		t.Errorf("query_digest = %q，应为 %q", req.QueryDigest, want)
+	// 摘要必须带主密钥派生出来的密钥位（裁决 18′）：这里按同一个用途域复算一遍，
+	// 于是「域名字符串写错了」也会在这里红 —— 换域名等于换掉所有历史摘要，
+	// 那种变更必须是显式的，不能是某次重构里手滑。
+	want := knowledge.Query{Terms: terms,
+		Pepper: h.cipher.Derive(secrets.PurposeKBQueryDigest, secrets.DeriveVersionV1)}.Digest()
+	if req.QueryDigest != want {
+		t.Errorf("query_digest = %q，应为密钥位口径 %q", req.QueryDigest, want)
+	}
+	// 反方向的守卫：无密钥的那条路径还在（Query.Pepper 留空 = 旧口径），
+	// 但**主密钥可用时不许静默退回去** —— 那个值可被离线穷举还原出「裁员赔偿怎么算」。
+	if plain := (knowledge.Query{Terms: terms}).Digest(); req.QueryDigest == plain {
+		t.Error("query_digest 没有密钥位：主密钥可用时退回无 pepper 口径就是给低熵检索词建字典")
 	}
 
 	rows := kbAudit(t, h, "alice")
@@ -359,6 +370,12 @@ func TestKnowledgeSearchSendsDigestOnlyAndAuditsIt(t *testing.T) {
 	}
 	if ev.QueryDigest == "" || ev.PolicyVersion != "t-open@1" {
 		t.Errorf("审计缺摘要/版本: %+v", ev)
+	}
+	// 对账不变量（裁决 18′ 把它收成一条构造函数的全部理由）：同一个检索词在同一次请求里
+	// 出现在委托请求体和逐源审计两处，两侧必须逐字节相等。任何一方漏了密钥位，
+	// 跨进程回放就再也认不出「这两条是同一个检索词」—— 而那正是对账要读的那两位。
+	if ev.QueryDigest != req.QueryDigest {
+		t.Errorf("审计 query_digest %q 与委托请求体 %q 不一致", ev.QueryDigest, req.QueryDigest)
 	}
 	if len(ev.Chain) != 1 || ev.Chain[0].ID != "alice" {
 		t.Errorf("chain = %v，检索必须带上归属范围", ev.Chain)

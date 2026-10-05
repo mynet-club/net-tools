@@ -15,7 +15,9 @@ package secrets
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -33,6 +35,9 @@ const (
 // Cipher 用一个主密钥加解密。零值不可用。
 type Cipher struct {
 	aead cipher.AEAD
+	// key 是主密钥原文，只为了派生子密钥而留着（见 Derive）。
+	// 加密路径只用 aead，不读这个字段。
+	key []byte
 }
 
 // LoadOrCreate 读取运行时目录下的主密钥；不存在则生成一个新的（0600）。
@@ -114,7 +119,7 @@ func newCipher(key []byte) (*Cipher, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Cipher{aead: aead}, nil
+	return &Cipher{aead: aead, key: append([]byte(nil), key...)}, nil
 }
 
 // Encrypt 加密一段明文。空字符串返回空切片（表示「没有密钥」而不是「加密的空串」）。
@@ -151,6 +156,53 @@ func (c *Cipher) Decrypt(blob []byte) (string, error) {
 		return "", fmt.Errorf("解密失败（主密钥可能已更换）: %w", err)
 	}
 	return string(plain), nil
+}
+
+// 派生用途域：**所有**使用面的清单集中在这一处，调用点不许自己写字符串。
+//
+// 为什么这么放：域名字符串一旦变动（哪怕只是打错一位）就等于把那一类派生值全换了一批
+// —— 而运行时看不出任何异常：假名照旧稳定、摘要照旧等长、审计照旧能等值比对，
+// 只有历史对不上账了。把它收成一个常量，改名与新增用途都会先在编译期撞一次。
+//
+// 现在两位用途各自牵着一条被测试钉住的行为：
+//   - PurposePIIPseudonym：pii-mask 的跨请求稳定假名（internal/server 的 withSecrets 注入）；
+//   - PurposeKBQueryDigest：知识检索词摘要的密钥位（internal/server 的 kbQuery 注入）。
+const (
+	PurposePIIPseudonym  = "pii-pseudonym"
+	PurposeKBQueryDigest = "kb-query-digest"
+
+	// DeriveVersionV1 是当前的派生版本串。将来换算法或换口径时升成 v2，
+	// 新旧派生值自然断开，不需要换主密钥。
+	// 反过来说：换主密钥会让**所有**用途一起变，代价写在 README。
+	DeriveVersionV1 = "v1"
+)
+
+// Derive 从主密钥派生一个用途专用的子密钥（32 字节）。
+//
+// 为什么要有这一位（裁决 18′）：跨请求稳定的假名与检索词摘要都需要一个密钥，
+// 而「再发一个密钥文件」会多出一个需要备份、轮换、权限管理的秘密面。
+// 主密钥已经是运行时目录里那个 0600 的 master.key，从它派生就够了。
+//
+// 但**不能直接把主密钥递给这两处**：它同时是 AES-256-GCM 的加密密钥，
+// 而假名与摘要会出现在要发给上游的正文里、以及审计表里 —— 那是两个可被外部观察的
+// MAC 使用面，直接复用等于让观察者为「能不能还原加密密钥」提供样本。
+// 所以这里做一层带域前缀的 HMAC-SHA256，每个用途拿到互不相同的子密钥，
+// 而整个体系仍然只有一把需要保管的钥匙。
+//
+// 域前缀带长度（`<len>:<s>`）是为了防止拼接歧义：两个不同的 (用途, 版本) 组合
+// 不应该因为边界挪动而派生出同一个串。
+//
+// c 为 nil（没加载主密钥）时返回 nil —— 调用方据此退回各自的现状行为，
+// 而不是拿一个全零密钥假装「有 pepper」。
+func (c *Cipher) Derive(purpose, version string) []byte {
+	if c == nil || len(c.key) == 0 {
+		return nil
+	}
+	mac := hmac.New(sha256.New, c.key)
+	for _, s := range []string{"llmproxy-derive", purpose, version} {
+		_, _ = fmt.Fprintf(mac, "%d:%s;", len(s), s)
+	}
+	return mac.Sum(nil)
 }
 
 // Mask 把密钥渲染成可安全展示的形式，只保留尾部 4 位。

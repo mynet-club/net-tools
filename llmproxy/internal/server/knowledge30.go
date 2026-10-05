@@ -44,6 +44,7 @@ import (
 	"github.com/mynet-club/net-tools/llmproxy/internal/config"
 	"github.com/mynet-club/net-tools/llmproxy/internal/knowledge"
 	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
+	"github.com/mynet-club/net-tools/llmproxy/internal/secrets"
 )
 
 const (
@@ -113,6 +114,15 @@ func (s *Server) buildKnowledgeRuntime(cfg *config.Config, rt *policyRuntime) *k
 		return nil
 	}
 	kr := &knowledgeRuntime{rt: rt, byKB: map[string]*knowledgeSource{}}
+	if s.secrets == nil {
+		// 摘要的密钥位来自 master.key（见 kbQuery）。主密钥不可用时检索词摘要**安静地**
+		// 退回无密钥形态 —— 那正是这一位要挡的「低熵检索词被离线穷举还原」，
+		// 所以不能只在文档里写、必须在装配时点名一次。
+		// 这里不 fail closed：委托协议本身仍然成立，把「没有主密钥」伪装成协议错误
+		// 会让拿不到密钥面的部署连知识库都用不了。
+		s.log.Warnf("主密钥不可用：%d 个知识源声明的 query_digest 没有密钥位，"+
+			"低熵检索词的摘要可被离线字典命中；配置 master.key 后重启即恢复", len(cfg.KnowledgeSources))
+	}
 	tr, trErr := s.Transports().Get("")
 	for i := range cfg.KnowledgeSources {
 		d := &cfg.KnowledgeSources[i]
@@ -341,11 +351,33 @@ type kbSourceHit struct {
 	docs   []knowledge.ReturnedDocument
 }
 
+// kbQuery 是网关侧构造检索词查询的**唯一**入口：摘要的密钥位只在这里绑定。
+//
+// 为什么收成一层（裁决 18′）：同一个检索词摘要会出现在三个地方（委托请求体、
+// 逐源审计、拒绝审计），任何一处漏了 pepper 就安静地退回「可被字典命中的裸摘要」，
+// 而三处不一致还会让同一次请求的对账当场失效。密钥位收在一个构造函数里，
+// 比在三处各自记得加一遍可靠。
+//
+// pepper 派生自 master.key（secrets.Cipher.Derive 的一个专用用途域，与 pii-mask 的
+// pseudonym 域互不相干；所有域名的清单在 secrets 的 Purpose* 常量那一处），
+// 所以整个体系仍然只有一把需要保管的钥匙。代价写在 README：
+// **主密钥轮转会改变所有历史检索词摘要**，
+// 跨轮换的「同一次搜索」关联就此断开，且新旧摘要无法并存对比。
+// s.secrets 为 nil（主密钥不可用的部署）时派生返回 nil，摘要退回无密钥口径 ——
+// 这件事在装配期点过一次名（见 buildKnowledgeRuntime），不留静默。
+func (s *Server) kbQuery(terms string, allowRawTerms bool) knowledge.Query {
+	return knowledge.Query{
+		Terms:         terms,
+		AllowRawTerms: allowRawTerms,
+		Pepper:        s.secrets.Derive(secrets.PurposeKBQueryDigest, secrets.DeriveVersionV1),
+	}
+}
+
 // kbSearch 是自助检索口的薄壳：检索词一律只传摘要，也不索取正文。
 func (s *Server) kbSearch(ctx context.Context, kc *knowledgeCall, allowed []string,
 	terms string, maxResults int, sink kbSearchSink) (*kbOutcome, error) {
 
-	out, _, err := s.kbSearchRun(ctx, kc, allowed, knowledge.Query{Terms: terms}, maxResults, sink)
+	out, _, err := s.kbSearchRun(ctx, kc, allowed, s.kbQuery(terms, false), maxResults, sink)
 	return out, err
 }
 
@@ -665,7 +697,7 @@ func (s *Server) knowledgeSearch(w http.ResponseWriter, r *http.Request, e *user
 		writeKnowledgeError(w, err)
 		return
 	}
-	q := knowledge.Query{Terms: terms}
+	q := s.kbQuery(terms, false)
 	payload := map[string]any{
 		"request_id":                 kc.requestID,
 		"policy_version":             kc.version,
