@@ -130,19 +130,21 @@ func (d *kbContentDeliverer) FetchKnowledgeContent(ctx context.Context,
 		// 不另造一个同义词 —— 两个错误指向同一个原因时，排查者只会多花一次工夫。
 		return empty, fmt.Errorf("%w: %v", errKbContentFailed, errKnowledgeNoBundle)
 	}
-	identity, err := policyIdentity(user.ID)
-	if err != nil {
-		return empty, fmt.Errorf("%w: %v", errKbContentNoUser, err)
-	}
 	// 知识库**准入**沿用检索口的 purpose（knowledge-search）：管理员为「哪个库能碰」
 	// 写的那条规则不该因为触发方是模型请求还是自助检索而给出不同答案。
 	// 而 knowledge.content / body.raw 两道授权用的是这次请求自己的上下文
 	// （req.Policy），因为那两问的正是「这一次模型调用能不能带内容」。
-	kbCtx, err := policy.NewPolicyContext(identity, kbPurpose, d.rt.dataLevel)
-	if err != nil {
+	//
+	// 身份与 org/project 直接取 req.Policy —— 它就是这一次请求的上下文（在 procCall 里
+	// 由同一个外部身份绑定算出，§9 P8）。从这里用 user.ID 重造一份身份会把链里的
+	// org/project 丢掉，而「按组织授权的库」正是要靠它命中（playbook §2.9）。
+	kbCtx := req.Policy
+	kbCtx.Purpose = kbPurpose
+	kbCtx.PolicyVersion = version
+	kbCtx = kbCtx.Normalize()
+	if err := kbCtx.Validate(); err != nil {
 		return empty, fmt.Errorf("%w: 策略上下文不合法: %v", errKbContentNoUser, err)
 	}
-	kbCtx.PolicyVersion = version
 	kc := &knowledgeCall{
 		kr: d.rt.kb, res: res, scope: user, subject: user.ID, chain: req.Chain,
 		ctx: kbCtx, version: version, maxLevel: d.rt.dataLevel,

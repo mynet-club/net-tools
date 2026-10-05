@@ -19,6 +19,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -392,7 +393,10 @@ func (pr *procRuntime) pipelineFor(chain policy.ScopeChain, version string) (*pr
 	applicable, blocked := pr.applicable(chain)
 	if len(blocked) > 0 {
 		// 命中了这条链、却装不起来的声明：把原因缓存下来，请求期据此拒绝。
-		perr := fmt.Errorf("%s", strings.Join(blocked, "; "))
+		// 用 errors.Join 而不是把原因拼成一个字符串：拼接会丢掉每条原因里的 %w 链，
+		// 于是执行半段就分不出「装配失败」与「用户级在替自己开注入」——
+		// 后者要记一条点名指标与 WARN，前者只要一条通用拒绝。
+		perr := errors.Join(blocked...)
 		pr.pipeErrs[key] = perr
 		return nil, perr
 	}
@@ -414,11 +418,11 @@ func (pr *procRuntime) pipelineFor(chain policy.ScopeChain, version string) (*pr
 // 判据复用 policy.ParseScopeSelector/Matches（A 包），本包不写第二套范围匹配：
 // 「kind:id 命中链上任一范围」这条规则一旦有两份实现，就会出现
 // 「配置说这条声明管这个组织，而运行时没跑它」。
-func (pr *procRuntime) applicable(chain policy.ScopeChain) (specs []processor.Spec, blocked []string) {
+func (pr *procRuntime) applicable(chain policy.ScopeChain) (specs []processor.Spec, blocked []error) {
 	for _, spec := range pr.specs {
 		sel, err := policy.ParseScopeSelector(spec.Scope)
 		if err != nil {
-			blocked = append(blocked, fmt.Sprintf("%s: scope %q 不合法: %v", spec.Name, spec.Scope, err))
+			blocked = append(blocked, fmt.Errorf("%s: scope %q 不合法: %w", spec.Name, spec.Scope, err))
 			continue
 		}
 		hit := false
@@ -432,12 +436,78 @@ func (pr *procRuntime) applicable(chain policy.ScopeChain) (specs []processor.Sp
 			continue
 		}
 		if reason, bad := pr.regErrs[spec.Name]; bad {
-			blocked = append(blocked, fmt.Sprintf("%s 装配不起来: %s", spec.Name, reason))
+			blocked = append(blocked, fmt.Errorf("%s 装配不起来: %s", spec.Name, reason))
 			continue
+		}
+		if spec.Type == processor.TypeKnowledgeContextInject {
+			if has, platformLevel := pr.injectionAuthority(chain); has && !platformLevel {
+				blocked = append(blocked, fmt.Errorf(
+					"%w：%s 命中范围链 %s，但覆盖这条链的 knowledge.content 授权全部来自 user 级策略包"+
+						"（「用户级范围不得自助开启注入」的运行期判定，决策包 §0.1 第 1 条「谁授权」）",
+					ErrInjectEnableNotPlatformLevel, spec.Name, chain.Display()))
+				continue
+			}
 		}
 		specs = append(specs, spec)
 	}
 	return specs, blocked
+}
+
+// ErrInjectEnableNotPlatformLevel 是「覆盖这条链的 knowledge.content 授权全部来自 user 级
+// 策略包」这一条运行期判定的哨兵错误。
+//
+// 它只服务可观测性：拒绝口径不变（enforce 下仍是 §2.9 规则 5 的
+// processor_unavailable，回话里不出现这条文案），但执行半段要能把它与其它装配失败
+// 分开 —— 前者记一条点名指标与 WARN（「谁在替自己开闸」是可审计事实），
+// 后者只需一条通用拒绝。所以它必须经 errors.Join 原样穿到 processorCall，
+// 而不是被拼成字符串。
+var ErrInjectEnableNotPlatformLevel = errors.New("正文注入的启用权不在平台/组织级")
+
+// injectionAuthority 报告这条范围链上的正文注入启用权落在哪一层。
+//
+// 这是决策包 §0.1 第 1 条「谁授权」的**运行期判定**：注入声明只允许由平台/组织级的
+// 策略授权开启，用户级范围不得自助开启 —— 声明表住在平台配置文件里是结构性事实，
+// 而这句话要能被运行时判出来。归属真进请求路径之后（P8），判定的依据就现成：
+// 覆盖这条链的策略包里，哪一个既授了 knowledge.content、范围种类又不是 user。
+//
+// 为什么判在**授权**这一侧而不是声明的 scope 字面：声明只是「哪些链参与」的选择器，
+// 真正开闸的是那条 knowledge.content 授权。而用户级链（只有 user:<名>）今天正是
+// 用户的常态形态 —— 按声明字面判会把「平台替某个用户开的注入」一起误伤，
+// 按授权来源判才问得准「这次开闸是谁给的」。
+//
+// 两个返回值分开，是因为它们对应两件不同的事，合起来会答错：
+//   - has=false：这条链上根本没有 knowledge.content 授权 —— 那是「管理员没授权」，
+//     既有路径按「不注入」处理（见 TestKbContentWithoutRawTermsGrantSendsNothing），
+//     不是本判定要拦的形态；
+//   - has=true 且 platformLevel=false：授权全来自 user 级包 —— 用户级范围在替自己开闸，
+//     本条按「装配不起来」拒之（enforce 下该请求被拒，而不是静默不注入）。
+func (pr *procRuntime) injectionAuthority(chain policy.ScopeChain) (has bool, platformLevel bool) {
+	if pr == nil || pr.rt == nil || pr.rt.set == nil {
+		return false, false
+	}
+	for _, b := range pr.rt.set.Bundles() {
+		if !b.Covers(chain) || !bundleGrantsKnowledgeContent(b) {
+			continue
+		}
+		has = true
+		if b.Scope.Kind != policy.ScopeUser {
+			platformLevel = true
+		}
+	}
+	return has, platformLevel
+}
+
+// bundleGrantsKnowledgeContent 报告这个包有没有一条 knowledge.content 的放行规则。
+//
+// 只看 allow、不看 deny：deny 是收紧方向，把它算成「有授权」会让一个
+// 「显式禁止取正文」的包反而成了开闸依据。
+func bundleGrantsKnowledgeContent(b policy.PolicyBundle) bool {
+	for _, e := range b.Entitlements {
+		if e.Resource == policy.ResourceKnowledgeContent && e.Effect == policy.EffectAllow {
+			return true
+		}
+	}
+	return false
 }
 
 // CheckProcessorParams 在启动时校验声明的运行参数文件（main 调用；失败即拒绝启动）。

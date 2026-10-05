@@ -71,6 +71,9 @@ type Config struct {
 	// KnowledgeSources 是知识检索的**委托入口**声明（协议见 docs/3.0-knowledge-delegation.md）。
 	// transport 不在这里：出网策略在 dialer 那一层，本段只固定「哪个库由哪个端点回答」。
 	KnowledgeSources []KnowledgeSourceDef `yaml:"knowledge_sources"`
+	// Identity 是 3.0 的**外部身份签发**块（见 identity30.go）。整段缺省 = 不启用，
+	// 请求头不带 IdP token 时行为与今天逐字节相同。
+	Identity IdentityConfig `yaml:"identity"`
 
 	// 下面是校验后的派生结构，供运行期直接使用
 	ProxyIndex map[string]ProxyDef `yaml:"-"`
@@ -865,6 +868,11 @@ func (c *Config) normalize(opts LoadOptions) error {
 		return err
 	}
 	if err := c.Policy.normalize(opts.KnownScopes, &c.Warnings); err != nil {
+		return err
+	}
+	// 外部身份段（见 identity30.go）。放在 policy 之后：legacy 下的告警口径
+	// 与 policy.bundles 一致（配了但不生效是回滚期间的正常状态，只 warn）。
+	if err := c.Identity.normalize(c.Policy.ModeResolved(), &c.Warnings); err != nil {
 		return err
 	}
 	// 3.0 的两张声明表（见 procconf.go）。校验放在 mode 之后：

@@ -65,17 +65,20 @@ type procCall struct {
 // 那种情况按 §3.0 的「可按 scope 回滚到 legacy」理解）。
 // 返回非 nil 且 err 非空表示「参与，但必须拒绝」。
 func (s *Server) processorCall(rt *policyRuntime, scope, requestID, model, path string,
-	stream bool, now time.Time) *procCall {
+	stream bool, now time.Time, identityToken string) *procCall {
 	if rt == nil || rt.mode != config.PolicyModeEnforce || rt.proc == nil {
 		return nil
 	}
 	pc := &procCall{server: s, actor: scope, requestID: requestID, model: model, path: path, stream: stream, now: now}
-	chain, err := policyChainFor(scope)
-	if err != nil {
-		pc.err = fmt.Errorf("范围链不合法: %w", err)
+	// 外部身份（§9 P8）：与判定核同一口径 —— org/project 并进链后，按 organization 声明的
+	// 处理器才会覆盖到这个人。不带 token 时与今天逐字节相同。
+	idn := s.requestIdentity30(rt, scope, identityToken, requestID)
+	if idn.err != nil {
+		pc.err = fmt.Errorf("范围链或身份不可构造: %w", idn.err)
 		pc.scope = scope
 		return pc
 	}
+	chain := idn.chain
 	pc.chain = chain
 	pc.scope = chain.Display()
 	// 版本取自本范围链生效的子集，与判定核同一口径（§6「审计版本必须取子集版本」）。
@@ -84,15 +87,16 @@ func (s *Server) processorCall(rt *policyRuntime, scope, requestID, model, path 
 		// 没有包覆盖这条链 = 这个范围没启用 3.0。声明在这里不越权生效。
 		return nil
 	}
-	id, err := policyIdentity(scope)
-	if err != nil {
-		pc.err = fmt.Errorf("身份不可构造: %w", err)
-		return pc
-	}
+	id := idn.identity
 	ctx, err := policy.NewPolicyContext(id, policyPurposeFor(path), rt.dataLevel)
 	if err != nil {
 		pc.err = fmt.Errorf("策略上下文不合法: %v", err)
 		return pc
+	}
+	if idn.org != "" {
+		ctx.Organization = idn.org
+		ctx.Project = idn.project
+		ctx = ctx.Normalize()
 	}
 	ctx.PolicyVersion = version
 	pc.ctx = ctx
@@ -100,6 +104,14 @@ func (s *Server) processorCall(rt *policyRuntime, scope, requestID, model, path 
 	pipe, perr := rt.proc.pipelineFor(chain, version)
 	pc.pipe = pipe
 	pc.err = perr
+	if errors.Is(perr, ErrInjectEnableNotPlatformLevel) {
+		// 用户级范围替自己开正文注入：拒绝口径不变（processor_unavailable），
+		// 但这条要能被运维看见 —— 它是「谁想越权开闸」而不是「配置写坏了」。
+		// 只记结论面：声明名与范围链（都是平台配置里的标识），不含任何内容或凭证。
+		s.metrics.noteInjectEnableDenied()
+		s.log.Warnf("event=processor_inject_denied request_id=%s scope=%s chain=%s reason=%s",
+			requestID, pc.scope, chain.Display(), processorMessage(perr))
+	}
 	if perr == nil {
 		pc.err = s.traceRawBodyGrant30(res, pc)
 	}

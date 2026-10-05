@@ -223,7 +223,10 @@ type knowledgeCall struct {
 
 // knowledgeFor 装配判定现场。四类失败都返回错误而不是「换一个看起来能用的键」：
 // legacy、没有源、本范围没有生效包、身份不合法 —— 各自有明确的回话口径。
-func (s *Server) knowledgeFor(bucket policy.ScopeRef, requestID string, now time.Time) (*knowledgeCall, error) {
+//
+// identityToken 是下游带的 IdP token（§9 P8）：与判定核同一口径 —— org/project 并进链后，
+// 「按组织授权的库」（playbook §2.9）才会覆盖到这个人。不带 token 时与今天逐字节相同。
+func (s *Server) knowledgeFor(bucket policy.ScopeRef, requestID string, now time.Time, identityToken string) (*knowledgeCall, error) {
 	rt := s.policyFor(s.cfgStore.Current())
 	if rt == nil {
 		return nil, errKnowledgeNoPolicy
@@ -231,14 +234,12 @@ func (s *Server) knowledgeFor(bucket policy.ScopeRef, requestID string, now time
 	if rt.kb == nil {
 		return nil, errKnowledgeNoSource
 	}
-	chain, err := policyChainFor(bucket.ID)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", errKnowledgeNoIdentity, err)
+	idn := s.requestIdentity30(rt, bucket.ID, identityToken, requestID)
+	if idn.err != nil {
+		return nil, fmt.Errorf("%w: %v", errKnowledgeNoIdentity, idn.err)
 	}
-	id, err := policyIdentity(bucket.ID)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", errKnowledgeNoIdentity, err)
-	}
+	chain := idn.chain
+	id := idn.identity
 	res, version, err := rt.resolverFor(chain)
 	if err != nil {
 		return nil, errKnowledgeNoBundle
@@ -247,12 +248,17 @@ func (s *Server) knowledgeFor(bucket policy.ScopeRef, requestID string, now time
 	if err != nil {
 		return nil, fmt.Errorf("%w: 策略上下文不合法: %v", errKnowledgeNoIdentity, err)
 	}
+	if idn.org != "" {
+		ctx.Organization = idn.org
+		ctx.Project = idn.project
+		ctx = ctx.Normalize()
+	}
 	ctx.PolicyVersion = version
 	return &knowledgeCall{
 		kr:        rt.kb,
 		res:       res,
 		scope:     bucket,
-		subject:   bucket.ID,
+		subject:   id.Subject,
 		chain:     chain,
 		ctx:       ctx,
 		version:   version,
@@ -557,7 +563,7 @@ func (s *Server) handleMeKnowledge(w http.ResponseWriter, r *http.Request, e *us
 			writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error", "只支持 GET")
 			return
 		}
-		s.knowledgeList(w, e, scope)
+		s.knowledgeList(w, r, e, scope)
 	case "search":
 		if r.Method != http.MethodPost {
 			writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error", "只支持 POST")
@@ -589,8 +595,8 @@ func kbDenialRows(kr *knowledgeRuntime, denials []knowledge.KnowledgeBaseDenial)
 //
 // 只读、无副作用，因此不落审计（与 /v1/_me/routing 同一口径：看判定结论不是访问内容）。
 // 端点地址刻意不出现 —— 用户要的是「能不能问」，委托入口的网络位置属于运维面。
-func (s *Server) knowledgeList(w http.ResponseWriter, e *userEntry, scope policy.ScopeRef) {
-	kc, err := s.knowledgeFor(scope, newRequestID(), time.Now())
+func (s *Server) knowledgeList(w http.ResponseWriter, r *http.Request, e *userEntry, scope policy.ScopeRef) {
+	kc, err := s.knowledgeFor(scope, newRequestID(), time.Now(), r.Header.Get(IdentityHeaderName))
 	if err != nil {
 		writeKnowledgeError(w, err)
 		return
@@ -687,7 +693,7 @@ func (s *Server) knowledgeSearch(w http.ResponseWriter, r *http.Request, e *user
 		return
 	}
 
-	kc, err := s.knowledgeFor(scope, newRequestID(), time.Now())
+	kc, err := s.knowledgeFor(scope, newRequestID(), time.Now(), r.Header.Get(IdentityHeaderName))
 	if err != nil {
 		writeKnowledgeError(w, err)
 		return

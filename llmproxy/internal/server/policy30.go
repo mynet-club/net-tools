@@ -79,6 +79,11 @@ type policyRuntime struct {
 	// 单独缓存会让「计划说用 X 执行器」与「本网关注册了什么」对不上。
 	exec *executorRuntime
 
+	// idn 是本修订对应的外部身份运行态（§9 P8，见 identity30.go）；nil = identity 段未配置。
+	// 与上面三个同一条理由：issuer/audience/JWKS 路径改了而旧 provider 还在用，
+	// 就是「配置说 A、验签按 B」的静默错配。
+	idn *identityRuntime
+
 	mu        sync.Mutex
 	resolvers map[string]*policy.Resolver // chain.Display() → 判定内核
 }
@@ -101,6 +106,13 @@ func newPolicyRuntime(cfg *config.Config, epoch string) (*policyRuntime, error) 
 	if err != nil {
 		return nil, fmt.Errorf("已加载策略包却取不出版本串: %w", err)
 	}
+	// 外部身份运行态（§9 P8）。identity 段配了但坏了（JWKS 文件缺失/不合法、
+	// issuer 与算法不合规）与策略包读不到是同一类事故：配置说「认外部身份」而实际
+	// 验不了 —— 那会让 org 级规则静默失配。整条修订按 legacy，与策略包加载失败同口径。
+	idn, err := newIdentityRuntime(cfg)
+	if err != nil {
+		return nil, err
+	}
 	return &policyRuntime{
 		mode:      pc.ModeResolved(),
 		dataLevel: pc.DataLevelResolved(),
@@ -109,6 +121,7 @@ func newPolicyRuntime(cfg *config.Config, epoch string) (*policyRuntime, error) 
 		fallback:  pc.FallbackToLegacyEnabled(),
 		planner:   routing.NewPlanner(),
 		epoch:     epoch,
+		idn:       idn,
 		resolvers: map[string]*policy.Resolver{},
 	}, nil
 }
@@ -315,8 +328,8 @@ func excludedByPolicy(r policy.Reason) bool {
 // 复用同一个判定核，却必须一点痕迹都不留 —— 模拟请求进了窗口，证据链里就掺进了
 // 人为流量（§3.0 线 1 禁止模拟进影子计数，同一条理由）。
 func (s *Server) policyEvaluate(rt *policyRuntime, scope, model, requestID, path string,
-	providers []config.Provider, sticky string, now time.Time) *policyShot {
-	shot := s.policyJudge(rt, scope, model, requestID, path, providers, sticky, now)
+	providers []config.Provider, sticky string, now time.Time, identityToken string) *policyShot {
+	shot := s.policyJudge(rt, scope, model, requestID, path, providers, sticky, now, identityToken)
 	if shot == nil {
 		return nil
 	}
@@ -335,19 +348,23 @@ func (s *Server) policyEvaluate(rt *policyRuntime, scope, model, requestID, path
 // 任何一步拿不到结论都不硬失败：影子模式绝不能因为 3.0 报错而让用户的请求变差；
 // enforce 下则由 fallback_to_legacy 决定回落还是拒绝（缺省回落，§3.0 要求可按 scope 回滚）。
 func (s *Server) policyJudge(rt *policyRuntime, scope, model, requestID, path string,
-	providers []config.Provider, sticky string, now time.Time) *policyShot {
+	providers []config.Provider, sticky string, now time.Time, identityToken string) *policyShot {
 	if rt == nil {
 		return nil
 	}
 	started := time.Now()
 	shot := &policyShot{Mode: rt.mode, Excluded: map[string]policy.Reason{}}
 
-	chain, err := policyChainFor(scope)
-	if err != nil {
-		shot.Note = fmt.Sprintf("范围链不合法: %v", err)
+	// 范围链与身份一次定下来：外部 IdP token（§9 P8）在场且 subject 与网关认定一致时，
+	// token 里的 org/project 并进链；否则就是 policyChainFor / policyIdentity 的原值。
+	// 这一句是 P8 的唯一作用点 —— 链变宽，org/project 级规则与按范围导出才有数据。
+	idn := s.requestIdentity30(rt, scope, identityToken, requestID)
+	if idn.err != nil {
+		shot.Note = fmt.Sprintf("范围链或身份不可构造: %v", idn.err)
 		shot.elapsedFrom(started)
 		return shot
 	}
+	chain := idn.chain
 	shot.chain = chain
 	shot.judgeNow = now
 	shot.resource = "model:" + model
@@ -362,18 +379,21 @@ func (s *Server) policyJudge(rt *policyRuntime, scope, model, requestID, path st
 	shot.res = res
 	shot.Version = version
 
-	id, err := policyIdentity(scope)
-	if err != nil {
-		shot.Note = fmt.Sprintf("身份不可构造: %v", err)
-		shot.elapsedFrom(started)
-		return shot
-	}
+	id := idn.identity
 	shot.subject = id
 	ctx, err := policy.NewPolicyContext(id, policyPurposeFor(path), rt.dataLevel)
 	if err != nil {
 		shot.Note = fmt.Sprintf("策略上下文不合法: %v", err)
 		shot.elapsedFrom(started)
 		return shot
+	}
+	// 外部身份带来的主组织/主项目：这是 §9 缺的那一格 —— 按 org/project 写的条件规则
+	// （entitlement 的 conditions 精确比对 ctx.Organization/ctx.Project）到这一步才有值。
+	// 未绑定时两者为空，与今天逐字节相同（今天的 ctx 就没有这两个字段）。
+	if idn.org != "" {
+		ctx.Organization = idn.org
+		ctx.Project = idn.project
+		ctx = ctx.Normalize()
 	}
 	ctx.PolicyVersion = version
 	shot.judgeCtx = ctx

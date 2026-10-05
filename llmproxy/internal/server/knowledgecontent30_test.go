@@ -80,6 +80,38 @@ entitlements:
     expires_at: "2030-01-01T00:00:00Z"
 `
 
+// 与 policyBundleKBContent 逐条相同，只把范围换成 user:alice —— 这正是 P8-5 要拦的形态：
+// 「用户级范围替自己开正文注入」。内容文件里的 scope 必须与配置引用逐字一致
+// （loadOneBundle 会核对），所以这条夹具只能配 kbContentSetup.bundleScope="user:alice" 一起用。
+//
+// 授权仍然显式给 alice：这不是「没授权」那种（那种按不注入处理），
+// 而是「授权存在、来源层级不对」——判定的两支必须分开，混起来会把「管理员没授权」
+// 也报成越权。
+const policyBundleKBContentUserScope = `
+id: t-open
+version: 1
+scope: user:alice
+entitlements:
+  - subject: "*"
+    resource: "model:*"
+    action: use
+    effect: allow
+  - subject: "*"
+    resource: "knowledge:kb-open"
+    action: read
+    effect: allow
+  - subject: alice
+    resource: "knowledge.content"
+    action: read
+    effect: allow
+    expires_at: "2030-01-01T00:00:00Z"
+  - subject: alice
+    resource: "body.raw"
+    action: read
+    effect: allow
+    expires_at: "2030-01-01T00:00:00Z"
+`
+
 // 只给 knowledge.content、没有 body.raw：两道锁各自独立，缺后者时委托请求
 // 不许带原文检索词（而协议没有「送脱敏检索词」形态，所以整条取正文必须停）。
 const policyBundleKBContentNoRaw = `
@@ -202,8 +234,12 @@ type kbContentSetup struct {
 	switchOn bool
 	// bundle 是本用例的策略包内容（空则用 policyBundleKBContent）。
 	bundle string
-	mode   string
-	decls  []string
+	// bundleScope 是配置引用与内容文件共用的策略包范围（空则 system:gateway）。
+	// 内容文件里的 scope 必须与它逐字一致（loadOneBundle 核对），所以要变范围
+	// 只能从这一处变，改 bundle 字符串里的 scope 会加载失败。
+	bundleScope string
+	mode        string
+	decls       []string
 	// endpointList 覆盖声明的 allowed_endpoints（nil = 两个端点都写）。
 	endpointList []string
 	// params 是运行参数文件内容（空则不写文件，走「参数文件可选」那条支路）。
@@ -221,7 +257,11 @@ func (s kbContentSetup) harness(t *testing.T) *muHarness {
 	t.Helper()
 	src := cfgYAML(map[string]string{"vendorA": s.upstream}, []string{"sk-local"})
 	if s.mode != "" {
-		src += policySection(s.mode, "t-open", "system:gateway", 1)
+		scope := s.bundleScope
+		if scope == "" {
+			scope = "system:gateway"
+		}
+		src += policySection(s.mode, "t-open", scope, 1)
 	}
 	src += "knowledge_sources:\n" +
 		"  - name: t-src\n" +
@@ -708,5 +748,54 @@ func TestKbContentEndpointsEnumerateBothEntrypoints(t *testing.T) {
 	}
 	if len(d.contentSources()) != 1 {
 		t.Errorf("参与正文交付的源 = %d，想要 1", len(d.contentSources()))
+	}
+}
+
+// P8-5：注入的启用权只认平台/组织级授权。用户级策略包即便显式授了 knowledge.content
+// 与 body.raw，也不能替自己开这条闸 —— enforce 下命中它的请求被拒，而不是悄悄注入。
+//
+// 这条钉的是「谁授权」这条运行期判定真的在跑：声明表住在平台配置文件里是结构事实，
+// 而「用户级不得自助开启」必须能被运行时判出来（决策包 §0.1 第 1 条；「显式判定并入 P8」
+// 的完成判据）。判定的两支在这里同时被钉住：
+//   - 授权来源是 user 级 → 拒（本用例）；
+//   - 授权来源是平台级（system:gateway，见 policyBundleKBContent）→ 正常注入，
+//     就是 TestKbContentInjectDeliversIntoUpstreamBody 那一支（同一条声明、同一条链）。
+//
+// 与 TestKbContentWithoutRawTermsGrantSendsNothing 的区别是判定的两支：
+// 那一条是「没有授权」（按不注入处理），这一条是「授权在、层级不对」（按拒处理）——
+// 合起来会把「管理员没授权」误报成越权。
+func TestKbContentUserScopedBundleCannotSelfEnableInject(t *testing.T) {
+	up := startProcUpstream(t, procJSON("pong"))
+	search := startKBStub(t)
+	deliver := startKBDeliverStub(t)
+
+	setup := kbContentSetup{upstream: up.url(), search: search.url(), deliver: deliver.url(),
+		switchOn: true, mode: "enforce", failClosed: true, bundle: policyBundleKBContentUserScope,
+		bundleScope: "user:alice", params: `{"max_passages":2,"max_total_bytes":4096}`}
+	setup.decls = []string{kbContentDecl(setup)}
+	h := setup.harness(t)
+	token := kbContentUser(t, h, "alice", setup.upstream)
+
+	resp, body := kbContentChat(t, h, token, "req-kbc-selfenable", "报销标准是什么")
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("用户级包不得自助开启注入，应拒而不是注入，实际 %d: %s",
+			resp.StatusCode, truncateMsg(string(body), 300))
+	}
+	if got := errorKind(t, body); got != "processor_unavailable" {
+		t.Errorf("错误类型 = %q，想要 processor_unavailable（越权与装配失败对外同形）", got)
+	}
+	// 拒绝发生在装配期：一个字节的委托都不出网，上游也拿不到任何东西。
+	if n := up.count(); n != 0 {
+		t.Errorf("被拒的请求不该打到上游，实际 %d 次", n)
+	}
+	if n := search.calls() + deliver.calls(); n != 0 {
+		t.Errorf("越权请求不该惊动知识源，实际出网 %d 次", n)
+	}
+	if n := len(kbContentRows(t, h, "alice")); n != 0 {
+		t.Errorf("没有交付动作就不该有正文留痕，实际 %d 条", n)
+	}
+	// 可观测：这次越权要被点名计一次（面板/健康检查据此看见「有人想替自己开闸」）。
+	if got, _ := h.srv.metrics.injectionSnapshot()["enable_denied"].(int64); got != 1 {
+		t.Errorf("enable_denied = %d，想要 1", got)
 	}
 }

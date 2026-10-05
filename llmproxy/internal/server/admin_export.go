@@ -35,6 +35,9 @@ func (s *Server) adminUsageExport(w http.ResponseWriter, r *http.Request) {
 		}
 		scope = &ref
 	}
+	if !s.exportScopeGuard30(w, r, scope) {
+		return
+	}
 	since, err := parseExportDay(q.Get("since"))
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "since: "+err.Error())
@@ -62,6 +65,7 @@ func (s *Server) adminUsageExport(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusInternalServerError, "internal", err.Error())
 			return
 		}
+		s.auditUsageExport30(scope, "monthly", len(rows))
 		if err := cw.Write([]string{
 			"month", "scope_kind", "scope_id", "requests", "ok", "failed",
 			"total_tokens", "charge", "frozen_charges",
@@ -85,6 +89,7 @@ func (s *Server) adminUsageExport(w http.ResponseWriter, r *http.Request) {
 	}
 	pricing := s.cfgStore.Current().Pricing
 	now := time.Now()
+	s.auditUsageExport30(scope, "daily", len(rows))
 	if err := cw.Write([]string{
 		"day", "scope_kind", "scope_id", "provider", "model", "upstream_model", "system_paid",
 		"requests", "ok", "failed",
@@ -130,6 +135,64 @@ func parseExportDay(s string) (time.Time, error) {
 		return time.Time{}, nil
 	}
 	return time.ParseInLocation("2006-01-02", s, time.Local)
+}
+
+// exportScopeGuard30 是「按范围的显式授权」——裁决 14′ 把它并入 P8，落点就是决策包 §7
+// 点名的那个位置：parseScopeParam 之后、读数据之前。两处导出（量、证据链）共用它。
+//
+// 语义是**只收窄、不放开**，所以它只在一件事上说话：
+//   - 没带 X-Identity-Token：返回 true（管理凭证即够，今天的行为逐字节不变）；
+//   - 带了：请求的精确 scope 必须落在这枚 token 的范围链里；没点名 scope（= 导全部）
+//     在这条路径上等于「要链外的数据」，拒；token 校验不了（未配身份 / 无效 / 过期）也拒。
+//
+// 为什么不做「带了 token 就自动收窄到它的链」那种更宽的解释：那是替调用方猜它想要什么，
+// 而这里没有可猜的默认 —— token 是调用方自报的约束，网关能做的是「要么照它收窄、要么不服务」。
+// 把自报约束当可选项忽略，等于让一枚本该只覆盖一个组织的凭据能导出整个网关的记录，
+// 与「任何降级不得绕过权限」相反。
+//
+// 回话只有原因类别与范围串，绝不含 token 原文、claims 或用户的其它数据。
+func (s *Server) exportScopeGuard30(w http.ResponseWriter, r *http.Request, scope *policy.ScopeRef) bool {
+	token := strings.TrimSpace(r.Header.Get(IdentityHeaderName))
+	if token == "" {
+		return true
+	}
+	requestID := strings.TrimSpace(r.Header.Get("X-Request-Id"))
+	chain, err := s.exportIdentityChain30(token, requestID)
+	if err != nil {
+		writeJSONError(w, http.StatusForbidden, "export_scope_denied",
+			"导出请求带了 "+IdentityHeaderName+" 但无法据此授权（"+exportIdentityErrText(err)+"）；"+
+				"要么去掉该头、改用管理凭证导出，要么换一枚可校验的 token")
+		return false
+	}
+	if scope == nil {
+		writeJSONError(w, http.StatusForbidden, "export_scope_denied",
+			"带 "+IdentityHeaderName+" 时必须显式指定 scope，且它要落在这枚 token 的范围链里"+
+				"（不写 scope 等于导出全部范围，那超出 token 能证明的范围）")
+		return false
+	}
+	if !chain.Includes(*scope) {
+		writeJSONError(w, http.StatusForbidden, "export_scope_denied",
+			fmt.Sprintf("请求的导出范围 %s 不在这枚 %s 的范围链内", scope.Display(), IdentityHeaderName))
+		return false
+	}
+	return true
+}
+
+// auditUsageExport30 给用量导出的出口留痕。与 replay.export 同一口径：
+// target 是范围全串（不过滤写 "usage"），一次 200 就一条痕。
+//
+// 为什么这条不能省：导出的 CSV 带金额，是「谁在什么时候导了哪个范围的账」这件事本身；
+// 之前 usage.export 是唯一一个没有出口留痕的导出口（replay.export 早就有），
+// 一个能被脚本批量拉账而不留痕的口，在事后追责里是一段空白。
+func (s *Server) auditUsageExport30(scope *policy.ScopeRef, kind string, rows int) {
+	target := "usage"
+	desc := "全部范围"
+	if scope != nil {
+		target = scope.Display()
+		desc = "范围 " + target
+	}
+	s.auditAt(policy.SystemScope, "admin", "usage.export", target,
+		fmt.Sprintf("导出用量（%s，%s）：%d 行", kind, desc, rows))
 }
 
 // auditAt 记一条带范围的审计（密钥/令牌永不进 detail）。

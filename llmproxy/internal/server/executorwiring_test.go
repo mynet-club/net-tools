@@ -103,7 +103,7 @@ func execPlanOf(t *testing.T, h *harness, model string) (policyCandidateSnapshot
 		t.Fatal("enforce 下应有策略运行态，却没有 —— 后面的断言全部失去意义")
 	}
 	providers, _ := h.srv.providersFor("", model)
-	shot := h.srv.policyJudge(rt, "", model, "req-wire-plan", "/v1/chat/completions", providers, "", time.Now())
+	shot := h.srv.policyJudge(rt, "", model, "req-wire-plan", "/v1/chat/completions", providers, "", time.Now(), "")
 	if shot == nil || shot.PlanErr != nil || len(shot.Plan.Fallbacks) == 0 {
 		t.Fatalf("计划应当有候选，实际: %+v", shot)
 	}

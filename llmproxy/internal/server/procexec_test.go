@@ -401,7 +401,7 @@ func TestProcessorChainFeedsRoutingPlan(t *testing.T) {
 		t.Fatal("enforce 下应有策略运行态")
 	}
 	providers, _ := h.srv.providersFor("", "gpt-4o")
-	shot := h.srv.policyJudge(rt, "", "gpt-4o", "req-plan-chain", "/v1/chat/completions", providers, "", time.Now())
+	shot := h.srv.policyJudge(rt, "", "gpt-4o", "req-plan-chain", "/v1/chat/completions", providers, "", time.Now(), "")
 	if shot == nil || shot.PlanErr != nil {
 		t.Fatalf("应出计划: %+v", shot)
 	}

@@ -125,6 +125,10 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 	scope := auth.UserName
 	bucket := auth.Bucket // 熔断状态落哪个桶（结构化范围，见 authResult.Bucket）
 
+	// 外部 IdP token（§9 P8）：只在这条请求的四个链构造点之间透传，不落库、不写日志。
+	// 取一次而不是每个调用点各取一次：四个点拿到的必须是同一枚凭证。
+	identityToken := r.Header.Get(IdentityHeaderName)
+
 	// 记账的归属跟**身份**走，不跟熔断桶走：静态 key 与匿名本机请求的桶是
 	// system:global，那只说明「这次用的是全局池」，不代表这笔账记在系统头上
 	// （§2.7 规则 5：没有归属就留空，不猜）。DB 用户则在这里把结构化范围定实，
@@ -211,7 +215,7 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 	// 再调一次 policyFor 就等于允许两次取到不同修订的配置。
 	rt := s.policyFor(cfg)
 	shot := s.policyEvaluate(rt, scope, probe.Model, requestID, r.URL.Path,
-		providers, affinityPrefer, started)
+		providers, affinityPrefer, started, identityToken)
 	if shot != nil {
 		// 影子也写 policy_version（§3.0 明文要求）；routing_seed / 代 / 候选摘要**不写**，
 		// 那三个字段描述的是真正跑过的计划，写进去等于让回放在复现一次没发生的决策。
@@ -306,7 +310,7 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 	// §3.0 执行期接线：processors 段的声明在 enforce 下真的跑起来（见 procexec.go 文件头）。
 	// 位置排在判定与配额之后、选路之前 —— 被策略拒掉的请求不该再去打 sidecar，
 	// 而「before-route」的语义边界是这次请求实际选哪家。
-	pc := s.processorCall(rt, scope, requestID, probe.Model, r.URL.Path, probe.Stream, started)
+	pc := s.processorCall(rt, scope, requestID, probe.Model, r.URL.Path, probe.Stream, started, identityToken)
 	if pc != nil {
 		// audit 阶段的正文句柄在 E 包里是结构性缺席的，这里能带的只有结论元数据。
 		// ctx 用 WithoutCancel：请求已经结束时 r.Context() 必然已取消，

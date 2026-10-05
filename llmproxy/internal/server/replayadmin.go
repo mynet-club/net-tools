@@ -168,17 +168,27 @@ func (s *Server) adminReplaySampling(w http.ResponseWriter, r *http.Request) {
 // scope 接受任意种类（2026-10-04 裁决第 7 条 C）：user / organization / project / system
 // 都认，命中条件是「这次判定的请求范围等于它，或当时的范围链里有它」。放开的代价要摊开说：
 // 一次导出的暴露面从一个人涨到一个组织，而响应体带 subject 与规则标识 —— 这是 §2.9
-// 规则 6 意义上的暴露等级变化。今天的授权口径与其它管理口相同（管理凭证，不分范围），
-// 「要不要按范围再收一层授权」留给主线，不在这包里自行加机制。
+// 规则 6 意义上的暴露等级变化。授权口径：管理凭证即够（裁决 14′），**若请求另带
+// X-Identity-Token 则按它的范围链收窄**（同一裁决的「按范围显式授权」并入 P8，
+// 见 exportScopeGuard30）；不带 token 时与放开当初逐字节相同。
 func (s *Server) adminReplayExport(w http.ResponseWriter, r *http.Request) {
-	var filter policy.ScopeRef
+	var filterPtr *policy.ScopeRef
 	if raw := strings.TrimSpace(r.URL.Query().Get("scope")); raw != "" {
 		ref, err := parseScopeParam(raw)
 		if err != nil {
 			writeJSONError(w, http.StatusBadRequest, "invalid_request_error", "scope: "+err.Error())
 			return
 		}
-		filter = ref
+		filterPtr = &ref
+	}
+	// 按范围的显式授权（裁决 14′ 并入 P8，落点就是这一段）：带了 IdP token 时，
+	// 请求的精确范围必须落在它的链里，且必须点名范围。不带 token 时与今天逐字节相同。
+	if !s.exportScopeGuard30(w, r, filterPtr) {
+		return
+	}
+	var filter policy.ScopeRef
+	if filterPtr != nil {
+		filter = *filterPtr
 	}
 	f, dropped, failed := s.replayWin.file(filter)
 	data, err := replay.Encode(f)

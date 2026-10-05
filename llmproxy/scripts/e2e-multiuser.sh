@@ -55,6 +55,22 @@ else
   echo "  网关用外部产物：${BIN}（$("${BIN}" --version 2>/dev/null | head -1)）"
 fi
 (cd "$SRC" && go build -o "$STUB" ./cmd/e2estub) || exit 1
+# §24 用的假 IdP：一次运行里签出 JWKS 与 token（同一把一次性密钥，天然一致）。
+# 它是**独立进程**签的 token、JWKS 是磁盘上的文件 —— 网关那边走的是与生产逐字相同的
+# 验签路径（iss/aud/kid/RS256 一样不放松），这正是「配置面 + 键来源」只在接线上才成立的那一段。
+IDP="$H/e2eidp"
+(cd "$SRC" && go build -o "$IDP" ./cmd/e2eidp) || exit 1
+# issuer/audience 在脚本里只定义一次：写进 config.yaml 与传给假 IdP 的必须是同一个值，
+# 否则「验签不过」会是配置写错而不是身份链路的问题，这一节就失去了鉴别力。
+IDP_ISSUER="https://idp.e2e.local"
+IDP_AUDIENCE="llmproxy-e2e"
+IDP_JWKS="$H/jwks.json"
+IDP_OUT=$("$IDP" -jwks "$IDP_JWKS" -issuer "$IDP_ISSUER" -audience "$IDP_AUDIENCE" \
+  -profiles "teacher-2001,student-1001") || { echo "  [NG] 假 IdP 没能签发 token"; exit 1; }
+I_TOKEN_GOOD=$(printf '%s\n' "$IDP_OUT" | sed -n '1p')
+I_TOKEN_OTHER=$(printf '%s\n' "$IDP_OUT" | sed -n '2p')
+[ -n "$I_TOKEN_GOOD" ] && [ -n "$I_TOKEN_OTHER" ] || { echo "  [NG] 假 IdP 只签出一枚 token"; exit 1; }
+[ -f "$IDP_JWKS" ] || { echo "  [NG] 假 IdP 没写出 JWKS：$IDP_JWKS"; exit 1; }
 
 echo "=== 临时运行时目录 $H ==="
 mkdir -p "$H/data" "$H/logs"
@@ -89,6 +105,15 @@ pricing:
 database:
   path: ""
   retain_days: 7
+# §24 的外部身份段。整段从启动就在配置里，但服务此刻是 legacy，identity 不参与判定
+# （与 policy 段同口径：回滚期间配置留着不动，切非 legacy 才生效）。
+# jwks_file 是相对配置文件目录 —— 这正是 §24 要验的「磁盘上的键来源」那一段。
+identity:
+  provider: oidc
+  source: campus-oidc
+  issuer: "$IDP_ISSUER"
+  audience: "$IDP_AUDIENCE"
+  jwks_file: jwks.json
 log:
   level: info
   max_mb: 10
@@ -1445,6 +1470,130 @@ chk "清空处理器声明（显式保存 []）" "$(PUTPROC)" "200"
 chk "回滚到 legacy 收尾" "$(POLICY_MODE '{"mode":"legacy"}')" "200"
 sleep 2.5
 echo "    假名读数：${P1} / ${M1}（换密钥后 ${P2}）"
+
+# 24. 3.0 外部身份（P8）：真 IdP 签的 token → org 进链 → 组织级导出第一次有真数据。
+#
+# 单元夹具能证明函数语义，证不了的是只在接线上成立的四件事：
+#   - identity 段从**磁盘上的 JWKS 文件**起验签链路（相对配置文件目录解析），
+#     token 由独立进程用一次性密钥现签 —— 配置面与键来源只有这里跑得出来；
+#   - 逐请求绑定要 subject 与网关用户名**逐字相同**才并入 org/project（P8-3）；
+#     带了别人的 token 只能退回，绝不能借它扩散权限；
+#   - 组织级导出因此第一次命中真记录（P8-4 收益：链里有 org + 过滤按链匹配）；
+#   - 导出的显式授权只收窄：带 token 时范围必须落在链内且必须点名，不带 token 时逐字节不变。
+echo
+echo "=== 24. 3.0 外部身份：每请求 IdP token（P8）==="
+
+# 24a 先造一处「只有链里有 organization:university 才放行」的判定：
+# 把 base 包收敛成只放行 base-ok，org 包（scope organization:university）单独放行 org-only-model。
+# 少这份收敛，base 原来的 model:* 会替所有人放行，org 条件就形同虚设、测不出绑定。
+code=$(curl -s -o "$H/pub-base2.json" -w '%{http_code}' -X PUT "$GW/v1/_admin/policy/bundles/e2e-base" \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d "{
+  \"version\": 2, \"scope\": \"system:global\", \"entitlements\": [
+    {\"subject\":\"*\",\"resource\":\"model:base-ok\",\"action\":\"use\",\"effect\":\"allow\"}
+  ]}")
+chk "把 base 包收到只放行 base-ok（v2）" "$code" "200"
+code=$(curl -s -o "$H/pub-org.json" -w '%{http_code}' -X PUT "$GW/v1/_admin/policy/bundles/e2e-org" \
+  -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' -d "{
+  \"version\": 1, \"scope\": \"organization:university\", \"entitlements\": [
+    {\"subject\":\"*\",\"resource\":\"model:org-only-model\",\"action\":\"use\",\"effect\":\"allow\"}
+  ]}")
+chk "发布组织范围策略包（scope organization:university）" "$code" "200"
+chk "进入 enforce（public）" "$(POLICY_MODE '{"mode":"enforce","data_level":"public"}')" "200"
+sleep 2.5
+
+# 网关用户名必须与 token 的 subject 逐字相同（uid-tea-2001 对应 teacher-2001 画像）：
+# 这是「这枚 token 就是这个用户」的唯一凭据，也是 P8-3 绑定成立的前提。
+IDN_USER="uid-tea-2001"
+I_TOKEN=$("$BIN" user add "$IDN_USER" | sed -n 's/.*下游 token: //p' | tr -d ' ')
+"$BIN" user mode "$IDN_USER" consumption >/dev/null
+sleep 2.6
+
+# 24b 逐请求绑定：不带 token → org 条件不满足 → 403；带对 token → org 进链 → 200。
+chk "不带外部 token：org 条件不满足，org-only-model 403" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/chat/completions" \
+     -H "Authorization: Bearer $I_TOKEN" -H 'Content-Type: application/json' \
+     -d '{"model":"org-only-model","messages":[{"role":"user","content":"hi"}]}')" "403"
+ORG_RID="e2e-idn-org-$$"
+chk "带有效 IdP token：org 进链，org-only-model 200" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/chat/completions" \
+     -H "Authorization: Bearer $I_TOKEN" -H "X-Identity-Token: $I_TOKEN_GOOD" -H "X-Request-Id: $ORG_RID" \
+     -H 'Content-Type: application/json' \
+     -d '{"model":"org-only-model","messages":[{"role":"user","content":"hi"}]}')" "200"
+# 拿**别人的**有效 token：subject 与网关认定不符 → 必须退回（不绑、不并 org），
+# 于是 org 条件不满足 → 403。这一格是「绝不借他人 token 扩散权限」的实况。
+chk "带他人 token：subject 不符 → 退回 → 403" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/chat/completions" \
+     -H "Authorization: Bearer $I_TOKEN" -H "X-Identity-Token: $I_TOKEN_OTHER" -H 'Content-Type: application/json' \
+     -d '{"model":"org-only-model","messages":[{"role":"user","content":"hi"}]}')" "403"
+BOUND=$(curl -s "$GW/healthz" | python3 -c 'import json,sys;print(json.load(sys.stdin)["metrics"]["identity"]["bound"])')
+MISMATCH=$(curl -s "$GW/healthz" | python3 -c 'import json,sys;print(json.load(sys.stdin)["metrics"]["identity"]["unbound"]["subject_mismatch"])')
+[ "${BOUND:-0}" -ge 1 ] && pass "绑定进 /healthz（bound=${BOUND}）" || fail "身份绑了却没计数：$BOUND"
+[ "${MISMATCH:-0}" -ge 1 ] && pass "subject 不符也单列计数（mismatch=${MISMATCH}）" || fail "mismatch 没计数：$MISMATCH"
+
+# 24c 采集与导出：org 级导出第一次命中真记录（P8-3 + P8-4 的自然结果）。
+"$BIN" replay on >/dev/null 2>&1 && pass "replay on" || fail "replay on 失败"
+OTH_RID="e2e-idn-static-$$"
+curl -s -o /dev/null -X POST "$GW/v1/chat/completions" -H "Authorization: Bearer $I_TOKEN" \
+  -H "X-Identity-Token: $I_TOKEN_GOOD" -H "X-Request-Id: $ORG_RID" \
+  -H 'Content-Type: application/json' -d '{"model":"org-only-model","messages":[{"role":"user","content":"hi"}]}'
+# 再采一条静态 key 的：它的链是 system:global，不该出现在 org 导出里（范围不串）。
+curl -s -o /dev/null -X POST "$GW/v1/chat/completions" -H "Authorization: Bearer sk-single-user" \
+  -H "X-Request-Id: $OTH_RID" -H 'Content-Type: application/json' \
+  -d '{"model":"base-ok","messages":[{"role":"user","content":"hi"}]}'
+# 不带 token 导组织范围：管理凭证即够（裁决 14′ 的前提），且拿到的是那条绑定判定。
+curl -s -o "$H/exp-idn-org.json" "$GW/v1/_admin/replay/export?scope=organization:university" \
+  -H "Authorization: Bearer $ADMIN"
+chk "组织级导出命中身份绑定那条（不带 token，管理凭证即够）" "$(rec_ids "$H/exp-idn-org.json")" "$ORG_RID"
+if grep -q "$OTH_RID" "$H/exp-idn-org.json"; then fail "组织导出串进了静态 key 的记录"; else pass "组织导出不含系统范围那条"; fi
+# 带 token 导链内范围：收窄之后仍拿得到同一条。
+curl -s -o "$H/exp-idn-org2.json" "$GW/v1/_admin/replay/export?scope=organization:university" \
+  -H "Authorization: Bearer $ADMIN" -H "X-Identity-Token: $I_TOKEN_GOOD"
+chk "带 token 导链内范围：200 且同一条" "$(rec_ids "$H/exp-idn-org2.json")" "$ORG_RID"
+
+# 24d 导出闸门只收窄（P8-4 的核心）。
+# 链外的组织 + token → 403；拒因是 export_scope_denied。
+chk "带 token 导链外组织 → 403" \
+  "$(curl -s -o "$H/exp-idn-out.json" -w '%{http_code}' "$GW/v1/_admin/replay/export?scope=organization:partner-institute" \
+     -H "Authorization: Bearer $ADMIN" -H "X-Identity-Token: $I_TOKEN_GOOD")" "403"
+grep -q 'export_scope_denied' "$H/exp-idn-out.json" && pass "拒因是 export_scope_denied" || fail "拒因不对：$(cat "$H/exp-idn-out.json")"
+# 同一枚 token 不点名范围（= 要全部）：403。
+chk "带 token 不点名范围 → 403（不写等于导全部）" \
+  "$(curl -s -o /dev/null -w '%{http_code}' "$GW/v1/_admin/replay/export" \
+     -H "Authorization: Bearer $ADMIN" -H "X-Identity-Token: $I_TOKEN_GOOD")" "403"
+# 无效 token：403，且回话里不留 token 原文。
+chk "无效 token → 403" \
+  "$(curl -s -o "$H/exp-idn-bad.json" -w '%{http_code}' "$GW/v1/_admin/replay/export?scope=organization:university" \
+     -H "Authorization: Bearer $ADMIN" -H "X-Identity-Token: not-a-jwt")" "403"
+if grep -q "$I_TOKEN_GOOD" "$H/exp-idn-out.json" "$H/exp-idn-bad.json" 2>/dev/null; then
+  fail "403 回话泄漏了 token 原文"
+else
+  pass "403 回话不含 token 原文"
+fi
+# 不带 token 时行为逐字节不变：链外组织照旧 200（管理凭证即够），不点名也 200。
+chk "不带 token 导链外组织 → 200（行为不变）" \
+  "$(curl -s -o /dev/null -w '%{http_code}' "$GW/v1/_admin/replay/export?scope=organization:partner-institute" \
+     -H "Authorization: Bearer $ADMIN")" "200"
+chk "不带 token 不点名范围 → 200（行为不变）" \
+  "$(curl -s -o /dev/null -w '%{http_code}' "$GW/v1/_admin/replay/export" -H "Authorization: Bearer $ADMIN")" "200"
+# 用量导出共用同一道闸门：链外范围 + token → 403。
+chk "用量导出共用闸门（链外 + token → 403）" \
+  "$(curl -s -o /dev/null -w '%{http_code}' "$GW/v1/_admin/usage/export?scope=organization:partner-institute" \
+     -H "Authorization: Bearer $ADMIN" -H "X-Identity-Token: $I_TOKEN_GOOD")" "403"
+# 泄漏面：token 不该出现在记录文件、审计或网关日志里。
+if grep -q "$I_TOKEN_GOOD" "$H/exp-idn-org.json" 2>/dev/null; then fail "导出记录里出现 token 原文"; else pass "导出记录不含 token 原文"; fi
+chk "审计里没有 token 原文" \
+  "$(sqlite3 "$DB" "SELECT COUNT(*) FROM audit_log WHERE detail LIKE '%$I_TOKEN_GOOD%';")" "0"
+if grep -q "$I_TOKEN_GOOD" "$GWLOG" 2>/dev/null; then fail "网关日志里出现 token 原文"; else pass "网关日志不含 token 原文"; fi
+"$BIN" replay off >/dev/null 2>&1 && pass "取完把采集关掉" || fail "replay off 失败"
+
+# 24e 回滚：legacy 下策略不参与，org-only-model 不再受组织条件管（行为恢复）。
+chk "切回 legacy" "$(POLICY_MODE '{"mode":"legacy"}')" "200"
+sleep 2.5
+chk "legacy 下模型不再受策略管辖（行为恢复）" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/chat/completions" \
+     -H "Authorization: Bearer $I_TOKEN" -H 'Content-Type: application/json' \
+     -d '{"model":"org-only-model","messages":[{"role":"user","content":"hi"}]}')" "200"
+echo "    身份读数：bound=$BOUND mismatch=$MISMATCH 组织导出=$(rec_ids "$H/exp-idn-org.json")"
 
 echo
 echo "================ 结果：通过 $PASS 项，失败 $FAIL 项 ================"

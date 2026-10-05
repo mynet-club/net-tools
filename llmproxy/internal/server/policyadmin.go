@@ -321,7 +321,10 @@ func (s *Server) adminPolicySimulate(w http.ResponseWriter, r *http.Request) {
 		sticky = s.affinity.Get(scope, req.SessionID, model)
 	}
 
-	shot := s.policyJudge(rt, scope, model, requestID, path, providers, sticky, s.now())
+	// 管理口的路由模拟**不带外部身份 token**：模拟的是「这个人调用这个模型会怎样」，
+	// 而模拟请求一旦接受外来的 IdP token，就把一条人为构造的判定掺进了「运维看到的
+	// 现网结论」里（§3.0 线 1 同一条理由）。要模拟带 org 的真实形态，走 e2e 真流量。
+	shot := s.policyJudge(rt, scope, model, requestID, path, providers, sticky, s.now(), "")
 	// enforce 作用面单独算一次：shadow 下线上请求不受影响，而运维要看的正是
 	// 「明天切成 enforce 会发生什么」。这一步不写任何东西，见 applyPolicyVerdict。
 	// enforce 作用面在**副本**上算：applyPolicyVerdict 会写 Note，而「这个范围没有生效的

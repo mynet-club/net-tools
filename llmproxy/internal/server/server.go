@@ -222,7 +222,9 @@ func (s *Server) withCORS(next http.Handler) http.Handler {
 	const (
 		allowOrigin  = "*"
 		allowMethods = "GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS"
-		allowHeaders = "Authorization, Content-Type, Accept, X-Requested-With"
+		// X-Identity-Token 是外部 IdP token（§9 P8）。它必须在这里放行，否则浏览器端
+		// 控制台无法把外部身份带进来（预检不过，请求根本发不出去）。
+		allowHeaders = "Authorization, Content-Type, Accept, X-Requested-With, X-Identity-Token"
 		maxAge       = "86400"
 	)
 	apply := func(w http.ResponseWriter) {

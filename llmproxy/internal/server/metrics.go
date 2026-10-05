@@ -60,6 +60,22 @@ type runtimeMetrics struct {
 	kbMs        int64
 	kbCitations int64
 	kbTruncated int64
+
+	// 外部身份绑定统计（§9 P8）。这一组回答「这次到底有没有把 IdP token 绑上」——
+	// 请求记录里只留最终范围链，看不出链里的 org/project 是自己带的还是没带上。
+	// 四种没绑上的原因各自指向不同处置，不能混成一个「未绑定」数：
+	//   no_token=客户端没带（推广期正常）、invalid=验签/时效失败、subject_mismatch=
+	//   拿的是别人的 token、static_key=静态 key 没有用户归属（永远绑不上）。
+	idnBound     atomic.Int64
+	idnNoToken   atomic.Int64
+	idnInvalid   atomic.Int64
+	idnMismatch  atomic.Int64
+	idnStaticKey atomic.Int64
+
+	// injectDenied 记「用户级范围想替自己开正文注入」被运行期判掉的次数（P8-5）。
+	// 单列一格而不是并进通用拒绝数：这是一个安全结论（谁想越权开闸），
+	// 处置动作与「声明装配不起来」完全不同 —— 前者要收紧策略包，后者要修配置文件。
+	injectDenied atomic.Int64
 }
 
 // latRingSize 足够估出 p99，又不至于在高 QPS 下变成延迟采样器的内存负担。
@@ -147,6 +163,66 @@ func (m *runtimeMetrics) setPolicyVersion(v string) {
 		return
 	}
 	m.policyVersion.Store(v)
+}
+
+// noteIdentity 累计一次外部身份绑定结论。reason 取值空间是封闭的（见 requestIdentity30）：
+// 传入未知取值不 panic 也不计数 —— 指标标签跟着请求内容长等于让一次配错把序列数打爆。
+func (m *runtimeMetrics) noteIdentity(reason string) {
+	if m == nil {
+		return
+	}
+	switch reason {
+	case "bound":
+		m.idnBound.Add(1)
+	case "unbound_no_token":
+		m.idnNoToken.Add(1)
+	case "unbound_invalid":
+		m.idnInvalid.Add(1)
+	case "unbound_subject_mismatch":
+		m.idnMismatch.Add(1)
+	case "unbound_static_key":
+		m.idnStaticKey.Add(1)
+	}
+}
+
+// identitySnapshot 给出外部身份绑定的读数。
+func (m *runtimeMetrics) identitySnapshot() map[string]any {
+	if m == nil {
+		return nil
+	}
+	return map[string]any{
+		"bound": m.idnBound.Load(),
+		"unbound": map[string]int64{
+			"no_token":         m.idnNoToken.Load(),
+			"invalid":          m.idnInvalid.Load(),
+			"subject_mismatch": m.idnMismatch.Load(),
+			"static_key":       m.idnStaticKey.Load(),
+		},
+	}
+}
+
+// noteInjectEnableDenied 累计一次「用户级范围不得自助开启注入」的运行期拒绝（P8-5）。
+//
+// 与 noteIdentity 同一条纪律：这是个结论计数，没有可传的标签 ——
+// 谁想开、哪条链，已经在拒绝那一刻的 WARN 日志里点名，指标只回答「发生过几次」。
+func (m *runtimeMetrics) noteInjectEnableDenied() {
+	if m != nil {
+		m.injectDenied.Add(1)
+	}
+}
+
+// injectionSnapshot 给出正文注入启用权判定的读数。
+//
+// 只有一格 denied 是有意的：正常形态（平台/组织级授权、或这条链上没有注入声明）
+// 不计数 —— 把「没被拦」也记一笔等于把指标养成第二张请求表（§6 体积），
+// 而「拦了几次」才是要长期看得见的那个安全信号。
+func (m *runtimeMetrics) injectionSnapshot() map[string]any {
+	if m == nil {
+		return nil
+	}
+	return map[string]any{
+		"enable_denied": m.injectDenied.Load(),
+	}
 }
 
 // shadowSnapshot 给出影子统计的一致率与均耗时。
@@ -419,6 +495,8 @@ func (m *runtimeMetrics) snapshot() map[string]any {
 		"policy_shadow":  m.shadowSnapshot(),
 		"executor":       m.executorSnapshot(),
 		"knowledge":      m.knowledgeSnapshot(),
+		"identity":       m.identitySnapshot(),
+		"injection":      m.injectionSnapshot(),
 	}
 }
 
