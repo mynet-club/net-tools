@@ -217,6 +217,11 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 	shot := s.policyEvaluate(rt, scope, probe.Model, requestID, r.URL.Path,
 		providers, affinityPrefer, started, identityToken)
 	if shot != nil {
+		// 身份来源（2026-10-05 裁决，决策包 §0.3）：这一列与 policy_version 同一层 ——
+		// 只要 3.0 判过就写，无论计划有没有真正作用到本请求。它补的是耐久缺口：
+		// 回放记录里虽然带同一事实，但那是**有界内存窗口、缺省关闭**，
+		// 离线审计要给 `source:` 条件复算，只能靠库里这一列。
+		rec.IdentitySource = shot.idSource
 		// 影子也写 policy_version（§3.0 明文要求）；routing_seed / 代 / 候选摘要**不写**，
 		// 那三个字段描述的是真正跑过的计划，写进去等于让回放在复现一次没发生的决策。
 		rec.PolicyVersion = shot.Version

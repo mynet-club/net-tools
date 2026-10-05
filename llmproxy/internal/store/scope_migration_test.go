@@ -229,11 +229,13 @@ func TestScopeMigrationRollsBackOnLateVerifyFailure(t *testing.T) {
 	if has, err := columnExists(db, "provider_stats", "scope"); err != nil || !has {
 		t.Errorf("回滚后 provider_stats.scope 应当还在（那是唯一的退路）: has=%v err=%v", has, err)
 	}
-	// 执行面摘要两列（版本 4）和 scope 两列一样是本轮补的，回滚必须一并撤掉：
-	// 留着它们，「结构退回 2.x」这句话就是假的——老库会被读成「有摘要列、只是没值」。
+	// 执行面摘要两列（版本 4）、身份来源列（版本 5）和 scope 两列一样是本轮补的，
+	// 回滚必须一并撤掉：留着它们，「结构退回 2.x」这句话就是假的
+	// —— 老库会被读成「有摘要列/身份来源列、只是没值」。
 	for _, t2 := range []struct{ table, col string }{
 		{"provider_stats", "scope_kind"}, {"user_prices", "scope_id"},
 		{"requests", "routing_seed"}, {"requests", "executor"}, {"requests", "exchange_reason"},
+		{"requests", "identity_source"},
 	} {
 		if has, err := columnExists(db, t2.table, t2.col); err != nil || has {
 			t.Errorf("回滚后 %s.%s 不该存在: has=%v err=%v", t2.table, t2.col, has, err)
@@ -275,7 +277,7 @@ func TestScopeMigrationRollsBackOnLateVerifyFailure(t *testing.T) {
 		t.Errorf("迁移完成后拼接列必须消失: has=%v err=%v", has, err)
 	}
 	// 补列路径也要走通：回滚删掉的列，第二轮得重新补上，且明细行还是那一条。
-	for _, col := range []string{"scope_kind", "routing_seed", "executor", "exchange_reason"} {
+	for _, col := range []string{"scope_kind", "routing_seed", "executor", "exchange_reason", "identity_source"} {
 		if has, err := columnExists(s.db, "requests", col); err != nil || !has {
 			t.Errorf("第二轮迁移后 requests.%s 应当存在: has=%v err=%v", col, has, err)
 		}
@@ -740,5 +742,50 @@ func TestRequestSummaryColumnsHealAfterVersionThree(t *testing.T) {
 	// 明细行没被这次启动动过。
 	if n, err := dbScalarInt(s2.db, s2.dialect, "SELECT COUNT(*) FROM requests"); err != nil || n != 1 {
 		t.Errorf("补建不该增删 requests 行: %d err=%v", n, err)
+	}
+}
+
+// TestRequestIdentityColumnHealsAfterVersionFour 是上面那条的版本 5 对偶：结构已经是
+// 版本 4（执行面摘要列在）、只差身份来源列的库，打开时必须把它补出来，而不是带着
+// 「版本 5 却没有 identity_source」的形状启动 —— 版本号一旦落下就对外宣称这一列可查。
+//
+// 走的是同一条最短分支（needsWork() 为假）：补列没挂上去，就只有这条测试会红。
+func TestRequestIdentityColumnHealsAfterVersionFour(t *testing.T) {
+	path := newLegacyScopeDBFile(t)
+	s := openTestStoreAt(t, path)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 退回「版本 4 迁完」的形状：撤掉身份来源列、版本号改成 4（摘要列保持不动）。
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("ALTER TABLE requests DROP COLUMN identity_source"); err != nil {
+		t.Fatalf("撤掉 identity_source 失败: %v", err)
+	}
+	if err := metaSetInt(db, SQLiteDialect{}, metaScopeSchemaVersion, 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2 := openTestStoreAt(t, path)
+	if v, err := s2.AppliedScopeSchemaVersion(); err != nil || v != ScopeSchemaVersion {
+		t.Fatalf("版本 4 的库必须升到 %d: %d err=%v", ScopeSchemaVersion, v, err)
+	}
+	if has, err := columnExists(s2.db, "requests", "identity_source"); err != nil || !has {
+		t.Errorf("补建之后 requests.identity_source 必须存在: has=%v err=%v", has, err)
+	}
+	// 补建只加列、不回填：那条历史行还是 NULL（NULL = 那一代没有这个事实）。
+	var got sql.NullString
+	if err := s2.db.QueryRow(
+		`SELECT identity_source FROM requests WHERE request_id='old-req'`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Valid {
+		t.Errorf("历史行不许回填身份来源，实际 %q", got.String)
 	}
 }

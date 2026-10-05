@@ -92,6 +92,15 @@ type RequestRecord struct {
 	// 那一发压根没发生，与 rec.Provider 只记「最后真打过的那家」同一条口径。
 	Executor       string
 	ExchangeReason string
+
+	// IdentitySource 是这次请求按哪个身份来源判的（2026-10-05 裁决，决策包 §0.3）。
+	// 取值 = 当时 policy.Identity.Source：`llmproxy-user-token` / `llmproxy-api-key`，
+	// 或 identity 段启用并被绑定后的外部取值（如 `campus-oidc`）。
+	//
+	// 它补的是耐久缺口：回放记录里虽然带着同一事实，但那是**有界内存窗口、缺省关闭**，
+	// 默认既落不了盘也活不过重启；这一列让 `source:` 条件能在离线审计里按当时的值复算。
+	// 空串落空串（不走 NULL）—— NULL 只留给版本 5 之前的历史行，见 requestsIdentityCols30。
+	IdentitySource string
 }
 
 // UsageRow 是统计查询的一行结果。
@@ -240,7 +249,9 @@ CREATE TABLE IF NOT EXISTS requests (
   -- 这里同样**没有任何正文/提示词列**，列定义见 scope_schema.go。
 ` + scopeColsFragment(requestsScopeCols30) + `,
   -- 执行面摘要两列（§2.8 + 2026-10-04 裁决 4=B）：可空，且 NULL 与空串两种读法必须留着
-` + scopeColsFragment(requestsExecCols30) + `
+` + scopeColsFragment(requestsExecCols30) + `,
+  -- 身份来源一列（2026-10-05 裁决，决策包 §0.3）：可空，NULL = 版本 5 之前的历史行不回填
+` + scopeColsFragment(requestsIdentityCols30) + `
 );
 CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
 CREATE INDEX IF NOT EXISTS idx_requests_provider_ts ON requests(provider, ts);
@@ -627,8 +638,8 @@ INSERT INTO requests (
   attempts, error_type, error_msg,
   cache_write_tokens, price_upstream_id, cost_upstream, price_downstream_id, charge, currency,
   scope_kind, scope_id, policy_version, routing_epoch, routing_seed, candidates_digest,
-  executor, exchange_reason
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+  executor, exchange_reason, identity_source
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		nowMs(rec.Ts), rec.RequestID, rec.ClientKeyHash, rec.ClientLabel, rec.ClientIP,
 		model, provider, rec.UpstreamModel, stream,
 		nullable(int64(rec.StatusCode)), map[bool]int{true: 1, false: 0}[rec.OK],
@@ -645,6 +656,9 @@ INSERT INTO requests (
 		// 执行面摘要**不走 emptyToNil**：这里的空串是有意义的取值（「没交给执行器」），
 		// 落成 NULL 就把「不应用」和「没有这一列的事实」并成一格了（见 requestsExecCols30）。
 		rec.Executor, rec.ExchangeReason,
+		// 身份来源同样不走 emptyToNil：NULL 留给「版本 5 之前的历史行」，写入侧的空串
+		// 表达的是「这条路径还没接入」—— 与执行面摘要同一套两分法（见 requestsIdentityCols30）。
+		rec.IdentitySource,
 	)
 	if err != nil {
 		return fmt.Errorf("写入 requests 失败: %w", err)

@@ -158,6 +158,55 @@ func runIntegrationSuite(t *testing.T, driver, pathOrDSN string) {
 		t.Errorf("%s: 补列之后 %d 行全都该读成 NULL（不回填），实际 %d 行", driver, total, n)
 	}
 
+	// 身份来源列（2026-10-05 裁决，决策包 §0.3）：与执行面摘要同一套要求在真库上成立 ——
+	// 列建得出来（VARCHAR(64) 过方言翻译）、值原样回来、补列不回填。
+	if err := s.InsertRequest(RequestRecord{
+		Ts: time.Now(), RequestID: "it-idn-" + uid, UserName: uid, Model: model,
+		Provider: prov, UpstreamModel: "m-up", OK: true,
+		IdentitySource: "campus-oidc",
+	}); err != nil {
+		t.Fatalf("%s: 写带身份来源的 requests 失败: %v", driver, err)
+	}
+	for _, tc := range []struct{ id, want string }{
+		{"it-" + uid, ""}, // 未设来源：落空串（「3.0 未参与」那一格），不是 NULL
+		{"it-idn-" + uid, "campus-oidc"},
+	} {
+		var got sql.NullString
+		if err := s.db.QueryRow(s.dialect.Rebind(
+			`SELECT identity_source FROM requests WHERE request_id=?`), tc.id).Scan(&got); err != nil {
+			t.Fatalf("%s: 读 %s 的身份来源失败: %v", driver, tc.id, err)
+		}
+		if !got.Valid {
+			t.Errorf("%s: %s 的身份来源读成 NULL，新建的库不该有那一格", driver, tc.id)
+			continue
+		}
+		if got.String != tc.want {
+			t.Errorf("%s: %s 身份来源 = %q，期望 %q", driver, tc.id, got.String, tc.want)
+		}
+	}
+	totalIdn, err := dbScalarInt(s.db, s.dialect, "SELECT COUNT(*) FROM requests")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range requestsIdentityCols30 {
+		if _, err := s.db.Exec(s.dialect.Rebind("ALTER TABLE requests DROP COLUMN " + c.name)); err != nil {
+			t.Fatalf("%s: 撤掉 requests.%s 失败（补列断言的前置）: %v", driver, c.name, err)
+		}
+	}
+	addedIdn, err := addRequestIdentityColumns(s.db, s.dialect)
+	if err != nil {
+		t.Fatalf("%s: 补身份来源列失败: %v", driver, err)
+	}
+	if len(addedIdn) != len(requestsIdentityCols30) {
+		t.Errorf("%s: 撤掉了 %d 列，补列应当报补上这么多，实际 %d",
+			driver, len(requestsIdentityCols30), len(addedIdn))
+	}
+	if n, err := dbScalarInt(s.db, s.dialect, "SELECT COUNT(*) FROM requests WHERE identity_source IS NULL"); err != nil {
+		t.Fatal(err)
+	} else if n != totalIdn {
+		t.Errorf("%s: 补列之后 %d 行全都该读成 NULL（不回填），实际 %d 行", driver, totalIdn, n)
+	}
+
 	// RowCharge 全冻结直接取冻结值 —— 与驱动无关
 	if got := RowCharge(rows[0], nil, time.Now()); got != 3.5 {
 		t.Errorf("RowCharge = %v, want 3.5", got)

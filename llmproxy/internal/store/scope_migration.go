@@ -290,6 +290,10 @@ func migrateScopeSchema(db *sql.DB, d Dialect, pathOrDSN string) error {
 		if _, err := addRequestSummaryColumns(db, d); err != nil {
 			return err
 		}
+		// 身份来源列同理：它是版本 5 的那一位，半恢复过的库同样可能缺它。
+		if _, err := addRequestIdentityColumns(db, d); err != nil {
+			return err
+		}
 		// 再补一次旧列退役：**上一版的二进制**迁完时还没有这一步，它的库里 users 仍带着
 		// 2.x 那四列配额列（3.0 不读它们，但形状没收干净）。删不动只打提示 ——
 		// 版本号已落、结构是完整的 3.0，不该为一句收尾的 DDL 把库锁在门外。
@@ -330,10 +334,15 @@ func migrateScopeSchema(db *sql.DB, d Dialect, pathOrDSN string) error {
 			return err
 		}
 		// 版本 4 的摘要列：这条分支是「形状已经是 3.0，只有版本号要落」，
-		// 而此刻要落的版本号是 4，所以列必须先补上再盖章 —— 顺序反了就会造出一个
-		// 「版本号说列在、列其实不在」的库，那正是收口校验要拦的形状。
+		// 而此刻要盖章的版本号（>= 4）已经宣称这两列可查，所以列必须先补上再盖章 ——
+		// 顺序反了就会造出一个「版本号说列在、列其实不在」的库，那正是收口校验要拦的形状。
 		if _, err := addRequestSummaryColumns(db, d); err != nil {
 			return fmt.Errorf("%w: 补执行面摘要列失败: %w", ErrScopeMigration, err)
+		}
+		// 版本 5 的身份来源列同理：要在同一句盖章之前补上，否则又是一次
+		// 「版本号说列在、列其实不在」。
+		if _, err := addRequestIdentityColumns(db, d); err != nil {
+			return fmt.Errorf("%w: 补身份来源列失败: %w", ErrScopeMigration, err)
 		}
 		if err := stampScopeSchemaVersion(db, d, scopeBackup{}, time.Now()); err != nil {
 			return err
@@ -709,6 +718,7 @@ func (p *scopeMigrationPlan) exec(q string, args ...any) error {
 //  2. user_prices 换代（补列 + 逐行映射，不重建表 —— 保住 id 与 requests 的引用）
 //  3. 补 requests / audit_log 的列，然后才建这三张表上的范围索引
 //     3b. 补 requests 的执行面摘要列（版本 4 新增的那一位，只加列不回填）
+//     3c. 补 requests 的身份来源列（版本 5 新增的那一位，只加列不回填）
 //  4. 回填 scope_quota（users 的 1:1 镜像）
 //  5. 回填 usage_scope_daily（usage_user_daily 的镜像，原表一行不动）
 //  6. 收口校验：四项全过才允许继续
@@ -727,6 +737,7 @@ func (p *scopeMigrationPlan) runAll(st scopeSchemaState, rep *ScopeMigrationRepo
 		{"换代 user_prices", func() error { return p.migrateUserPrices(st, rep) }},
 		{"补 requests/audit_log 的列", func() error { return p.addScopeColumns(st, rep) }},
 		{"补 requests 的执行面摘要列", func() error { return p.addRequestSummaryPhase() }},
+		{"补 requests 的身份来源列", func() error { return p.addRequestIdentityPhase() }},
 		{"回填 scope_quota", func() error { return p.backfillScopeQuota(st, rep) }},
 		{"回填 usage_scope_daily", func() error { return p.backfillUsageScopeDaily(st, rep) }},
 		{"收口校验", func() error { return p.verify(st, rep) }},
@@ -1064,6 +1075,80 @@ func checkRequestSummaryColumns(db *sql.DB, d Dialect) error {
 	return nil
 }
 
+// addRequestIdentityColumns 补齐 requests 的身份来源列（版本 5，2026-10-05 裁决，决策包 §0.3）。
+//
+// 只加列、一律**不回填**：Source 是「当时按哪个身份来源判的」这一事实，历史行那一代
+// 库里根本没有它，替它们编一个来源值就是把追溯变成伪证 —— 与执行面摘要列同一套两分法：
+// 留 NULL = 「那一代没有这个事实」，非空才是当时的取值。
+//
+// 返回实际补上的列名（可能为空），调用方据此登记补偿；重复执行是空转。
+// 三条调用路径共用这一个实现：runAll 的阶段表、「结构已是 3.0」那条早退分支、
+// 以及版本号已落时的补建分支（用外部逻辑备份半恢复过的库会走到第三条）。
+func addRequestIdentityColumns(db *sql.DB, d Dialect) ([]string, error) {
+	var missing []string
+	for _, c := range requestsIdentityCols30 {
+		has, err := d.HasColumn(db, "requests", c.name)
+		if err != nil {
+			return nil, err
+		}
+		if !has {
+			missing = append(missing, c.name)
+		}
+	}
+	if len(missing) == 0 {
+		return nil, nil
+	}
+	if err := addColumnsIfMissing(db, d, "requests", scopeColsMap(requestsIdentityCols30)); err != nil {
+		return nil, err
+	}
+	fmt.Fprintf(scopeMigrationOutput,
+		"[scope-migration] requests 补上身份来源列（%s）；历史行保持 NULL = 那一代没有这个事实，"+
+			"非空才是当时 policy.Identity.Source 的取值\n", strings.Join(missing, ", "))
+	return missing, nil
+}
+
+// addRequestIdentityPhase 是 runAll 里的阶段形式：补列 + 登记「把补上的列删回去」。
+//
+// 补偿写法沿用 addRequestSummaryPhase 的那一份：DROP COLUMN 逐条执行，execMulti 认
+// 「对象本来就不存在」为可忽略，所以哪一列其实没被这次动过也不会因为撤它而失败。
+func (p *scopeMigrationPlan) addRequestIdentityPhase() error {
+	added, err := addRequestIdentityColumns(p.db, p.d)
+	if err != nil {
+		return err
+	}
+	if len(added) == 0 {
+		return nil
+	}
+	stmts := make([]string, 0, len(added))
+	for _, c := range added {
+		stmts = append(stmts, "ALTER TABLE requests DROP COLUMN "+c)
+	}
+	p.add("删掉 requests 补上的身份来源列", func() error {
+		return execMulti(p.db, p.d, stmts)
+	})
+	return nil
+}
+
+// checkRequestIdentityColumns 是收口校验里属于版本 5 的那一项：身份来源列必须在。
+//
+// 只由迁移路径调用（verify），不进只读体检 —— 与执行面摘要列同一个理由：
+// 体检的对象可能就是还没升的 2.x 库，在那里缺列是事实而不是故障；反过来迁移走到收口时
+// 缺列，意味着补列那一步被方言差异或人工干预吃掉了，而版本号一旦落下就对外宣称
+// 「这一列可查」。
+func checkRequestIdentityColumns(db *sql.DB, d Dialect) error {
+	for _, c := range requestsIdentityCols30 {
+		has, err := d.HasColumn(db, "requests", c.name)
+		if err != nil {
+			return err
+		}
+		if !has {
+			return fmt.Errorf("%w: requests.%s 没补上 —— 不许把没有身份来源列的库标成版本 %d",
+				ErrScopeMigration, c.name, ScopeSchemaVersion)
+		}
+	}
+	return nil
+}
+
 // writeScopeQuotaRows 落「每个 user 一行配额」这件事：先按旧列覆盖已有行，再补没有的键。
 //
 // 输入按 st.usersQuotaLegacy 二选一（见 backfillScopeQuota），两条语句都**不删行**，
@@ -1369,7 +1454,14 @@ func (p *scopeMigrationPlan) verify(st scopeSchemaState, rep *ScopeMigrationRepo
 	if err := checkRequestSummaryColumns(p.db, p.d); err != nil {
 		return err
 	}
-	return injectFault("执行面摘要列")
+	if err := injectFault("执行面摘要列"); err != nil {
+		return err
+	}
+	// ⑥ 版本 5 的形状：身份来源列必须在，否则「版本 5」这个盖章同样是空头承诺。
+	if err := checkRequestIdentityColumns(p.db, p.d); err != nil {
+		return err
+	}
+	return injectFault("身份来源列")
 }
 
 func pkCheckTables() []struct {

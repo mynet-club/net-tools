@@ -297,6 +297,11 @@ type policyShot struct {
 	resource string
 	action   string
 	judgeNow time.Time
+	// idSource 是本次判定用的身份来源（`llmproxy-user-token` / `llmproxy-api-key`，
+	// 绑定外部身份后是 identity.source 的取值）。它在范围链构造之后、任何早退之前就定下来，
+	// 所以**没有包覆盖这条链**时也照样有值 —— 请求记录那一列要的是「这次按哪个来源判的」，
+	// 不是「有没有跑出一份计划」。2026-10-05 裁决（决策包 §0.3）把它落进 requests.identity_source。
+	idSource string
 	// replaySnapshot 是这次规划用过的完整回放输入（nil = 组不出，记录退化成解释性回放）。
 	// 它是「首选顺序逐位复现」唯一凭据的那一半（另一半是 sampling_algo），
 	// 也只被回放采集读：不进响应、不参与结论。
@@ -366,6 +371,9 @@ func (s *Server) policyJudge(rt *policyRuntime, scope, model, requestID, path st
 	}
 	chain := idn.chain
 	shot.chain = chain
+	// 身份来源在这里就落进 shot：下面的「这条链没有生效的策略包」早退也要带着它，
+	// 因为记录里的 identity_source 描述的是「这次按哪个来源判身份」，与有没有跑到计划无关。
+	shot.idSource = idn.identity.Source
 	shot.judgeNow = now
 	shot.resource = "model:" + model
 	shot.action = "use"

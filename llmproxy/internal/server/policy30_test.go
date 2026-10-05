@@ -769,6 +769,74 @@ func TestPolicy30ScopeChainAndIdentityForStaticKey(t *testing.T) {
 	}
 }
 
+// 身份来源要落进 shot（2026-10-05 裁决，决策包 §0.3）：它描述的是「这次按哪个来源判身份」，
+// 与「有没有跑到一份计划」无关 —— 所以「这条链没有生效的策略包」那条早退也要带着它。
+//
+// 这一格今天唯一的耐久去处是 requests.identity_source：回放记录里虽然带同一事实，
+// 但那条路是有界内存窗口、缺省关闭，离线审计问不回来。这里钉住写入侧的两个取值：
+// 静态 key = llmproxy-api-key，用户 = llmproxy-user-token。
+func TestPolicy30ShotCarriesIdentitySource(t *testing.T) {
+	up := startMockUpstream(t, &mockUpstream{name: "a", apiKey: "sk-a"})
+	// 包只覆盖 user:alice —— 于是同一份运行态上两种路径都能跑到：
+	// alice 走完整判定，bob 与静态 key 都在「这条链没有生效的策略包」处早退。
+	// 内容文件与 policy.bundles 的引用必须同 id 同 scope（加载器会比对，只改一边即失败）。
+	h := newHarness(t, cfgYAML(map[string]string{"a": up.baseURL}, []string{"sk-local"})+
+		policySection("shadow", "t-open", "user:alice", 1))
+	writePolicyBundle(t, h, `
+id: t-open
+version: 1
+scope: user:alice
+entitlements:
+  - subject: "*"
+    resource: "model:*"
+    action: use
+    effect: allow
+`)
+
+	rt := h.srv.policyFor(h.cfgStore.Current())
+	if rt == nil {
+		t.Fatal("shadow 下应有策略运行态，却没有 —— 后面的断言全部失去意义")
+	}
+	providers, _ := h.srv.providersFor("", "m")
+
+	judge := func(scope, requestID string) *policyShot {
+		t.Helper()
+		shot := h.srv.policyJudge(rt, scope, "m", requestID, "/v1/chat/completions", providers, "", time.Now(), "")
+		if shot == nil {
+			t.Fatalf("policyJudge(scope=%q) 不该返回 nil", scope)
+		}
+		return shot
+	}
+
+	// 静态 key（scope 为空 → system:gateway）：本包是 user 级，不覆盖它 → 早退，
+	// 但身份来源仍必须是 api-key（字段在任何早退之前就定下来，这正是要钉的那个点）。
+	static := judge("", "req-idn-static")
+	if static.idSource != policySourceStatic {
+		t.Errorf("静态 key 的身份来源 = %q，want %q（早退路径也要带上它）", static.idSource, policySourceStatic)
+	}
+	if static.Note == "" {
+		t.Error("user 级包不该覆盖 system:gateway 那条链，应当留下「没有生效的策略包」的注记")
+	}
+
+	// alice：链被覆盖，走完整判定。
+	alice := judge("alice", "req-idn-user")
+	if alice.idSource != policySourceUser {
+		t.Errorf("用户请求的身份来源 = %q，want %q", alice.idSource, policySourceUser)
+	}
+	if alice.Version == "" {
+		t.Error("被覆盖的链应当出版本，否则这次判定根本没跑到包上")
+	}
+
+	// bob：user 级但没被这个包覆盖 → 早退，身份来源照旧是 user-token。
+	bob := judge("bob", "req-idn-bob")
+	if bob.idSource != policySourceUser {
+		t.Errorf("未覆盖用户链的身份来源 = %q，want %q", bob.idSource, policySourceUser)
+	}
+	if bob.Version != "" {
+		t.Errorf("未覆盖的链不该出版本，实际 %q", bob.Version)
+	}
+}
+
 // 网关侧有两个 system 范围 id，它们不打架**只靠一条不变量**，这里把它钉住。
 //
 //	判定链：静态 key 的请求落在 system:gateway（policySystemScope，§3.0 线 1）

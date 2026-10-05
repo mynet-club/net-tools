@@ -144,6 +144,27 @@ var requestsExecCols30 = []scopeColumn{
 	{"exchange_reason", "VARCHAR(64)"},
 }
 
+// requestsIdentityCols30 是「这次请求按哪个身份来源判的」那一列（2026-10-05 裁决，决策包 §0.3）。
+//
+// Source 此前只是**运行期判定输入**：`source:` 条件拿它命中，但没有任何持久副本。
+// 回放记录（replay.DecisionRecord.Subject.Source）里虽然带着它，可那条路是**有界内存窗口、
+// 缺省关闭**（internal/server/replay30.go 的 replayWindow）—— 默认既不落盘也活不过重启，
+// 于是「上周那条记录当时按哪个身份来源判的」在库里问不回来。这一列补的正是这个耐久缺口：
+// 它让 `source:` 条件能在**离线审计**里按当时的值复算，而不必依赖当时恰好开着采集窗口。
+//
+// 与 requestsExecCols30 一样**可空**，NULL 与空串是两件事：
+//   - NULL = 版本 5 之前的历史行，那一代没有这个事实，迁移一律不回填（猜出来的来源
+//     会把追溯变成伪证，与 §2.7 规则 5「不伪造历史归属」同一条口径）；
+//   - 非空 = 当时的 policy.Identity.Source（`llmproxy-user-token` / `llmproxy-api-key`，
+//     或 identity 段启用后的外部取值，如 `campus-oidc`）。
+//
+// 列宽 64 由 internal/config 对 identity.source 的长度校验上界决定，与 policy 的
+// maxSubjectLen 同一量级。写入侧正常一路非空（只要 3.0 为这条请求判过身份就写），
+// 空串只在「3.0 未参与这条请求」时出现（legacy 模式，或身份根本构造不出来）。
+var requestsIdentityCols30 = []scopeColumn{
+	{"identity_source", "VARCHAR(64)"},
+}
+
 // auditScopeCols30 是审计表的 scope 维度。
 //
 // 与 requests 相反：audit_log 在 2.x 只记管理员操作，那些操作**本来就**属于
