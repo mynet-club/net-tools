@@ -420,7 +420,7 @@ func TestExecutor30ProductionRegistryIsOneName(t *testing.T) {
 	}
 }
 
-// fake 执行器只允许活在测试与高校示例里。
+// fake 执行器只允许活在测试与参考实现里（examples/ 下的高校与企业两个示例）。
 //
 // 这条是"不允许因为 executor 未注册而静默回落 fake"的结构面：接线代码里连那个标识符
 // 都不出现，回落就无从写起。判定用源码扫描而不是运行时断言，因为**没写的代码**
@@ -459,8 +459,9 @@ func TestExecutor30FakeExecutorStaysOutOfProductionCode(t *testing.T) {
 	}
 
 	for _, hit := range hits {
-		if !strings.HasPrefix(filepath.ToSlash(hit), "examples/university/") {
-			t.Errorf("fake 执行器出现在非测试、非高校示例的生产代码里：%s", hit)
+		slash := filepath.ToSlash(hit)
+		if !strings.HasPrefix(slash, "examples/university/") && !strings.HasPrefix(slash, "examples/enterprise/") {
+			t.Errorf("fake 执行器出现在非测试、非参考实现的生产代码里：%s", hit)
 		}
 	}
 }

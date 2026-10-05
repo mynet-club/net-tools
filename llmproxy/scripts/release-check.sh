@@ -20,7 +20,7 @@ cd "$ROOT"
 # 3.0 领域包清单。合并一个包就把名字从 INFLIGHT 移到 OWNED（两个脚本各自的名单），
 # 名单是唯一来源：脚本里另写一份硬编码 case，漏改的那处不报错，
 # 只会让该包继续享受「红也不拦」的待遇。
-DOMAIN_OWNED="internal/policy internal/replay internal/identity internal/knowledge internal/processor internal/routing internal/executor examples/university"
+DOMAIN_OWNED="internal/policy internal/replay internal/identity internal/knowledge internal/processor internal/routing internal/executor examples/university examples/enterprise"
 DOMAIN_INFLIGHT=""
 
 QUICK=0

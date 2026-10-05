@@ -17,7 +17,7 @@ cd "$ROOT"
 
 # 3.0 领域包：OWNED 已合并并冻结，INFLIGHT 并行在途。
 # 合并一个包就把名字从 INFLIGHT 移到 OWNED，两个脚本都要改（名单各自唯一）。
-DOMAIN_OWNED="./internal/policy/... ./internal/replay/... ./internal/identity/... ./internal/knowledge/... ./internal/processor/... ./internal/routing/... ./internal/executor/... ./examples/university/..."
+DOMAIN_OWNED="./internal/policy/... ./internal/replay/... ./internal/identity/... ./internal/knowledge/... ./internal/processor/... ./internal/routing/... ./internal/executor/... ./examples/university/... ./examples/enterprise/..."
 DOMAIN_INFLIGHT=""
 
 MODE=sqlite
