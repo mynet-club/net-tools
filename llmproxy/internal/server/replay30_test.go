@@ -876,11 +876,14 @@ func TestReplay30StatusReportsAsOfAndCounters(t *testing.T) {
 	}
 }
 
-// ── A 包不变量与回放比对的冲突位（登记给主线裁决，不伪装成已完成） ──────────
+// ── 拒绝记录里「原文出网授权」这一位的比对口径（裁决 2026-10-05 §0.2 第 1 条） ──
 
 // policyBundleDenyWithRawGrant 拒绝 secret-model，却同时授了一条**带期限**的原文出网。
 // 两者按 A 包是不同资源的独立判定（model:<名>/use 与 body.raw/read），所以这套包合法，
-// 而它正好落在记录 schema 与回放比对的冲突点上。
+// 而它正好落在记录 schema 的不变量与回放比对的交界上：deny 记录里
+// ExternalPlaintextAllowed 被 DecisionRecord.Validate 钉死为 false（record.go 那条
+// 「拒绝的结论不得授予原文出网」），回放侧却按另一个资源独立重算 —— 照原样比，
+// 一次真实拒绝会永远报出一位假差异。
 const policyBundleDenyWithRawGrant = `
 id: t-open
 version: 1
@@ -901,19 +904,17 @@ entitlements:
     expires_at: "2030-01-01T00:00:00Z"
 `
 
-// TestReplay30DenyEvidenceAndRawBodyGrantConflict 把那条冲突钉成会失败的断言。
+// TestReplay30DenyRecordSkipsRawBodyBit 钉住「拒绝记录里这一位不参与比对」。
 //
-// 冲突的两端都是冻结口径：DecisionRecord.Validate 钉死「拒绝的结论不可能授予原文出网」，
-// 所以采集侧对一次 deny 只能写 false（replay30.go 里那个 if 不是偷懒）；而
-// ReplayDecision 无条件重跑 AllowsRawBody 并把这一位比进差异。AllowsRawBody 判的是
-// **另一个资源**，它与本次结论允许与否无关 —— 于是「带原文授权的范围里发生的一次真实拒绝」
-// 在回放里必然报成差异，而这份差异既不是策略变了也不是记录坏了。
+// 裁决 2026-10-05 §0.2 第 1 条：记录 schema 的不变量一字不动（deny 不得带原文出网授权），
+// 改动落在回放核的**比对侧** —— Effect 为 deny 时跳过 external_plaintext_allowed。
+// 拒绝是否被复现由 effect/reason 那几位负责，跳过这一位不损失信息；不跳过则会让
+// 「带原文授权的范围里发生的一次真实拒绝」永远报成差异，被读成「策略动过」。
 //
-// 这不是接线能单方面修的：改 A 的不变量会放宽 §2.9 的隐私闸门，改比对要动冻结的回放核。
-// 断言锁住**今天的真实形态**（差异、且只有这一位差），将来主线给出「拒绝时跳过这一位」
-// 或「拒绝记录不得进入比对」的口径时，这条会红并要求重写，而不是让一个假差异长期混在
-// 回放报告里被当成「策略动过」。
-func TestReplay30DenyEvidenceAndRawBodyGrantConflict(t *testing.T) {
+// 这条曾是钉住冲突的必红断言（原名 TestReplay30DenyEvidenceAndRawBodyGrantConflict），
+// 口径落地后它转绿。对偶的允许侧另有 TestReplay30AllowRecordStillComparesRawBodyBit，
+// 两条合起来锁死「跳过只针对 deny」—— 防止把跳过写成无条件、连允许侧的真差异一起吞掉。
+func TestReplay30DenyRecordSkipsRawBodyBit(t *testing.T) {
 	h := policyAdminHarnessBundles(t, "enforce", "t-open", "system:gateway", 1, policyBundleDenyWithRawGrant)
 	openReplayWindow(t, h)
 
@@ -933,24 +934,130 @@ func TestReplay30DenyEvidenceAndRawBodyGrantConflict(t *testing.T) {
 	if rec.ExternalPlaintextAllowed {
 		t.Fatalf("deny 记录里不能带原文出网授权")
 	}
+	// deny 的请求被拦在选路之前，所以窗口里不该有选路条目 —— 下面按 kind 取判定条目。
+	if len(f.Routings) != 0 {
+		t.Fatalf("被拒的请求不该产生选路记录，实际 %d", len(f.Routings))
+	}
 
-	// 同一套包（版本对得上，所以不会被拒绝回放）重跑：AllowsRawBody 判 body.raw，
-	// 与 model:secret-model 的 deny 无关，于是算出 true —— 差异只出现在这一位。
+	// 同一套包重跑：AllowsRawBody 判 body.raw 仍会算出 true，但记录是 deny，
+	// 这一位不参与比对 —— 于是整条记录逐字段复现，不再有假差异。
 	report := replayFromDisk(t, mustBundles(t, h), raw, time.Now().UTC().Add(time.Minute))
-	passed, mismatch, rejected := report.Counts()
-	if rejected != 0 {
-		t.Fatalf("版本一致，不该走拒绝回放: %d\n%s", rejected, report)
+	if passed, mismatch, rejected := report.Counts(); rejected != 0 || passed != 1 || mismatch != 0 {
+		t.Fatalf("deny 记录应逐字段复现（这一位已跳过），实际 passed=%d mismatch=%d rejected=%d\n%s",
+			passed, mismatch, rejected, report)
 	}
-	if mismatch != 1 || passed != 0 {
-		t.Fatalf("今天的形态是「只有这一位报差异」，实际 passed=%d mismatch=%d\n%s", passed, mismatch, report)
+	o := decisionOutcomeOf(t, report)
+	if o.Status != replay.StatusPassed {
+		t.Fatalf("判定条目该是 passed，实际 %s\n%s", o.Status, report)
 	}
-	var fields []string
-	for _, o := range report.Outcomes {
-		for _, d := range o.Diffs {
-			fields = append(fields, d.Field)
+	for _, d := range o.Diffs {
+		if d.Field == "external_plaintext_allowed" {
+			t.Fatalf("deny 记录不该再报这一位差异:\n%s", report)
 		}
 	}
-	if strings.Join(fields, ",") != "external_plaintext_allowed" {
-		t.Fatalf("差异字段应只有 external_plaintext_allowed，实际 %v\n%s", fields, report)
+}
+
+// policyBundleAllowWithRawGrant 是上面那套的「允许」对偶：池子放行，且授了原文出网。
+// 允许记录里 ExternalPlaintextAllowed 才携带信息（true 表示这次真的允许了原文出网），
+// 所以这一位在允许记录上必须照旧逐位比对。
+const policyBundleAllowWithRawGrant = `
+id: t-open
+version: 1
+scope: system:gateway
+entitlements:
+  - subject: "*"
+    resource: "model:*"
+    action: use
+    effect: allow
+  - subject: gateway
+    resource: "body.raw"
+    action: read
+    effect: allow
+    expires_at: "2030-01-01T00:00:00Z"
+`
+
+// policyBundleAllowNoRawGrant 是上一套的「策略真变了」形态：版本仍是 1（所以不会被
+// 拒绝回放，差异才会被算出来），但原文出网那条授权没了 —— 回放侧重算必然得出
+// 「不允许」，与记录里的 true 形成一位真实差异。
+const policyBundleAllowNoRawGrant = `
+id: t-open
+version: 1
+scope: system:gateway
+entitlements:
+  - subject: "*"
+    resource: "model:*"
+    action: use
+    effect: allow
+`
+
+// TestReplay30AllowRecordStillComparesRawBodyBit 是 TestReplay30DenyRecordSkipsRawBodyBit
+// 的对偶：跳过只针对 deny，允许记录里这一位仍必须逐位比。
+func TestReplay30AllowRecordStillComparesRawBodyBit(t *testing.T) {
+	h := policyAdminHarnessBundles(t, "enforce", "t-open", "system:gateway", 1, policyBundleAllowWithRawGrant)
+	openReplayWindow(t, h)
+
+	if code, raw := chatWith(t, h.harness, "sk-static", "allow-1", "gpt-x"); code != http.StatusOK {
+		t.Fatalf("gpt-x 应放行（200），实际 %d: %s", code, raw)
 	}
+	_, raw := replayExport(t, h, "")
+	f := mustDecodeRecords(t, raw)
+	if len(f.Decisions) != 1 {
+		t.Fatalf("应恰好 1 条判定证据，实际 %d", len(f.Decisions))
+	}
+	rec := f.Decisions[0]
+	if rec.Effect != policy.EffectAllow {
+		t.Fatalf("该记成 allow，实际 %s", rec.Effect)
+	}
+	if !rec.ExternalPlaintextAllowed {
+		t.Fatalf("这套包授了 body.raw，允许记录应现算出 external_plaintext_allowed=true")
+	}
+
+	// 同一套包：允许记录逐字段复现（这一位比了且一致）。
+	if r := replayFromDisk(t, mustBundles(t, h), raw, time.Now().UTC().Add(time.Minute)); !r.Clean() {
+		t.Fatalf("同版本回放应复现（含这一位）:\n%s", r)
+	}
+
+	// 再喂「策略真变了」：版本仍是 1，但原文出网授权没了 —— 允许记录里这一位必须报差异。
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(h.cfgYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bundleDir := filepath.Join(dir, config.DefaultBundleDir)
+	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "t-open.yaml"), []byte(policyBundleAllowNoRawGrant), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report := replayFromDisk(t, loadBundlesAt(t, cfgPath), raw, time.Now().UTC().Add(time.Minute))
+	o := decisionOutcomeOf(t, report)
+	if o.Status != replay.StatusMismatch {
+		t.Fatalf("少了原文授权的允许记录该报差异，实际 %s\n%s", o.Status, report)
+	}
+	var fields []string
+	for _, d := range o.Diffs {
+		fields = append(fields, d.Field)
+	}
+	if strings.Join(fields, ",") != "external_plaintext_allowed" {
+		t.Fatalf("允许记录的差异应只有这一位，实际 %v\n%s", fields, report)
+	}
+}
+
+// decisionOutcomeOf 取出报告里唯一一条判定条目。
+//
+// 多路回放报告把判定与选路条目混在 Outcomes 里，按位置取会在「允许请求多了选路条目」
+// 时取错；按 kind 过滤才稳。多于或少于一条都直接失败，逼报告保持可解析。
+func decisionOutcomeOf(t *testing.T, r replay.Report) replay.Outcome {
+	t.Helper()
+	var got []replay.Outcome
+	for _, o := range r.Outcomes {
+		if o.Kind == replay.KindDecision {
+			got = append(got, o)
+		}
+	}
+	if len(got) != 1 {
+		t.Fatalf("报告里的判定条目应恰好 1 条，实际 %d\n%s", len(got), r)
+	}
+	return got[0]
 }

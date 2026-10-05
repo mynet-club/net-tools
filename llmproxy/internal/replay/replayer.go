@@ -203,10 +203,20 @@ func collectDecisionDiffs(o *Outcome, rec DecisionRecord, d policy.Decision, gra
 		addDiff(o, "winner", rec.Winner.SortKey, "<无命中>")
 	}
 
-	addDiff(o, "external_plaintext_allowed", fmt.Sprintf("%t", rec.ExternalPlaintextAllowed), fmt.Sprintf("%t", granted))
-	if rec.ExternalPlaintextAllowed != granted {
-		// 授权档位差异常来自两条门槛：允许档位（explicit/group 而非通配）与授权自身期限。
-		o.Notes = append(o.Notes, fmt.Sprintf("原文出网授权回放结论 %v，原因码 %s", granted, string(grantReason)))
+	// external_plaintext_allowed 只在记录为 allow 时参与比对。
+	//
+	// 拒绝记录里这一位被 DecisionRecord.Validate 钉死为 false（record.go 里那条
+	// 「deny 不得带原文出网授权」的不变量），因此它对「这次到底允不允许原文出网」
+	// 不携带任何信息；而回放侧是按**另一个资源**（body.raw/read）独立重算的 —— 直接比
+	// 会把「带原文授权的范围里发生的一次真实拒绝」报成差异，那既不是策略变了也不是记录
+	// 坏了。跳过这一位不损失信息：拒绝是否被复现由上面的 effect/reason 差异负责。
+	// 允许记录照旧逐位比 —— 那里这一位才是真信号（裁决 2026-10-05 §0.2 第 1 条）。
+	if rec.Effect != policy.EffectDeny {
+		addDiff(o, "external_plaintext_allowed", fmt.Sprintf("%t", rec.ExternalPlaintextAllowed), fmt.Sprintf("%t", granted))
+		if rec.ExternalPlaintextAllowed != granted {
+			// 授权档位差异常来自两条门槛：允许档位（explicit/group 而非通配）与授权自身期限。
+			o.Notes = append(o.Notes, fmt.Sprintf("原文出网授权回放结论 %v，原因码 %s", granted, string(grantReason)))
+		}
 	}
 
 	if strict {
