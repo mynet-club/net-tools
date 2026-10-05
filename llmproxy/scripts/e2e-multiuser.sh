@@ -18,6 +18,17 @@ STUB=$H/e2estub
 BIN=${LLMPROXY_BIN:-$H/llmproxy}
 PASS=0; FAIL=0
 
+# 依赖预检：缺工具时按「环境」点名退出，而不是让几十处断言各自变红。
+# 一台最小 Ubuntu 没装 sqlite3 CLI，本脚本会以 32 条形如「审计里没有 token 原文：期望 0，实际空」
+# 的失败收场 —— 读起来像代码缺陷（§17 与 test-matrix.sh 的 docker 腿踩的是同一类坑）。
+# 放在 freeport 之前：python3 下面的 freeport 就用了，晚一步检查它就先炸在 shell 层。
+for t in go python3 curl sqlite3; do
+  command -v "$t" >/dev/null 2>&1 || {
+    echo "  [环境] 缺外部命令：$t —— 本脚本需要 go / python3 / curl / sqlite3"
+    exit 2
+  }
+done
+
 # 端口全部动态取，避免和上一次运行的残留实例撞车
 freeport() {
   python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()'
