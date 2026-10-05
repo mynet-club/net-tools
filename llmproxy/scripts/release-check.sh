@@ -141,6 +141,24 @@ gate_ui_refs() {
   ./scripts/check-ui-refs.sh || fail "UI 元素引用对不上"
 }
 
+# gate_ui_panel 跑回放面板的 UI 层驱动夹具（scripts/ui-panel-fixture.sh）——
+# check-ui-refs 只查静态 id 引用，抓不到「非法值被静默丢掉」「控件被挤成四行」这类
+# 只有真在 DOM 上点一次才现形的问题。这一条用真实无头 Chrome 把五件事点一遍。
+# 需要无头浏览器：缺它时夹具以退出码 3 报「缺外部条件」，门禁**不拦停**但点名这条腿没跑
+# —— 与 drill 脚本按平台挑产物同一口径：缺机器不是代码缺陷。
+gate_ui_panel() {
+  step "回放面板 UI 驱动夹具（真实无头 Chrome）"
+  set +e
+  ./scripts/ui-panel-fixture.sh
+  local rc=$?
+  set -e
+  case "$rc" in
+    0) echo "  ✓ 五件事（保存开关 / 非法值拒绝 / 导出逐字节对账 / 清空 / 模式联动）全过" ;;
+    3) warn "缺外部条件：本机没有无头 Chrome，界面夹具未跑（不是代码缺陷；装 Chrome 或设 CHROME_PATH）" ;;
+    *) fail "回放面板 UI 驱动夹具未通过（见上，退出码 ${rc}）" ;;
+  esac
+}
+
 # run_pkg_checks 按包跑 vet + test（+ 可选 race），逐包标注归属，在途包不拦停。
 run_pkg_checks() {
   local with_race=$1
@@ -202,6 +220,7 @@ if [ "$ONLY3P0" -eq 1 ]; then
   gate_gofmt
   gate_tests_present
   gate_ui_refs
+  if [ "$QUICK" -eq 0 ]; then gate_ui_panel; else echo "  （--quick：跳过界面驱动夹具）"; fi
   step "3.0 OWNED 包全量 vet + test"
   # 目标一律从 DOMAIN_OWNED 派生：硬编码包名会让「把某个包升成 OWNED」需要同时改
   # 变量和三行命令，漏改的那一行不会报错，只会让该包从此红也不拦。
@@ -233,6 +252,7 @@ fi
 gate_gofmt
 gate_tests_present
 gate_ui_refs
+if [ "$QUICK" -eq 0 ]; then gate_ui_panel; else echo "  （--quick：跳过界面驱动夹具）"; fi
 
 step "go vet"
 go vet ./... || fail "go vet 未通过"
