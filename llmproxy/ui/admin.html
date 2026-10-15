@@ -43,11 +43,35 @@
     </div>
   </header>
 
-  <main class="wrap">
-    <p class="banner" id="admin-banner" hidden></p>
+  <div class="shell">
+    <nav class="nav" id="admin-nav" aria-label="功能导航">
+      <button type="button" data-page="overview" class="on">概览</button>
+      <button type="button" data-page="cfg">系统上游</button>
+      <button type="button" data-page="policy">策略与路由</button>
+      <button type="button" data-page="decl">处理器与知识库</button>
+      <button type="button" data-page="replay">回放证据链</button>
+      <button type="button" data-page="users">用户</button>
+      <button type="button" data-page="audit">操作审计</button>
+    </nav>
 
-    <!-- 系统上游：直接编辑 config.yaml 的 providers 段 -->
-    <section class="card">
+    <main class="wrap">
+      <p class="banner" id="admin-banner" hidden></p>
+
+      <!-- 概览：网关现在的运行状态（/healthz 8 秒轮询，只在本页激活时刷） -->
+      <section class="card page" id="page-overview" data-page="overview">
+        <div class="head">
+          <h2>概览</h2>
+          <span class="grow"></span>
+          <span class="muted" id="ov-asof"></span>
+          <button type="button" id="ov-refresh" class="ghost sm">刷新</button>
+        </div>
+        <div id="ov-stats" class="gridn"></div>
+        <h3 class="sub-h">系统上游</h3>
+        <div id="ov-prov"></div>
+      </section>
+
+      <!-- 系统上游：直接编辑 config.yaml 的 providers 段 -->
+      <section class="card page" id="page-cfg" data-page="cfg" hidden>
       <div class="head">
         <h2>系统上游</h2>
         <span class="mono muted" id="sys-path"></span>
@@ -67,7 +91,7 @@
     </section>
 
     <!-- 策略与路由（3.0）：只读可见性 —— 现在到底生效了什么、切 enforce 会怎么判、当时判成了什么 -->
-    <section class="card" id="policy">
+    <section class="card page" id="policy" data-page="policy" hidden>
       <div class="head">
         <h2>策略与路由</h2>
         <span class="mono muted" id="pl-rev"></span>
@@ -114,7 +138,7 @@
 
     <!-- 处理器与知识库（3.0 §3.H）：config.yaml 的 processors / knowledge_sources 两段声明，
          整段读写。这一屏只做「把磁盘上那一段交给人改」，判据全在服务端领域校验。 -->
-    <section class="card" id="decl">
+    <section class="card page" id="decl" data-page="decl" hidden>
       <div class="head">
         <h2>处理器与知识库</h2>
         <span class="mono muted" id="pc-rev"></span>
@@ -183,7 +207,7 @@
 
     <!-- 回放证据链（3.0 §2.8）：把采集开起来、把记录取走、取完清掉。
          判定与回放都不在这屏里跑 —— 回放是另一个进程拿着这份文件加当时那套策略包做的事。 -->
-    <section class="card" id="replay">
+    <section class="card page" id="replay" data-page="replay" hidden>
       <div class="head">
         <h2>回放证据链</h2>
         <span class="mono muted" id="rp-asof"></span>
@@ -240,7 +264,7 @@
     </section>
 
     <!-- 用户列表 -->
-    <section class="card">
+    <section class="card page" id="page-users" data-page="users" hidden>
       <div class="head">
         <h2>用户</h2>
         <button type="button" id="u-add" class="primary sm">新建用户</button>
@@ -266,8 +290,6 @@
         </div>
       </form>
 
-      <pre id="new-token" class="out" hidden></pre>
-
       <div class="tablewrap">
         <table id="u-table">
           <thead>
@@ -280,8 +302,9 @@
       <p class="muted" id="u-empty" hidden>还没有用户。</p>
     </section>
 
-    <!-- 用户详情 -->
-    <section class="card" id="u-detail" hidden>
+    <!-- 用户详情：点用户行弹出的大弹窗（原来在列表下方，要滚过去） -->
+    <div class="modal" id="u-detail" hidden>
+      <div class="modal-box ud-box">
       <div class="head">
         <h2 id="ud-title">用户详情</h2>
         <span class="grow"></span>
@@ -403,10 +426,11 @@
         </table>
       </div>
       <p class="muted" id="ud-usage-empty" hidden>最近没有记录。</p>
-    </section>
+      </div>
+    </div>
 
     <!-- 操作审计（§3.H）：谁在什么时候把哪一版换成了哪一版 -->
-    <section class="card" id="audit">
+    <section class="card page" id="audit" data-page="audit" hidden>
       <div class="head">
         <h2>操作审计</h2>
         <span class="grow"></span>
@@ -431,9 +455,17 @@
           <tbody></tbody>
         </table>
       </div>
+      <div class="pager">
+        <button type="button" id="ad-prev" class="ghost sm">上一页</button>
+        <span class="pinfo" id="ad-pageinfo"></span>
+        <button type="button" id="ad-next" class="ghost sm">下一页</button>
+        <span class="grow"></span>
+        <span class="muted">每页 50 条</span>
+      </div>
       <p class="muted" id="ad-empty" hidden>这个范围下没有记录。</p>
     </section>
-  </main>
+    </main>
+  </div>
 </div>
 
 <!-- ── 选模型弹窗：把上游实际提供的模型列出来勾选，不用手写模型名 ── -->

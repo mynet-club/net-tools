@@ -46,12 +46,23 @@
     </div>
   </header>
 
-  <main class="wrap">
+  <div class="shell">
+    <nav class="nav" id="user-nav" aria-label="功能导航">
+      <button type="button" data-page="overview" class="on">概览</button>
+      <button type="button" data-page="providers">我的上游</button>
+      <button type="button" data-page="models">我的模型</button>
+      <button type="button" data-page="usage">我的用量</button>
+      <button type="button" data-page="try">试一下</button>
+    </nav>
 
-    <p class="banner" id="banner" hidden></p>
+    <main class="wrap">
 
-    <!-- 概览 -->
-    <section class="card">
+      <p class="banner" id="banner" hidden></p>
+
+      <!-- 概览（含消费模式的配额与可用模型） -->
+      <div class="page" data-page="overview">
+
+      <section class="card">
       <h2>概览
         <button type="button" id="rotate-token" class="ghost sm" title="旧 token 立即失效">轮换 token</button>
       </h2>
@@ -75,11 +86,13 @@
       <p class="muted" id="models-empty" hidden>系统池里还没有声明任何模型 —— 请联系管理员。</p>
     </section>
 
-    <!-- byo 相关卡片在消费模式下的说明 -->
-    <p class="banner warn" id="byo-notice" hidden></p>
+      </div>
 
-    <!-- 我的上游（byo 模式主路径；消费模式下不参与选路） -->
-    <section class="card" id="my-providers-card">
+      <!-- 我的上游（byo 模式主路径；消费模式下不参与选路） -->
+      <div class="page" data-page="providers" hidden>
+
+      <p class="banner warn" id="byo-notice" hidden></p>
+      <section class="card" id="my-providers-card">
       <div class="head">
         <h2>我的上游</h2>
         <button type="button" id="add-open" class="primary sm">新增上游</button>
@@ -177,10 +190,12 @@
       </div>
       <p class="muted" id="pempty" hidden>还没有配置上游。这种方式下没有上游时请求会直接失败（不会回退到系统上游）——
         要么自己配一个，要么让管理员把你的模式改成 consumption 来使用系统上游。</p>
-    </section>
+      </section>
+      </div>
 
-    <!-- 我的模型：按下游模型名聚合，可在这里把同一名字映射到多家上游 -->
-    <section class="card" id="my-models-card">
+      <!-- 我的模型：按下游模型名聚合，可在这里把同一名字映射到多家上游 -->
+      <div class="page" data-page="models" hidden>
+      <section class="card" id="my-models-card">
       <div class="head">
         <h2>我的模型</h2>
         <button type="button" id="mm-open" class="primary sm">映射模型</button>
@@ -222,10 +237,12 @@
       </div>
       <p class="muted" id="my-models-empty" hidden>还没有映射到具体模型名的上游。点右上「映射模型」建一个。</p>
       <p class="muted" id="my-models-pass" hidden></p>
-    </section>
+      </section>
+      </div>
 
-    <!-- 用量 -->
-    <section class="card">
+      <!-- 用量 -->
+      <div class="page" data-page="usage" hidden>
+      <section class="card">
       <div class="head">
         <h2>我的用量</h2>
         <div class="seg" id="days">
@@ -249,10 +266,12 @@
         </table>
       </div>
       <p class="muted" id="uempty" hidden>这个时间段没有记录。</p>
-    </section>
+      </section>
+      </div>
 
-    <!-- 试一下 -->
-    <section class="card">
+      <!-- 试一下 -->
+      <div class="page" data-page="try" hidden>
+      <section class="card">
       <h2>试一下</h2>
       <p class="sub">用你自己的 token 从网关发一条请求，看看能不能通、被哪个上游接走了。</p>
       <div class="try-grid">
@@ -271,9 +290,11 @@
         <span class="muted mono" id="t-meta"></span>
       </div>
       <pre id="t-out" class="out" hidden></pre>
-    </section>
+      </section>
+      </div>
 
-  </main>
+    </main>
+  </div>
 </div>
 
 <script src="common.js"></script>

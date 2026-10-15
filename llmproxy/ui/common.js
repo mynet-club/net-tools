@@ -100,3 +100,232 @@ function sessionLoad() {
 function sessionClear() {
   sessionStorage.removeItem(state.storageKey + '.token');
 }
+
+/* ── 统一反馈组件（管理台与用户台共用）────────────────────────────────
+   toast / 确认弹窗 / 输入弹窗 / 详情浮框四件套，两边长成同一套交互。
+   两条既有口径继续生效：接口字符串一律 textContent（XSS）；动态定位走
+   CSSOM 赋值而不是 style 属性（CSP style-src 'self' 会丢内联 style 属性）。
+   确认/输入弹窗只替原生 confirm/prompt —— 表单内的行内错误提示仍在原位
+   （回放面板门禁断言 #rp-err 的语义，动了会让夹具假红）。 */
+
+function toastRoot() {
+  let r = $('toast-root');
+  if (!r) {
+    r = h('div', { id: 'toast-root' });
+    document.body.append(r);
+  }
+  return r;
+}
+
+// toast：右下角、绿/红、2.5 秒淡出（smartxray 同款节奏）。
+function toast(msg, kind) {
+  const t = h('div', { class: 'toast ' + (kind === 'err' ? 'err' : 'ok'), text: String(msg == null ? '' : msg) });
+  toastRoot().append(t);
+  setTimeout(() => {
+    t.classList.add('gone');
+    setTimeout(() => t.remove(), 350);
+  }, 2500);
+}
+
+// modalOverlay：遮罩 + ESC 双通道关闭；onClose 只调一次。
+function modalOverlay(box, onClose) {
+  let closed = false;
+  const finish = () => {
+    if (closed) return;
+    closed = true;
+    document.removeEventListener('keydown', esc);
+    overlay.remove();
+    onClose();
+  };
+  const esc = (e) => { if (e.key === 'Escape') finish(); };
+  const overlay = h('div', {
+    class: 'modal',
+    onclick: (e) => { if (e.target === overlay) finish(); },
+  }, box);
+  document.addEventListener('keydown', esc);
+  document.body.append(overlay);
+  return { close: finish };
+}
+
+// confirmDialog：替代原生 confirm，resolve(true)=确定 / resolve(false)=取消、遮罩、ESC。
+function confirmDialog(opts = {}) {
+  return new Promise((resolve) => {
+    let ctl, settled = false;
+    const finish = (v) => {
+      if (settled) return;
+      settled = true;
+      ctl.close();
+      resolve(v);
+    };
+    const box = h('div', { class: 'modal-box confirm-box' },
+      h('div', { class: 'modal-head' },
+        h('strong', { text: opts.title || '确认操作' }),
+        h('span', { class: 'grow' }),
+        h('button', {
+          type: 'button', class: 'ghost sm', text: '✕',
+          onclick: () => finish(false),
+        })),
+      h('p', { class: 'sub confirm-body', text: opts.body || '' }),
+      h('div', { class: 'row' },
+        h('span', { class: 'grow' }),
+        h('button', { type: 'button', class: 'ghost', text: opts.cancelText || '取消', onclick: () => finish(false) }),
+        h('button', {
+          type: 'button', class: opts.danger ? 'primary danger' : 'primary',
+          text: opts.okText || '确定', onclick: () => finish(true),
+        })));
+    ctl = modalOverlay(box, () => finish(false));
+  });
+}
+
+// promptDialog：替代原生 prompt，resolve(输入值) / resolve(null)=放弃。
+function promptDialog(opts = {}) {
+  return new Promise((resolve) => {
+    let ctl, settled = false;
+    const input = h('input', {
+      type: 'text', spellcheck: 'false', autocomplete: 'off',
+      placeholder: opts.placeholder || '', value: opts.value || '',
+    });
+    const finish = (v) => {
+      if (settled) return;
+      settled = true;
+      ctl.close();
+      resolve(v);
+    };
+    const box = h('div', { class: 'modal-box confirm-box' },
+      h('div', { class: 'modal-head' },
+        h('strong', { text: opts.title || '请输入' }),
+        h('span', { class: 'grow' }),
+        h('button', {
+          type: 'button', class: 'ghost sm', text: '✕',
+          onclick: () => finish(null),
+        })),
+      h('p', { class: 'sub confirm-body', text: opts.body || '' }),
+      input,
+      h('div', { class: 'row' },
+        h('span', { class: 'grow' }),
+        h('button', { type: 'button', class: 'ghost', text: opts.cancelText || '取消', onclick: () => finish(null) }),
+        h('button', {
+          type: 'button', class: 'primary', text: opts.okText || '确定',
+          onclick: () => finish(input.value),
+        })));
+    ctl = modalOverlay(box, () => finish(null));
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') finish(input.value);
+    });
+    input.focus();
+  });
+}
+
+// detailPop：列表行点开的详情浮框 —— 跟随点击位置定位，ESC/遮罩关闭。
+// content 必须是已按 textContent 口径构造好的节点，这里不再拼任何字符串进 HTML。
+function detailPop(anchor, content, opts = {}) {
+  let closed = false;
+  const veil = h('div', { class: 'pop-veil' });
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    document.removeEventListener('keydown', esc);
+    veil.remove();
+    if (opts.onClose) opts.onClose();
+  };
+  const esc = (e) => { if (e.key === 'Escape') close(); };
+  const box = h('div', { class: 'pop-box' },
+    h('div', { class: 'pop-head' },
+      h('strong', { text: opts.title || '详情' }),
+      h('span', { class: 'grow' }),
+      h('button', { type: 'button', class: 'ghost sm', text: '✕', onclick: close })),
+    content);
+  veil.append(box);
+  veil.addEventListener('click', (e) => { if (e.target === veil) close(); });
+  document.addEventListener('keydown', esc);
+  document.body.append(veil);
+  // 定位：贴着点击处展开、不出屏。必须走 CSSOM 赋值 ——
+  // CSP style-src 'self' 会把内联 style 属性整个丢掉，浮框就永远停在左上角。
+  const r = anchor.getBoundingClientRect();
+  const bw = box.offsetWidth, bh = box.offsetHeight;
+  const left = Math.min(Math.max(8, r.left), Math.max(8, window.innerWidth - bw - 8));
+  let top = r.bottom + 8;
+  if (top + bh > window.innerHeight - 8) top = Math.max(8, r.top - bh - 8);
+  box.style.left = left + 'px';
+  box.style.top = top + 'px';
+  return { close };
+}
+
+// withBusy：按钮在异步操作期间禁用并转圈，finally 一定还原。
+async function withBusy(btn, fn) {
+  if (btn) { btn.disabled = true; btn.classList.add('busy'); }
+  try {
+    return await fn();
+  } finally {
+    if (btn) { btn.disabled = false; btn.classList.remove('busy'); }
+  }
+}
+
+// copyText：复制到剪贴板。非安全上下文（http 局域网地址）下 navigator.clipboard
+// 不存在，退回 execCommand 兜底 —— 两条路都没有就让调用方报「复制没成功」。
+async function copyText(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch { /* 落到兜底 */ }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.append(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+// showTokenDialog：一次性凭据（新 token）弹窗展示 + 一键复制。
+// 不用 alert —— alert 里的文本选不中也复制不了，而这串值关掉就再也拿不到明文。
+function showTokenDialog(token, title) {
+  return new Promise((resolve) => {
+    let ctl, settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      ctl.close();
+      resolve();
+    };
+    const ta = h('textarea', {
+      class: 'token-box', rows: '3', readonly: 'readonly', spellcheck: 'false',
+    });
+    ta.value = token || '';
+    ta.addEventListener('focus', () => ta.select());
+    const box = h('div', { class: 'modal-box confirm-box' },
+      h('div', { class: 'modal-head' },
+        h('strong', { text: title || '新 token' }),
+        h('span', { class: 'grow' }),
+        h('button', { type: 'button', class: 'ghost sm', text: '✕', onclick: finish })),
+      ta,
+      h('div', { class: 'row' },
+        h('button', {
+          type: 'button', class: 'sm', text: '复制',
+          onclick: async () => {
+            const ok = await copyText(token || '');
+            if (ok) toast('已复制到剪贴板');
+            else toast('复制没成功，请手动全选上面的文本', 'err');
+          },
+        }),
+        h('span', { class: 'grow' }),
+        h('button', { type: 'button', class: 'primary', text: '我已保存', onclick: finish })));
+    ctl = modalOverlay(box, finish);
+    ta.focus();
+  });
+}
+
+// tableState：把表格体换成一行占位文字（「加载中…」「还没有记录」）。
+function tableState(tb, colSpan, msg) {
+  tb.replaceChildren(h('tr', null,
+    h('td', { class: 'muted tstate', colspan: String(colSpan), text: msg })));
+}

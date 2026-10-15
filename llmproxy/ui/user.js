@@ -22,6 +22,7 @@ async function login(base, token) {
     state.me = data;
     sessionSave();
     renderApp();
+    showPage('overview');
     await Promise.all([loadProviders(), loadModelOverview(), loadUsage()]);
   } catch (e) {
     state.token = '';
@@ -257,12 +258,18 @@ async function saveProvider(ev) {
 }
 
 async function delProvider(p) {
-  if (!confirm('删除上游 ' + p.name + '？之后使用它承接的模型会失败。')) return;
+  if (!(await confirmDialog({
+    title: '删除上游',
+    okText: '删除',
+    danger: true,
+    body: '删除上游 ' + p.name + '？之后使用它承接的模型会失败。',
+  }))) return;
   try {
     await api('/v1/_me/providers/' + encodeURIComponent(p.name), { method: 'DELETE' });
+    toast('上游 ' + p.name + ' 已删除');
     await Promise.all([loadProviders(), loadModelOverview(), refreshMe()]);
   } catch (e) {
-    alert(e.message);
+    toast(e.message, 'err');
   }
 }
 
@@ -805,7 +812,12 @@ async function saveModelMap(ev) {
 
 // 从所有上游上摘掉这个下游名。
 async function removeModel(down) {
-  if (!confirm('从所有上游上移除模型 ' + down + '？之后用它发请求会失败。')) return;
+  if (!(await confirmDialog({
+    title: '移除模型',
+    okText: '移除',
+    danger: true,
+    body: '从所有上游上移除模型 ' + down + '？之后用它发请求会失败。',
+  }))) return;
   try {
     for (const p of state.providers || []) {
       const m = p.models || {};
@@ -824,8 +836,9 @@ async function removeModel(down) {
       });
     }
     await Promise.all([loadProviders(), loadModelOverview(), refreshMe()]);
+    toast('模型 ' + down + ' 已移除');
   } catch (e) {
-    alert('移除失败：' + e.message);
+    toast('移除失败：' + e.message, 'err');
   }
 }
 
@@ -963,6 +976,23 @@ $('login-form').addEventListener('submit', (e) => {
 });
 
 $('logout').addEventListener('click', logout);
+
+/* ── 侧边栏导航（与管理台同一套交互）────────────────────────────────
+   页面切换只做显隐；各页数据仍由登录时的全量加载与各自动作维护。 */
+
+function showPage(name) {
+  for (const b of $('user-nav').querySelectorAll('button[data-page]')) {
+    b.classList.toggle('on', b.dataset.page === name);
+  }
+  for (const s of document.querySelectorAll('.page[data-page]')) {
+    s.hidden = s.dataset.page !== name;
+  }
+}
+$('user-nav').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-page]');
+  if (btn) showPage(btn.dataset.page);
+});
+
 $('add-open').addEventListener('click', () => openForm(null));
 $('add-cancel').addEventListener('click', closeForm);
 $('pform').addEventListener('submit', saveProvider);
@@ -971,12 +1001,17 @@ $('mm-cancel').addEventListener('click', closeModelForm);
 $('mmform').addEventListener('submit', saveModelMap);
 $('t-send').addEventListener('click', trySend);
 $('rotate-token') && $('rotate-token').addEventListener('click', async () => {
-  if (!confirm('轮换后旧 token 立即失效，确定？')) return;
+  if (!(await confirmDialog({
+    title: '轮换 token',
+    okText: '轮换',
+    danger: true,
+    body: '轮换后旧 token 立即失效，要用新 token 重新登录，确定？',
+  }))) return;
   try {
     const { data } = await api('/v1/_me/token', { method: 'POST' });
-    alert('新 token（只显示这一次）：\n' + (data && data.token));
+    showTokenDialog(data && data.token, '你的新 token（只显示这一次，请立刻保存）');
   } catch (e) {
-    alert('失败：' + e.message);
+    toast('轮换失败：' + e.message, 'err');
   }
 });
 $('m-sync').addEventListener('click', mmSync);
@@ -994,7 +1029,7 @@ $('days').addEventListener('click', (e) => {
   if (!b) return;
   state.days = Number(b.dataset.days);
   for (const x of $('days').querySelectorAll('button')) x.classList.toggle('on', x === b);
-  loadUsage().catch((err) => alert(err.message));
+  loadUsage().catch((err) => toast(err.message, 'err'));
 });
 
 

@@ -366,3 +366,96 @@ select:focus { outline: 2px solid #c7c3f7; outline-offset: 1px; }
 .ubar { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; height: 100%; min-width: 14px; }
 .ubar-fill { background: #6c7cff; border-radius: 3px 3px 0 0; min-height: 4px; }
 .ubar-lab { font-size: 9px; color: var(--muted); text-align: center; margin-top: 2px; }
+
+/* ── 统一反馈组件（toast / 确认弹窗 / 详情浮框 / 忙碌态）────────────── */
+#toast-root {
+  position: fixed; right: 18px; bottom: 18px; z-index: 80;
+  display: flex; flex-direction: column; gap: 8px; align-items: flex-end;
+  pointer-events: none;
+}
+.toast {
+  background: var(--ok); color: #fff; padding: 9px 14px; border-radius: 8px;
+  font-size: 12.5px; box-shadow: 0 6px 20px rgba(22, 24, 29, .18);
+  max-width: 360px; opacity: 1; transition: opacity .35s ease;
+}
+.toast.err { background: var(--danger); }
+.toast.gone { opacity: 0; }
+
+.confirm-box { max-width: 460px; }
+.confirm-body { white-space: pre-wrap; margin: 8px 0 2px; }
+button.primary.danger { background: var(--danger); }
+button.primary.danger:hover { background: #b42318; }
+
+/* 详情浮框：贴点击处展开的轻浮层，遮罩几乎透明（点外面关） */
+.pop-veil {
+  position: fixed; inset: 0; z-index: 60; background: transparent;
+}
+.pop-box {
+  position: fixed; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; box-shadow: 0 12px 32px rgba(22, 24, 29, .22);
+  padding: 12px 14px; max-width: 480px; max-height: 70vh; overflow: auto;
+}
+.pop-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.pop-head strong { font-size: 13px; }
+
+/* 忙碌态：按钮禁用 + 原地转圈（::after，不动布局宽度） */
+button.busy { opacity: .65; cursor: default; }
+button.busy::after {
+  content: ''; display: inline-block; width: 10px; height: 10px; margin-left: 7px;
+  border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%;
+  animation: spin .7s linear infinite; vertical-align: -1px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* 表格占位行（加载中 / 空态） */
+td.tstate { text-align: center; padding: 22px 0; }
+
+/* ── 侧边栏导航 ───────────────────────────────────────────────────── */
+.shell { display: flex; align-items: flex-start; }
+.nav {
+  flex: none; width: 176px; margin: 20px 0 20px; padding: 8px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  position: sticky; top: 20px; display: flex; flex-direction: column; gap: 2px;
+}
+.nav button {
+  border: 0; background: transparent; text-align: left; padding: 8px 12px;
+  border-radius: 7px; font-size: 12.5px; color: var(--muted); cursor: pointer;
+  font-weight: 500;
+}
+.nav button:hover { background: #f0f2f6; color: var(--ink); }
+.nav button.on { background: #eef0fe; color: var(--accent); }
+.shell > .wrap { flex: 1; min-width: 0; }
+
+@media (max-width: 900px) {
+  .shell { flex-direction: column; }
+  .nav {
+    width: auto; align-self: stretch; position: static;
+    flex-direction: row; flex-wrap: wrap; margin-bottom: 0;
+  }
+  .nav button { flex: none; }
+}
+
+/* ── 审计分页 ─────────────────────────────────────────────────────── */
+.pager { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.pager .pinfo { color: var(--muted); font-size: 12px; }
+
+/* 可点开详情的列表行（用户、审计） */
+tr.rowclick { cursor: pointer; }
+tr.rowclick:hover { background: #f6f7fa; }
+
+/* 详情浮框里的键值清单 */
+.pop-kv { display: flex; flex-direction: column; gap: 5px; max-width: 440px; }
+.pop-kv-row { display: flex; gap: 10px; font-size: 12px; }
+.pop-kv .k { flex: none; width: 62px; color: var(--muted); }
+.pop-kv .v { flex: 1; min-width: 0; word-break: break-all; white-space: pre-wrap; }
+
+/* 一次性凭据弹窗：可全选、可复制的等宽文本 */
+.token-box {
+  width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 7px;
+  background: #fcfcfd; color: var(--ink);
+  font-family: var(--mono); font-size: 12px; line-height: 1.5; resize: none;
+}
+.token-box:focus { outline: 2px solid #c7c3f7; outline-offset: 1px; }
+
+/* 用户详情大弹窗：比默认弹窗宽，两栏编辑区才排得开 */
+.modal-box.ud-box { max-width: 860px; }

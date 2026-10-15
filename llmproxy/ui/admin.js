@@ -44,9 +44,11 @@ async function enterAdmin() {
   await Promise.all([loadSysProviders(), loadAdminUsers(), loadPolicy(), loadReplay()]);
   // 用户列表与策略包是并行拉回来的，范围选项此时才完整（列表本身 loadPolicy 已经查过）。
   fillAuditScopes();
+  showPage('overview');
 }
 
 function adminLogout() {
+  if (ovTimer) { clearInterval(ovTimer); ovTimer = 0; }
   sessionClear();
   state.token = '';
   ADM.users = [];
@@ -491,6 +493,7 @@ async function saveConfig() {
     if (data.warning) msg += '\n⚠ ' + data.warning;
     if (data.warnings && data.warnings.length) msg += '\n注意：' + data.warnings.join('；');
     showCfgResult(msg, data.warning ? 'err' : '');
+    if (!data.warning) toast('配置已保存');
     await loadSysProviders();
   } catch (e) {
     showCfgResult('保存失败（原文件未改动）：' + e.message, 'err');
@@ -510,6 +513,7 @@ async function validateConfig() {
     let msg = '校验通过：' + data.providers + ' 家供应商（未落盘）。';
     if (data.warning) msg += '\n⚠ ' + data.warning;
     showCfgResult(msg, data.warning ? 'err' : '');
+    if (!data.warning) toast('校验通过');
   } catch (e) {
     showCfgResult('校验不通过：' + e.message, 'err');
   } finally {
@@ -774,7 +778,7 @@ function backupBox(id, count) {
   return det;
 }
 
-function withdrawBundle(r, pb) {
+async function withdrawBundle(r, pb) {
   const others = (pb.refs || []).filter((x) => x.id !== r.id);
   if (r.active && others.length === 0) {
     return showPlStatus('这是唯一的策略包：停用 3.0 请在下面「模式」里选 legacy（应急开关，改一行即可），'
@@ -782,10 +786,17 @@ function withdrawBundle(r, pb) {
   }
   let path = '/v1/_admin/policy/bundles/' + encodeURIComponent(r.id);
   if (r.active) {
-    const pick = prompt('要撤的正是生效包，接棒者的包 id：', others[0] ? others[0].id : '');
+    const pick = await promptDialog({
+      title: '撤生效包：指定接棒者',
+      body: '要撤的正是生效包，接棒者的包 id：',
+      value: others[0] ? others[0].id : '',
+    });
     if (!pick) return showPlStatus('没给接棒者，已取消。', 'err');
     path += '?active=' + encodeURIComponent(pick.trim());
-  } else if (!confirm('撤下对 ' + r.id + ' 的引用？内容文件会留在磁盘上（变成「没被引用」，随时能引回来）。')) {
+  } else if (!(await confirmDialog({
+    title: '撤下引用',
+    body: '撤下对 ' + r.id + ' 的引用？内容文件会留在磁盘上（变成「没被引用」，随时能引回来）。',
+  }))) {
     return;
   }
   return plCall('DELETE', path);
@@ -818,12 +829,16 @@ async function plCall(method, path, body) {
 // 引用它 = POST …/reference：把磁盘上那份内容重新写回配置引用。
 // 这里刻意不重发规则 —— 条件值不经读侧下发，界面手里本来就只有键名；
 // 让服务端读那份已经在受校验目录里的文件，才是这个动作的真实语义。
-function referenceBundle(o) {
+async function referenceBundle(o) {
   if (!o.id) {
     return showPlStatus('这个文件连 id 都读不出来（坏在文件里），要用 PUT 重新发布覆盖它。', 'err');
   }
-  if (!confirm('按磁盘上的 ' + o.id + '.yaml（v' + o.version + '，scope=' + o.scope + '，'
-    + num(o.count || 0) + ' 条规则）重新建立引用，并设为生效包？')) return;
+  if (!(await confirmDialog({
+    title: '重建引用',
+    okText: '重建引用',
+    body: '按磁盘上的 ' + o.id + '.yaml（v' + o.version + '，scope=' + o.scope + '，'
+      + num(o.count || 0) + ' 条规则）重新建立引用，并设为生效包？',
+  }))) return;
   return plCall('POST', '/v1/_admin/policy/bundles/' + encodeURIComponent(o.id) + '/reference', {});
 }
 
@@ -1398,7 +1413,7 @@ async function pcCall(method, path, body, s) {
   return d;
 }
 
-function saveDeclarations(s) {
+async function saveDeclarations(s) {
   showErr($(s.err), '');
   let arr;
   try {
@@ -1412,8 +1427,13 @@ function saveDeclarations(s) {
   const onDisk = (((ADM.decl || {})[s.which] || {})[s.key] || []).length;
   // 整段替换意味着「保存空数组」= 删掉全部声明，而配置文件的段是整体写的，
   // 事后逐条撤销做不到 —— 所以这一笔单独确认，其余条数变化直接落。
-  if (!arr.length && onDisk && !confirm('清空 ' + s.key + ' 段？磁盘上现在有 ' + onDisk
-    + ' 条。整段替换是一次写完的，撤销只能靠那次写的配置备份文件。')) return;
+  if (!arr.length && onDisk && !(await confirmDialog({
+    title: '清空整段',
+    okText: '清空并保存',
+    danger: true,
+    body: '清空 ' + s.key + ' 段？磁盘上现在有 ' + onDisk
+      + ' 条。整段替换是一次写完的，撤销只能靠那次写的配置备份文件。',
+  }))) return;
   return pcCall('PUT', s.path, { [s.key]: arr }, s);
 }
 
@@ -1552,6 +1572,7 @@ async function rpSave() {
       method: 'POST', body: JSON.stringify(body),
     });
     showRpStatus(data.note || '开关已改。', data.warning ? 'err' : '');
+    if (!data.warning) toast('采集开关已保存');
     await loadReplay(true);
   } catch (e) {
     showErr($('rp-err'), e.message);
@@ -1658,32 +1679,62 @@ function fillAuditScopes() {
   sel.value = opts.some((o) => o.v === cur) ? cur : '';
 }
 
+// 审计查询结果整份留在内存里，翻页只切片重绘（接口本身是「取最近 N 条」，没有页码参数）。
+const AD = { rows: [], page: 0, perPage: 50 };
+
+function auditRow(e) {
+  const row = h('tr', { class: 'rowclick', title: '点击看这条的完整内容' },
+    h('td', { class: 'mono', text: e.ts ? new Date(e.ts).toLocaleString('zh-CN', { hour12: false }) : '—' }),
+    h('td', null, h('code', { class: 'k', text: (e.scope && e.scope.kind ? e.scope.kind + ':' + e.scope.id : '—') })),
+    h('td', null, e.actor || '—'),
+    h('td', null, h('span', { class: 'tag' + (String(e.action || '').startsWith('policy.') ? ' ok' : ''), text: e.action || '' })),
+    h('td', { class: 'mono', text: e.target || '—' }),
+    h('td', { class: 'muted', text: e.detail || '' }));
+  row.addEventListener('click', () => {
+    const kv = h('div', { class: 'pop-kv' },
+      ...[['时间', e.ts ? new Date(e.ts).toLocaleString('zh-CN', { hour12: false }) : '—'],
+        ['归属范围', e.scope && e.scope.kind ? e.scope.kind + ':' + e.scope.id : '—'],
+        ['操作者', e.actor || '—'],
+        ['动作', e.action || '—'],
+        ['对象', e.target || '—'],
+        ['说明', e.detail || '（无）']].map(([k, v]) => h('div', { class: 'pop-kv-row' },
+        h('span', { class: 'k', text: k }), h('span', { class: 'v', text: String(v) }))));
+    detailPop(row, kv, { title: '审计记录' });
+  });
+  return row;
+}
+
+function renderAuditPage() {
+  const tb = $('ad-table').querySelector('tbody');
+  const start = AD.page * AD.perPage;
+  tb.replaceChildren(...AD.rows.slice(start, start + AD.perPage).map(auditRow));
+  $('ad-empty').hidden = AD.rows.length > 0;
+  const pages = Math.max(1, Math.ceil(AD.rows.length / AD.perPage));
+  $('ad-pageinfo').textContent = AD.rows.length
+    ? '第 ' + (AD.page + 1) + ' / ' + pages + ' 页（共 ' + AD.rows.length + ' 条）'
+    : '';
+  $('ad-prev').disabled = AD.page <= 0;
+  $('ad-next').disabled = AD.page >= pages - 1;
+}
+
 async function loadAudit() {
   showErr($('ad-err'), '');
-  const btn = $('ad-run');
-  btn.disabled = true;
-  try {
-    const scope = $('ad-scope').value;
-    const n = $('ad-n').value.trim() || '100';
-    const q = '/v1/_admin/audit?n=' + encodeURIComponent(n) +
-      (scope ? '&scope=' + encodeURIComponent(scope) : '');
-    const { data } = await adminApi(q);
-    const list = (data && data.entries) || [];
-    const tb = $('ad-table').querySelector('tbody');
-    tb.replaceChildren(...list.map((e) => h('tr', null,
-      h('td', { class: 'mono', text: e.ts ? new Date(e.ts).toLocaleString('zh-CN', { hour12: false }) : '—' }),
-      h('td', null, h('code', { class: 'k', text: (e.scope && e.scope.kind ? e.scope.kind + ':' + e.scope.id : '—') })),
-      h('td', null, e.actor || '—'),
-      h('td', null, h('span', { class: 'tag' + (String(e.action || '').startsWith('policy.') ? ' ok' : ''), text: e.action || '' })),
-      h('td', { class: 'mono', text: e.target || '—' }),
-      h('td', { class: 'muted', text: e.detail || '' }))));
-    $('ad-empty').hidden = list.length > 0;
-  } catch (e) {
-    tbClear();
-    showErr($('ad-err'), e.message);
-  } finally {
-    btn.disabled = false;
-  }
+  await withBusy($('ad-run'), async () => {
+    try {
+      const scope = $('ad-scope').value;
+      const n = $('ad-n').value.trim() || '100';
+      const q = '/v1/_admin/audit?n=' + encodeURIComponent(n) +
+        (scope ? '&scope=' + encodeURIComponent(scope) : '');
+      const { data } = await adminApi(q);
+      AD.rows = (data && data.entries) || [];
+      AD.page = 0;
+      renderAuditPage();
+    } catch (e) {
+      AD.rows = [];
+      renderAuditPage();
+      showErr($('ad-err'), e.message);
+    }
+  });
 }
 
 function tbClear() { $('ad-table').querySelector('tbody').replaceChildren(); $('ad-empty').hidden = true; }
@@ -1712,7 +1763,10 @@ async function loadAdminUsers() {
     const lim = u.limits || {};
     const limText = [lim.rpm > 0 ? lim.rpm + '/分' : null, lim.max_concurrent > 0 ? '并发 ' + lim.max_concurrent : null]
       .filter(Boolean).join('、') || '不限';
-    return h('tr', null,
+    return h('tr', {
+      class: 'rowclick', title: '点击看详情',
+      onclick: () => openUser(u.name),
+    },
       h('td', null, h('code', { class: 'k', text: u.name })),
       h('td', null, h('span', { class: 'dot' + (u.enabled ? '' : ' off') }), u.enabled ? '启用' : '停用'),
       h('td', null, h('span', { class: 'tag' + (u.mode === 'consumption' ? ' ok' : ''), text: u.mode })),
@@ -1722,7 +1776,11 @@ async function loadAdminUsers() {
       h('td', null, h('span', { class: 'muted', text: limText })),
       h('td', null, h('button', {
         type: 'button', class: 'link', text: '编辑',
-        onclick: () => openUser(u.name),
+        onclick: (e) => {
+          // 行本身已经能点开详情，按钮这一下不再冒泡去开第二次
+          e.stopPropagation();
+          openUser(u.name);
+        },
       })),
     );
   }));
@@ -1742,7 +1800,11 @@ async function openUser(name, quiet) {
   ADM.editing = name;
   $('u-detail').hidden = false;
   showErr($('ud-err'), '');
-  if (!quiet) $('u-detail').scrollIntoView({ block: 'start', behavior: 'smooth' });
+  if (!quiet) {
+    const t = $('ud-title');
+    t.setAttribute('tabindex', '-1');
+    t.focus();
+  }
 
   const { data } = await adminApi('/v1/_admin/users/' + encodeURIComponent(name));
   ADM.detail = data;
@@ -1888,7 +1950,11 @@ async function switchToInherit() {
   const name = ADM.editing;
   if (!name) return;
   const n = $('ud-models').querySelectorAll('tbody tr').length;
-  if (n && !confirm('改为继承系统池？会清空该用户现有的 ' + n + ' 条模型映射。')) {
+  if (n && !(await confirmDialog({
+    title: '改为继承系统池',
+    okText: '清空映射并继承',
+    body: '改为继承系统池？会清空该用户现有的 ' + n + ' 条模型映射。',
+  }))) {
     renderModelScope(ADM.detail || {});
     return;
   }
@@ -1924,6 +1990,7 @@ async function saveUser() {
       }),
     });
     showErr($('ud-err'), '');
+    toast('已保存');
     await loadAdminUsers();
   } catch (e) {
     showErr($('ud-err'), e.message);
@@ -1935,10 +2002,15 @@ async function saveUser() {
 async function rotateToken() {
   const name = ADM.editing;
   if (!name) return;
-  if (!confirm('轮换 ' + name + ' 的 token？旧 token 立即失效，要用新 token 重新登录。')) return;
+  if (!(await confirmDialog({
+    title: '轮换 token',
+    okText: '轮换',
+    danger: true,
+    body: '轮换 ' + name + ' 的 token？旧 token 立即失效，要用新 token 重新登录。',
+  }))) return;
   try {
     const { data } = await adminApi('/v1/_admin/users/' + encodeURIComponent(name) + '/token', { method: 'POST' });
-    showToken(data.token, '新 token（只显示这一次）');
+    showTokenDialog(data.token, '用户 ' + name + ' 的新 token（只显示这一次，请立刻交给他）');
   } catch (e) {
     showErr($('ud-err'), e.message);
   }
@@ -1947,11 +2019,17 @@ async function rotateToken() {
 async function deleteUser() {
   const name = ADM.editing;
   if (!name) return;
-  if (!confirm('删除用户 ' + name + ' 及其全部模型映射与上游？不可恢复。')) return;
+  if (!(await confirmDialog({
+    title: '删除用户',
+    okText: '删除',
+    danger: true,
+    body: '删除用户 ' + name + ' 及其全部模型映射与上游？不可恢复。',
+  }))) return;
   try {
     await adminApi('/v1/_admin/users/' + encodeURIComponent(name), { method: 'DELETE' });
     $('u-detail').hidden = true;
     ADM.editing = null;
+    toast('用户 ' + name + ' 已删除');
     await loadAdminUsers();
   } catch (e) {
     showErr($('ud-err'), e.message);
@@ -2031,12 +2109,18 @@ async function addModel() {
 }
 
 async function deleteModel(name, model) {
-  if (!confirm('删除映射 ' + model + '？')) return;
+  if (!(await confirmDialog({
+    title: '删除映射',
+    okText: '删除',
+    danger: true,
+    body: '删除映射 ' + model + '？',
+  }))) return;
   try {
     // 模型名可能含 /，所以走 query 不走路径
     await adminApi('/v1/_admin/users/' + encodeURIComponent(name) + '/models?model=' + encodeURIComponent(model), {
       method: 'DELETE',
     });
+    toast('映射 ' + model + ' 已删除');
     await Promise.all([loadUserModels(name), loadAdminUsers()]);
   } catch (e) {
     showErr($('ud-err'), e.message);
@@ -2102,7 +2186,7 @@ async function createUser(ev) {
     $('nu-name').value = '';
     $('u-add-form').hidden = true;
     showErr($('nu-err'), '');
-    showToken(data.token, '用户 ' + name + ' 的 token（只显示这一次，请立刻交给他）');
+    showTokenDialog(data.token, '用户 ' + name + ' 的 token（只显示这一次，请立刻交给他）');
     if ($('nu-mode').value === 'consumption') {
       await adminApi('/v1/_admin/users/' + encodeURIComponent(name), {
         method: 'PUT', body: JSON.stringify({ mode: 'consumption' }),
@@ -2115,15 +2199,88 @@ async function createUser(ev) {
   }
 }
 
-function showToken(token, title) {
-  const box = $('new-token');
-  box.hidden = false;
-  box.textContent = title + '\n\n' + token;
+/* ── 侧边栏导航 / 概览 ─────────────────────────────────────────────
+   页面切换只做显隐 + 按页刷数据，不整页重渲染；概览的 8 秒轮询只在
+   概览页激活时跑（smartxray 同款口径），切走即停。 */
+
+let ovTimer = 0;
+
+// 按页刷新的装载器。两页刻意不自动重载：策略与路由（写侧有草稿）、操作审计（查询条件在手），
+// 都有各自的「刷新 / 查询」按钮。cfg 只在没改过时重载 —— 换页不该把没保存的编辑冲掉。
+// decl 与 replay 的装载器自带脏标记保护（declDirty / rpDirty），换页重载不丢草稿。
+const pageLoaders = {
+  cfg: () => { if (!ADM.dirty) loadSysProviders(); },
+  decl: () => loadDeclarations(),
+  replay: () => loadReplay(),
+  users: () => loadAdminUsers(),
+};
+
+function showPage(name) {
+  for (const b of $('admin-nav').querySelectorAll('button[data-page]')) {
+    b.classList.toggle('on', b.dataset.page === name);
+  }
+  for (const s of document.querySelectorAll('.page[data-page]')) {
+    s.hidden = s.dataset.page !== name;
+  }
+  if (ovTimer) { clearInterval(ovTimer); ovTimer = 0; }
+  if (name === 'overview') {
+    loadOverview().catch(() => {});
+    ovTimer = setInterval(() => { loadOverview().catch(() => {}); }, 8000);
+  } else if (pageLoaders[name]) {
+    pageLoaders[name]().catch((e) => toast('加载失败：' + e.message, 'err'));
+  }
 }
+
+function uptimeText(s) {
+  const n = Number(s || 0);
+  if (n < 60) return n + ' 秒';
+  if (n < 3600) return Math.floor(n / 60) + ' 分';
+  if (n < 86400) return Math.floor(n / 3600) + ' 时 ' + Math.floor((n % 3600) / 60) + ' 分';
+  return Math.floor(n / 86400) + ' 天 ' + Math.floor((n % 86400) / 3600) + ' 时';
+}
+
+async function loadOverview() {
+  const { data } = await api('/healthz');
+  const m = data.metrics || {};
+  const lat = m.latency_ms || {};
+  const users = ADM.users || [];
+  const usedTok = users.reduce((a, u) => a + Number((u.quota || {}).used_tokens || 0), 0);
+  const usedCost = users.reduce((a, u) => a + Number((u.quota || {}).used_cost || 0), 0);
+  const bad = Number(m.client_err || 0) + Number(m.upstream_err || 0);
+  $('ov-stats').replaceChildren(
+    stat('运行状态', data.status === 'ok' ? '正常' : String(data.status || '未知'), data.status === 'ok' ? 'ok' : 'bad'),
+    stat('版本', String(data.version || '—'), 'sm'),
+    stat('已运行', uptimeText(data.uptime_s), 'sm'),
+    stat('配置修订', String(data.revision == null ? '—' : data.revision), 'sm'),
+    stat('系统上游', String(data.providers == null ? '—' : data.providers) + ' 家', 'sm'),
+    stat('进程内请求', num(m.requests), ''),
+    stat('成功 / 失败', num(m.ok) + ' / ' + num(bad), 'sm', '失败 = client_err + upstream_err'),
+    stat('在途 / 限流', num(m.inflight) + ' / ' + num(m.rate_limited), 'sm'),
+    stat('延迟 p50 / p95', (lat.p50 || 0) + 'ms / ' + (lat.p95 || 0) + 'ms', 'sm'),
+    stat('审计记录', m.audit ? num(m.audit.rows) + ' 行' : '—', 'sm'),
+    stat('用户', num(users.length) + ' 个', 'sm'),
+    stat('本月 token / 金额', num(usedTok) + ' / ' + moneyShort(usedCost), 'sm'),
+  );
+  let asof = '刷新于 ' + new Date().toLocaleTimeString('zh-CN');
+  if (Number(data.persist_failures || 0) > 0) {
+    asof += '　记账落库失败 ' + data.persist_failures + ' 次（查磁盘/锁，转发本身是好的）';
+  }
+  $('ov-asof').textContent = asof;
+  $('ov-prov').replaceChildren(h('div', { class: 'chips' },
+    ...(ADM.cfg.providers || []).map((p) => h('span', {
+      class: 'chip',
+      title: (p.base_url || '') + (p.keyHint ? '　' + p.keyHint : ''),
+    }, h('span', { class: 'dot' + (p.enabled ? '' : ' off') }), p.name))));
+}
+
+$('admin-nav').addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-page]');
+  if (btn) showPage(btn.dataset.page);
+});
+$('ov-refresh').addEventListener('click', () => loadOverview().catch((e) => toast('刷新失败：' + e.message, 'err')));
 
 /* ── 事件绑定 ────────────────────────────────────────────────────── */
 
-$('admin-logout').addEventListener('click', adminLogout);
 $('u-add').addEventListener('click', () => {
   $('u-add-form').hidden = !$('u-add-form').hidden;
   $('nu-name').focus();
@@ -2131,6 +2288,19 @@ $('u-add').addEventListener('click', () => {
 $('nu-cancel').addEventListener('click', () => { $('u-add-form').hidden = true; });
 $('u-add-form').addEventListener('submit', createUser);
 $('ud-close').addEventListener('click', () => { $('u-detail').hidden = true; ADM.editing = null; });
+// u-detail 现在是大弹窗：点遮罩或 ESC 关闭（与其它浮层同一套习惯）
+$('u-detail').addEventListener('click', (e) => {
+  if (e.target === $('u-detail')) { $('u-detail').hidden = true; ADM.editing = null; }
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !$('u-detail').hidden) { $('u-detail').hidden = true; ADM.editing = null; }
+});
+$('ad-prev').addEventListener('click', () => {
+  if (AD.page > 0) { AD.page--; renderAuditPage(); }
+});
+$('ad-next').addEventListener('click', () => {
+  if (AD.page < Math.ceil(AD.rows.length / AD.perPage) - 1) { AD.page++; renderAuditPage(); }
+});
 $('ud-save').addEventListener('click', saveUser);
 $('ud-token').addEventListener('click', rotateToken);
 $('ud-delete').addEventListener('click', deleteUser);
