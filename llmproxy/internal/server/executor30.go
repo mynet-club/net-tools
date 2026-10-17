@@ -236,6 +236,11 @@ func (s *Server) executorCallFor(rt *policyRuntime, shot *policyShot, ask execut
 	if ask.prov == nil {
 		return nil, nil
 	}
+	// Anthropic 协议上游不走执行器委托：它的形变收在 2.x 传输段（anthropic_up.go），
+	// 翻译点只留一个，两条出网路的治理面完全一致。返回 (nil, nil) = 按未委托交换跑。
+	if ask.prov.Protocol == config.ProtocolAnthropicMessages {
+		return nil, nil
+	}
 	// 边界 3 的非流式那一半：Attempt.Timeout 强制为正，而现网的 timeout 取自
 	// provider.timeout_ms（配置加载时兜到 120s）。0 或负值在这里就不是「不限」，
 	// 而是「这次交换没法交给 F 描述」，交回 2.x 跑它原来的行为。

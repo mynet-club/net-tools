@@ -285,16 +285,9 @@ func writeAnthropicBody(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// sseDataPayload 从一个 SSE 帧里抽出 data 载荷（多行 data 按规范用 \n 拼接）。
-func sseDataPayload(frame []byte) string {
-	var parts []string
-	for _, line := range strings.Split(string(frame), "\n") {
-		if strings.HasPrefix(line, "data:") {
-			parts = append(parts, strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
-		}
-	}
-	return strings.Join(parts, "\n")
-}
+// sseDataPayload 从一个 SSE 帧里抽出 data 载荷 —— 帧解析口径与出网侧共用
+// （anthropic.SSEDataPayload），两处各写一份迟早走偏。
+var sseDataPayload = anthropic.SSEDataPayload
 
 // 确认 anthropicWriter 仍满足 http.Flusher（relay 的流式路径按它判断）。
 var _ http.Flusher = (*anthropicWriter)(nil)

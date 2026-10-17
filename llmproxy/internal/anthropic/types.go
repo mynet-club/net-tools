@@ -185,34 +185,46 @@ type ChatResponse struct {
 	Usage *ChatUsage `json:"usage,omitempty"`
 }
 
-// ChatUsage 是 OpenAI 形状的用量。
+// ChatUsage 是 OpenAI 形状的用量。TotalTokens 在回形侧要一并给：
+// usageScanner 靠 total_tokens 合总账，缺了这列记账就少一格。
 type ChatUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens,omitempty"`
 }
 
 // ChatChunk 是流式的一个增量片段。
 type ChatChunk struct {
-	ID      string `json:"id"`
-	Model   string `json:"model"`
-	Choices []struct {
-		Index int `json:"index"`
-		Delta struct {
-			Role             string `json:"role"`
-			Content          string `json:"content"`
-			ReasoningContent string `json:"reasoning_content"`
-			Reasoning        string `json:"reasoning"`
-			ToolCalls        []struct {
-				Index    int    `json:"index"`
-				ID       string `json:"id"`
-				Type     string `json:"type"`
-				Function struct {
-					Name      string `json:"name"`
-					Arguments string `json:"arguments"`
-				} `json:"function"`
-			} `json:"tool_calls"`
-		} `json:"delta"`
-		FinishReason string `json:"finish_reason"`
-	} `json:"choices"`
-	Usage *ChatUsage `json:"usage,omitempty"`
+	ID      string            `json:"id"`
+	Model   string            `json:"model"`
+	Choices []ChatChunkChoice `json:"choices"`
+	Usage   *ChatUsage        `json:"usage,omitempty"`
+}
+
+// ChatChunkChoice 是 chunk 的一个候选增量。
+type ChatChunkChoice struct {
+	Index        int            `json:"index"`
+	Delta        ChatChunkDelta `json:"delta"`
+	FinishReason string         `json:"finish_reason,omitempty"`
+}
+
+// ChatChunkDelta 是增量内容。content 恒在（哪怕是空串），
+// reasoning_content / tool_calls 缺省不出现 —— 与主流上游的流式形态一致。
+type ChatChunkDelta struct {
+	Role             string              `json:"role,omitempty"`
+	Content          string              `json:"content"`
+	ReasoningContent string              `json:"reasoning_content,omitempty"`
+	Reasoning        string              `json:"reasoning,omitempty"`
+	ToolCalls        []ChatChunkToolCall `json:"tool_calls,omitempty"`
+}
+
+// ChatChunkToolCall 是流式工具调用增量：首片带 id/name，后续片只带参数碎片。
+type ChatChunkToolCall struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id,omitempty"`
+	Type     string `json:"type,omitempty"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
 }

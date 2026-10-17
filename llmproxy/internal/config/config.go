@@ -216,6 +216,29 @@ type ProxyDef struct {
 	URL  string `yaml:"url"`
 }
 
+// 在线协议形态的封闭集取值（与 internal/executor.Protocol 的字面量同词表）。
+const (
+	ProtocolOpenAIChat        = "openai_chat"
+	ProtocolOllamaNative      = "ollama_native"
+	ProtocolAnthropicMessages = "anthropic_messages"
+)
+
+// ParseProviderProtocol 校验 protocol 字段并定下缺省值。
+//
+// 拼错即报错而不是静默退化成 openai_chat：那会把「我以为在打 Anthropic 端点」
+// 变成「实际在打 /chat/completions」，错误会出现在上游的 404 里而不是配置行上。
+func ParseProviderProtocol(raw, where string) (string, error) {
+	switch strings.TrimSpace(raw) {
+	case "":
+		return ProtocolOpenAIChat, nil
+	case ProtocolOpenAIChat, ProtocolOllamaNative, ProtocolAnthropicMessages:
+		return strings.TrimSpace(raw), nil
+	default:
+		return "", fmt.Errorf("%s.protocol 取值不认：%q（可选：%s / %s / %s）",
+			where, raw, ProtocolOpenAIChat, ProtocolOllamaNative, ProtocolAnthropicMessages)
+	}
+}
+
 // ProviderRaw 是 YAML 里的原始供应商条目。
 type ProviderRaw struct {
 	Name         string            `yaml:"name"`
@@ -227,6 +250,10 @@ type ProviderRaw struct {
 	TimeoutMs    int               `yaml:"timeout_ms"`
 	Models       yaml.Node         `yaml:"models"`
 	ExtraHeaders map[string]string `yaml:"extra_headers"`
+	// Protocol 是这家上游的在线协议形态（封闭集见 ParseProviderProtocol）。
+	// 缺省 openai_chat；anthropic_messages = Anthropic Messages 线格式（/v1/messages），
+	// 二次翻转的出网侧翻译在传输层做，治理核不受影响。
+	Protocol string `yaml:"protocol"`
 	// MaxDataLevel 声明这家上游**最多能承接哪个数据分级**（§2.3 的四级词表）。
 	// 3.0 的分级门比的就是这个事实：请求的有效分级高于它时，这家不参与选路。
 	// 启用 3.0（policy.mode ≠ legacy）时已启用的供应商必须显式写它 ——
@@ -398,6 +425,11 @@ type Provider struct {
 	// （见 checkProviderDataLevels），运行期构造的 Provider（用户自配上游）没有申报
 	// 渠道，取分级时按最低级处理（见 DataLevelCeiling）。
 	MaxDataLevel policy.DataLevel
+	// Protocol 是这家上游的在线协议形态（ParseProviderProtocol 的封闭集）：
+	// openai_chat（缺省）= /chat/completions 直发；anthropic_messages = Anthropic
+	// Messages 线格式（/v1/messages），出网传输层做二次翻转的下半场翻译，
+	// 治理核（策略/审计/记账）看到的仍是 OpenAI 形状。
+	Protocol string
 	// SystemPaid 是**运行期**标记：true = 这家来自系统池（config.yaml 的 providers），
 	// 这次消耗算网关主人的账，要进用户的配额与金额；false = 用户自己配的上游。
 	// 不参与 YAML 解析 —— 它由 providersFor 在拼候选池时按来源打上，用来决定计费归属。
@@ -782,6 +814,11 @@ func (c *Config) normalize(opts LoadOptions) error {
 			maxLevel = lv
 		}
 
+		proto, err := ParseProviderProtocol(p.Protocol, where+" ("+p.Name+")")
+		if err != nil {
+			return err
+		}
+
 		c.Normalized = append(c.Normalized, Provider{
 			Name:         p.Name,
 			Enabled:      enabled,
@@ -794,6 +831,7 @@ func (c *Config) normalize(opts LoadOptions) error {
 			Models:       spec,
 			Index:        i,
 			MaxDataLevel: maxLevel,
+			Protocol:     proto,
 		})
 	}
 

@@ -684,7 +684,9 @@ func roundTripUpstream(ctx context.Context, tr http.RoundTripper, prov *config.P
 		req.Header.Set(k, v)
 	}
 	// 刻意不转发下游的 Authorization / Cookie / X-Api-Key
-	return tr.RoundTrip(req)
+	// anthropic_messages 协议的供应商在这里做二次翻转的出网侧翻译（见 anthropic_up.go），
+	// 上面所有路径看到的请求/响应都还是 OpenAI 形状。
+	return wrapAnthropicTransport(tr, prov).RoundTrip(req)
 }
 
 // relayOutcome 是 relay 的结果，用来决定熔断计数与会话粘性怎么记。
