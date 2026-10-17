@@ -2206,12 +2206,15 @@ async function createUser(ev) {
 
 let ovTimer = 0;
 
-// 按页刷新的装载器。两页刻意不自动重载：策略与路由（写侧有草稿）、操作审计（查询条件在手），
+// 按页刷新的装载器。两页刻意不自动重载：策略发布（写侧有草稿）、操作审计（查询条件在手），
 // 都有各自的「刷新 / 查询」按钮。cfg 只在没改过时重载 —— 换页不该把没保存的编辑冲掉。
-// decl 与 replay 的装载器自带脏标记保护（declDirty / rpDirty），换页重载不丢草稿。
+// proc / kb 的装载器自带脏标记保护（declDirty），换页重载不丢草稿；
+// 策略观测 / 策略发布拆成两页后共用 loadPolicy（读侧幂等）。
 const pageLoaders = {
   cfg: () => { if (!ADM.dirty) loadSysProviders(); },
-  decl: () => loadDeclarations(),
+  'policy-view': () => loadPolicy(),
+  proc: () => loadDeclarations(),
+  kb: () => loadDeclarations(),
   replay: () => loadReplay(),
   users: () => loadAdminUsers(),
 };

@@ -45,17 +45,25 @@
 
   <div class="shell">
     <nav class="nav" id="admin-nav" aria-label="功能导航">
+      <span class="nav-group">看板</span>
       <button type="button" data-page="overview" class="on">概览</button>
+      <span class="nav-group">观测</span>
+      <button type="button" data-page="policy-view">策略观测</button>
+      <span class="nav-group">配置</span>
       <button type="button" data-page="cfg">系统上游</button>
-      <button type="button" data-page="policy">策略与路由</button>
-      <button type="button" data-page="decl">处理器与知识库</button>
+      <button type="button" data-page="policy-write">策略发布</button>
+      <button type="button" data-page="proc">处理器</button>
+      <button type="button" data-page="kb">知识源</button>
       <button type="button" data-page="replay">回放证据链</button>
+      <span class="nav-group">运营</span>
       <button type="button" data-page="users">用户</button>
       <button type="button" data-page="audit">操作审计</button>
     </nav>
 
     <main class="wrap">
       <p class="banner" id="admin-banner" hidden></p>
+      <p class="banner" id="pl-status" hidden></p>
+      <p class="banner" id="pc-status" hidden></p>
 
       <!-- 概览：网关现在的运行状态（/healthz 8 秒轮询，只在本页激活时刷） -->
       <section class="card page" id="page-overview" data-page="overview">
@@ -126,30 +134,29 @@
     </section>
 
     <!-- 策略与路由（3.0）：只读可见性 —— 现在到底生效了什么、切 enforce 会怎么判、当时判成了什么 -->
-    <section class="card page" id="policy" data-page="policy" hidden>
+    <!-- 策略观测（只读）：现在生效什么、模拟会怎么判、当时判成了什么 -->
+    <section class="card page" id="policy" data-page="policy-view" hidden>
       <div class="head">
-        <h2>策略与路由</h2>
+        <h2>策略观测</h2>
         <span class="mono muted" id="pl-rev"></span>
         <span class="grow"></span>
         <button type="button" id="pl-refresh" class="ghost sm">刷新</button>
       </div>
-      <p class="sub">这一屏回答推进 shadow→enforce 时唯一要看的那三件事：现在生效的是什么、
-        切 enforce 会怎么判、当时判成了什么。判定全部由服务端的判定核给出，界面不复算权限。</p>
-      <p class="banner" id="pl-status" hidden></p>
+      <p class="sub">只读面：判定全部由服务端的判定核给出，界面不复算权限。</p>
+      <details class="why"><summary>这一页回答什么</summary>
+        <p class="sub">推进 shadow→enforce 时唯一要看的那三件事：现在生效的是什么、
+          切 enforce 会怎么判、当时判成了什么。</p>
+      </details>
       <div id="pl-stats" class="gridn"></div>
       <div id="pl-bundles"></div>
 
-      <h3 class="sub-h">模式、生效包与版本发布</h3>
-      <p class="sub">这三件事都会改 <code>config.yaml</code>（改前自动备份，段外内容与注释原样）。
-        发布一次同时写引用与 <code>policy-bundles/&lt;id&gt;.yaml</code>，任何一步校验不过就整笔还原。
-        <b>注意</b>：下面的表格只回显规则的<b>选择器与条件键名</b>（条件值不经这个端点外泄），
-        所以规则正文要从你自己的策略源文件粘贴进来 —— 拿界面上的回显当原件发布会丢条件值。</p>
-      <div id="pl-write"></div>
-
       <h3 class="sub-h">路由模拟</h3>
-      <p class="sub">与线上请求走<b>同一个判定核</b>，所以「模拟通过」和「线上通过」是同一个答案。
-        它不写影子差异统计、不碰熔断/粘性/计量 —— 否则差异报告里的「一致率」就掺进了人为流量。
-        响应只有标识与结论：规则只列选择器与条件<b>键名</b>，不含条件值、上游地址与密钥。</p>
+      <p class="sub">与线上请求走同一个判定核 —— 「模拟通过」就是「线上通过」。</p>
+      <details class="why"><summary>模拟为什么不影响统计</summary>
+        <p class="sub">它不写影子差异统计、不碰熔断/粘性/计量 —— 否则差异报告里的「一致率」
+          就掺进了人为流量。响应只有标识与结论：规则只列选择器与条件<b>键名</b>，
+          不含条件值、上游地址与密钥。</p>
+      </details>
       <div class="row">
         <select id="sim-scope"></select>
         <input id="sim-model" class="mono" placeholder="模型名，如 gpt-4o-mini" autocomplete="off">
@@ -160,9 +167,11 @@
       <div id="sim-out" hidden></div>
 
       <h3 class="sub-h">决策痕迹</h3>
-      <p class="sub">按 <code>request_id</code> 回当时的策略版本、路由代、seed 与候选摘要。
-        只有 enforce 且计划真的作用到请求上才谈得上<b>逐位复现</b>；影子请求与回落旧路由的请求
-        只能做解释性回放，这里会照实写出来。</p>
+      <p class="sub">按 request_id 回当时的策略版本、路由代、seed 与候选摘要。</p>
+      <details class="why"><summary>什么才谈得上逐位复现</summary>
+        <p class="sub">只有 enforce 且计划真的作用到请求上才谈得上<b>逐位复现</b>；
+          影子请求与回落旧路由的请求只能做解释性回放，这里会照实写出来。</p>
+      </details>
       <div class="row">
         <input id="tr-rid" class="mono" placeholder="request_id" autocomplete="off">
         <button type="button" id="tr-run" class="sm">查询</button>
@@ -171,37 +180,52 @@
       <div id="tr-out" hidden></div>
     </section>
 
-    <!-- 处理器与知识库（3.0 §3.H）：config.yaml 的 processors / knowledge_sources 两段声明，
-         整段读写。这一屏只做「把磁盘上那一段交给人改」，判据全在服务端领域校验。 -->
-    <section class="card page" id="decl" data-page="decl" hidden>
+    <!-- 策略发布（写侧）：模式、生效包、发布新版 —— 只有这一屏会改 config.yaml -->
+    <section class="card page" id="policy-write" data-page="policy-write" hidden>
       <div class="head">
-        <h2>处理器与知识库</h2>
+        <h2>策略发布</h2>
+      </div>
+      <p class="sub">写侧三件事：模式、生效包、发布新版。都会改 <code>config.yaml</code>
+        （改前自动备份，段外内容与注释原样）。</p>
+      <details class="why"><summary>发布前必读：回显不是原件</summary>
+        <p class="sub">发布一次同时写引用与 <code>policy-bundles/&lt;id&gt;.yaml</code>，
+          任何一步校验不过就整笔还原。下面的表格只回显规则的<b>选择器与条件键名</b>
+          （条件值不经这个端点外泄），所以规则正文要从你自己的策略源文件粘贴进来 ——
+          拿界面上的回显当原件发布会丢条件值。</p>
+      </details>
+      <div id="pl-write"></div>
+    </section>
+
+    <!-- 处理器（3.0 §3.H）：config.yaml 的 processors 段整段读写，判据全在服务端领域校验 -->
+    <section class="card page" id="decl" data-page="proc" hidden>
+      <div class="head">
+        <h2>处理器</h2>
         <span class="mono muted" id="pc-rev"></span>
         <span class="grow"></span>
         <button type="button" id="pc-refresh" class="ghost sm">刷新</button>
       </div>
-      <p class="sub">这里配的是<b>约束</b>（处理器挂在哪个范围、能读正文吗、失败时放行还是拒、
-        出网白名单、体积与超时上限；知识源委托给哪个入口、服务哪几个库）。
-        运行参数（脱敏类型、规则表、JSON Schema、sidecar 端点与请求头）在配置文件同级的
-        <code>processor_params/&lt;声明名&gt;.json</code>，不在这个文件里；HTTP 客户端、
-        正文交付器与出网授权判定器由网关按出网策略和生效策略包注入，三处都不接受文件给出 ——
-        所有判据由服务端领域校验给出，界面不复算权限。</p>
-      <p class="sub"><b>「装配」那一格是运行态读数</b>：磁盘上有这条声明，和网关把这个修订装起来了，
-        是两件事。装配结果只存在进程内存里、<b>不落库</b>，所以<b>重启后只反映重启之后的状态</b>，
-        历史上的装配结果查不到（要查那次请求为什么被拒，看审计与请求明细）。
-        装不起来的声明在 enforce 下会让命中它的请求直接被拒，绝不放行未处理正文。
-        补好<code>processor_params/&lt;声明名&gt;.json</code>之后红灯不会自己灭 —— 运行参数不在配置里，
-        光补文件不换了配置修订，网关不会重装配；改一次配置（或重启）再刷新才是绿。</p>
-      <p class="banner" id="pc-status" hidden></p>
+      <p class="sub">这里配的是<b>约束</b>（挂在哪个范围、能读正文吗、失败放行还是拒、
+        出网白名单、体积与超时上限）。所有判据由服务端领域校验给出，界面不复算权限。</p>
+      <details class="why"><summary>运行参数在哪、装配红灯怎么灭</summary>
+        <p class="sub">运行参数（脱敏类型、规则表、JSON Schema、sidecar 端点与请求头）在配置文件
+          同级的 <code>processor_params/&lt;声明名&gt;.json</code>，不在这个文件里；HTTP 客户端、
+          正文交付器与出网授权判定器由网关按出网策略和生效策略包注入，三处都不接受文件给出。</p>
+        <p class="sub"><b>「装配」那一格是运行态读数</b>：磁盘上有这条声明，和网关把这个修订装起来了，
+          是两件事。装配结果只存在进程内存里、<b>不落库</b>，重启后只反映重启之后的状态。
+          装不起来的声明在 enforce 下会让命中它的请求直接被拒，绝不放行未处理正文。
+          补好<code>processor_params/&lt;声明名&gt;.json</code>之后红灯不会自己灭 ——
+          光补文件不换配置修订，网关不会重装配；改一次配置（或重启）再刷新才是绿。</p>
+      </details>
       <div id="pc-stats" class="gridn"></div>
 
       <h3 class="sub-h">处理器声明（<code>processors</code> 段）</h3>
-      <p class="sub">整段提交：改一条也要把整个数组发回来，服务端把这一段整体替换进
-        <code>config.yaml</code>（改前自动备份，段外内容与注释原样）。
-        <b>清空请显式保存 <code>[]</code></b> —— 少带字段不会被当成清空。
-        取值域见下方对照表，写坏的声明只会退回错误、磁盘不动。
-        要装知识库正文注入（<code>kb-context-inject</code>）时，<code>allowed_endpoints</code>
-        必须同时列出检索入口与正文交付入口 —— 那一发同样是出网。</p>
+      <p class="sub">整段提交：改一条也要把整个数组发回来。<b>清空请显式保存 <code>[]</code></b>。</p>
+      <details class="why"><summary>整段提交的口径</summary>
+        <p class="sub">服务端把这一段整体替换进 <code>config.yaml</code>（改前自动备份，段外内容与
+          注释原样）；少带字段不会被当成清空。取值域见下方对照表，写坏的声明只会退回错误、磁盘不动。
+          要装知识库正文注入（<code>kb-context-inject</code>）时，<code>allowed_endpoints</code>
+          必须同时列出检索入口与正文交付入口 —— 那一发同样是出网。</p>
+      </details>
       <textarea id="pc-p-json" class="pl-rules" rows="12" spellcheck="false"
         placeholder="[{&quot;name&quot;:…}] —— 点「填入最小示例」拿形状"></textarea>
       <div class="row">
@@ -213,17 +237,30 @@
         <span class="muted" id="pc-p-hint"></span>
       </div>
 
-      <h3 class="sub-h">知识源委托入口（<code>knowledge_sources</code> 段）</h3>
+      <details class="why"><summary>取值域（服务端下发，不是手抄的表）</summary>
+        <p class="sub">这一屏能填什么，完全由服务端注册表与领域上限决定；这里只回显它报出来的那份。
+          界面不校验业务规则（阶段配对了什么档、上限之间怎么互相约束）—— 那是唯一真值来源的活。</p>
+        <div id="pc-vocab"></div>
+      </details>
+    </section>
+
+    <!-- 知识源（3.0 §3.H）：knowledge_sources 段整段读写 -->
+    <section class="card page" id="kb" data-page="kb" hidden>
+      <div class="head">
+        <h2>知识源</h2>
+        <span class="grow"></span>
+      </div>
       <p class="sub">网关不自己实现检索：这一段声明「哪个知识库 ID 交给哪个内部入口」，
-        请求侧只带知识库 ID，出网目标与预算由这里钉死。同一个库不能让两家入口同时服务
-        （否则「谁答的」在审计里就成了事后猜）。</p>
-      <p class="sub">正文交付<b>默认关</b>：<code>return_raw_body</code> 不写就是关着，
-        这一屏的默认形态只给引用不给正文。打开它必须同时写独立的
-        <code>delivery_endpoint</code>（与 <code>endpoint</code> 相同会被拒），
-        而且这放开的是<b>方向</b>不是某一篇：正文要进上下文还得策略里
-        <code>knowledge.content</code> 与 <code>body.raw</code> 两道授权各自带到期时刻，
-        缺任何一道就不会有正文进来。那两道在「策略与路由」配，不在这里。</p>
-      <textarea id="pc-kn-json" class="pl-rules" rows="10" spellcheck="false"
+        出网目标与预算由这里钉死。同一个库不能让两家入口同时服务（否则「谁答的」在审计里
+        就成了事后猜）。正文交付<b>默认关</b>。</p>
+      <details class="why"><summary>正文交付为什么默认关</summary>
+        <p class="sub"><code>return_raw_body</code> 不写就是关着，这一屏的默认形态只给引用不给正文。
+          打开它必须同时写独立的 <code>delivery_endpoint</code>（与 <code>endpoint</code> 相同会被拒），
+          而且这放开的是<b>方向</b>不是某一篇：正文要进上下文还得策略里
+          <code>knowledge.content</code> 与 <code>body.raw</code> 两道授权各自带到期时刻，
+          缺任何一道就不会有正文进来。那两道在「策略发布」配，不在这里。</p>
+      </details>
+      <textarea id="pc-kn-json" class="pl-rules" rows="12" spellcheck="false"
         placeholder="[{&quot;name&quot;:…}] —— 点「填入最小示例」拿形状"></textarea>
       <div class="row">
         <button type="button" id="pc-kn-save" class="primary sm">整段保存</button>
@@ -233,11 +270,6 @@
         <span class="grow"></span>
         <span class="muted" id="pc-kn-hint"></span>
       </div>
-
-      <h3 class="sub-h">取值域（服务端下发，不是这里手抄的表）</h3>
-      <p class="sub">这一屏能填什么，完全由服务端注册表与领域上限决定；这里只回显它报出来的那份。
-        界面不校验业务规则（阶段配对了什么档、上限之间怎么互相约束）—— 那是唯一真值来源的活。</p>
-      <div id="pc-vocab"></div>
     </section>
 
     <!-- 回放证据链（3.0 §2.8）：把采集开起来、把记录取走、取完清掉。
@@ -249,28 +281,32 @@
         <span class="grow"></span>
         <button type="button" id="rp-refresh" class="ghost sm">刷新</button>
       </div>
-      <p class="sub">这一屏只管三件事：开多大比例的采集、把窗口里的记录取走、取完把窗口清掉。
-        记录里带<b>用户名</b>（谁在什么时候被授权用了哪个模型），所以缺省是关的 ——
-        运维口径是「要证据时打开 → 跑一批流量 → 导出取走 → 关掉或清空」，而不是长期开着。
-        回放本身不在这里跑：那份文件要在<b>另一个进程</b>里配合当时那套策略包重跑
-        （<code>llmproxy replay run -records … -now …</code>），这屏给出的每一条数字都只是窗口的计数。
-        首选顺序能不能<b>逐位</b>复现，取决于记录里有没有带上当时那份完整回放输入
-        （<code>schema_version=2</code> 的 <code>replay_snapshot</code>）；导入的旧记录照样能回放，
-        只是报告会明写它<b>只做解释性回放</b>，不会静默算成复现成功。</p>
+      <p class="sub">只管三件事：开多大比例的采集、把窗口里的记录取走、取完把窗口清掉。
+        记录里带用户名，缺省是关的。</p>
+      <details class="why"><summary>运维口径与回放在哪跑</summary>
+        <p class="sub">运维口径是「要证据时打开 → 跑一批流量 → 导出取走 → 关掉或清空」，而不是长期开着。
+          回放本身不在这里跑：那份文件要在<b>另一个进程</b>里配合当时那套策略包重跑
+          （<code>llmproxy replay run -records … -now …</code>），这屏给出的每一条数字都只是窗口的计数。
+          首选顺序能不能<b>逐位</b>复现，取决于记录里有没有带上当时那份完整回放输入
+          （<code>schema_version=2</code> 的 <code>replay_snapshot</code>）；导入的旧记录照样能回放，
+          只是报告会明写它<b>只做解释性回放</b>，不会静默算成复现成功。</p>
+      </details>
       <p class="banner" id="rp-status" hidden></p>
       <div id="rp-stats" class="gridn"></div>
 
       <h3 class="sub-h">采集开关</h3>
-      <p class="sub">四个字段各管各的：留空的<b>不动</b>（服务端是指针语义，不是整体覆盖），
-        所以只想调比例时不必先把当前范围过滤抄一遍。千分率 1000 = 全采。
-        范围过滤只认<b>精确的 <code>kind:id</code></b>（<code>user:alice</code>、
-        <code>organization:university</code>、<code>system:global</code>……种类不限），
-        命中条件是「这次判定的请求范围<b>等于</b>它，<b>或</b>当时的范围链<b>里有</b>它」——
-        按组织导证据靠的是后一半。通配仍然当场拒：它按相等匹配会一条都不命中，
-        那是「开了采集却一条没收」这种最难查的形态。今天还得提醒一句：线上流量的链上只有
-        <code>user</code> 与 <code>system</code>（身份映射那条 <code>claim→organization</code>
-        没接进请求路径），所以按 org 过滤<b>会是明确的 0 条</b>，这不是过滤器坏了 ——
-        导出那份审计里会把原因一起写下来。</p>
+      <p class="sub">四个字段各管各的：留空的<b>不动</b>（指针语义，不是整体覆盖）；
+        千分率 1000 = 全采。</p>
+      <details class="why"><summary>范围过滤怎么算命中</summary>
+        <p class="sub">范围过滤只认<b>精确的 <code>kind:id</code></b>（<code>user:alice</code>、
+          <code>organization:university</code>、<code>system:global</code>……种类不限），
+          命中条件是「这次判定的请求范围<b>等于</b>它，<b>或</b>当时的范围链<b>里有</b>它」——
+          按组织导证据靠的是后一半。通配仍然当场拒：它按相等匹配会一条都不命中，
+          那是「开了采集却一条没收」这种最难查的形态。今天还得提醒一句：线上流量的链上只有
+          <code>user</code> 与 <code>system</code>（身份映射那条 <code>claim→organization</code>
+          没接进请求路径），所以按 org 过滤<b>会是明确的 0 条</b>，这不是过滤器坏了 ——
+          导出那份审计里会把原因一起写下来。</p>
+      </details>
       <div class="row">
         <label class="inline"><input type="checkbox" id="rp-enabled"> 开启采集</label>
         <input id="rp-permille" class="mono" inputmode="numeric" placeholder="千分率，如 50" autocomplete="off">
@@ -282,13 +318,15 @@
       <p class="hint" id="rp-hint"></p>
 
       <h3 class="sub-h">导出与清空</h3>
-      <p class="sub">导出拿到的就是记录文件<b>本身</b>（<code>replay.File</code>，不加包装字段），
-        所以浏览器存下来的那份可以直接交给另一个进程重跑；这里也刻意不做任何「下载后再拼一层」的处理。
-        导出过滤与采集用<b>同一条命中规则</b>（等于它，或当时的范围链里有它），种类不限、通配仍拒。
-        空窗口导出的是一个只含 <code>schema_version</code> 的合法文件，
-        按某个范围导出但一条都没命中时同样是 200 + 空记录 ——
-        「没有记录」与「这个端点不存在」是两件事，回放侧会报前者，而这次导出记的审计会把
-        <b>命中 0 条</b>和它指着的范围一起留下。</p>
+      <p class="sub">导出拿到的就是记录文件<b>本身</b>，浏览器存下来的那份直接交给另一个进程重跑。</p>
+      <details class="why"><summary>空窗口与 0 命中的语义</summary>
+        <p class="sub">这里刻意不做任何「下载后再拼一层」的处理。
+          导出过滤与采集用<b>同一条命中规则</b>（等于它，或当时的范围链里有它），种类不限、通配仍拒。
+          空窗口导出的是一个只含 <code>schema_version</code> 的合法文件，
+          按某个范围导出但一条都没命中时同样是 200 + 空记录 ——
+          「没有记录」与「这个端点不存在」是两件事，回放侧会报前者，而这次导出记的审计会把
+          <b>命中 0 条</b>和它指着的范围一起留下。</p>
+      </details>
       <div class="row">
         <input id="rp-export-scope" class="mono" placeholder="导出过滤，如 user:alice（精确 kind:id；留空=全窗口）" autocomplete="off">
         <button type="button" id="rp-export" class="sm">导出记录文件</button>

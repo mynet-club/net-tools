@@ -465,3 +465,18 @@ tr.rowclick:hover { background: #f6f7fa; }
 
 /* 用户详情大弹窗：比默认弹窗宽，两栏编辑区才排得开 */
 .modal-box.ud-box { max-width: 860px; }
+
+/* ── 导航分组标签与折叠说明 ───────────────────────────────────────── */
+.nav-group {
+  padding: 10px 12px 2px; font-size: 10.5px; color: var(--muted);
+  letter-spacing: .08em; user-select: none;
+}
+details.why { margin: 6px 0 10px; }
+details.why summary {
+  cursor: pointer; font-size: 12px; color: var(--muted); list-style: none;
+}
+details.why summary::-webkit-details-marker { display: none; }
+details.why summary::before { content: '▸ '; }
+details.why[open] summary::before { content: '▾ '; }
+details.why summary:hover { color: var(--ink); }
+details.why .sub { margin: 4px 0 0; }
