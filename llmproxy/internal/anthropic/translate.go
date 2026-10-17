@@ -10,15 +10,14 @@ import (
 
 // ToChat 把 Anthropic Messages 请求翻成内部 chat/completions 形状。
 //
-// 两处刻意的丢弃：
-//   - top_k：OpenAI 形状没有这个字段，也没有等价物，静默丢弃（带上去反而会被
-//     一些上游判成非法字段）；
-//   - thinking：Claude Code 默认带 extended thinking，但内部形状与多数上游
-//     都没有对应参数。丢掉它请求照常成立（thinking 是增强不是前提），
-//     响应里也就不会有 thinking 块 —— 翻译层在响应侧同样不造这个块。
+// 一处刻意的丢弃：top_k —— OpenAI 形状没有这个字段也没有等价物，静默丢弃
+// （带上去反而会被一些上游判成非法字段）。
 //
-// max_tokens 的必填校验在调用方（/v1/messages 要求正整数，count_tokens 共用
-// 同一形状但不带它），这里只负责翻。
+// thinking（extended thinking）翻成 reasoning_effort：预算按三档映射
+// （<8192 low、<24576 medium、其余 high；不带预算按 medium）。上游认不认这个
+// 字段随它 —— 不认的（如 deepseek-chat）忽略即可，deepseek-reasoner 这类
+// 「换了模型才思考」的上游由用户自己的模型映射决定。响应侧的推理正文由
+// FromChat / StreamTranslator 翻回 thinking 块。
 //
 // 返回的 estimate 是给 message_start / count_tokens 用的输入 token 估算值。
 func ToChat(req *Request) (*ChatRequest, int, error) {
@@ -30,12 +29,13 @@ func ToChat(req *Request) (*ChatRequest, int, error) {
 	}
 
 	out := &ChatRequest{
-		Model:       req.Model,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
-		TopP:        req.TopP,
-		Stop:        req.StopSequences,
-		Stream:      req.Stream,
+		Model:           req.Model,
+		MaxTokens:       req.MaxTokens,
+		Temperature:     req.Temperature,
+		TopP:            req.TopP,
+		Stop:            req.StopSequences,
+		Stream:          req.Stream,
+		ReasoningEffort: reasoningEffort(req.Thinking),
 	}
 
 	// system → 首条 system 消息
@@ -146,7 +146,9 @@ func chatMessages(m *Message) ([]ChatMessage, int, error) {
 			})
 			est += EstimateText(res)
 		case "thinking":
-			// 丢弃：见 ToChat 注释
+			// 历史轮的思考正文不进上游：内部是 OpenAI 形状，没有这个字段；
+			// 带签名的块也没有可校验的对端。当轮的 thinking 由请求参数决定
+			// （见 reasoningEffort），响应侧的推理正文由 FromChat 翻回来。
 		default:
 			return nil, 0, fmt.Errorf("不认的内容块类型 %q", b.Type)
 		}
@@ -171,7 +173,30 @@ func chatMessages(m *Message) ([]ChatMessage, int, error) {
 	return out, est, nil
 }
 
+// reasoningEffort 把 thinking 预算翻成上游的 reasoning_effort 三档。
+// disabled / 不带 thinking 返回空串（不写这个字段）。
+func reasoningEffort(th *Thinking) string {
+	if th == nil || th.Type != "enabled" {
+		return ""
+	}
+	switch {
+	case th.BudgetTokens == 0:
+		return "medium"
+	case th.BudgetTokens < 8192:
+		return "low"
+	case th.BudgetTokens < 24576:
+		return "medium"
+	default:
+		return "high"
+	}
+}
+
 // FromChat 把 OpenAI 形状的非流式响应翻成 Anthropic Messages 响应。
+//
+// 上游给了推理正文（reasoning_content，另一些网关叫 reasoning）就翻成 thinking
+// 块放最前面 —— 不管这次请求有没有点 thinking：deepseek-reasoner 这类上游换了
+// 模型就一直在想，把它想的东西藏掉才是损失。请求侧不回传 thinking 块
+// （chatMessages 丢弃），所以这里造的块不需要签名也能闭环。
 func FromChat(resp *ChatResponse, fallbackModel string) (*Response, error) {
 	out := &Response{
 		ID:           "msg_" + randHex(16),
@@ -188,6 +213,9 @@ func FromChat(resp *ChatResponse, fallbackModel string) (*Response, error) {
 		return nil, fmt.Errorf("上游响应里没有 choices")
 	}
 	ch := resp.Choices[0]
+	if think := firstNonEmpty(ch.Message.ReasoningContent, ch.Message.Reasoning); think != "" {
+		out.Content = append(out.Content, ResponseBlock{Type: "thinking", Thinking: think})
+	}
 	if t := strings.TrimSpace(ch.Message.Content); t != "" {
 		out.Content = append(out.Content, ResponseBlock{Type: "text", Text: t})
 	}
@@ -211,6 +239,16 @@ func FromChat(resp *ChatResponse, fallbackModel string) (*Response, error) {
 		}
 	}
 	return out, nil
+}
+
+// firstNonEmpty 回第一个非空串（reasoning_content 与 reasoning 两个字段名取先到者）。
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // stopReason 把 OpenAI 的 finish_reason 翻成 Anthropic 的 stop_reason。

@@ -16,19 +16,26 @@ import "encoding/json"
 // content 的两种形态（字符串或块数组）都收：Claude Code 用块数组，
 // 一行 curl 常用字符串，二者语义相同。
 type Request struct {
-	Model         string          `json:"model"`
-	MaxTokens     int             `json:"max_tokens"`
-	Messages      []Message       `json:"messages"`
-	System        Content         `json:"system,omitempty"`
-	Tools         []Tool          `json:"tools,omitempty"`
-	ToolChoice    *ToolChoice     `json:"tool_choice,omitempty"`
-	Temperature   *float64        `json:"temperature,omitempty"`
-	TopP          *float64        `json:"top_p,omitempty"`
-	TopK          *float64        `json:"top_k,omitempty"` // OpenAI 形状没有对应物，翻译时丢弃
-	StopSequences []string        `json:"stop_sequences,omitempty"`
-	Stream        bool            `json:"stream,omitempty"`
-	Metadata      *Metadata       `json:"metadata,omitempty"`
-	Thinking      json.RawMessage `json:"thinking,omitempty"` // 原样收下但不参与翻译（见 ToChat 注释）
+	Model         string      `json:"model"`
+	MaxTokens     int         `json:"max_tokens"`
+	Messages      []Message   `json:"messages"`
+	System        Content     `json:"system,omitempty"`
+	Tools         []Tool      `json:"tools,omitempty"`
+	ToolChoice    *ToolChoice `json:"tool_choice,omitempty"`
+	Temperature   *float64    `json:"temperature,omitempty"`
+	TopP          *float64    `json:"top_p,omitempty"`
+	TopK          *float64    `json:"top_k,omitempty"` // OpenAI 形状没有对应物，翻译时丢弃
+	StopSequences []string    `json:"stop_sequences,omitempty"`
+	Stream        bool        `json:"stream,omitempty"`
+	Metadata      *Metadata   `json:"metadata,omitempty"`
+	Thinking      *Thinking   `json:"thinking,omitempty"`
+}
+
+// Thinking 是 extended thinking 开关：type=enabled 时带上预算。
+// 预算翻成上游的 reasoning_effort（见 ToChat 的分档）；type=disabled 不带。
+type Thinking struct {
+	Type         string `json:"type"`
+	BudgetTokens int    `json:"budget_tokens,omitempty"`
 }
 
 // Metadata 只有 user_id 一个字段会被上游认得；这里收下是为了校验形态。
@@ -96,13 +103,14 @@ type Response struct {
 	Usage        Usage           `json:"usage"`
 }
 
-// ResponseBlock 是响应里的内容块：text 或 tool_use。
+// ResponseBlock 是响应里的内容块：thinking、text 或 tool_use。
 type ResponseBlock struct {
-	Type  string          `json:"type"`
-	Text  string          `json:"text,omitempty"`
-	ID    string          `json:"id,omitempty"`
-	Name  string          `json:"name,omitempty"`
-	Input json.RawMessage `json:"input,omitempty"`
+	Type     string          `json:"type"`
+	Text     string          `json:"text,omitempty"`
+	Thinking string          `json:"thinking,omitempty"`
+	ID       string          `json:"id,omitempty"`
+	Name     string          `json:"name,omitempty"`
+	Input    json.RawMessage `json:"input,omitempty"`
 }
 
 // Usage 是 Anthropic 口径的用量。count_tokens 端点只回 input_tokens。
@@ -115,15 +123,16 @@ type Usage struct {
 
 // ChatRequest 是内部 chat/completions 请求形状。
 type ChatRequest struct {
-	Model       string        `json:"model"`
-	Messages    []ChatMessage `json:"messages"`
-	MaxTokens   int           `json:"max_tokens,omitempty"`
-	Temperature *float64      `json:"temperature,omitempty"`
-	TopP        *float64      `json:"top_p,omitempty"`
-	Stop        []string      `json:"stop,omitempty"`
-	Stream      bool          `json:"stream,omitempty"`
-	Tools       []ChatTool    `json:"tools,omitempty"`
-	ToolChoice  any           `json:"tool_choice,omitempty"`
+	Model           string        `json:"model"`
+	Messages        []ChatMessage `json:"messages"`
+	MaxTokens       int           `json:"max_tokens,omitempty"`
+	Temperature     *float64      `json:"temperature,omitempty"`
+	TopP            *float64      `json:"top_p,omitempty"`
+	Stop            []string      `json:"stop,omitempty"`
+	Stream          bool          `json:"stream,omitempty"`
+	Tools           []ChatTool    `json:"tools,omitempty"`
+	ToolChoice      any           `json:"tool_choice,omitempty"`
+	ReasoningEffort string        `json:"reasoning_effort,omitempty"`
 }
 
 // ChatMessage 是 OpenAI 形状的对话消息。content 可以是字符串或多模态块数组；
@@ -165,9 +174,11 @@ type ChatResponse struct {
 	Choices []struct {
 		Index   int `json:"index"`
 		Message struct {
-			Role      string         `json:"role"`
-			Content   string         `json:"content"`
-			ToolCalls []ChatToolCall `json:"tool_calls,omitempty"`
+			Role             string         `json:"role"`
+			Content          string         `json:"content"`
+			ReasoningContent string         `json:"reasoning_content"` // deepseek 等的推理正文
+			Reasoning        string         `json:"reasoning"`         // 同事实的另一些网关用名
+			ToolCalls        []ChatToolCall `json:"tool_calls,omitempty"`
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
@@ -187,9 +198,11 @@ type ChatChunk struct {
 	Choices []struct {
 		Index int `json:"index"`
 		Delta struct {
-			Role      string `json:"role"`
-			Content   string `json:"content"`
-			ToolCalls []struct {
+			Role             string `json:"role"`
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
+			Reasoning        string `json:"reasoning"`
+			ToolCalls        []struct {
 				Index    int    `json:"index"`
 				ID       string `json:"id"`
 				Type     string `json:"type"`

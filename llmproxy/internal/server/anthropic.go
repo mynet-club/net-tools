@@ -18,8 +18,9 @@ import (
 // 出口用 anthropicWriter 把响应（含 SSE 流）翻回 Anthropic 格式。管线一个字节
 // 不改，治理面一视同仁地罩住两种协议进来的流量。
 //
-// 已知取舍（phase 1）：thinking 参数收下但不参与翻译（响应里没有 thinking 块）；
-// top_k 丢弃；上游必须是 OpenAI 兼容形状（Anthropic 原生上游的直通是另一包活）。
+// 已知取舍（phase 1）：top_k 丢弃；stop_sequences 命中哪条回填不了（OpenAI 侧不报）；
+// 上游必须是 OpenAI 兼容形状（Anthropic 原生上游的直通是另一包活）。thinking 已双向
+// 翻译：请求侧预算 → reasoning_effort，响应侧 reasoning_content → thinking 块。
 
 // writeAnthropicError 按 Anthropic 的错误形状回错：
 // {"type":"error","error":{"type":…,"message":…}}。

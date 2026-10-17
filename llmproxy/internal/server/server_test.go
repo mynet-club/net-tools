@@ -36,6 +36,7 @@ type mockUpstream struct {
 	failStatus int    // 非 0 时固定返回该状态码
 	failTimes  int    // 只失败前 N 次，之后恢复；-1 表示一直失败
 	streamable bool
+	reasoning  bool   // 回带 reasoning_content（deepseek 风格的推理正文）
 	baseURL    string // startMockUpstream 填充
 	mu         sync.Mutex
 	calls      []upstreamCall
@@ -96,6 +97,9 @@ func startMockUpstream(t *testing.T, m *mockUpstream) *mockUpstream {
 
 		if stream {
 			w.Header().Set("Content-Type", "text/event-stream")
+			if m.reasoning {
+				fmt.Fprintf(w, "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"先想想\"}}]}\n\n")
+			}
 			fmt.Fprintf(w, "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n")
 			fmt.Fprintf(w, "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"}}]}\n\n")
 			fmt.Fprintf(w, "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":22,\"total_tokens\":33}}\n\n")
@@ -107,8 +111,12 @@ func startMockUpstream(t *testing.T, m *mockUpstream) *mockUpstream {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"id":"chatcmpl-1","object":"chat.completion","model":%q,"choices":[{"index":0,"message":{"role":"assistant","content":"pong from %s"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}}`,
-			model, m.name)
+		reasonJSON := ""
+		if m.reasoning {
+			reasonJSON = `"reasoning_content":"先想想",`
+		}
+		fmt.Fprintf(w, `{"id":"chatcmpl-1","object":"chat.completion","model":%q,"choices":[{"index":0,"message":{"role":"assistant",%s"content":"pong from %s"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12}}`,
+			model, reasonJSON, m.name)
 	}))
 	t.Cleanup(srv.Close)
 	m.baseURL = srv.URL

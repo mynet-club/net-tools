@@ -127,6 +127,30 @@ func TestStreamFinalizedIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestStreamThinkingLifecycle(t *testing.T) {
+	tr := NewStreamTranslator("claude-x", 1)
+	frames := feedAll(t, tr,
+		`{"choices":[{"index":0,"delta":{"reasoning_content":"先"}}]}`,
+		`{"choices":[{"index":0,"delta":{"reasoning":"想想"}}]}`,
+		`{"choices":[{"index":0,"delta":{"content":"答"}}]}`,
+		`{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":3}}`,
+	)
+	want := []string{"message_start",
+		"content_block_start", "content_block_delta", "content_block_delta", "content_block_stop",
+		"content_block_start", "content_block_delta", "content_block_stop",
+		"message_delta", "message_stop"}
+	got := eventNames(frames)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("事件序列不对:\n got %v\nwant %v", got, want)
+	}
+	if !strings.Contains(frames, `"type":"thinking"`) || !strings.Contains(frames, `"thinking":"先"`) {
+		t.Fatalf("thinking 块/增量不对: %s", frames)
+	}
+	if !strings.Contains(frames, `"type":"thinking_delta"`) {
+		t.Fatalf("缺 thinking_delta: %s", frames)
+	}
+}
+
 func TestStreamEventFramesAreValidSSE(t *testing.T) {
 	tr := NewStreamTranslator("claude-x", 1)
 	frames := feedAll(t, tr, `{"choices":[{"index":0,"delta":{"content":"你好 \"世界\""}}]}`)

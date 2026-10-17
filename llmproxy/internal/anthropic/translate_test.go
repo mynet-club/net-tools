@@ -2,6 +2,7 @@ package anthropic
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -140,9 +141,11 @@ func TestFromChatTextAndTools(t *testing.T) {
 	var ch struct {
 		Index   int `json:"index"`
 		Message struct {
-			Role      string         `json:"role"`
-			Content   string         `json:"content"`
-			ToolCalls []ChatToolCall `json:"tool_calls,omitempty"`
+			Role             string         `json:"role"`
+			Content          string         `json:"content"`
+			ReasoningContent string         `json:"reasoning_content"`
+			Reasoning        string         `json:"reasoning"`
+			ToolCalls        []ChatToolCall `json:"tool_calls,omitempty"`
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	}
@@ -177,6 +180,75 @@ func TestFromChatTextAndTools(t *testing.T) {
 	}
 }
 
+func TestToChatThinkingMapping(t *testing.T) {
+	cases := []struct {
+		budget int
+		want   string
+	}{
+		{0, "medium"},    // 不带预算按 medium
+		{1024, "low"},    // <8192
+		{8192, "medium"}, // <24576
+		{24576, "high"},  // 之上
+	}
+	for _, tc := range cases {
+		req := mustReq(t, `{"model":"m","max_tokens":1,
+			"messages":[{"role":"user","content":"x"}],
+			"thinking":{"type":"enabled","budget_tokens":`+itoa(tc.budget)+`}}`)
+		chat, _, err := ToChat(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if chat.ReasoningEffort != tc.want {
+			t.Fatalf("budget=%d → %q，想要 %q", tc.budget, chat.ReasoningEffort, tc.want)
+		}
+	}
+	// disabled 与缺省都不写这个字段
+	for _, src := range []string{
+		`{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"x"}],"thinking":{"type":"disabled"}}`,
+		`{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"x"}]}`,
+	} {
+		req := mustReq(t, src)
+		chat, _, err := ToChat(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if chat.ReasoningEffort != "" {
+			t.Fatalf("%s 时不该带 reasoning_effort，拿到 %q", src, chat.ReasoningEffort)
+		}
+	}
+}
+
+func TestFromChatThinkingBlock(t *testing.T) {
+	resp := &ChatResponse{Model: "up"}
+	var ch struct {
+		Index   int `json:"index"`
+		Message struct {
+			Role             string         `json:"role"`
+			Content          string         `json:"content"`
+			ReasoningContent string         `json:"reasoning_content"`
+			Reasoning        string         `json:"reasoning"`
+			ToolCalls        []ChatToolCall `json:"tool_calls,omitempty"`
+		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
+	}
+	ch.Message.Role = "assistant"
+	ch.Message.ReasoningContent = "先想想"
+	ch.Message.Content = "答案"
+	ch.FinishReason = "stop"
+	resp.Choices = append(resp.Choices, ch)
+
+	out, err := FromChat(resp, "fallback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Content) != 2 || out.Content[0].Type != "thinking" || out.Content[0].Thinking != "先想想" {
+		t.Fatalf("thinking 块应在最前: %+v", out.Content)
+	}
+	if out.Content[1].Type != "text" || out.Content[1].Text != "答案" {
+		t.Fatalf("text 块不对: %+v", out.Content[1])
+	}
+}
+
 func TestStopReasonMapping(t *testing.T) {
 	cases := map[string]string{
 		"stop":           "end_turn",
@@ -201,4 +273,8 @@ func mustJSON(t *testing.T, v any) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+func itoa(n int) string {
+	return strconv.Itoa(n)
 }

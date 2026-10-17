@@ -62,6 +62,20 @@ func (t *StreamTranslator) Feed(data []byte) ([]byte, error) {
 	}
 
 	for _, c := range chunk.Choices {
+		if think := firstNonEmpty(c.Delta.ReasoningContent, c.Delta.Reasoning); think != "" {
+			if t.blockOpen && t.blockType != "thinking" {
+				out = append(out, t.blockStop()...)
+			}
+			if !t.blockOpen {
+				out = append(out, t.blockStart("thinking", "", "")...)
+			}
+			out = append(out, eventFrame("content_block_delta", map[string]any{
+				"type":  "content_block_delta",
+				"index": t.blockIdx,
+				"delta": map[string]any{"type": "thinking_delta", "thinking": think},
+			})...)
+			t.outChars += len([]rune(think))
+		}
 		if s := c.Delta.Content; s != "" {
 			if t.blockOpen && t.blockType != "text" {
 				out = append(out, t.blockStop()...)
@@ -162,9 +176,12 @@ func (t *StreamTranslator) blockStart(kind, id, name string) []byte {
 	t.blockOpen = true
 	t.blockType = kind
 	var block map[string]any
-	if kind == "tool_use" {
+	switch kind {
+	case "tool_use":
 		block = map[string]any{"type": "tool_use", "id": id, "name": name, "input": map[string]any{}}
-	} else {
+	case "thinking":
+		block = map[string]any{"type": "thinking", "thinking": ""}
+	default:
 		block = map[string]any{"type": "text", "text": ""}
 	}
 	return eventFrame("content_block_start", map[string]any{
