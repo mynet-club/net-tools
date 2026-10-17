@@ -68,6 +68,41 @@
         <div id="ov-stats" class="gridn"></div>
         <h3 class="sub-h">系统上游</h3>
         <div id="ov-prov"></div>
+
+        <h3 class="sub-h">用量看板</h3>
+        <div class="row">
+          <div class="seg" id="ov-days">
+            <button type="button" data-days="7" class="on">7 天</button>
+            <button type="button" data-days="30">30 天</button>
+            <button type="button" data-days="90">90 天</button>
+          </div>
+          <span class="grow"></span>
+          <span class="muted" id="ov-usage-asof"></span>
+        </div>
+        <div id="ov-usage-totals" class="gridn"></div>
+        <div class="ubars" id="ov-ubars" hidden></div>
+        <div class="ov-two">
+          <div>
+            <h3 class="sub-h">按模型</h3>
+            <div class="tablewrap">
+              <table id="ov-by-model">
+                <thead><tr><th>上游</th><th>模型</th><th>请求</th><th>token</th><th>金额</th><th>平均延迟</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+            <p class="muted" id="ov-by-model-empty" hidden>这个窗口内没有消耗。</p>
+          </div>
+          <div>
+            <h3 class="sub-h">按用户</h3>
+            <div class="tablewrap">
+              <table id="ov-by-scope">
+                <thead><tr><th>范围</th><th>请求</th><th>token</th><th>金额</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+            <p class="muted" id="ov-by-scope-empty" hidden>这个窗口内没有消耗。</p>
+          </div>
+        </div>
       </section>
 
       <!-- 系统上游：直接编辑 config.yaml 的 providers 段 -->

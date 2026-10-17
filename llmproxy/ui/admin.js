@@ -2,6 +2,7 @@
 
 const ADM = { users: [], sys: [], cfg: { providers: [] }, cands: {}, editing: null, detail: null,
   policy: null, plb: null, plbErr: '', plDraft: null,
+  ovDays: 7,
   decl: null, declDraft: { p: '', kn: '' }, declDisk: { p: '', kn: '' }, declDirty: { p: false, kn: false } };
 
 // 管理台的请求都用 state.token（里面存的就是 admin_token），与公共 api() 是同一套
@@ -2225,6 +2226,7 @@ function showPage(name) {
   if (ovTimer) { clearInterval(ovTimer); ovTimer = 0; }
   if (name === 'overview') {
     loadOverview().catch(() => {});
+    loadUsageStats(ADM.ovDays).catch(() => {});
     ovTimer = setInterval(() => { loadOverview().catch(() => {}); }, 8000);
   } else if (pageLoaders[name]) {
     pageLoaders[name]().catch((e) => toast('加载失败：' + e.message, 'err'));
@@ -2277,7 +2279,65 @@ $('admin-nav').addEventListener('click', (e) => {
   const btn = e.target.closest('button[data-page]');
   if (btn) showPage(btn.dataset.page);
 });
-$('ov-refresh').addEventListener('click', () => loadOverview().catch((e) => toast('刷新失败：' + e.message, 'err')));
+$('ov-refresh').addEventListener('click', () => {
+  loadOverview().catch((e) => toast('刷新失败：' + e.message, 'err'));
+  loadUsageStats(ADM.ovDays).catch((e) => toast('刷新失败：' + e.message, 'err'));
+});
+$('ov-days').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-days]');
+  if (!b) return;
+  ADM.ovDays = Number(b.dataset.days);
+  for (const x of $('ov-days').querySelectorAll('button')) x.classList.toggle('on', x === b);
+  loadUsageStats(ADM.ovDays).catch((err) => toast(err.message, 'err'));
+});
+
+// loadUsageStats 是用量看板（按日/按模型/按范围的窗口聚合）。
+// 只拉聚合值：明细在用量导出与用户详情里，看板要的是趋势与分组对比。
+async function loadUsageStats(days) {
+  const { data } = await api('/v1/_admin/stats?days=' + days);
+  const t = data.totals || {};
+  $('ov-usage-totals').replaceChildren(
+    stat('窗口请求', num(t.requests), ''),
+    stat('成功 / 失败', num(t.ok) + ' / ' + num(t.failed), 'sm'),
+    stat('合计 token', num(t.total_tokens), ''),
+    stat('金额（分发价）', moneyShort(t.charge), 'sm', '向用户收的分发价合计（charge）'),
+  );
+
+  const byDay = data.by_day || [];
+  const max = Math.max(1, ...byDay.map((r) => r.total_tokens || 0));
+  const bars = byDay.slice(-14).map((r) => h('div', {
+    class: 'ubar',
+    title: r.day + ' · ' + num(r.total_tokens) + ' tok · ' + num(r.requests) + ' 次',
+  },
+    h('div', {
+      class: 'ubar-fill',
+      style: 'height:' + Math.max(4, Math.round(((r.total_tokens || 0) / max) * 100)) + '%',
+    }),
+    h('span', { class: 'ubar-lab', text: r.day.slice(5) })));
+  $('ov-ubars').replaceChildren(...bars);
+  $('ov-ubars').hidden = bars.length === 0;
+
+  const mrows = data.by_model || [];
+  $('ov-by-model').querySelector('tbody').replaceChildren(...mrows.map((r) => h('tr', null,
+    h('td', null, r.provider),
+    h('td', { class: 'mono', text: r.model }),
+    h('td', { class: 'num', text: num(r.requests) }),
+    h('td', { class: 'num', text: num(r.total_tokens) }),
+    h('td', { class: 'num', text: moneyShort(r.charge) }),
+    h('td', { class: 'num', text: ms(Math.round(r.avg_latency_ms)) }),
+  )));
+  $('ov-by-model-empty').hidden = mrows.length > 0;
+
+  const srows = data.by_scope || [];
+  $('ov-by-scope').querySelector('tbody').replaceChildren(...srows.map((r) => h('tr', null,
+    h('td', null, h('code', { class: 'k', text: r.scope.kind + ':' + r.scope.id })),
+    h('td', { class: 'num', text: num(r.requests) }),
+    h('td', { class: 'num', text: num(r.total_tokens) }),
+    h('td', { class: 'num', text: moneyShort(r.charge) }),
+  )));
+  $('ov-by-scope-empty').hidden = srows.length > 0;
+  $('ov-usage-asof').textContent = '窗口 ' + data.days + ' 天';
+}
 
 /* ── 事件绑定 ────────────────────────────────────────────────────── */
 

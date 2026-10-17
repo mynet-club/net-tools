@@ -811,6 +811,131 @@ FROM usage_scope_daily `+where, args...).Scan(
 	return out, err
 }
 
+// UsageStats 是管理台统计看板的聚合读数：按日、按（供应商,模型）、按范围三个视角。
+// 读源是 usage_scope_daily（§2.7 读侧口径）。三个视角各自在库里 SUM 聚合 ——
+// 明细行数无上界，看板只该拿聚合值，不拉明细回来自己加。
+type UsageStats struct {
+	ByDay   []UsageRow
+	ByModel []UsageRow
+	ByScope []ScopeUsageRow
+}
+
+// ScopeUsageStats 聚合一段时间内**全部范围**的用量（统计看板用）。
+// since / until 为零值时不限那一头；日窗口口径与 scopeDayFilter 一致（闭区间）。
+func (s *Store) ScopeUsageStats(since, until time.Time) (UsageStats, error) {
+	where, args := dayRangeFilter(since, until)
+	sumCols := `SUM(requests), SUM(ok), SUM(failed),
+       SUM(prompt_tokens), SUM(completion_tokens), SUM(total_tokens),
+       SUM(cache_hit_tokens), SUM(cache_miss_tokens),
+       COALESCE(SUM(charge),0), COALESCE(SUM(frozen_charges),0),
+       COALESCE(SUM(latency_sum_ms),0)`
+
+	var out UsageStats
+
+	rows, err := s.query(`SELECT day, `+sumCols+` FROM usage_scope_daily`+where+` GROUP BY day ORDER BY day`, args...)
+	if err != nil {
+		return out, err
+	}
+	out.ByDay, err = scanUsageAggs(rows, 1, func(r *UsageRow, g []string) {
+		r.Day = g[0]
+	})
+	if err != nil {
+		return out, err
+	}
+
+	rows, err = s.query(`SELECT provider, model, `+sumCols+` FROM usage_scope_daily`+where+
+		` GROUP BY provider, model ORDER BY SUM(total_tokens) DESC`, args...)
+	if err != nil {
+		return out, err
+	}
+	out.ByModel, err = scanUsageAggs(rows, 2, func(r *UsageRow, g []string) {
+		r.Provider, r.Model = g[0], g[1]
+	})
+	if err != nil {
+		return out, err
+	}
+
+	rows, err = s.query(`SELECT scope_kind, scope_id, `+sumCols+` FROM usage_scope_daily`+where+
+		` GROUP BY scope_kind, scope_id ORDER BY SUM(total_tokens) DESC`, args...)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	out.ByScope = []ScopeUsageRow{}
+	for rows.Next() {
+		var kind, id string
+		var r UsageRow
+		var latencySum int64
+		if err := rows.Scan(&kind, &id,
+			&r.Requests, &r.OK, &r.Failed,
+			&r.PromptTokens, &r.CompletionTokens, &r.TotalTokens,
+			&r.CacheHitTokens, &r.CacheMissTokens,
+			&r.Charge, &r.FrozenCharges, &latencySum); err != nil {
+			return out, err
+		}
+		r.AvgLatencyMs = avgLatency(latencySum, r.Requests)
+		out.ByScope = append(out.ByScope, ScopeUsageRow{
+			UsageRow: r,
+			Scope:    policy.ScopeRef{Kind: policy.ScopeKind(kind), ID: id},
+		})
+	}
+	return out, rows.Err()
+}
+
+// dayRangeFilter 只按日窗口过滤（不分范围）：看板聚合的是全部范围。
+func dayRangeFilter(since, until time.Time) (string, []any) {
+	where := ""
+	args := []any{}
+	if !since.IsZero() {
+		where += " WHERE day >= ?"
+		args = append(args, since.Format("2006-01-02"))
+	}
+	if !until.IsZero() {
+		if where == "" {
+			where = " WHERE day <= ?"
+		} else {
+			where += " AND day <= ?"
+		}
+		args = append(args, until.Format("2006-01-02"))
+	}
+	return where, args
+}
+
+// scanUsageAggs 扫「groupCols 个分组列 + 11 个聚合列」的结果集，
+// lead 把分组列填进 UsageRow 的对应字段（按日/按模型两个视角共用这一套）。
+func scanUsageAggs(rows *sql.Rows, groupCols int, lead func(*UsageRow, []string)) ([]UsageRow, error) {
+	defer rows.Close()
+	out := []UsageRow{}
+	for rows.Next() {
+		var r UsageRow
+		var latencySum int64
+		groups := make([]string, groupCols)
+		scanArgs := make([]any, 0, groupCols+11)
+		for i := range groups {
+			scanArgs = append(scanArgs, &groups[i])
+		}
+		scanArgs = append(scanArgs,
+			&r.Requests, &r.OK, &r.Failed,
+			&r.PromptTokens, &r.CompletionTokens, &r.TotalTokens,
+			&r.CacheHitTokens, &r.CacheMissTokens,
+			&r.Charge, &r.FrozenCharges, &latencySum)
+		if err := rows.Scan(scanArgs...); err != nil {
+			return nil, err
+		}
+		lead(&r, groups)
+		r.AvgLatencyMs = avgLatency(latencySum, r.Requests)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func avgLatency(sum, requests int64) float64 {
+	if requests <= 0 {
+		return 0
+	}
+	return float64(sum) / float64(requests)
+}
+
 // ScopeSystemUsage 汇总某个范围由系统上游承接的用量（配额计 token 的口径）。
 func (s *Store) ScopeSystemUsage(scope policy.ScopeRef, since time.Time) (SystemUsage, error) {
 	var out SystemUsage

@@ -1286,6 +1286,8 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		s.adminPricesRoute(w, r, strings.Trim(strings.TrimPrefix(rest, "prices"), "/"))
 	case rest == "usage/export" || rest == "usage/export/":
 		s.adminUsageExport(w, r)
+	case rest == "stats" || rest == "stats/":
+		s.adminStats(w, r)
 	case rest == "audit" || rest == "audit/":
 		s.adminAuditLog(w, r)
 	case rest == "providers":

@@ -439,6 +439,12 @@ td.tstate { text-align: center; padding: 22px 0; }
 .pager { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
 .pager .pinfo { color: var(--muted); font-size: 12px; }
 
+/* ── 概览用量看板：分模型/分用户两栏 ───────────────────────────────── */
+.ov-two { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+@media (max-width: 900px) {
+  .ov-two { grid-template-columns: 1fr; }
+}
+
 /* 可点开详情的列表行（用户、审计） */
 tr.rowclick { cursor: pointer; }
 tr.rowclick:hover { background: #f6f7fa; }
