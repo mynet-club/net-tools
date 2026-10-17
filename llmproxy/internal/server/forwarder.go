@@ -143,7 +143,7 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 	// 自有上游在承接（用户自己结算）。要等模型解析完、知道有没有自有候选之后再判，
 	// 否则「额度用完」会连他自己的上游一起挡住。见下面 providersFor 之后那一段。
 	if e := s.usersSnapshot().byName[scope]; e != nil {
-		release, err := s.meters.Acquire(e.Name, e.RPM, e.MaxConcurrent)
+		release, err := s.meters.Acquire(e.Name, e.RPM, e.MaxConcurrent, e.TokensPerMin)
 		if err != nil {
 			var le *limitedError
 			if errors.As(err, &le) {
@@ -534,7 +534,7 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 			var upBody []byte
 			upBody, xErr = rewriteModelBody(raw, cand.UpstreamModel, probe.Stream)
 			if xErr == nil {
-				resp, xErr = roundTripUpstream(ctx, tr, &cand.Provider, r, upBody, suffix)
+				resp, xErr = roundTripUpstream(ctx, tr, &cand.Provider, r, upBody, suffix, s.slots)
 			}
 		}
 		if xErr != nil {
@@ -665,9 +665,16 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 // 归因一旦分叉（哪些算客户端断开、哪些算超时、哪些要报给熔断），线上就会同时
 // 存在两套错误文案，而排障的人不知道该信哪一套。
 func roundTripUpstream(ctx context.Context, tr http.RoundTripper, prov *config.Provider,
-	r *http.Request, upBody []byte, suffix string) (*http.Response, error) {
+	r *http.Request, upBody []byte, suffix string, slots *providerSlots) (*http.Response, error) {
+	// 并发帽先占槽（providers[].max_concurrent）：拿不到就在请求期限内排队，
+	// 槽的归还挂在响应体 Close 上 —— 占用期与这次交换同长。
+	releaseSlot, err := slots.acquire(ctx, prov)
+	if err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, prov.BaseURL+suffix, bytes.NewReader(upBody))
 	if err != nil {
+		releaseSlot()
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -686,7 +693,13 @@ func roundTripUpstream(ctx context.Context, tr http.RoundTripper, prov *config.P
 	// 刻意不转发下游的 Authorization / Cookie / X-Api-Key
 	// anthropic_messages 协议的供应商在这里做二次翻转的出网侧翻译（见 anthropic_up.go），
 	// 上面所有路径看到的请求/响应都还是 OpenAI 形状。
-	return wrapAnthropicTransport(tr, prov).RoundTrip(req)
+	resp, err := wrapAnthropicTransport(tr, prov).RoundTrip(req)
+	if err != nil {
+		releaseSlot()
+		return nil, err
+	}
+	resp.Body = &releaseOnClose{ReadCloser: resp.Body, release: releaseSlot}
+	return resp, nil
 }
 
 // relayOutcome 是 relay 的结果，用来决定熔断计数与会话粘性怎么记。

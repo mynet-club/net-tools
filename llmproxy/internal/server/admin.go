@@ -178,6 +178,7 @@ func (s *Server) userSummary(name string) (map[string]any, error) {
 		"limits": map[string]any{
 			"rpm":            q.RPM,
 			"max_concurrent": q.MaxConcurrent,
+			"tokens_per_min": q.TokensPerMin,
 		},
 		"usage_all": map[string]any{ // 全部流量（含用户自己上游的，不计配额）
 			"requests":     all.Requests,
@@ -247,6 +248,7 @@ func (s *Server) adminUpdateUser(w http.ResponseWriter, r *http.Request, name st
 		QuotaMonthCost   *float64 `json:"quota_month_cost"`
 		RPM              *int     `json:"rpm"`
 		MaxConcurrent    *int     `json:"max_concurrent"`
+		TokensPerMin     *int     `json:"tokens_per_min"`
 		Enabled          *bool    `json:"enabled"`
 	}
 	if err := readJSONBody(w, r, &req); err != nil {
@@ -273,7 +275,7 @@ func (s *Server) adminUpdateUser(w http.ResponseWriter, r *http.Request, name st
 	}
 	// 配额与限流都落在**范围配额行**上（§2.7 规则 2）：一次 PATCH 只交给 PatchScopeQuota，
 	// 避免「token 改了、金额被顺手清零」这种各写一半的事故。
-	if req.QuotaMonthTokens != nil || req.QuotaMonthCost != nil || req.RPM != nil || req.MaxConcurrent != nil {
+	if req.QuotaMonthTokens != nil || req.QuotaMonthCost != nil || req.RPM != nil || req.MaxConcurrent != nil || req.TokensPerMin != nil {
 		// NewScopeRef 而不是 MustScope：老库里可能有改规则之前建的、当不了范围键的名字，
 		// 那种情况下要回 400 说清名字有问题，而不是 panic 掉这个请求。
 		scope, err := policy.NewScopeRef(policy.ScopeUser, name)
@@ -287,6 +289,7 @@ func (s *Server) adminUpdateUser(w http.ResponseWriter, r *http.Request, name st
 			Cost:          req.QuotaMonthCost,
 			RPM:           req.RPM,
 			MaxConcurrent: req.MaxConcurrent,
+			TokensPerMin:  req.TokensPerMin,
 		}
 		for _, item := range []struct {
 			label string
@@ -296,6 +299,7 @@ func (s *Server) adminUpdateUser(w http.ResponseWriter, r *http.Request, name st
 			{"金额配额", req.QuotaMonthCost != nil && *req.QuotaMonthCost < 0},
 			{"rpm", req.RPM != nil && *req.RPM < 0},
 			{"并发上限", req.MaxConcurrent != nil && *req.MaxConcurrent < 0},
+			{"token 限速", req.TokensPerMin != nil && *req.TokensPerMin < 0},
 		} {
 			if item.bad {
 				writeJSONError(w, http.StatusBadRequest, "invalid_request_error",

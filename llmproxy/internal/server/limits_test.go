@@ -31,7 +31,7 @@ func (m *meterSet) inflightOf(user string) int {
 func TestAcquireReleaseDecrementsOriginalMeter(t *testing.T) {
 	m := newTestMeterSet()
 
-	release1, err := m.Acquire("alice", 0, 4)
+	release1, err := m.Acquire("alice", 0, 4, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +41,7 @@ func TestAcquireReleaseDecrementsOriginalMeter(t *testing.T) {
 
 	// 把桶换掉：Forget 模拟删用户，下一次 Acquire 会建一个全新的桶
 	m.Forget("alice")
-	release2, err := m.Acquire("alice", 0, 4)
+	release2, err := m.Acquire("alice", 0, 4, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,19 +73,19 @@ func TestAcquireConcurrencyLimit(t *testing.T) {
 	m := newTestMeterSet()
 	var releases []func()
 	for i := 0; i < 3; i++ {
-		rel, err := m.Acquire("bob", 0, 3)
+		rel, err := m.Acquire("bob", 0, 3, 0)
 		if err != nil {
 			t.Fatalf("第 %d 次占用不该被拒: %v", i, err)
 		}
 		releases = append(releases, rel)
 	}
-	if _, err := m.Acquire("bob", 0, 3); err == nil {
+	if _, err := m.Acquire("bob", 0, 3, 0); err == nil {
 		t.Error("第 4 次应当被并发上限挡住")
 	} else if le, ok := err.(*limitedError); !ok || le.kind != "concurrency_limited" {
 		t.Errorf("应当是 concurrency_limited，实际 %v", err)
 	}
 	releases[0]()
-	if _, err := m.Acquire("bob", 0, 3); err != nil {
+	if _, err := m.Acquire("bob", 0, 3, 0); err != nil {
 		t.Errorf("释放一个之后应当能再占: %v", err)
 	}
 }
@@ -93,7 +93,7 @@ func TestAcquireConcurrencyLimit(t *testing.T) {
 // 没配限流（rpm 与 maxConcurrent 都是 0）时不该建桶、也不该挡。
 func TestAcquireNoLimitsIsNoop(t *testing.T) {
 	m := newTestMeterSet()
-	rel, err := m.Acquire("carol", 0, 0)
+	rel, err := m.Acquire("carol", 0, 0, 0)
 	if err != nil {
 		t.Fatalf("不该被拒: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestAcquireNoLimitsIsNoop(t *testing.T) {
 		t.Errorf("没配限流时不该建桶，实际 inflight=%d", got)
 	}
 	// 空用户名同样直接放过
-	if _, err := m.Acquire("", 60, 8); err != nil {
+	if _, err := m.Acquire("", 60, 8, 0); err != nil {
 		t.Errorf("空用户名不该被拒: %v", err)
 	}
 }
@@ -180,7 +180,7 @@ func TestMeterSetConcurrent(t *testing.T) {
 			defer wg.Done()
 			user := fmt.Sprintf("u%d", g%4)
 			for i := 0; i < 300; i++ {
-				if rel, err := m.Acquire(user, 0, 64); err == nil {
+				if rel, err := m.Acquire(user, 0, 64, 0); err == nil {
 					m.Add(user, "m", 10, 0, 10, 5, time.Now(), nil)
 					m.CheckQuota(user, 1<<62, 0)
 					m.Snapshot(user)

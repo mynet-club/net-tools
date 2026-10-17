@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS scope_quota (
   quota_month_cost   REAL    NOT NULL DEFAULT 0,
   rpm                INTEGER NOT NULL DEFAULT 0,
   max_concurrent     INTEGER NOT NULL DEFAULT 0,
+  tokens_per_min     INTEGER NOT NULL DEFAULT 0,
   enabled            INTEGER NOT NULL DEFAULT 1,
   created_at         INTEGER NOT NULL,
   updated_at         INTEGER NOT NULL,

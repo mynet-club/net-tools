@@ -53,6 +53,10 @@ type userMeter struct {
 	cost     float64
 	inflight int
 	bucket   *tokenBucket
+	// rateStart / rateTokens 是 token 速率限制的 60 秒窗口（事后滑窗的简化版：
+	// 窗口随时间整体重置）。计数口径与月计量一致：prompt + output。
+	rateStart  time.Time
+	rateTokens int64
 }
 
 func newMeterSet(db *store.Store, price func() *config.PricingConfig) *meterSet {
@@ -68,10 +72,14 @@ type limitedError struct {
 
 func (e *limitedError) Error() string { return e.msg }
 
-// Acquire 做速率与并发检查，通过则占一个并发位。
+// Acquire 做速率、token 速率与并发检查，通过则占一个并发位。
 // 返回的 release 必须调用（用 defer），否则并发位会泄漏。
-func (m *meterSet) Acquire(user string, rpm, maxConcurrent int) (func(), error) {
-	if user == "" || (rpm <= 0 && maxConcurrent <= 0) {
+//
+// token 速率是**事后滑窗**（简化版）：窗口里已完成的 token 达到上限才拒新请求 ——
+// 事前没法知道这趟会烧多少 token（流式更是收完才知道），预扣会变成猜。
+// 代价要说清楚：并发在飞的那几条可能把窗口顶超一点，与配额的软限制同一口径。
+func (m *meterSet) Acquire(user string, rpm, maxConcurrent, tokensPerMin int) (func(), error) {
+	if user == "" || (rpm <= 0 && maxConcurrent <= 0 && tokensPerMin <= 0) {
 		return func() {}, nil
 	}
 	um := m.meterFor(user)
@@ -87,6 +95,19 @@ func (m *meterSet) Acquire(user string, rpm, maxConcurrent int) (func(), error) 
 			return nil, &limitedError{
 				status: 429, kind: "rate_limited",
 				msg: fmt.Sprintf("请求过于频繁（上限 %d 次/分钟），请稍后再试", rpm),
+			}
+		}
+	}
+	if tokensPerMin > 0 {
+		now := m.now()
+		if um.rateStart.IsZero() || now.Sub(um.rateStart) >= time.Minute {
+			um.rateStart = now
+			um.rateTokens = 0
+		}
+		if um.rateTokens >= int64(tokensPerMin) {
+			return nil, &limitedError{
+				status: 429, kind: "token_rate_limited",
+				msg: fmt.Sprintf("token 用量过于密集（上限 %d token/分钟），请稍后再试", tokensPerMin),
 			}
 		}
 	}
@@ -153,6 +174,12 @@ func (m *meterSet) Add(user, upstreamModel string, prompt, cacheHit, cacheMiss, 
 	m.loadMonthLocked(um)
 
 	um.tokens += prompt + output
+	// token 速率窗口同口径累加（60 秒窗口整体重置，见 Acquire 的说明）
+	if um.rateStart.IsZero() || m.now().Sub(um.rateStart) >= time.Minute {
+		um.rateStart = m.now()
+		um.rateTokens = 0
+	}
+	um.rateTokens += prompt + output
 	if frozen != nil {
 		um.cost += *frozen
 		return

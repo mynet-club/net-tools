@@ -567,3 +567,37 @@ func TestAuditScopedRoundtripAndIsolation(t *testing.T) {
 		t.Error("零值范围的单查询必须被拒绝")
 	}
 }
+
+// TestScopeQuotaTokensPerMin 版本 6 那一位的写读往返与补丁语义：
+// 0 = 不限、没给的项不动、显式 0 = 放开。
+func TestScopeQuotaTokensPerMin(t *testing.T) {
+	s := openTestStore(t)
+	scope := policy.MustScope(policy.ScopeUser, "alice")
+	if err := s.SetScopeQuota(ScopeQuota{
+		Scope: scope, TokensPerMin: 6000, RPM: 30, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got := mustQuota(t, s, scope)
+	if got.TokensPerMin != 6000 {
+		t.Fatalf("tokens_per_min 没落库: %+v", got)
+	}
+
+	// 补丁只动给了的项
+	zero := 0
+	if err := s.PatchScopeQuota(scope, QuotaPatch{TokensPerMin: &zero}); err != nil {
+		t.Fatal(err)
+	}
+	got = mustQuota(t, s, scope)
+	if got.TokensPerMin != 0 {
+		t.Fatalf("显式 0 应为不限: %+v", got)
+	}
+	if got.RPM != 30 {
+		t.Fatalf("没给的项不该被动: %+v", got)
+	}
+
+	// 负数拒收
+	if err := s.SetScopeQuota(ScopeQuota{Scope: scope, TokensPerMin: -1}); err == nil {
+		t.Fatal("负数限速应报错")
+	}
+}

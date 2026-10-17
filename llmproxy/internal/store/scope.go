@@ -26,12 +26,13 @@ import (
 // 版本 4 = requests 的执行面摘要两列（2026-10-04 裁决第 4 条：B）；
 // 版本 5 = requests 的身份来源列 identity_source（2026-10-05 裁决，决策包 §0.3）——
 // 把 Source 从「运行期判定输入、只有缺省关闭的内存窗口带它」补成可离线复算的耐久事实。
+// 版本 6 = scope_quota 的 tokens_per_min（2026-10-18 限量包）—— 用户级 token 速率限制。
 // 三者都挂在同一个键上是有意的：这一串版本的含义从来不是「scope 那四张表的形状」，
 // 而是「3.0 要求的在线记录齐了没有」（§2.8 那四列在版本 3 里就已经是它的一部分）。
 // 另起一个键会让接线方读两次库、并且要为「只升了一半」造第二个中间态判定。
 //
 // 每一次 +1 都是一次性结构迁移：补列不回填、失败就不启动，口径与备份规则见 scope_migration.go。
-const ScopeSchemaVersion int64 = 5
+const ScopeSchemaVersion int64 = 6
 
 // meta 表里与 scope 迁移相关的键。
 //
@@ -212,9 +213,12 @@ type ScopeQuota struct {
 	QuotaMonthCost   float64
 	RPM              int
 	MaxConcurrent    int
-	Enabled          bool
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
+	// TokensPerMin 是用户级 token 速率限制（0 = 不限）：过去 60 秒的已完成 token
+	// 用量达到上限时拒绝新请求（事后滑窗口径，见 server/limits.go）。
+	TokensPerMin int
+	Enabled      bool
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 // ScopedAuditEntry 是一条带范围的审计。Detail 沿用旧口径：不许写密钥明文。

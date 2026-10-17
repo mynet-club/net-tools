@@ -441,14 +441,14 @@ func (s *Store) queryScopePrices(q string, args ...any) ([]ScopePrice, error) {
 // ------------------------------------------------------------------ 配额
 
 const scopeQuotaCols = `scope_kind, scope_id, quota_month_tokens, quota_month_cost,
-	rpm, max_concurrent, enabled, created_at, updated_at`
+	rpm, max_concurrent, tokens_per_min, enabled, created_at, updated_at`
 
 func scanScopeQuota(row interface{ Scan(...any) error }) (ScopeQuota, error) {
 	var q ScopeQuota
 	var kind string
 	var enabled, created, updated int64
 	if err := row.Scan(&kind, &q.Scope.ID, &q.QuotaMonthTokens, &q.QuotaMonthCost,
-		&q.RPM, &q.MaxConcurrent, &enabled, &created, &updated); err != nil {
+		&q.RPM, &q.MaxConcurrent, &q.TokensPerMin, &enabled, &created, &updated); err != nil {
 		return q, err
 	}
 	parsed, err := policy.ParseScopeKind(kind)
@@ -470,24 +470,25 @@ func upsertScopeQuotaTx(tx *sql.Tx, d Dialect, q ScopeQuota) error {
 	if err := checkScope("写入 scope_quota", q.Scope); err != nil {
 		return err
 	}
-	if q.QuotaMonthTokens < 0 || q.QuotaMonthCost < 0 || q.RPM < 0 || q.MaxConcurrent < 0 {
-		return fmt.Errorf("配额与限流不能为负（0 表示不限）: tokens=%d cost=%v rpm=%d concurrent=%d",
-			q.QuotaMonthTokens, q.QuotaMonthCost, q.RPM, q.MaxConcurrent)
+	if q.QuotaMonthTokens < 0 || q.QuotaMonthCost < 0 || q.RPM < 0 || q.MaxConcurrent < 0 || q.TokensPerMin < 0 {
+		return fmt.Errorf("配额与限流不能为负（0 表示不限）: tokens=%d cost=%v rpm=%d concurrent=%d tokens_min=%d",
+			q.QuotaMonthTokens, q.QuotaMonthCost, q.RPM, q.MaxConcurrent, q.TokensPerMin)
 	}
 	now := time.Now().UnixMilli()
 	if _, err := txExec(tx, d, `
 INSERT INTO scope_quota (
-  scope_kind, scope_id, quota_month_tokens, quota_month_cost, rpm, max_concurrent,
+  scope_kind, scope_id, quota_month_tokens, quota_month_cost, rpm, max_concurrent, tokens_per_min,
   enabled, created_at, updated_at
-) VALUES (?,?,?,?,?,?,?,?,?)
+) VALUES (?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(scope_kind, scope_id) DO UPDATE SET
   quota_month_tokens = excluded.quota_month_tokens,
   quota_month_cost   = excluded.quota_month_cost,
   rpm                = excluded.rpm,
   max_concurrent     = excluded.max_concurrent,
+  tokens_per_min     = excluded.tokens_per_min,
   enabled            = excluded.enabled,
   updated_at         = excluded.updated_at`,
-		string(q.Scope.Kind), q.Scope.ID, q.QuotaMonthTokens, q.QuotaMonthCost, q.RPM, q.MaxConcurrent,
+		string(q.Scope.Kind), q.Scope.ID, q.QuotaMonthTokens, q.QuotaMonthCost, q.RPM, q.MaxConcurrent, q.TokensPerMin,
 		boolToInt(q.Enabled), now, now); err != nil {
 		return fmt.Errorf("写入 scope_quota 失败: %w", err)
 	}
@@ -542,6 +543,7 @@ type QuotaPatch struct {
 	Cost          *float64
 	RPM           *int
 	MaxConcurrent *int
+	TokensPerMin  *int
 	Enabled       *bool
 }
 
@@ -577,12 +579,15 @@ func (s *Store) PatchScopeQuota(scope policy.ScopeRef, p QuotaPatch) error {
 	if p.MaxConcurrent != nil {
 		cur.MaxConcurrent = *p.MaxConcurrent
 	}
+	if p.TokensPerMin != nil {
+		cur.TokensPerMin = *p.TokensPerMin
+	}
 	if p.Enabled != nil {
 		cur.Enabled = *p.Enabled
 	}
-	if cur.QuotaMonthTokens < 0 || cur.QuotaMonthCost < 0 || cur.RPM < 0 || cur.MaxConcurrent < 0 {
-		return fmt.Errorf("配额与限流不能为负（0 表示不限）: tokens=%d cost=%v rpm=%d concurrent=%d",
-			cur.QuotaMonthTokens, cur.QuotaMonthCost, cur.RPM, cur.MaxConcurrent)
+	if cur.QuotaMonthTokens < 0 || cur.QuotaMonthCost < 0 || cur.RPM < 0 || cur.MaxConcurrent < 0 || cur.TokensPerMin < 0 {
+		return fmt.Errorf("配额与限流不能为负（0 表示不限）: tokens=%d cost=%v rpm=%d concurrent=%d tokens_min=%d",
+			cur.QuotaMonthTokens, cur.QuotaMonthCost, cur.RPM, cur.MaxConcurrent, cur.TokensPerMin)
 	}
 	cur.Scope = scope
 	return s.SetScopeQuota(*cur)

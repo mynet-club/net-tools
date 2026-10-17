@@ -102,6 +102,8 @@ async function loadSysProviders() {
       proxy: p.proxy || 'direct',
       timeout_ms: p.timeout_ms || 120000,
       max_data_level: p.max_data_level || '',
+      protocol: p.protocol || '',
+      max_concurrent: p.max_concurrent || 0,
       passthrough: !!(p.models && p.models.passthrough),
       map: Object.entries((p.models && p.models.map) || {}),
       catchAll: !!(p.models && p.models.catch_all),
@@ -224,6 +226,7 @@ function cfgRow(p, i) {
       h('div', null, h('label', { text: '权重' }), num('pweight', p.weight, (v) => { p.weight = v; })),
       h('div', null, h('label', { text: '代理' }), text('pproxy mono', p.proxy, 'direct', (v) => { p.proxy = v; })),
       h('div', null, h('label', { text: '超时 (ms)' }), num('ptimeout', p.timeout_ms, (v) => { p.timeout_ms = v; })),
+      h('div', null, h('label', { text: '并发上限' }), num('pconc', p.max_concurrent, (v) => { p.max_concurrent = v; })),
       h('div', null, h('label', { text: '可承接最高分级' }), level),
     ),
     h('div', { class: 'prow-models' },
@@ -458,6 +461,8 @@ function cfgPayload() {
         proxy: p.proxy.trim(),
         timeout_ms: p.timeout_ms,
         max_data_level: p.max_data_level || '',
+        protocol: p.protocol || '',
+        max_concurrent: p.max_concurrent || 0,
       };
       if (p.passthrough) {
         body.models = ['*'];
@@ -1762,7 +1767,7 @@ async function loadAdminUsers() {
       ? moneyShort(q.used_cost) + ' / ' + q.month_cost.toFixed(2)
       : moneyShort(q.used_cost);
     const lim = u.limits || {};
-    const limText = [lim.rpm > 0 ? lim.rpm + '/分' : null, lim.max_concurrent > 0 ? '并发 ' + lim.max_concurrent : null]
+    const limText = [lim.rpm > 0 ? lim.rpm + '/分' : null, lim.max_concurrent > 0 ? '并发 ' + lim.max_concurrent : null, lim.tokens_per_min > 0 ? num(lim.tokens_per_min) + ' tok/分' : null]
       .filter(Boolean).join('、') || '不限';
     return h('tr', {
       class: 'rowclick', title: '点击看详情',
@@ -1819,6 +1824,7 @@ async function openUser(name, quiet) {
   $('ud-qcost').value = q.month_cost || 0;
   $('ud-rpm').value = lim.rpm || 0;
   $('ud-conc').value = lim.max_concurrent || 0;
+  $('ud-tokensmin').value = lim.tokens_per_min || 0;
 
   const banner = $('admin-banner');
   if (data.warning) {
@@ -1988,6 +1994,7 @@ async function saveUser() {
         quota_month_cost: Number($('ud-qcost').value) || 0,
         rpm: Number($('ud-rpm').value) || 0,
         max_concurrent: Number($('ud-conc').value) || 0,
+        tokens_per_min: Number($('ud-tokensmin').value) || 0,
       }),
     });
     showErr($('ud-err'), '');

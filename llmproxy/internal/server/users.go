@@ -39,6 +39,7 @@ type userEntry struct {
 	QuotaMonthCost   float64
 	RPM              int
 	MaxConcurrent    int
+	TokensPerMin     int
 	// Models 既是白名单也是「下游名 → 系统模型」的映射，只对消费模式有意义
 	Models []store.UserModel
 }
@@ -172,6 +173,7 @@ func (s *Server) buildRegistry() (*userRegistry, error) {
 			QuotaMonthCost:   q.QuotaMonthCost,
 			RPM:              q.RPM,
 			MaxConcurrent:    q.MaxConcurrent,
+			TokensPerMin:     q.TokensPerMin,
 		}
 		for _, um := range models[u.Name] {
 			if um.Enabled {
@@ -636,8 +638,8 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, auth authResul
 				"last_day":          tot.LastDay,
 			},
 		}
-		if e.RPM > 0 || e.MaxConcurrent > 0 {
-			out["limits"] = map[string]any{"rpm": e.RPM, "max_concurrent": e.MaxConcurrent}
+		if e.RPM > 0 || e.MaxConcurrent > 0 || e.TokensPerMin > 0 {
+			out["limits"] = map[string]any{"rpm": e.RPM, "max_concurrent": e.MaxConcurrent, "tokens_per_min": e.TokensPerMin}
 		}
 		if e.Consumption {
 			used, cost := s.meters.Snapshot(e.Name)

@@ -107,6 +107,11 @@ func configProviderView(p config.ProviderRaw) map[string]any {
 		// 分级声明是 3.0 分级门的事实来源，界面要能看见并改它。空串 = 未声明，
 		// 保存时同样按「留空 = 沿用原值」处理，否则一次保存就把声明抹掉了。
 		"max_data_level": strings.TrimSpace(p.MaxDataLevel),
+		// protocol 与 max_concurrent 必须下发：界面保存是**全量重建**供应商段，
+		// 少读一项就等于一次无关保存把它冲掉（protocol 被抹会让 Anthropic 上游
+		// 突然收到 OpenAI 请求）。
+		"protocol":       strings.TrimSpace(p.Protocol),
+		"max_concurrent": p.MaxConcurrent,
 		"models":         models,
 	}
 }
@@ -152,15 +157,17 @@ func (s *Server) adminShowConfig(w http.ResponseWriter) {
 func (s *Server) adminSaveProviders(w http.ResponseWriter, r *http.Request, dryRun bool) {
 	var req struct {
 		Providers []struct {
-			Name         string          `json:"name"`
-			Enabled      *bool           `json:"enabled"`
-			BaseURL      string          `json:"base_url"`
-			APIKey       string          `json:"api_key"`
-			Weight       float64         `json:"weight"`
-			Proxy        string          `json:"proxy"`
-			TimeoutMs    int             `json:"timeout_ms"`
-			MaxDataLevel string          `json:"max_data_level"`
-			Models       json.RawMessage `json:"models"`
+			Name          string          `json:"name"`
+			Enabled       *bool           `json:"enabled"`
+			BaseURL       string          `json:"base_url"`
+			APIKey        string          `json:"api_key"`
+			Weight        float64         `json:"weight"`
+			Proxy         string          `json:"proxy"`
+			TimeoutMs     int             `json:"timeout_ms"`
+			MaxDataLevel  string          `json:"max_data_level"`
+			Protocol      string          `json:"protocol"`
+			MaxConcurrent *int            `json:"max_concurrent"`
+			Models        json.RawMessage `json:"models"`
 		} `json:"providers"`
 	}
 	if err := readJSONBody(w, r, &req); err != nil {
@@ -189,9 +196,13 @@ func (s *Server) adminSaveProviders(w http.ResponseWriter, r *http.Request, dryR
 	}
 	current := map[string]string{}
 	currentLevel := map[string]string{}
+	currentProto := map[string]string{}
+	currentConc := map[string]int{}
 	for _, p := range rawList {
 		current[p.Name] = p.APIKey
 		currentLevel[p.Name] = strings.TrimSpace(p.MaxDataLevel)
+		currentProto[p.Name] = strings.TrimSpace(p.Protocol)
+		currentConc[p.Name] = p.MaxConcurrent
 	}
 
 	out := make([]config.ProviderRaw, 0, len(req.Providers))
@@ -237,6 +248,27 @@ func (s *Server) adminSaveProviders(w http.ResponseWriter, r *http.Request, dryR
 			level = currentLevel[name]
 		}
 		p.MaxDataLevel = level
+		// protocol 同一把尺：留空 = 沿用原值；给了必须是封闭集取值。
+		proto := strings.TrimSpace(in.Protocol)
+		if proto == "" {
+			proto = currentProto[name]
+		} else if _, err := config.ParseProviderProtocol(proto, "供应商 "+name); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		p.Protocol = proto
+		// max_concurrent：0 是有意义的「不限」，所以用指针区分「没给」与「显式 0」——
+		// 沿用原值，别让一次无关保存把帽悄悄松掉。
+		conc := currentConc[name]
+		if in.MaxConcurrent != nil {
+			if *in.MaxConcurrent < 0 {
+				writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
+					fmt.Sprintf("供应商 %s 的 max_concurrent 不能为负（0 = 不限）", name))
+				return
+			}
+			conc = *in.MaxConcurrent
+		}
+		p.MaxConcurrent = conc
 		if in.Enabled != nil {
 			p.Enabled.Set = true
 			p.Enabled.Value = *in.Enabled

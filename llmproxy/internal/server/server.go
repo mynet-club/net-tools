@@ -106,6 +106,9 @@ type Server struct {
 
 	// auditVolume 是审计表规模读数的缓存（见 audit30.go 的 auditVolumeSnapshot）。
 	auditVolume auditVolumeCache
+
+	// slots 是上游并发帽的信号量表（providers[].max_concurrent，见 providerslots.go）。
+	slots *providerSlots
 }
 
 // now 返回当前时刻；测试可以通过 nowFn 固定它。
@@ -134,6 +137,7 @@ func New(cfgStore *config.Store, db *store.Store, r *router.Router, lg *logx.Log
 		usageCache:   newUsageReportCache(),
 		metrics:      newRuntimeMetrics(),
 		replayWin:    newReplayWindow(),
+		slots:        newProviderSlots(),
 	}
 	if ac := cfgStore.Current(); ac != nil {
 		s.quotaAlerts = newQuotaAlert(ac.Alerts.WebhookURL, ac.Alerts.EffectiveWarnRatio())

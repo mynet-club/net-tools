@@ -67,6 +67,11 @@ providers:
     max_data_level: internal        # 3.0 参与判定时的必填项（见本段开头）
     proxy: us-http                  # direct / 留空 = 直连；也可写代理名或内联 URL
     timeout_ms: 120000
+    # 并发交换上限（0 = 不限）：拿不到槽的请求在自己的期限内排队
+    max_concurrent: 0
+    # 上游协议：openai_chat（缺省）/ anthropic_messages（Anthropic /v1/messages，
+    # 出网传输层做二次翻转）/ ollama_native
+    # protocol: openai_chat
     models:                         # 下游模型名 → 上游真实模型名
       gpt-4o: gpt-4o-2024-11-20
       gpt-4o-mini: gpt-4o-mini

@@ -294,6 +294,11 @@ func migrateScopeSchema(db *sql.DB, d Dialect, pathOrDSN string) error {
 		if _, err := addRequestIdentityColumns(db, d); err != nil {
 			return err
 		}
+		// 版本 6 的 tokens_per_min 同一把尺：半恢复过的库缺它就退回「不限」，
+		// 而管理员设过的限速会静默消失 —— 补列必须幂等地再跑一次。
+		if err := addScopeQuotaTokenRate(db, d); err != nil {
+			return err
+		}
 		// 再补一次旧列退役：**上一版的二进制**迁完时还没有这一步，它的库里 users 仍带着
 		// 2.x 那四列配额列（3.0 不读它们，但形状没收干净）。删不动只打提示 ——
 		// 版本号已落、结构是完整的 3.0，不该为一句收尾的 DDL 把库锁在门外。
@@ -343,6 +348,10 @@ func migrateScopeSchema(db *sql.DB, d Dialect, pathOrDSN string) error {
 		// 「版本号说列在、列其实不在」。
 		if _, err := addRequestIdentityColumns(db, d); err != nil {
 			return fmt.Errorf("%w: 补身份来源列失败: %w", ErrScopeMigration, err)
+		}
+		// 版本 6 的 tokens_per_min：同一口径，先补列再盖章。
+		if err := addScopeQuotaTokenRate(db, d); err != nil {
+			return fmt.Errorf("%w: 补限速列失败: %w", ErrScopeMigration, err)
 		}
 		if err := stampScopeSchemaVersion(db, d, scopeBackup{}, time.Now()); err != nil {
 			return err
@@ -999,6 +1008,14 @@ func (p *scopeMigrationPlan) addScopeColumns(st scopeSchemaState, _ *ScopeMigrat
 		return fmt.Errorf("%w: %w", ErrScopeMigration, err)
 	}
 	return nil
+}
+
+// addScopeQuotaTokenRate 给既有库补 scope_quota.tokens_per_min（版本 6 的那一位）。
+// 补列不回填：缺省 0 = 不限，语义就是「从来没设过」。
+func addScopeQuotaTokenRate(db *sql.DB, d Dialect) error {
+	return addColumnsIfMissing(db, d, "scope_quota", map[string]string{
+		"tokens_per_min": "INTEGER NOT NULL DEFAULT 0",
+	})
 }
 
 // addRequestSummaryColumns 补齐 requests 的执行面摘要两列（版本 4，2026-10-04 裁决 4=B）。
