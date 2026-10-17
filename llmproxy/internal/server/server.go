@@ -713,6 +713,12 @@ func (s *Server) handleV1(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodPost:
+		// Anthropic Messages 兼容入口（/v1/messages）：线格式不是 chat/completions
+		// 同族，走自己的边缘翻译器；鉴权已经在上面统一做过，治理面与 OpenAI 入口一致。
+		if path == "/v1/messages" || path == "/v1/messages/count_tokens" {
+			s.handleAnthropic(w, r, auth)
+			return
+		}
 		if !isAllowedPostPath(path) {
 			writeJSONError(w, http.StatusNotFound, "invalid_request_error",
 				fmt.Sprintf("不支持 POST %s。可用端点：%s", path, strings.Join(allowedPostPaths, "、")))
