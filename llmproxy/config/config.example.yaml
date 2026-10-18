@@ -134,6 +134,10 @@ log:
 #   # enforce = 允许新策略影响路由与处理器。
 #   # legacy = 完全沿用现有 provider 路由。
 #   mode: shadow
+#   # 候选排序目标函数：fixed-order（缺省，与旧路由同分布）| cheapest | fastest。
+#   # cheapest 只比较有价目的候选（未知成本排除，不会被当成 0 价）；
+#   # fastest 按成功请求的 EWMA 延迟排序，样本不足 20 次的候选排在已有观测之后。
+#   routing_objective: fixed-order
 #   # 3.0 算不出可用计划时是否回落旧路由。缺省 true —— §3.0 要求
 #   # 「任何新路径都必须可以按 scope 回滚到 legacy」。
 #   # 显式 false 是 fail-closed 决定：新路径没计划就直接失败。

@@ -59,6 +59,9 @@ const (
 type policyRuntime struct {
 	mode      config.PolicyMode
 	dataLevel policy.DataLevel
+	// objective 是候选排序目标函数（policy.routing_objective）。候选池的成本与延迟
+	// 事实由 policyOffers 填进 Offer；这里只决定 D 按哪一列排。
+	objective routing.Objective
 	set       *policy.BundleSet
 	version   string // 整集版本串（日志/健康检查用；判定用的是按范围过滤后的子集串）
 	fallback  bool
@@ -116,6 +119,7 @@ func newPolicyRuntime(cfg *config.Config, epoch string) (*policyRuntime, error) 
 	return &policyRuntime{
 		mode:      pc.ModeResolved(),
 		dataLevel: pc.DataLevelResolved(),
+		objective: pc.RoutingObjectiveResolved(),
 		set:       set,
 		version:   version,
 		fallback:  pc.FallbackToLegacyEnabled(),
@@ -410,7 +414,7 @@ func (s *Server) policyJudge(rt *policyRuntime, scope, model, requestID, path st
 	// 「池子里有没有这家」与「能不能用这家」是两个问题，答案必须是「不能用」。
 	shot.Decision = res.Evaluate(ctx, chain, shot.resource, shot.action, now)
 
-	offers, err := s.policyOffers(scope, providers, model, now)
+	offers, err := s.policyOffers(scope, providers, model, now, rt.objective)
 	if err != nil {
 		shot.Note = fmt.Sprintf("候选构造失败: %v", err)
 		shot.elapsedFrom(started)
@@ -434,12 +438,14 @@ func (s *Server) policyJudge(rt *policyRuntime, scope, model, requestID, path st
 		Gate:        policyGate{res: res},
 		Requirement: routing.Requirement{Model: model},
 		MaxRetries:  s.router.RetryLimit(),
-		// 目标函数取 default（与现网同分布的固定档序），成本/延迟目标留到全量替换阶段：
-		// 那要求把规则 B 的峰谷系数与币种口径整体搬进候选构造，
-		// 在这里另算一份价格等于制造第二套计费规则（§5 禁止）。
-		Now:  now,
-		TTL:  policyPlanTTL,
-		Seed: seed,
+		// 目标函数来自 policy.routing_objective，缺省 fixed-order（与旧路由同分布）。
+		// 成本与观测延迟已由 policyOffers 填进候选；缺数据的候选由 D 按目标函数
+		// 自己的规则处理（cheapest 排除未知成本、fastest 把无观测排到最后），
+		// 不在接线层另算一份价格或延迟。
+		Objective: rt.objective,
+		Now:       now,
+		TTL:       policyPlanTTL,
+		Seed:      seed,
 		// 粘性如实传给 D：不传的话计划永远按「新会话」算，差异报告里的
 		// primary_moved 大半是假的。D 内部粘性命中时不消耗随机数（§2.8）。
 		Sticky: stickyState(sticky, version),
@@ -603,7 +609,7 @@ func (g policyGate) Allows(ctx policy.PolicyContext, chain policy.ScopeChain,
 // 档序是接线方的规则（routing 包明确「档序不归 D」），这里直接读 router.PlanFor ——
 // 它和真实选路共用同一份 bucketize/priorityTiers 分类，抄一份档序表就会出现
 // 「影子算的次序和线上走的次序不是一回事」这种根本没法解读的差异报告。
-func (s *Server) policyOffers(scope string, providers []config.Provider, model string, now time.Time) (routing.Offers, error) {
+func (s *Server) policyOffers(scope string, providers []config.Provider, model string, now time.Time, objective routing.Objective) (routing.Offers, error) {
 	tiers := s.router.PlanFor(userBucket(scope), providers, model)
 	byName := make(map[string]providerFacts, len(providers))
 	for i := range providers {
@@ -616,6 +622,12 @@ func (s *Server) policyOffers(scope string, providers []config.Provider, model s
 			declared: p.Declares(model), maxLevel: p.DataLevelCeiling()}
 	}
 	states := s.router.SnapshotFor(userBucket(scope))
+	// 只有目标函数真的要看成本/延迟时才去查：fixed-order 是默认档，不该为了
+	// 一份不参与排序的事实给每条请求加一次价目查询/画像读取。
+	var costs map[string]providerCostFact
+	if objective == routing.ObjectiveCheapest {
+		costs = s.providerCostFacts(providers, model, now)
+	}
 
 	seen := map[string]bool{}
 	offers := make(routing.Offers, 0, len(providers))
@@ -630,6 +642,11 @@ func (s *Server) policyOffers(scope string, providers []config.Provider, model s
 			seen[e.Name] = true
 			facts := byName[e.Name]
 			declared := facts.declared
+			cost, costKnown := costs[e.Name]
+			var latency int64
+			if objective == routing.ObjectiveFastest {
+				latency = s.metrics.observedLatency(e.Name, facts.upstream)
+			}
 			var cooldown time.Time
 			if st, ok := states[e.Name]; ok {
 				cooldown = st.UnhealthyUntil
@@ -647,10 +664,14 @@ func (s *Server) policyOffers(scope string, providers []config.Provider, model s
 					// 那会让每次判定都变成「候选构造失败」而不是一条能解读的差异。
 					MaxDataLevel: facts.maxLevel,
 				},
-				Tier:           tier,
-				Healthy:        e.Healthy,
-				CooldownUntil:  cooldown,
-				DeclaredModels: declaredModels(model, declared),
+				Tier:              tier,
+				Healthy:           e.Healthy,
+				CooldownUntil:     cooldown,
+				CostPer1KIn:       cost.in,
+				CostPer1KOut:      cost.out,
+				CostKnown:         costKnown,
+				ObservedLatencyMs: latency,
+				DeclaredModels:    declaredModels(model, declared),
 			})
 		}
 	}

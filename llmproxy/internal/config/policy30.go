@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
+	"github.com/mynet-club/net-tools/llmproxy/internal/routing"
 )
 
 // 配置文件结构版本（不是策略内容版本）。
@@ -70,6 +71,10 @@ type PolicyConfig struct {
 	// 猜 public 等于把敏感流量当公开流量放行，猜 restricted 会让每条 deny 规则都命中，
 	// 两种猜法都会让差异报告失去意义，而错误的方式是「看起来配好了」。
 	DataLevel string `yaml:"data_level"`
+	// RoutingObjective 是候选排序的目标函数（fixed-order / cheapest / fastest）。
+	// 留空取 fixed-order —— 它是唯一与旧路由同分布的一档，漏配最坏只是「没有变聪明」。
+	// 只有 shadow/enforce 有意义；legacy 下不参与判定。
+	RoutingObjective string `yaml:"routing_objective"`
 	// FallbackToLegacy 报告 3.0 算不出可用计划时是否回落旧路由。
 	// 缺省 true：§3.0 要求「任何新路径都必须可以按 scope 回滚到 legacy」，
 	// 关掉它是显式的 fail-closed 决定，只在 enforce 下有意义。
@@ -79,6 +84,7 @@ type PolicyConfig struct {
 	// --- 加载期解析出的派生值，运行期只读 ---
 	mode      PolicyMode
 	dataLevel policy.DataLevel
+	objective routing.Objective
 	refIndex  map[string]PolicyBundleRef
 	scopeRefs map[string]policy.ScopeRef
 }
@@ -121,6 +127,15 @@ func (p *PolicyConfig) DataLevelResolved() policy.DataLevel {
 		return policy.LevelUnknown
 	}
 	return p.dataLevel
+}
+
+// RoutingObjectiveResolved 返回候选排序目标函数；未解析时取 routing 包的默认值
+// （fixed-order，与旧路由同分布）。
+func (p *PolicyConfig) RoutingObjectiveResolved() routing.Objective {
+	if p == nil || p.objective == "" {
+		return routing.DefaultObjective
+	}
+	return p.objective
 }
 
 // UsesPolicy 报告 3.0 是否参与本次请求（shadow 也算参与，只是不改路由）。
@@ -213,8 +228,17 @@ func (p *PolicyConfig) normalize(known KnownScopes, warnings *[]string) error {
 	}
 	mode := strings.TrimSpace(p.Mode)
 	active := strings.TrimSpace(p.ActiveBundle)
+	objective, err := routing.ParseObjective(p.RoutingObjective)
+	if err != nil {
+		return fmt.Errorf("policy.routing_objective: %w", err)
+	}
+	p.objective = objective
 	if mode == "" && len(p.Bundles) == 0 && active == "" {
 		// 整段缺省：legacy。这是唯一能保证「升级二进制不动配置」的取值。
+		if strings.TrimSpace(p.RoutingObjective) != "" {
+			*warnings = append(*warnings,
+				"policy.mode 未启用（legacy），已配置的 policy.routing_objective 不会参与任何判定")
+		}
 		p.mode = PolicyModeLegacy
 		return nil
 	}
@@ -235,6 +259,10 @@ func (p *PolicyConfig) normalize(known KnownScopes, warnings *[]string) error {
 		if len(p.Bundles) > 0 {
 			*warnings = append(*warnings,
 				"policy.mode=legacy，已配置的 policy.bundles 不会生效（回滚期间的正常状态）")
+		}
+		if strings.TrimSpace(p.RoutingObjective) != "" {
+			*warnings = append(*warnings,
+				"policy.mode=legacy，已配置的 policy.routing_objective 不会参与任何判定")
 		}
 		p.refIndex = nil
 		return nil

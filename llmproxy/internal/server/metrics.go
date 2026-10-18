@@ -32,6 +32,12 @@ type runtimeMetrics struct {
 	latPos  int
 	latFull bool
 
+	// 上游级延迟画像：fastest 目标函数的事实来源。按 (provider, 上游模型) 维护
+	// 指数滑动平均，只在成功请求上取样。样本数低于门槛时返回 0（无观测），
+	// 排序层会把无观测的候选排在已有观测之后。
+	profMu sync.Mutex
+	prof   map[providerLatencyKey]*latencyProfile
+
 	// 影子运行统计（§3.0：shadow 必须记录决策差异和性能）。
 	// 单独一组计数而不是塞进请求计数：影子判定不是请求终态，混在一起会让
 	// 「一致率」看起来像成功率。
@@ -81,8 +87,73 @@ type runtimeMetrics struct {
 // latRingSize 足够估出 p99，又不至于在高 QPS 下变成延迟采样器的内存负担。
 const latRingSize = 4096
 
+// 上游延迟画像的参数。
+//
+//   - minSamples：样本太少时 EWMA 只是噪声，不参与排序（3.0 的置信度门槛）。
+//   - alpha：新样本权重。0.2 大约相当于最近 10 次请求的滑动窗口，但对突发延迟
+//     不会像定长窗口那样「一滑就全变」。
+//   - maxProfiles：上限必须有（§3.7）。键是 provider+上游模型，用户可控上游
+//     可以造出很多模型名；满了以后新键不再取样，已有键照常更新。
+const (
+	latencyProfileMinSamples = 20
+	latencyProfileAlpha      = 0.2
+	maxLatencyProfiles       = 512
+)
+
+type providerLatencyKey struct{ provider, upstream string }
+
+type latencyProfile struct {
+	samples int64
+	ewma    float64
+}
+
 func newRuntimeMetrics() *runtimeMetrics {
-	return &runtimeMetrics{lat: make([]int64, latRingSize)}
+	return &runtimeMetrics{
+		lat:  make([]int64, latRingSize),
+		prof: map[providerLatencyKey]*latencyProfile{},
+	}
+}
+
+// observeProviderLatency 记一次成功交换的延迟样本。
+func (m *runtimeMetrics) observeProviderLatency(provider, upstream string, ms int64) {
+	if m == nil || provider == "" || ms <= 0 {
+		return
+	}
+	k := providerLatencyKey{provider: provider, upstream: upstream}
+	m.profMu.Lock()
+	defer m.profMu.Unlock()
+	if m.prof == nil {
+		m.prof = map[providerLatencyKey]*latencyProfile{}
+	}
+	p, ok := m.prof[k]
+	if !ok {
+		if len(m.prof) >= maxLatencyProfiles {
+			return
+		}
+		p = &latencyProfile{}
+		m.prof[k] = p
+	}
+	p.samples++
+	if p.samples == 1 {
+		p.ewma = float64(ms)
+	} else {
+		p.ewma = p.ewma*(1-latencyProfileAlpha) + float64(ms)*latencyProfileAlpha
+	}
+}
+
+// observedLatency 返回某家上游的观测延迟（毫秒）；样本不足或没有记录时返回 0。
+func (m *runtimeMetrics) observedLatency(provider, upstream string) int64 {
+	if m == nil || provider == "" {
+		return 0
+	}
+	k := providerLatencyKey{provider: provider, upstream: upstream}
+	m.profMu.Lock()
+	defer m.profMu.Unlock()
+	p := m.prof[k]
+	if p == nil || p.samples < latencyProfileMinSamples {
+		return 0
+	}
+	return int64(p.ewma + 0.5)
 }
 
 func (m *runtimeMetrics) beginRequest() func() {
@@ -111,6 +182,9 @@ func (m *runtimeMetrics) observe(rec *store.RequestRecord) {
 	}
 	if rec.Attempts > 1 {
 		m.retries.Add(1)
+	}
+	if rec.OK && rec.LatencyMs > 0 {
+		m.observeProviderLatency(rec.Provider, rec.UpstreamModel, rec.LatencyMs)
 	}
 	m.observeLatency(rec.LatencyMs)
 }

@@ -22,38 +22,36 @@ import (
 // 太短会让规则 B 一遍遍把请求送到已经没额度的家。
 const ruleBQuotaCooldown = 5 * time.Minute
 
-// cheapestProvider 在当前候选里按上游价挑最便宜的一家；挑不出来返回空串
-// （调用方回落到原来的按权重随机）。
+// providerCostFact 是「这家此刻每 1K token 的输入/输出有效成本」。
+// 币种不同或没有价目的家不出现在结果里 —— 不知道价不等于零价。
+type providerCostFact struct {
+	in  float64
+	out float64
+}
+
+// providerCostFacts 是规则 B 与 3.0 候选构造**共用**的成本事实来源。
 //
-// 三条刻意的取舍：
-//   - **只按有价目的候选排**：没录价目的候选不参与"比价"（不知道价不等于便宜）。
-//     全都没价目 → 返回空串，行为与以前完全一致。
-//   - **跳过冷却中的候选**：这正是 402/429 记冷却的意义；也顺带避开熔断中的家。
-//   - **排序键是 in_miss + out**：把两档单价相加当标量，粗糙但透明 —— 输入输出都贵的家一定靠后。
-//     真正精确的做法是按实测 token 混合比加权，那需要历史数据，留待以后。
-//   - **乘上各家自己的峰谷系数**：单价是「供应商 × 模型 × 时段」的函数，两家的
-//     高峰时段（甚至时区）可以不同，同一时刻谁便宜会因此翻转。不乘就会在空闲时段
-//     把贵的家选出来 —— DeepSeek 的高峰价正好是空闲价的两倍，错一次就是双倍成本。
-func (s *Server) cheapestProvider(scope string, providers []config.Provider, model string) string {
+// 两个消费者必须读同一份计算：规则 B 用 (in+out) 挑最便宜的家，routing.Offer
+// 用同一对数字给 cheapest 目标函数排序。各算一份就会在峰谷系数或币种口径上
+// 出现「规则 B 选了 A、3.0 计划说 B」的静默分叉。
+func (s *Server) providerCostFacts(providers []config.Provider, model string, now time.Time) map[string]providerCostFact {
+	out := make(map[string]providerCostFact, len(providers))
 	if s.db == nil {
-		return ""
+		return out
 	}
-	now := s.now()
 	prices, err := s.db.ProviderPricesEffective(now)
 	if err != nil {
-		s.log.Warnf("查当前在效价目失败，规则 B 本次跳过: %v", err)
-		return ""
+		s.log.Warnf("查当前在效价目失败，成本事实本次跳过: %v", err)
+		return out
 	}
 	if len(prices) == 0 {
-		return ""
+		return out
 	}
 	type key struct{ provider, upstream string }
 	byKey := make(map[key]store.ProviderPrice, len(prices))
 	for _, p := range prices {
 		byKey[key{p.Provider, p.UpstreamModel}] = p
 	}
-
-	best, bestCost := "", 0.0
 	base := s.baseCurrency()
 	for _, p := range providers {
 		if !p.Enabled {
@@ -61,9 +59,6 @@ func (s *Server) cheapestProvider(scope string, providers []config.Provider, mod
 		}
 		up, ok := p.UpstreamModel(model)
 		if !ok {
-			continue
-		}
-		if s.router.Cooling(userBucket(scope), p.Name) {
 			continue
 		}
 		price, ok := byKey[key{p.Name, up}]
@@ -78,7 +73,39 @@ func (s *Server) cheapestProvider(scope string, providers []config.Provider, mod
 			continue
 		}
 		ratio := s.peakRuleAt(price.PeakHours, price.OffPeakRatio, price.PeakTZ).RatioAt(now)
-		cost := (price.InMiss + price.Out) * ratio
+		out[p.Name] = providerCostFact{in: price.InMiss * ratio, out: price.Out * ratio}
+	}
+	return out
+}
+
+// cheapestProvider 在当前候选里按上游价挑最便宜的一家；挑不出来返回空串
+// （调用方回落到原来的按权重随机）。
+//
+// 三条刻意的取舍：
+//   - **只按有价目的候选排**：没录价目的候选不参与"比价"（不知道价不等于便宜）。
+//     全都没价目 → 返回空串，行为与以前完全一致。
+//   - **跳过冷却中的候选**：这正是 402/429 记冷却的意义；也顺带避开熔断中的家。
+//   - **排序键是 in_miss + out**：把两档单价相加当标量，粗糙但透明 —— 输入输出都贵的家一定靠后。
+//     真正精确的做法是按实测 token 混合比加权，那需要历史数据，留待以后。
+//   - **乘上各家自己的峰谷系数**：单价是「供应商 × 模型 × 时段」的函数，两家的
+//     高峰时段（甚至时区）可以不同，同一时刻谁便宜会因此翻转。不乘就会在空闲时段
+//     把贵的家选出来 —— DeepSeek 的高峰价正好是空闲价的两倍，错一次就是双倍成本。
+func (s *Server) cheapestProvider(scope string, providers []config.Provider, model string) string {
+	now := s.now()
+	facts := s.providerCostFacts(providers, model, now)
+	best, bestCost := "", 0.0
+	for _, p := range providers {
+		if !p.Enabled {
+			continue
+		}
+		if s.router.Cooling(userBucket(scope), p.Name) {
+			continue
+		}
+		f, ok := facts[p.Name]
+		if !ok {
+			continue
+		}
+		cost := f.in + f.out
 		if best == "" || cost < bestCost {
 			best, bestCost = p.Name, cost
 		}

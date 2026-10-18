@@ -880,3 +880,67 @@ func TestPolicy30StickyStateOnlyForNamedProvider(t *testing.T) {
 		t.Errorf("粘性输入 = %+v", got)
 	}
 }
+
+// policyHarnessWithObjective 起一个 enforce 夹具，并把目标函数写进 policy 段。
+func policyHarnessWithObjective(t *testing.T, objective string, upstreams map[string]string) *harness {
+	t.Helper()
+	src := cfgYAML(upstreams, []string{"sk-local"}) +
+		policySection("enforce", "t-open", "system:gateway", 1) +
+		"  routing_objective: " + objective + "\n"
+	h := newHarness(t, src)
+	writePolicyBundle(t, h, policyBundleOpen)
+	return h
+}
+
+// fastest：指标画像里延迟低的那家应当成为计划首选。没有价目时规则 B 不参与，
+// 所以选路结果直接反映 routing.Objective 的排序。
+func TestPolicy30ObjectiveFastestUsesObservedLatency(t *testing.T) {
+	a := startMockUpstream(t, &mockUpstream{name: "a", apiKey: "sk-a"})
+	b := startMockUpstream(t, &mockUpstream{name: "b", apiKey: "sk-b"})
+	h := policyHarnessWithObjective(t, "fastest", map[string]string{"a": a.baseURL, "b": b.baseURL})
+
+	// 两家都攒够样本：a 明显更快。
+	for i := 0; i < latencyProfileMinSamples; i++ {
+		h.srv.metrics.observeProviderLatency("a", "m", 80)
+		h.srv.metrics.observeProviderLatency("b", "m", 900)
+	}
+	for i := 0; i < 5; i++ {
+		resp, body := postID(t, h, fmt.Sprintf("req-fast-%d", i), "m")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("第 %d 次应 200，实际 %d: %s", i, resp.StatusCode, body)
+		}
+		if got := resp.Header.Get("X-LLMProxy-Provider"); got != "a" {
+			t.Fatalf("fastest 应选观测延迟更低的 a，第 %d 次实际 %q", i, got)
+		}
+	}
+}
+
+// cheapest：候选构造必须把价目事实填进 Offer，否则 D 会把两家都当成未知成本排除，
+// enforce 只能回落旧路由（按权重随机），这条用例就会在 b 上随机失败。
+func TestPolicy30ObjectiveCheapestUsesProviderPrices(t *testing.T) {
+	a := startMockUpstream(t, &mockUpstream{name: "a", apiKey: "sk-a"})
+	b := startMockUpstream(t, &mockUpstream{name: "b", apiKey: "sk-b"})
+	h := policyHarnessWithObjective(t, "cheapest", map[string]string{"a": a.baseURL, "b": b.baseURL})
+
+	from := hourFloor(time.Now().Add(-2 * time.Hour))
+	if err := h.db.InsertProviderPrice(&store.ProviderPrice{
+		Provider: "a", UpstreamModel: "m", ValidFrom: from, InMiss: 1, Out: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.db.InsertProviderPrice(&store.ProviderPrice{
+		Provider: "b", UpstreamModel: "m", ValidFrom: from, InMiss: 50, Out: 50,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 5; i++ {
+		resp, body := postID(t, h, fmt.Sprintf("req-cheap-%d", i), "m")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("第 %d 次应 200，实际 %d: %s", i, resp.StatusCode, body)
+		}
+		if got := resp.Header.Get("X-LLMProxy-Provider"); got != "a" {
+			t.Fatalf("cheapest 应选有价目且更低的 a，第 %d 次实际 %q", i, got)
+		}
+	}
+}

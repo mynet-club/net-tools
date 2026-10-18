@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -310,5 +311,51 @@ func TestKnowledgeFailureMetricIgnoresUnregisteredReason(t *testing.T) {
 	}
 	if _, ok := byReason[string(knowledge.ReasonTimeout)]; !ok {
 		t.Errorf("注册过的码没记上: %v", byReason)
+	}
+}
+
+// 延迟画像的置信度门槛：样本不足时返回 0（无观测），排序层会把无观测排到最后；
+// 达到门槛后取 EWMA，新样本只按 alpha 拉动，不会被一次抖动整个带跑。
+func TestProviderLatencyProfileNeedsEnoughSamples(t *testing.T) {
+	m := newRuntimeMetrics()
+	for i := 0; i < latencyProfileMinSamples-1; i++ {
+		m.observe(&store.RequestRecord{OK: true, Provider: "a", UpstreamModel: "m", LatencyMs: 100})
+	}
+	if got := m.observedLatency("a", "m"); got != 0 {
+		t.Fatalf("样本不足时不得给出观测值，实际 %d", got)
+	}
+	m.observe(&store.RequestRecord{OK: true, Provider: "a", UpstreamModel: "m", LatencyMs: 100})
+	if got := m.observedLatency("a", "m"); got != 100 {
+		t.Fatalf("达到门槛后应返回 100，实际 %d", got)
+	}
+	m.observe(&store.RequestRecord{OK: true, Provider: "a", UpstreamModel: "m", LatencyMs: 200})
+	if got := m.observedLatency("a", "m"); got <= 100 || got >= 200 {
+		t.Fatalf("EWMA 应被新样本拉动但不等于新样本，实际 %d", got)
+	}
+}
+
+// 失败请求的延迟不能进画像：快速失败的 50ms 会把「这家很慢/很快」的结论带偏，
+// 而 fastest 要比较的是成功交换的耗时。
+func TestProviderLatencyProfileIgnoresFailures(t *testing.T) {
+	m := newRuntimeMetrics()
+	for i := 0; i < latencyProfileMinSamples; i++ {
+		m.observe(&store.RequestRecord{
+			OK: false, Provider: "a", UpstreamModel: "m", LatencyMs: 50,
+			StatusCode: 500, ErrorType: "upstream_http",
+		})
+	}
+	if got := m.observedLatency("a", "m"); got != 0 {
+		t.Fatalf("失败样本不得进延迟画像，实际 %d", got)
+	}
+}
+
+// §3.7：用户可控上游能造出很多模型名，画像必须有界；满了以后新键不再取样。
+func TestProviderLatencyProfileBounded(t *testing.T) {
+	m := newRuntimeMetrics()
+	for i := 0; i < maxLatencyProfiles+32; i++ {
+		m.observeProviderLatency(fmt.Sprintf("p%d", i), "m", 10)
+	}
+	if got := len(m.prof); got != maxLatencyProfiles {
+		t.Fatalf("画像上限 = %d，实际 %d", maxLatencyProfiles, got)
 	}
 }

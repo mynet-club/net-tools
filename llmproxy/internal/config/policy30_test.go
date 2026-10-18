@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/policy"
+	"github.com/mynet-club/net-tools/llmproxy/internal/routing"
 )
 
 // 3.0 接线块（§3.0）的加载测试。这里的每一条都对应一个「配错之后的后果」：
@@ -516,4 +517,30 @@ func replaceOnce(t *testing.T, src, old, new string) string {
 		t.Fatalf("替换没生效（源里没有 %q）:\n%s", old, src)
 	}
 	return out
+}
+
+// 目标函数：缺省 fixed-order（与旧路由同分布），显式取值被解析，拼错必须在加载期失败。
+// 这个字段决定候选排序，静默回落到默认会让「我明明配了 cheapest」变成一句空话。
+func TestPolicyRoutingObjective(t *testing.T) {
+	if got := mustCfg30(t, cfg30ValidShadow).Policy.RoutingObjectiveResolved(); got != routing.DefaultObjective {
+		t.Errorf("缺省目标函数 = %q，want %q", got, routing.DefaultObjective)
+	}
+	cfg := mustCfg30(t, cfg30ValidShadow+"  routing_objective: cheapest\n")
+	if got := cfg.Policy.RoutingObjectiveResolved(); got != routing.ObjectiveCheapest {
+		t.Errorf("显式目标函数 = %q，want %q", got, routing.ObjectiveCheapest)
+	}
+	if _, err := cfg30(t, cfg30ValidShadow+"  routing_objective: turbo\n"); err == nil ||
+		!strings.Contains(err.Error(), "routing_objective") {
+		t.Errorf("拼错的目标函数必须在加载期报错，实际 err=%v", err)
+	}
+}
+
+// 改目标函数必须被判成配置变更：否则热加载会把它当成「没改」而跳过重建运行态，
+// 管理台一直显示新值、请求路径仍按旧目标函数排序。
+func TestConfigEqualDetectsRoutingObjective(t *testing.T) {
+	base := mustCfg30(t, cfg30ValidShadow)
+	changed := mustCfg30(t, cfg30ValidShadow+"  routing_objective: fastest\n")
+	if configEqual(base, changed) {
+		t.Error("routing_objective 改了却判为相等")
+	}
 }

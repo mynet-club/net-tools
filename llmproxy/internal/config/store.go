@@ -260,6 +260,7 @@ func knowledgeSourcesEqual(a, b []KnowledgeSourceDef) bool {
 func policyEqual(a, b PolicyConfig) bool {
 	if a.ModeResolved() != b.ModeResolved() ||
 		a.DataLevelResolved() != b.DataLevelResolved() ||
+		a.RoutingObjectiveResolved() != b.RoutingObjectiveResolved() ||
 		a.FallbackToLegacyEnabled() != b.FallbackToLegacyEnabled() ||
 		strings.TrimSpace(a.BundleDir) != strings.TrimSpace(b.BundleDir) ||
 		strings.TrimSpace(a.ActiveBundle) != strings.TrimSpace(b.ActiveBundle) {
