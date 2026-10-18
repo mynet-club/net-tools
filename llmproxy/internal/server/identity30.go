@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/config"
 	"github.com/mynet-club/net-tools/llmproxy/internal/identity"
@@ -39,6 +40,11 @@ const IdentityHeaderName = "X-Identity-Token"
 type identityRuntime struct {
 	provider identity.Provider
 	source   string
+	// ldap 非空表示这次修订用的是目录身份：登录端点用它认证，请求路径用 sessions 验令牌。
+	ldap *identity.LDAPDirectoryProvider
+	// sessions 是 LDAP 登录后短时令牌的签发/验证器（与 provider 指向同一对象）。
+	sessions   *identity.SessionCodec
+	sessionTTL time.Duration
 }
 
 // newIdentityRuntime 从配置构造运行态；identity 段未启用时返回 (nil, nil)。
@@ -47,10 +53,13 @@ type identityRuntime struct {
 // 「配置引用缺文件」这一类事故，启动期就该炸（与 CheckPolicyRuntime 同口径）。
 // 之后每次验签仍按 TTL 重读文件（identity.NewCachedKeys），所以轮换密钥不必重启 ——
 // 构造期的这一次读只是「确认这个东西现在存在且能解析」，不是缓存。
-func newIdentityRuntime(cfg *config.Config) (*identityRuntime, error) {
+func newIdentityRuntime(cfg *config.Config, sessionKey []byte) (*identityRuntime, error) {
 	ic := &cfg.Identity
 	if !ic.Enabled() {
 		return nil, nil
+	}
+	if ic.IsLDAP() {
+		return newLDAPIdentityRuntime(cfg, sessionKey)
 	}
 	path := ic.ResolveJWKS(cfg.BundleBaseDir())
 	if _, err := readJWKSFile(path); err != nil {
@@ -83,6 +92,66 @@ func newIdentityRuntime(cfg *config.Config) (*identityRuntime, error) {
 	return &identityRuntime{provider: provider, source: ic.Source}, nil
 }
 
+// newLDAPIdentityRuntime 构造目录身份：登录用 LDAP，请求路径用网关签发的短时令牌。
+func newLDAPIdentityRuntime(cfg *config.Config, sessionKey []byte) (*identityRuntime, error) {
+	if len(sessionKey) == 0 {
+		// 会话令牌的签名密钥从 master.key 派生。没有它就只能退回 legacy，
+		// 那会让「配了 LDAP」看起来像接上了而实际不判身份 —— 宁可启动失败。
+		return nil, fmt.Errorf("identity.provider=ldap 需要 master.key 派生会话签名密钥，但主密钥不可用")
+	}
+	ic := &cfg.Identity
+	ld := ic.LDAP
+	ttl := ic.SessionTTL()
+	provider, err := identity.NewLDAPDirectoryProvider(identity.LDAPTrust{
+		Source:             ic.Source,
+		URL:                ld.URL,
+		BindDN:             ld.BindDN,
+		BindPassword:       ld.BindPassword,
+		BaseDN:             ld.BaseDN,
+		UserAttr:           ld.UserAttr,
+		DisplayNameAttr:    ld.DisplayNameAttr,
+		GroupAttr:          ld.GroupAttr,
+		GroupBaseDN:        ld.GroupBaseDN,
+		RoleAttr:           ld.RoleAttr,
+		IdentityTTL:        ttl,
+		MaxPasswordBytes:   ld.MaxPasswordBytes,
+		AllowedBindTargets: ld.AllowedBindTargets,
+		Timeout:            ic.LDAPTimeout(),
+		StartTLS:           ld.StartTLS,
+		RootCAFile:         ic.ResolveRootCA(cfg.BundleBaseDir()),
+	}, identity.NewGoLDAPDirectory())
+	if err != nil {
+		return nil, fmt.Errorf("identity 段不可用: %w", err)
+	}
+	codec, err := identity.NewSessionCodec(sessionKey, ic.Source, ttl)
+	if err != nil {
+		return nil, fmt.Errorf("identity 会话令牌不可用: %w", err)
+	}
+	return &identityRuntime{
+		provider:   codec,
+		source:     ic.Source,
+		ldap:       provider,
+		sessions:   codec,
+		sessionTTL: ttl,
+	}, nil
+}
+
+// authenticateLDAP 用目录口令认证一次；成功返回可签发会话令牌的主体。
+func (r *identityRuntime) authenticateLDAP(ctx context.Context, username, password, requestID string) (identity.Principal, error) {
+	if r == nil || r.ldap == nil {
+		return identity.Principal{}, fmt.Errorf("%w: 本网关没有启用 LDAP 身份", identity.ErrConfig)
+	}
+	return r.ldap.Authenticate(ctx, username, password, requestID)
+}
+
+// issueLDAPSession 签发一枚短时令牌。
+func (r *identityRuntime) issueLDAPSession(p identity.Principal) (string, time.Time, error) {
+	if r == nil || r.sessions == nil {
+		return "", time.Time{}, fmt.Errorf("%w: 本网关没有启用 LDAP 身份", identity.ErrConfig)
+	}
+	return r.sessions.Issue(p, r.sessionTTL)
+}
+
 // readJWKSFile 读本机 JWKS 文件并解析成公钥集合。
 //
 // **只读本机文件**：出网取键要走受约束的 dialer 与出网策略，属另一个包
@@ -107,7 +176,11 @@ func readJWKSFile(path string) ([]identity.JWK, error) {
 // 为了让绑定口径只有一份，统一由调用方传 ctx（真实请求传 context.Background()，见
 // requestIdentity30）。
 func (r *identityRuntime) resolve(ctx context.Context, token, requestID string) (identity.Principal, error) {
-	cred, err := identity.NewCredential(identity.CredentialOIDCToken, token)
+	kind := identity.CredentialOIDCToken
+	if r.ldap != nil {
+		kind = identity.CredentialSessionToken
+	}
+	cred, err := identity.NewCredential(kind, token)
 	if err != nil {
 		return identity.Principal{}, err
 	}

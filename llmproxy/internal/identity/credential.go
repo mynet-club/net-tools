@@ -16,6 +16,9 @@ const (
 	CredentialSAMLAssertion CredentialKind = "saml-assertion"
 	// CredentialLDAPBind：DN + 口令的目录绑定。值是 "dn\npassword" 形式。
 	CredentialLDAPBind CredentialKind = "ldap-bind"
+	// CredentialSessionToken 是网关在 LDAP 绑定成功后签发的短时会话令牌。
+	// 请求路径只认这一种 LDAP 凭证，目录口令不逐请求上传。
+	CredentialSessionToken CredentialKind = "ldap-session"
 	// CredentialFakeFixture：FakeProvider 的 fixture 名，只在测试与影子演练里出现。
 	CredentialFakeFixture CredentialKind = "fake-fixture"
 )
@@ -95,7 +98,7 @@ func SubjectRef(raw string) string {
 
 func knownCredentialKind(k CredentialKind) bool {
 	switch k {
-	case CredentialOIDCToken, CredentialSAMLAssertion, CredentialLDAPBind, CredentialFakeFixture:
+	case CredentialOIDCToken, CredentialSAMLAssertion, CredentialLDAPBind, CredentialSessionToken, CredentialFakeFixture:
 		return true
 	}
 	return false

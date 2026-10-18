@@ -42,6 +42,11 @@ var (
 	ErrConfig          = errors.New("identity: 身份来源配置不合法")
 	ErrNotImplemented  = errors.New("identity: 该身份来源尚未实现")
 	ErrInternal        = errors.New("identity: 内部错误")
+
+	// LDAP 目录通路。
+	ErrDirectoryUnavailable = errors.New("identity: 目录服务不可用")
+	ErrLDAPEntryNotFound    = errors.New("identity: 目录里找不到该用户")
+	ErrLDAPEntryAmbiguous   = errors.New("identity: 目录里匹配到多个用户")
 )
 
 // ReasonCode 是身份解析结论的稳定原因码（手册 §5：所有安全决策必须返回 reason code）。
@@ -89,6 +94,11 @@ const (
 	ReasonMembershipTTL     ReasonCode = "membership_ttl_missing"
 	ReasonFixtureNotFound   ReasonCode = "fixture_not_found"
 
+	// LDAP。
+	ReasonDirectoryUnavailable ReasonCode = "ldap_unavailable"
+	ReasonLDAPEntryNotFound    ReasonCode = "ldap_entry_not_found"
+	ReasonLDAPEntryAmbiguous   ReasonCode = "ldap_entry_ambiguous"
+
 	// stub。
 	ReasonNotImplemented ReasonCode = "not_implemented"
 )
@@ -107,6 +117,7 @@ func init() {
 		ReasonLifetimeExceeded, ReasonSubjectMissing, ReasonSubjectUnstable,
 		ReasonClaimShapeInvalid, ReasonClaimOverflow, ReasonScopeUnmapped, ReasonMembershipTTL,
 		ReasonFixtureNotFound,
+		ReasonDirectoryUnavailable, ReasonLDAPEntryNotFound, ReasonLDAPEntryAmbiguous,
 		ReasonNotImplemented,
 	} {
 		registeredReasons[r] = true
@@ -153,6 +164,9 @@ var sentinelReasons = []struct {
 	{ErrScopeUnmapped, ReasonScopeUnmapped},
 	{ErrMembershipTTL, ReasonMembershipTTL},
 	{ErrFixtureNotFound, ReasonFixtureNotFound},
+	{ErrDirectoryUnavailable, ReasonDirectoryUnavailable},
+	{ErrLDAPEntryNotFound, ReasonLDAPEntryNotFound},
+	{ErrLDAPEntryAmbiguous, ReasonLDAPEntryAmbiguous},
 	{ErrConfig, ReasonConfigInvalid},
 	{ErrNotImplemented, ReasonNotImplemented},
 	{ErrInternal, ReasonInternalError},
@@ -179,6 +193,8 @@ func ReasonFor(err error) ReasonCode {
 var dependencyReasons = map[ReasonCode]bool{
 	ReasonKeyUnavailable: true,
 	ReasonInternalError:  true,
+	// LDAP 目录不可用是依赖故障，不是「这个人被拒了」。
+	ReasonDirectoryUnavailable: true,
 	// 尚未实现（LDAP/SAML 的 stub 路径）既不是调用方的错，也不是权限判定结论：
 	// 是本包还没提供那块能力。归进依赖失败，Outcome 才是 error 而不是 denied，
 	// 大盘上「这个来源压根没接通」与「这个人被拒了」才分得开。

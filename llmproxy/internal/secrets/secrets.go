@@ -170,6 +170,10 @@ func (c *Cipher) Decrypt(blob []byte) (string, error) {
 const (
 	PurposePIIPseudonym  = "pii-pseudonym"
 	PurposeKBQueryDigest = "kb-query-digest"
+	// PurposeLDAPSession 是 LDAP 登录后短时会话令牌的 HMAC 签名密钥位。
+	// 与上面两位互不相干：令牌签名密钥一旦被拿去算假名，两条使用面就可以互相
+	// 提供样本，而它们一个对外可见（假名在正文里）、一个只在本机验签。
+	PurposeLDAPSession = "ldap-session"
 
 	// DeriveVersionV1 是当前的派生版本串。将来换算法或换口径时升成 v2，
 	// 新旧派生值自然断开，不需要换主密钥。

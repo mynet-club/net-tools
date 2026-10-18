@@ -109,6 +109,9 @@ type Server struct {
 
 	// slots 是上游并发帽的信号量表（providers[].max_concurrent，见 providerslots.go）。
 	slots *providerSlots
+
+	// loginGate 管 LDAP 登录端点的并发与频率（见 ldaplogin.go）。
+	loginGate *loginGate
 }
 
 // now 返回当前时刻；测试可以通过 nowFn 固定它。
@@ -117,6 +120,18 @@ func (s *Server) now() time.Time {
 		return s.nowFn()
 	}
 	return time.Now()
+}
+
+// identitySessionKey 返回 LDAP 会话令牌的签名子密钥。
+//
+// 从 master.key 派生而不是新增一个密钥文件：令牌只在本机验签，派生位
+// 与假名/检索摘要互不相干（见 secrets.PurposeLDAPSession 的注释）。
+// 主密钥不可用时返回 nil，LDAP 身份会在构造期明确失败而不是静默降级。
+func (s *Server) identitySessionKey() []byte {
+	if s.secrets == nil {
+		return nil
+	}
+	return s.secrets.Derive(secrets.PurposeLDAPSession, secrets.DeriveVersionV1)
 }
 
 func New(cfgStore *config.Store, db *store.Store, r *router.Router, lg *logx.Logger) *Server {
@@ -138,6 +153,7 @@ func New(cfgStore *config.Store, db *store.Store, r *router.Router, lg *logx.Log
 		metrics:      newRuntimeMetrics(),
 		replayWin:    newReplayWindow(),
 		slots:        newProviderSlots(),
+		loginGate:    newLoginGate(),
 	}
 	if ac := cfgStore.Current(); ac != nil {
 		s.quotaAlerts = newQuotaAlert(ac.Alerts.WebhookURL, ac.Alerts.EffectiveWarnRatio())
@@ -687,6 +703,13 @@ func (s *Server) handleV1(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error",
 			fmt.Sprintf("不支持 %s /v1。可用端点：POST /v1/chat/completions、GET /v1/models", r.Method))
+		return
+	}
+
+	// LDAP 登录换 token：这枚 token 是外部身份，不是网关凭证，所以走在鉴权之前；
+	// 端点自身用 loginGate 限速（见 ldaplogin.go）。
+	if path == identityLoginPath {
+		s.handleLDAPLogin(w, r)
 		return
 	}
 

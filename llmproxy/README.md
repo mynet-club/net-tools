@@ -580,6 +580,35 @@ shadow。热加载只看配置文件 mtime，因此「内存里还是上一次�
 路由模拟、决策痕迹。界面**不复算权限**（只检查 JSON 语法与必填项），条件键、选择器形态、
 分级取值一律由服务端领域校验判 —— 前端算一套就会出现「界面说会过、线上拒了」的分叉。
 
+#### 外部身份（3.0）：OIDC 每请求验签，LDAP 登录换短时 token
+
+OIDC 继续走 `X-Identity-Token`（JWT），网关只读本机 `identity.jwks_file` 验签。
+LDAP / AD 多一步登录，目录口令只在登录那一刻出现：
+
+```http
+POST /v1/_identity/ldap/login
+{"username":"alice","password":"..."}
+
+→ 200 {"token":"v1...","token_type":"Bearer","expires_at":"...",
+        "subject":"alice","display_name":"Alice","header":"X-Identity-Token"}
+```
+
+之后每请求带 `X-Identity-Token: <token>`。令牌由网关用 `master.key` 派生的
+HMAC 子密钥签名，寿命取 `identity.ldap.session_ttl_ms`（默认 15 分钟，上限 24 小时）；
+请求路径不再上传目录口令。
+
+安全口径：
+
+- `identity.ldap.url` 必须是 `ldaps://`，或 `ldap://` 且 `start_tls: true` —— 明文 LDAP 直接拒绝启动；
+- `allowed_targets` 必填，逐条写 `host:port`，不配等于不允许任何目录目标；
+- 登录端点按 IP 每分钟 10 次、全局并发 4 限速；失败只回「用户名或口令不正确」，
+  不区分用户不存在与口令错误，也不回显目录 DN；
+- 目录属性映射：`user_attr` → subject（`objectGUID` 转十六进制），
+  `display_name_attr` → 显示名，`group_attr` / `group_base_dn` → groups（组 DN 只保留 CN），
+  `role_attr` → roles，`department` / `college` / `organization` → organization 范围；
+- 会话 token 的 subject 仍必须等于网关认定用户名，静态 key 没有用户归属，永远绑不上；
+- SAML 仍是显式 stub（`ErrNotImplemented`），不会伪装成已接上。
+
 #### 回放证据链（3.0）：把线上判定取出来，换个进程重跑一遍
 
 | 方法 | 路径 | 用途 |

@@ -96,7 +96,7 @@ type policyRuntime struct {
 // 策略包内容加载失败是真错误而不是警告：mode 写了 shadow/enforce 却读不到内容，
 // 意味着网关会以「有策略版本」的姿态服务而实际没有任何规则生效 ——
 // 那比启动失败糟得多（§2.7 的「禁止带着半迁移状态启动」是同一个道理）。
-func newPolicyRuntime(cfg *config.Config, epoch string) (*policyRuntime, error) {
+func newPolicyRuntime(cfg *config.Config, epoch string, sessionKey []byte) (*policyRuntime, error) {
 	pc := &cfg.Policy
 	if !pc.UsesPolicy() {
 		return nil, nil
@@ -112,7 +112,7 @@ func newPolicyRuntime(cfg *config.Config, epoch string) (*policyRuntime, error) 
 	// 外部身份运行态（§9 P8）。identity 段配了但坏了（JWKS 文件缺失/不合法、
 	// issuer 与算法不合规）与策略包读不到是同一类事故：配置说「认外部身份」而实际
 	// 验不了 —— 那会让 org 级规则静默失配。整条修订按 legacy，与策略包加载失败同口径。
-	idn, err := newIdentityRuntime(cfg)
+	idn, err := newIdentityRuntime(cfg, sessionKey)
 	if err != nil {
 		return nil, err
 	}
@@ -167,7 +167,7 @@ func (s *Server) policyFor(cfg *config.Config) *policyRuntime {
 	if s.policyBadRev == rev {
 		return nil
 	}
-	rt, err := newPolicyRuntime(cfg, fmt.Sprintf("rev-%d", rev))
+	rt, err := newPolicyRuntime(cfg, fmt.Sprintf("rev-%d", rev), s.identitySessionKey())
 	if err != nil {
 		s.log.Errorf("策略包加载失败（修订 %d），本次配置按 legacy 运行且不再重试直到修订变化: %v", rev, err)
 		// 这一版按 legacy 跑，报出的策略版本必须是空：留着上一版的版本号，
@@ -206,11 +206,11 @@ func (s *Server) policyFor(cfg *config.Config) *policyRuntime {
 }
 
 // CheckPolicyRuntime 在启动时验证 3.0 配置可用（main 调用；失败即拒绝启动）。
-func CheckPolicyRuntime(cfg *config.Config) error {
+func CheckPolicyRuntime(cfg *config.Config, sessionKey []byte) error {
 	if !cfg.Policy.UsesPolicy() {
 		return nil
 	}
-	rt, err := newPolicyRuntime(cfg, "rev-startup")
+	rt, err := newPolicyRuntime(cfg, "rev-startup", sessionKey)
 	if err != nil {
 		return err
 	}

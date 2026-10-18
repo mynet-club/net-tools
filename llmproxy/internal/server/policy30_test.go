@@ -673,7 +673,7 @@ func TestPolicy30BrokenBundleFailsLoudlyAndRecoversOnNextRevision(t *testing.T) 
 		policySection("enforce", "t-open", "system:gateway", 1)
 	h := newHarness(t, src) // 故意不写内容文件
 
-	if err := CheckPolicyRuntime(h.cfgStore.Current()); err == nil {
+	if err := CheckPolicyRuntime(h.cfgStore.Current(), nil); err == nil {
 		t.Fatal("引用了不存在的策略包内容必须拒绝启动")
 	} else if !strings.Contains(err.Error(), "t-open.yaml") {
 		t.Errorf("错误要说清缺哪个文件: %v", err)

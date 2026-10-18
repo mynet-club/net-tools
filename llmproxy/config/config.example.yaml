@@ -154,6 +154,39 @@ log:
 #       version: 1                   # 从 1 起；0 分不清「没填」和「第 0 版」
 #       scope: organization:university   # 必须写成 kind:id（user|organization|project|system）
 
+# ============================ 外部身份（§9）============================
+# 外部身份只管「属于哪些范围」；能不能调仍由网关自己的 key / 用户 token 决定。
+# 整段缺省 = 不启用，行为与 2.x 逐字节相同。
+#
+# OIDC：每请求带 X-Identity-Token（JWT），网关用本机 JWKS 验签。
+# identity:
+#   provider: oidc
+#   source: campus-oidc
+#   issuer: https://idp.example.edu/realms/campus
+#   audience: llmproxy-gateway
+#   jwks_file: keys/jwks.json          # 只接受本机文件，不支持 http(s)://
+#
+# LDAP / AD：先 POST /v1/_identity/ldap/login 用目录口令换一枚短时 token，
+# 之后每请求带 X-Identity-Token: <token>。目录口令不会逐请求上传。
+# identity:
+#   provider: ldap
+#   source: campus-ldap
+#   ldap:
+#     url: ldaps://ldap.example.edu:636   # 必须 ldaps://，或 ldap:// + start_tls: true
+#     bind_dn: cn=svc,ou=services,dc=example,dc=edu
+#     bind_password: ${LDAP_BIND_PASSWORD}
+#     base_dn: ou=people,dc=example,dc=edu
+#     user_attr: uid                   # AD 可用 sAMAccountName / objectGUID
+#     display_name_attr: displayName
+#     group_attr: memberOf
+#     group_base_dn: ""                # 非空时按 member=<用户 DN> 反查组
+#     role_attr: eduPersonScopedAffiliation
+#     allowed_targets:                 # 必填：只允许连这些 host:port
+#       - ldap.example.edu:636
+#     timeout_ms: 5000
+#     session_ttl_ms: 900000           # 会话令牌寿命，默认 15 分钟
+#     max_password_bytes: 256
+
 # ============================ 处理器声明表（§2.6 / §3.H）============================
 # 这一段只声明**约束**：阶段、正文档位、大小与超时上限、失败策略、出网白名单。
 # 运行参数（脱敏类型子集、字段替换规则、JSON Schema、过滤词表、sidecar 的端点与请求头）

@@ -275,12 +275,20 @@ func cmdStart(paths config.Paths) error {
 		fmt.Fprintf(os.Stderr, "警告: %s\n", w)
 	}
 
+	// 主密钥先于 3.0 配置校验加载：LDAP 会话令牌的签名密钥从它派生，
+	// 启动期校验必须拿得到 —— 否则「配了 LDAP」会在第一条登录时才暴露主密钥不可用。
+	cipher, secErr := secrets.LoadOrCreate(paths.RuntimeDir)
+	var identitySessionKey []byte
+	if secErr == nil {
+		identitySessionKey = cipher.Derive(secrets.PurposeLDAPSession, secrets.DeriveVersionV1)
+	}
+
 	// 启动期是唯一的严格窗口：此刻还没有流量要保护，而「策略包引用缺文件 / 条件键写错」
 	// 这类配置的真实后果是**一条规则都没加载**。这种网关照常应答、健康检查也正常，
 	// 唯独 enforce 的禁令全部不存在 —— 比拒之门外危险得多。
 	// 运行期故意相反：SIGHUP 热加载撞见坏配置按 legacy 继续服务并打 ERROR 日志，
 	// 一次改错配置不该把在跑的网关打挂。
-	if err := server.CheckPolicyRuntime(cfg); err != nil {
+	if err := server.CheckPolicyRuntime(cfg, identitySessionKey); err != nil {
 		return fmt.Errorf("3.0 策略配置不可用，拒绝启动: %w", err)
 	}
 	// 处理器的运行参数文件与策略包文件是同一类事故面：声明在配置里、参数在文件里，
@@ -330,7 +338,6 @@ func cmdStart(paths config.Paths) error {
 	srv := server.New(storeCfg, db, r, lg)
 
 	// 多用户能力依赖主密钥（用户自带的上游密钥要加密落库）
-	cipher, secErr := secrets.LoadOrCreate(paths.RuntimeDir)
 	if secErr != nil {
 		// 库里已经有用户却拿不到主密钥：拒绝启动。否则这些用户会莫名其妙地全部 401。
 		if existing, _ := db.ListUsers(); len(existing) > 0 {

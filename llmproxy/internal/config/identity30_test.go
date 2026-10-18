@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // identity 段（§9 P8 / 决策包 §0.1 第 11′–14′ 行）的加载测试。
@@ -98,8 +99,8 @@ identity:
   audience: llmproxy-gateway
   jwks_file: keys/jwks.json
 `)
-	if err == nil || !strings.Contains(err.Error(), "只实现 oidc") {
-		t.Fatalf("非 oidc 的 provider 必须显式报错，得到 %v", err)
+	if err == nil || !strings.Contains(err.Error(), "saml 尚未实现") {
+		t.Fatalf("未实现的 provider 必须显式报错，得到 %v", err)
 	}
 }
 
@@ -190,5 +191,74 @@ identity:
 `)
 	if err == nil {
 		t.Fatal("identity.max_lifetime 不在词表内（裁决 13′ 不加网关侧 TTL 上限），KnownFields 应当拒绝")
+	}
+}
+
+const identityLDAPPolicy = `
+policy:
+  mode: enforce
+  data_level: internal
+  active_bundle: b1
+  bundles:
+    - id: b1
+      version: 1
+      scope: system:global
+identity:
+  provider: ldap
+  source: campus-ldap
+  ldap:
+    url: ldaps://ldap.example.edu:636
+    bind_dn: cn=svc,ou=services,dc=example,dc=edu
+    bind_password: ${LDAP_BIND_PASSWORD}
+    base_dn: ou=people,dc=example,dc=edu
+    user_attr: uid
+    allowed_targets:
+      - ldap.example.edu:636
+`
+
+func TestIdentity30LDAPConfig(t *testing.T) {
+	cfg, err := cfg30(t, identityLDAPPolicy)
+	if err != nil {
+		t.Fatalf("合法 LDAP 配置应加载成功: %v", err)
+	}
+	if !cfg.Identity.IsLDAP() {
+		t.Fatal("IsLDAP 应为 true")
+	}
+	if got := cfg.Identity.SessionTTL(); got != DefaultLDAPSessionTTL {
+		t.Errorf("缺省会话语义 = %v，want %v", got, DefaultLDAPSessionTTL)
+	}
+	if got := cfg.Identity.LDAPTimeout(); got != 5*time.Second {
+		t.Errorf("缺省目录超时 = %v，want 5s", got)
+	}
+}
+
+func TestIdentity30LDAPRejectsUnsafeShapes(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{"空目标白名单", strings.Replace(identityLDAPPolicy,
+			"    allowed_targets:\n      - ldap.example.edu:636\n", "", 1), "allowed_targets 必填"},
+		{"目标不在白名单", strings.Replace(identityLDAPPolicy,
+			"      - ldap.example.edu:636", "      - other.example.edu:636", 1), "不在 allowed_targets"},
+		{"ldaps 加 StartTLS", strings.Replace(identityLDAPPolicy,
+			"    allowed_targets:", "    start_tls: true\n    allowed_targets:", 1), "不能再配 start_tls"},
+		{"ldap 明文", strings.Replace(identityLDAPPolicy,
+			"ldaps://ldap.example.edu:636", "ldap://ldap.example.edu:389", 1), "必须配 start_tls"},
+		{"ldap 配 OIDC 字段", strings.Replace(identityLDAPPolicy,
+			"  ldap:\n", "  issuer: https://idp.example\n  ldap:\n", 1), "不要配置 OIDC 字段"},
+		{"超时越界", strings.Replace(identityLDAPPolicy,
+			"    allowed_targets:", "    timeout_ms: 60000\n    allowed_targets:", 1), "timeout_ms"},
+		{"会话语义越界", strings.Replace(identityLDAPPolicy,
+			"    allowed_targets:", "    session_ttl_ms: 1000\n    allowed_targets:", 1), "session_ttl_ms"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := cfg30(t, tc.src)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("应报 %q，实际 %v", tc.want, err)
+			}
+		})
 	}
 }
