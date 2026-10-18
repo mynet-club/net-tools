@@ -254,6 +254,9 @@ type ProviderRaw struct {
 	// 缺省 openai_chat；anthropic_messages = Anthropic Messages 线格式（/v1/messages），
 	// 二次翻转的出网侧翻译在传输层做，治理核不受影响。
 	Protocol string `yaml:"protocol"`
+	// MaxConcurrent 是这家上游的并发交换上限（0 = 不限）：拿不到槽的请求在自己的
+	// 期限内排队，不静默换下一家 —— 「限流」不能被记成「这家挂了」。
+	MaxConcurrent int `yaml:"max_concurrent"`
 	// MaxDataLevel 声明这家上游**最多能承接哪个数据分级**（§2.3 的四级词表）。
 	// 3.0 的分级门比的就是这个事实：请求的有效分级高于它时，这家不参与选路。
 	// 启用 3.0（policy.mode ≠ legacy）时已启用的供应商必须显式写它 ——
@@ -430,6 +433,9 @@ type Provider struct {
 	// Messages 线格式（/v1/messages），出网传输层做二次翻转的下半场翻译，
 	// 治理核（策略/审计/记账）看到的仍是 OpenAI 形状。
 	Protocol string
+	// MaxConcurrent 是这家上游的并发交换上限（0 = 不限），出网时按它排他；
+	// 拿不到槽的请求在自己的期限内排队，不静默换下一家。
+	MaxConcurrent int
 	// SystemPaid 是**运行期**标记：true = 这家来自系统池（config.yaml 的 providers），
 	// 这次消耗算网关主人的账，要进用户的配额与金额；false = 用户自己配的上游。
 	// 不参与 YAML 解析 —— 它由 providersFor 在拼候选池时按来源打上，用来决定计费归属。
@@ -818,20 +824,25 @@ func (c *Config) normalize(opts LoadOptions) error {
 		if err != nil {
 			return err
 		}
+		if p.MaxConcurrent < 0 {
+			return fmt.Errorf("%s (\"%s\").max_concurrent 不能为负（0 = 不限），当前 %d",
+				where, p.Name, p.MaxConcurrent)
+		}
 
 		c.Normalized = append(c.Normalized, Provider{
-			Name:         p.Name,
-			Enabled:      enabled,
-			BaseURL:      strings.TrimRight(p.BaseURL, "/"),
-			APIKey:       p.APIKey,
-			Weight:       p.Weight,
-			TimeoutMs:    p.TimeoutMs,
-			ExtraHeaders: p.ExtraHeaders,
-			Proxy:        proxyRef,
-			Models:       spec,
-			Index:        i,
-			MaxDataLevel: maxLevel,
-			Protocol:     proto,
+			Name:          p.Name,
+			Enabled:       enabled,
+			BaseURL:       strings.TrimRight(p.BaseURL, "/"),
+			APIKey:        p.APIKey,
+			Weight:        p.Weight,
+			TimeoutMs:     p.TimeoutMs,
+			ExtraHeaders:  p.ExtraHeaders,
+			Proxy:         proxyRef,
+			Models:        spec,
+			Index:         i,
+			MaxDataLevel:  maxLevel,
+			Protocol:      proto,
+			MaxConcurrent: p.MaxConcurrent,
 		})
 	}
 

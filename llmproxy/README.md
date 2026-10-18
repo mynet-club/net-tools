@@ -29,7 +29,7 @@
 - **多用户中转器（可选）**：每个用户带自己的 token 和**自己的上游**（自带 `base_url` / `api_key`），
   网关只负责鉴权、转发、按用户记账；上游密钥 AES-256-GCM 加密落库，熔断按用户隔离
 - **两种用户模式**：`byo`（用户自带上游，网关不掏钱）与 `consumption`（用户消费系统上游，
-  带模型白名单、月度配额与金额估算、RPM 与并发上限）
+  带模型白名单、月度配额与金额估算、RPM、token 速率与并发上限）
 - **网页控制台**：`GET /ui/` 自带一个单页界面，用户用自己的 token 登录即可管自己的上游、
   看自己的用量、发一条请求验证链路；静态资源编在二进制里，不需要额外部署
 
@@ -206,6 +206,7 @@ providers:
     weight: 10                        # 相对权重
     proxy: us-http                    # direct / 留空 = 直连；也可写代理名或内联 URL
     timeout_ms: 120000
+    max_concurrent: 0                 # 这家上游的并发交换上限（0 = 不限）；满员时排队，不静默换家
     models:                           # 下游模型名 → 上游真实模型名
       gpt-4o: gpt-4o-2024-11-20
       gpt-4o-mini: gpt-4o-mini
@@ -855,7 +856,7 @@ token 只存这个标签页的会话里，关掉标签就失效，不进 URL、C
 
 # 3) 配额与限流（0 或省略 = 不限）
 ./llmproxy user quota  alice -tokens 50000000 -cost 100
-./llmproxy user limits alice -rpm 120 -concurrent 8
+./llmproxy user limits alice -rpm 120 -concurrent 8 -tokens-per-min 200000
 
 ./llmproxy user models alice      # 看白名单
 ./llmproxy user show   alice      # 模式 / 配额 / 限流 / 本月消费

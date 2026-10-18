@@ -161,15 +161,16 @@ func userLimits(paths config.Paths, rest []string) error {
 	fs := flag.NewFlagSet("user limits", flag.ContinueOnError)
 	rpm := fs.Int("rpm", -1, "每分钟请求上限（0 = 不限）")
 	conc := fs.Int("concurrent", -1, "同时进行的请求上限（0 = 不限）")
+	tokens := fs.Int("tokens-per-min", -1, "每分钟 token 上限（0 = 不限）")
 	if len(rest) == 0 {
-		return fmt.Errorf("用法: llmproxy user limits <名字> [-rpm N] [-concurrent N]（0 表示不限）")
+		return fmt.Errorf("用法: llmproxy user limits <名字> [-rpm N] [-concurrent N] [-tokens-per-min N]（0 表示不限）")
 	}
 	name := rest[0]
 	if err := fs.Parse(rest[1:]); err != nil {
 		return err
 	}
-	if *rpm < 0 && *conc < 0 {
-		return fmt.Errorf("至少给一个 -rpm 或 -concurrent")
+	if *rpm < 0 && *conc < 0 && *tokens < 0 {
+		return fmt.Errorf("至少给一个 -rpm、-concurrent 或 -tokens-per-min")
 	}
 	db, _, err := openUserStore(paths)
 	if err != nil {
@@ -191,6 +192,9 @@ func userLimits(paths config.Paths, rest []string) error {
 	if *conc >= 0 {
 		patch.MaxConcurrent = conc
 	}
+	if *tokens >= 0 {
+		patch.TokensPerMin = tokens
+	}
 	if err := db.PatchScopeQuota(scope, patch); err != nil {
 		return err
 	}
@@ -198,7 +202,7 @@ func userLimits(paths config.Paths, rest []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("用户 %s 的限流：%d 次/分钟，并发 %d\n", name, q.RPM, q.MaxConcurrent)
+	fmt.Printf("用户 %s 的限流：%d 次/分钟，并发 %d，%d token/分钟\n", name, q.RPM, q.MaxConcurrent, q.TokensPerMin)
 	runningHint()
 	return nil
 }
@@ -348,7 +352,7 @@ func printUserMode(db *store.Store, cfg *config.Config, u *store.User) {
 		return
 	}
 	fmt.Printf("  月度配额  token %s / 金额 %s\n", limitText(q.QuotaMonthTokens), costText(q.QuotaMonthCost))
-	fmt.Printf("  限流      %d 次/分钟，并发 %d\n", q.RPM, q.MaxConcurrent)
+	fmt.Printf("  限流      %d 次/分钟，并发 %d，%d token/分钟\n", q.RPM, q.MaxConcurrent, q.TokensPerMin)
 
 	// 系统付费用量按范围读（§2.7 规则 8：usage_user_daily 已经不再写，读侧只留 scope 形状）
 	scope, err := userScopeOf(u.Name)

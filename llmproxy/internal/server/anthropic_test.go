@@ -193,6 +193,64 @@ func TestAnthropicCountTokens(t *testing.T) {
 	}
 }
 
+func TestAnthropicThinkingNonStream(t *testing.T) {
+	up := startMockUpstream(t, &mockUpstream{name: "a", apiKey: "sk-a", reasoning: true})
+	h := newHarness(t, cfgYAML(map[string]string{"a": up.baseURL}, []string{"sk-local"}))
+
+	body := anthropicBody(false)
+	body["thinking"] = map[string]any{"type": "enabled", "budget_tokens": 1024}
+	resp, raw := h.post(t, "/v1/messages", "sk-local", body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("状态 %d：%s", resp.StatusCode, raw)
+	}
+	var out struct {
+		Content []struct {
+			Type     string `json:"type"`
+			Text     string `json:"text"`
+			Thinking string `json:"thinking"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("响应解析失败: %v\n%s", err, raw)
+	}
+	if len(out.Content) != 2 || out.Content[0].Type != "thinking" || !strings.Contains(out.Content[0].Thinking, "先想想") {
+		t.Fatalf("thinking 块应在最前: %s", raw)
+	}
+	if out.Content[1].Type != "text" {
+		t.Fatalf("text 块应跟在后面: %s", raw)
+	}
+	// 预算 1024 → 上游收到 reasoning_effort=low
+	if eff, _ := up.Calls()[0].Body["reasoning_effort"].(string); eff != "low" {
+		t.Fatalf("reasoning_effort 应为 low，上游收到 %q", eff)
+	}
+}
+
+func TestAnthropicThinkingStream(t *testing.T) {
+	up := startMockUpstream(t, &mockUpstream{name: "a", apiKey: "sk-a", reasoning: true})
+	h := newHarness(t, cfgYAML(map[string]string{"a": up.baseURL}, []string{"sk-local"}))
+
+	body := anthropicBody(true)
+	body["thinking"] = map[string]any{"type": "enabled", "budget_tokens": 20000}
+	resp, raw := h.post(t, "/v1/messages", "sk-local", body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("状态 %d：%s", resp.StatusCode, raw)
+	}
+	b := string(raw)
+	if !strings.Contains(b, `"type":"thinking"`) || !strings.Contains(b, `"type":"thinking_delta"`) {
+		t.Fatalf("流里缺 thinking 事件: %s", b)
+	}
+	// 事件序：thinking 块要完整闭合再开 text 块
+	start := strings.Index(b, `"type":"thinking"`)
+	stop := strings.Index(b, "event: content_block_stop")
+	text := strings.Index(b, `"type":"text"`)
+	if !(start < stop && stop < text) {
+		t.Fatalf("thinking 块生命周期顺序不对:\n%s", b)
+	}
+	if eff, _ := up.Calls()[0].Body["reasoning_effort"].(string); eff != "medium" {
+		t.Fatalf("预算 20000 应映射 medium，上游收到 %q", eff)
+	}
+}
+
 // TestAnthropicStreamKeepsBilling 证明翻译只动出口：上游 usage 记账照常落库。
 func TestAnthropicStreamKeepsBilling(t *testing.T) {
 	up := startMockUpstream(t, &mockUpstream{name: "a", apiKey: "sk-a"})
