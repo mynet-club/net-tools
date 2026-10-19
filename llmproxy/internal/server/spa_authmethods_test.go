@@ -35,10 +35,10 @@ func TestAuthMethodsListsFour(t *testing.T) {
 		id      string
 		enabled bool
 	}{
+		{"password", false}, // 没有主密钥 = 多用户模式未启用
 		{"token", true},
-		{"ldap", false},
-		{"password", false},
 		{"oauth", false},
+		{"ldap", false},
 	}
 	if len(payload.Methods) != len(want) {
 		t.Fatalf("方法数 = %d，期望 %d: %s", len(payload.Methods), len(want), raw)

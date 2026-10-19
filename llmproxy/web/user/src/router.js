@@ -7,6 +7,7 @@ export const session = createSession('llmproxy.user')
 
 const routes = [
   { path: '/login', name: 'login', component: () => import('./views/Login.vue'), meta: { public: true } },
+  { path: '/oauth-callback', name: 'oauth-callback', component: () => import('./views/OAuthCallback.vue'), meta: { public: true } },
   { path: '/', redirect: '/overview' },
   { path: '/overview', name: 'overview', component: () => import('./views/Overview.vue'), meta: { title: '概览' } },
   { path: '/token', name: 'token', component: () => import('./views/Token.vue'), meta: { title: '我的 API Token' } },

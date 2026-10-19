@@ -330,7 +330,7 @@ func (s *Store) userUpdate(setClause string, setArgs []any, name string) error {
 		return fmt.Errorf("更新用户失败: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("用户 %q 不存在", name)
+		return fmt.Errorf("%w: %q", ErrUserNotFound, name)
 	}
 	if err := bumpRevision(tx, s.dialect); err != nil {
 		return err

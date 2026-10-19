@@ -362,6 +362,11 @@ func OpenDialect(driver, pathOrDSN string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("迁移消费模式表结构失败: %w", err)
 	}
+	// 本地账号密码：users 加 password_hash 列
+	if err := migrateAuth(db, d); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("迁移登录表结构失败: %w", err)
+	}
 	// 计价与成本模型：provider_prices（上游价）+ user_prices（分发价），都带历史
 	if err := execSchema(db, d, pricingSchema); err != nil {
 		_ = db.Close()

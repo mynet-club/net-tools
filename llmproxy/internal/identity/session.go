@@ -61,13 +61,22 @@ type SessionCodec struct {
 	settings settings
 }
 
-// NewSessionCodec 构造会话编解码器。key 必须至少 32 字节（调用方从主密钥派生）。
+// NewSessionCodec 构造 LDAP 会话令牌编解码器。key 必须至少 32 字节（调用方从主密钥派生）。
 func NewSessionCodec(key []byte, source string, maxTTL time.Duration, opts ...Option) (*SessionCodec, error) {
+	return NewSessionCodecWithProvider(key, source, "ldap-session", maxTTL, opts...)
+}
+
+// NewSessionCodecWithProvider 允许换一个 provider 标签（本地账密 / OAuth 的网关会话
+// 与 LDAP 会话不是同一个签发方；标签不同，令牌互相验不过）。
+func NewSessionCodecWithProvider(key []byte, source, provider string, maxTTL time.Duration, opts ...Option) (*SessionCodec, error) {
 	if len(key) < 32 {
 		return nil, fmt.Errorf("%w: 会话密钥至少 32 字节", ErrConfig)
 	}
 	if strings.TrimSpace(source) == "" {
 		return nil, fmt.Errorf("%w: 会话令牌缺少 source", ErrConfig)
+	}
+	if strings.TrimSpace(provider) == "" {
+		return nil, fmt.Errorf("%w: 会话令牌缺少 provider", ErrConfig)
 	}
 	if maxTTL <= 0 || maxTTL > maxSessionTTL {
 		return nil, fmt.Errorf("%w: 会话 TTL %v 必须在 (0, %v] 内", ErrConfig, maxTTL, maxSessionTTL)
@@ -75,7 +84,7 @@ func NewSessionCodec(key []byte, source string, maxTTL time.Duration, opts ...Op
 	return &SessionCodec{
 		key:      append([]byte(nil), key...),
 		source:   source,
-		provider: "ldap-session",
+		provider: provider,
 		maxTTL:   maxTTL,
 		settings: newSettings(opts),
 	}, nil

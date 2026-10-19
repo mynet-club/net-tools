@@ -10,6 +10,7 @@ import (
 
 	"github.com/mynet-club/net-tools/llmproxy/internal/config"
 	"github.com/mynet-club/net-tools/llmproxy/internal/identity"
+	"github.com/mynet-club/net-tools/llmproxy/internal/secrets"
 )
 
 type loginFakeDirectory struct {
@@ -49,6 +50,16 @@ func loginHarness(t *testing.T, dir identity.LDAPDirectory) *harness {
 	up := startMockUpstream(t, &mockUpstream{name: "a", apiKey: "sk-a"})
 	h := newHarness(t, cfgYAML(map[string]string{"a": up.baseURL}, []string{"sk-local"})+
 		policySection("shadow", "t-open", "system:gateway", 1))
+	// 生产里 LDAP 会话的 HMAC 子密钥来自 master.key；这里给一份主密钥，
+	// 让「登录 → 开户 → 会话令牌」走与生产相同的路径。
+	cipher, err := secrets.LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatalf("生成主密钥失败: %v", err)
+	}
+	h.srv.WithSecrets(cipher)
+	if err := h.srv.SyncUsers(); err != nil {
+		t.Fatalf("SyncUsers: %v", err)
+	}
 
 	provider, err := identity.NewLDAPDirectoryProvider(identity.LDAPTrust{
 		Source:             "campus-ldap",

@@ -116,6 +116,9 @@ type Server struct {
 
 	// loginGate 管 LDAP 登录端点的并发与频率（见 ldaplogin.go）。
 	loginGate *loginGate
+
+	// oauthFlows 是 OAuth 授权码流程的一次性 state / code（见 oauthlogin.go）。
+	oauthFlows *oauthFlows
 }
 
 // now 返回当前时刻；测试可以通过 nowFn 固定它。
@@ -158,6 +161,7 @@ func New(cfgStore *config.Store, db *store.Store, r *router.Router, lg *logx.Log
 		replayWin:    newReplayWindow(),
 		slots:        newProviderSlots(),
 		loginGate:    newLoginGate(),
+		oauthFlows:   newOAuthFlows(),
 	}
 	if ac := cfgStore.Current(); ac != nil {
 		s.quotaAlerts = newQuotaAlert(ac.Alerts.WebhookURL, ac.Alerts.EffectiveWarnRatio())
@@ -720,6 +724,21 @@ func (s *Server) handleV1(w http.ResponseWriter, r *http.Request) {
 		s.handleAuthMethods(w, r)
 		return
 	}
+	// 登录入口：都在鉴权之前（凭据本身就是「换取身份」的那一步）
+	switch path {
+	case passwordLoginPath:
+		s.handlePasswordLogin(w, r)
+		return
+	case oauthStartPath:
+		s.handleOAuthStart(w, r)
+		return
+	case config.OAuthCallbackPath:
+		s.handleOAuthCallback(w, r)
+		return
+	case oauthExchangePath:
+		s.handleOAuthExchange(w, r)
+		return
+	}
 
 	// LDAP 登录换 token：这枚 token 是外部身份，不是网关凭证，所以走在鉴权之前；
 	// 端点自身用 loginGate 限速（见 ldaplogin.go）。
@@ -742,6 +761,11 @@ func (s *Server) handleV1(w http.ResponseWriter, r *http.Request) {
 	}
 
 	auth := s.authenticate(r)
+	// /v1/_me* 还认登录会话（X-Identity-Token）：登录后不必先有下游 token 就能
+	// 看自己的资料、创建/轮换 token。模型调用仍只认下游 token（sk-…）。
+	if !auth.OK && !auth.Disabled && strings.HasPrefix(path, "/v1/_me") {
+		auth = s.authenticateLoginSession(r)
+	}
 	if !auth.OK {
 		if auth.Disabled {
 			s.log.Warnf("账号已停用 ip=%s path=%s user=%s", auth.ClientIP, path, auth.UserName)

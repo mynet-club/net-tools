@@ -108,6 +108,8 @@ func (s *Server) adminUsersRoute(w http.ResponseWriter, r *http.Request, tail st
 			"token": token,
 			"note":  "明文只在这里返回一次，请立刻交给用户",
 		})
+	case "password":
+		s.handleAdminSetPassword(w, r, name)
 	case "enable", "disable":
 		if r.Method != http.MethodPost {
 			writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error", "只支持 POST")
@@ -130,7 +132,7 @@ func (s *Server) adminUsersRoute(w http.ResponseWriter, r *http.Request, tail st
 		s.adminTestUser(w, r, name)
 	default:
 		writeJSONError(w, http.StatusNotFound, "invalid_request_error",
-			"可用路径：/v1/_admin/users/{name}[/token|enable|disable|providers|models|usage|test]")
+			"可用路径：/v1/_admin/users/{name}[/token|password|enable|disable|providers|models|usage|test]")
 	}
 }
 

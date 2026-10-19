@@ -75,6 +75,9 @@ type Config struct {
 	// 请求头不带 IdP token 时行为与今天逐字节相同。
 	Identity IdentityConfig `yaml:"identity"`
 
+	// Auth 是登录页的四类登录方式与 OAuth 客户端（见 auth.go）。
+	Auth AuthConfig `yaml:"auth"`
+
 	// 下面是校验后的派生结构，供运行期直接使用
 	ProxyIndex map[string]ProxyDef `yaml:"-"`
 	Normalized []Provider          `yaml:"-"`
@@ -922,6 +925,10 @@ func (c *Config) normalize(opts LoadOptions) error {
 	// 外部身份段（见 identity30.go）。放在 policy 之后：legacy 下的告警口径
 	// 与 policy.bundles 一致（配了但不生效是回滚期间的正常状态，只 warn）。
 	if err := c.Identity.normalize(c.Policy.ModeResolved(), &c.Warnings); err != nil {
+		return err
+	}
+	// 登录方式与 OAuth 客户端（见 auth.go）
+	if err := c.Auth.normalize(); err != nil {
 		return err
 	}
 	// 3.0 的两张声明表（见 procconf.go）。校验放在 mode 之后：

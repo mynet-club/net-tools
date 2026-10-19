@@ -174,6 +174,10 @@ const (
 	// 与上面两位互不相干：令牌签名密钥一旦被拿去算假名，两条使用面就可以互相
 	// 提供样本，而它们一个对外可见（假名在正文里）、一个只在本机验签。
 	PurposeLDAPSession = "ldap-session"
+	// PurposeLoginSession 是「本地账密 / OAuth 登录」换到的网关会话令牌的签名位。
+	// 与 LDAP 会话分开：两类令牌的签发方与信任来源不同（一个是目录，一个是本机密码库
+	// 或外部 IdP），分开派生让它们互相验不过，也便于将来单独轮换。
+	PurposeLoginSession = "login-session"
 
 	// DeriveVersionV1 是当前的派生版本串。将来换算法或换口径时升成 v2，
 	// 新旧派生值自然断开，不需要换主密钥。

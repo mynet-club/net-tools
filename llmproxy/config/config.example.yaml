@@ -186,6 +186,33 @@ log:
 #     timeout_ms: 5000
 #     session_ttl_ms: 900000           # 会话令牌寿命，默认 15 分钟
 #     max_password_bytes: 256
+#
+# 登录方式（用户控制台登录页的 tab）：
+#   - 四个开关缺省都是启用；依赖不齐时（没配 LDAP / 没配 OAuth）自动不可用；
+#   - password 是本地账号密码（管理员用 PUT /v1/_admin/users/{名字}/password 设置）；
+#   - token 是下游 token（sk-…）直接登录；
+#   - oauth 走授权码 + PKCE，回调路径固定 /v1/_auth/oauth/callback（必须外部可达）。
+# auth:
+#   session_ttl_ms: 43200000             # 登录会话寿命，默认 12 小时，上限 24 小时
+#   methods:
+#     password: true
+#     token: true
+#     oauth: true
+#     ldap: true
+#   oauth:
+#     provider_name: 统一身份认证          # 登录页上的按钮文案
+#     client_id: llmproxy
+#     client_secret: ${OAUTH_CLIENT_SECRET}
+#     auth_url: https://sso.example.edu/oauth2/authorize
+#     token_url: https://sso.example.edu/oauth2/token
+#     userinfo_url: https://sso.example.edu/oauth2/userinfo
+#     scopes: [openid, profile]
+#     redirect_url: https://llmproxy.example.edu/v1/_auth/oauth/callback
+#     subject_claim: sub                  # 从 userinfo 取稳定 ID 的字段
+#     name_claim: name                    # 显示名
+#     auth_style: basic                   # basic（默认）| post
+#     timeout_ms: 10000
+#     spa_path: /spa/user/                # 登录成功后跳回的 SPA 路径
 
 # ============================ 处理器声明表（§2.6 / §3.H）============================
 # 这一段只声明**约束**：阶段、正文档位、大小与超时上限、失败策略、出网白名单。

@@ -253,8 +253,8 @@ func TestIdentityMintTokenNotFoundWithoutIdentity(t *testing.T) {
 }
 
 func TestIdentityMintTokenRequiresMultiUser(t *testing.T) {
-	// 身份在、主密钥不在：登录能换会话令牌，但下游 token 无处安放（多用户模式没开）。
-	h := loginHarness(t, loginAliceDirectory())
+	// 主密钥不在 = 多用户模式没开：下游 token 无处安放。
+	h := newHarness(t, cfgYAML(map[string]string{"a": "http://127.0.0.1:9/v1"}, []string{"sk-local"}))
 	code, body := postMint(t, h.gateway.URL, "v1.x.y")
 	if code != http.StatusNotImplemented {
 		t.Fatalf("多用户未启用应 501，实际 %d: %v", code, body)

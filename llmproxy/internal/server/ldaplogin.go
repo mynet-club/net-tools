@@ -166,6 +166,22 @@ func (s *Server) handleLDAPLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, "internal", "签发会话令牌失败")
 		return
 	}
+	// 目录身份第一次登录时按 subject 开号（默认 byo），之后 /v1/_me* 才能找到这个用户。
+	if _, err := s.ensureLoginUser(principal.Identity.Subject); err != nil {
+		switch {
+		case errors.Is(err, errLoginSubjectInvalid):
+			writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
+				"目录账号不能作网关用户名（只允许字母、数字、点、下划线、连字符）；"+
+					"请调整 identity.ldap.user_attr 的映射")
+		case errors.Is(err, errLoginUserDisabled):
+			writeJSONError(w, http.StatusForbidden, "account_disabled",
+				"账号 "+principal.Identity.Subject+" 已停用")
+		default:
+			s.log.Errorf("LDAP 登录开户失败 user=%s request_id=%s: %v", principal.Identity.Subject, requestID, err)
+			writeJSONError(w, http.StatusInternalServerError, "internal", "登录失败，请联系管理员")
+		}
+		return
+	}
 	s.log.Infof("LDAP 登录成功 user=%s ip=%s request_id=%s", principal.Identity.Subject, ip, requestID)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"token":        token,
