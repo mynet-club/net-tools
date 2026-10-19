@@ -6,11 +6,90 @@ function renderLogin(msg) {
   $('app').hidden = true;
   $('login').hidden = false;
   $('login-base').value = state.base || defaultBase();
+  renderCampus('token');
+  campusSession = null;
   showErr($('login-err'), msg);
   $('login-hint').textContent = location.protocol === 'file:'
     ? '当前是从本地文件打开的：接口调用需要跨源，浏览器通常会拦。要用真实数据请访问网关的 /ui/。'
     : '地址默认就是当前站点的来源（同源，不需要 CORS）。';
   $('login-token').focus();
+}
+
+// renderCampus 切登录卡的三段：token 登录 / 校园网账号登录 / 登录成功后的动作区。
+// hidden 但 required 的字段会拦住表单提交，所以必填也跟着模式走。
+function renderCampus(stage) {
+  $('cred-token').hidden = stage !== 'token';
+  $('cred-campus').hidden = stage !== 'campus';
+  $('campus-after').hidden = stage !== 'after';
+  $('login-campus').hidden = stage !== 'token';
+  $('campus-back').hidden = stage !== 'campus';
+  $('login-btn').hidden = stage === 'after';
+  $('login-token').required = stage === 'token';
+  $('campus-user').required = stage === 'campus';
+  $('campus-pass').required = stage === 'campus';
+  if (stage !== 'after') $('campus-enter').hidden = true;
+}
+
+/* ── 校园网账号登录（LDAP / AD）─────────────────────────────────────
+   目录口令只在登录那一刻发给网关，换短时会话令牌（X-Identity-Token）。
+   这枚会话令牌是外部身份证明，不是网关凭证；控制台要用的下游 token 由用户
+   登录后自己创建/轮换（POST /v1/_identity/me/token），明文只显示一次。 */
+
+let campusSession = null; // { token, subject, expiresAt }
+let campusMinted = '';
+
+async function campusLogin() {
+  const base = ($('login-base').value.trim() || defaultBase()).replace(/\/+$/, '');
+  state.base = base;
+  showErr($('login-err'), '');
+  try {
+    const { data } = await api('/v1/_identity/ldap/login', {
+      method: 'POST',
+      body: JSON.stringify({
+        username: $('campus-user').value.trim(),
+        password: $('campus-pass').value,
+      }),
+    });
+    $('campus-pass').value = '';
+    campusSession = { token: data.token, subject: data.subject, expiresAt: data.expires_at };
+    const until = data.expires_at ? new Date(data.expires_at).toLocaleTimeString('zh-CN') : '';
+    $('campus-who').textContent = '已以 ' + (data.subject || '') +
+      (data.display_name ? '（' + data.display_name + '）' : ' ') + '登录' +
+      (until ? '，会话令牌 ' + until + ' 前有效' : '') + '。';
+    campusMinted = '';
+    renderCampus('after');
+  } catch (e) {
+    showErr($('login-err'), e.status ? e.message : '连不上网关：' + e.message);
+  }
+}
+
+async function campusMint() {
+  if (!campusSession) return;
+  if (!(await confirmDialog({
+    title: '创建 / 轮换 API token',
+    okText: '继续',
+    danger: true,
+    body: '第一次点是创建；如果你以前已经拿到过 token，这一下会让旧 token 立即失效' +
+      '（正在用它的脚本会断）。新 token 只显示一次，确定？',
+  }))) return;
+  try {
+    const { data } = await api('/v1/_identity/me/token', {
+      method: 'POST',
+      headers: { 'X-Identity-Token': campusSession.token },
+      body: '{}',
+    });
+    campusMinted = data.token || '';
+    await showTokenDialog(campusMinted,
+      (data.created ? '已创建' : '已轮换') + ' API token（只显示这一次，请立刻保存）');
+    $('campus-enter').hidden = !campusMinted;
+  } catch (e) {
+    if (e.status === 401) {
+      // 会话令牌过期/失效：回登录态重新来，不把人留在一个点不动的面板上
+      campusSession = null;
+      renderCampus('campus');
+    }
+    toast('拿 token 失败：' + e.message, 'err');
+  }
 }
 
 // 用户台只有「用户」这一个身份，不做任何身份猜测：管理员入口在 /admin/，是另一个页面。
@@ -971,8 +1050,34 @@ $('login-form').addEventListener('submit', (e) => {
   const btn = $('login-btn');
   btn.disabled = true;
   showErr($('login-err'), '');
-  login($('login-base').value.trim() || defaultBase(), $('login-token').value.trim())
-    .finally(() => { btn.disabled = false; });
+  const done = () => { btn.disabled = false; };
+  if (!$('cred-campus').hidden) {
+    campusLogin().finally(done);
+  } else {
+    login($('login-base').value.trim() || defaultBase(), $('login-token').value.trim())
+      .finally(done);
+  }
+});
+$('login-campus').addEventListener('click', () => {
+  showErr($('login-err'), '');
+  renderCampus('campus');
+  $('campus-user').focus();
+});
+$('campus-back').addEventListener('click', () => {
+  showErr($('login-err'), '');
+  renderCampus('token');
+  $('login-token').focus();
+});
+$('campus-mint').addEventListener('click', () => { campusMint().catch((e) => toast(e.message, 'err')); });
+$('campus-enter').addEventListener('click', () => {
+  if (campusMinted) login(state.base, campusMinted);
+});
+$('campus-again').addEventListener('click', () => {
+  campusSession = null;
+  campusMinted = '';
+  showErr($('login-err'), '');
+  renderCampus('campus');
+  $('campus-user').focus();
 });
 
 $('logout').addEventListener('click', logout);

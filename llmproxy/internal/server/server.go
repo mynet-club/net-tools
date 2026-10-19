@@ -713,6 +713,13 @@ func (s *Server) handleV1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 登录后的自助 token 创建/轮换：凭据是外部身份令牌（X-Identity-Token），
+	// 同样走在下游鉴权之前（见 identitytoken.go）。
+	if path == identityTokenPath {
+		s.handleIdentityMintToken(w, r)
+		return
+	}
+
 	// 管理接口用自己的 admin_token 鉴权，必须走在下游鉴权前面
 	if strings.HasPrefix(path, "/v1/_admin") {
 		s.handleAdmin(w, r)

@@ -13,19 +13,40 @@
 <main id="login" class="login-wrap" hidden>
   <form class="card login-card" id="login-form">
     <h1>llmproxy</h1>
-    <p class="sub">用你的下游 token 登录，管理自己的上游与用量。<br>
-       token 只存在这个标签页的会话里（sessionStorage），关闭标签即失效，
+    <p class="sub">用下游 token 或校园网账号登录，管理自己的上游与用量。<br>
+       凭据只存在这个标签页的会话里（sessionStorage），关闭标签即失效，
        不会进 URL、Cookie 或 localStorage。</p>
 
     <label for="login-base">网关地址</label>
     <input id="login-base" type="text" spellcheck="false" autocomplete="off"
            placeholder="http://127.0.0.1:8787">
 
-    <label for="login-token">下游 token</label>
-    <input id="login-token" type="password" spellcheck="false" autocomplete="off"
-           placeholder="sk-…" required>
+    <div id="cred-token">
+      <label for="login-token">下游 token</label>
+      <input id="login-token" type="password" spellcheck="false" autocomplete="off"
+             placeholder="sk-…" required>
+    </div>
+
+    <div id="cred-campus" hidden>
+      <label for="campus-user">校园网账号</label>
+      <input id="campus-user" type="text" spellcheck="false" autocomplete="username"
+             placeholder="学号 / 工号">
+      <label for="campus-pass">口令</label>
+      <input id="campus-pass" type="password" autocomplete="current-password" required>
+    </div>
 
     <button type="submit" id="login-btn" class="primary">登录</button>
+    <button type="button" id="login-campus" class="ghost">用校园网账号登录</button>
+    <button type="button" id="campus-back" class="ghost" hidden>返回用 token 登录</button>
+
+    <div id="campus-after" hidden>
+      <p class="hint" id="campus-who"></p>
+      <button type="button" id="campus-mint" class="primary">创建 / 轮换 API token</button>
+      <p class="hint">第一次点是创建，之后再点就是轮换 —— 旧 token 立即失效。token 只显示一次，之后只能再轮换。</p>
+      <button type="button" id="campus-enter" class="ghost" hidden>用新 token 进入控制台</button>
+      <button type="button" id="campus-again" class="ghost">换个账号</button>
+    </div>
+
     <p class="err" id="login-err" hidden></p>
     <p class="hint" id="login-hint"></p>
     <p class="hint">管理员入口在 <a href="/admin/">/admin/</a>（用 admin_token 登录）。</p>

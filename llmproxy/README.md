@@ -597,6 +597,26 @@ POST /v1/_identity/ldap/login
 HMAC 子密钥签名，寿命取 `identity.ldap.session_ttl_ms`（默认 15 分钟，上限 24 小时）；
 请求路径不再上传目录口令。
 
+登录之后自助拿下游 token（`sk-…`）—— 会话令牌是外部身份证明，不是网关凭证，
+调 `/v1/chat/completions` 与 `/v1/_me` 要的是后者：
+
+```http
+POST /v1/_identity/me/token
+X-Identity-Token: v1...
+
+→ 201 {"name":"alice","token":"sk-…","created":true,  …}   # 首次：按 subject 开号
+→ 200 {"name":"alice","token":"sk-…","created":false, …}   # 之后：轮换，旧 token 立即失效
+```
+
+- 鉴权凭据就是登录换到的会话令牌（OIDC 的 JWT 也走同一个端点）；明文只回一次；
+- 一个用户只有一枚下游 token，这端点的语义是「有则轮换、无则创建」；
+- 首次调用按 subject 自动开号（默认 byo 模式：只能带自己的上游，要消费系统上游
+  得管理员显式改 consumption 并配模型白名单）；已停用账号一律拒绝；
+- subject 必须能当网关用户名（字母/数字/点/下划线/连字符）；不合法直接拒绝、
+  不做改名兜底 —— 改出来的名字会与 token 的 subject 永久对不上，绑定永远失败；
+- 用户控制台 `/ui/` 的「校园网账号登录」是同一对端点的界面版：登录 → 创建/轮换
+  token（弹窗只显示一次）→ 进控制台。
+
 安全口径：
 
 - `identity.ldap.url` 必须是 `ldaps://`，或 `ldap://` 且 `start_tls: true` —— 明文 LDAP 直接拒绝启动；
