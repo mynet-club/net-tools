@@ -1,0 +1,23 @@
+{
+  "name": "llmproxy-web",
+  "private": true,
+  "type": "module",
+  "description": "llmproxy 两个 SPA（user / admin）与共享代码的构建入口",
+  "scripts": {
+    "dev:user": "vite --config user/vite.config.js",
+    "dev:admin": "vite --config admin/vite.config.js",
+    "build": "npm run build:user && npm run build:admin",
+    "build:user": "vite build --config user/vite.config.js",
+    "build:admin": "vite build --config admin/vite.config.js"
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "^2.3.2",
+    "element-plus": "^2.14.7",
+    "vue": "^3.5.44",
+    "vue-router": "^4.5.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.1",
+    "vite": "^8.3.4"
+  }
+}

@@ -19,5 +19,12 @@ dist/
 /master.key
 /data/master.key
 
+# 前端依赖与构建产物：产物由 npm run build / scripts/build.sh 生成，不入库
+/web/node_modules/
+/ui/spa/user/*
+!/ui/spa/user/.gitkeep
+/ui/spa/admin/*
+!/ui/spa/admin/.gitkeep
+
 # 本地跑 UI 自动化测试时的 playwright 产物
 .playwright-cli/

@@ -1,8 +1,12 @@
 package server
 
 import (
+	"io"
 	"io/fs"
 	"net/http"
+	"os"
+	"path"
+	"path/filepath"
 	"strings"
 
 	"github.com/mynet-club/net-tools/llmproxy/ui"
@@ -97,4 +101,109 @@ func (s *Server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
 	w.Header().Set("Cache-Control", "public, max-age=3600")
 	_, _ = w.Write(b)
+}
+
+// ------------------------------------------------------------------ 两个 SPA
+//
+// 迁移期先挂在 /spa/{user,admin}/ 下，旧页面继续在 /ui/、/admin/ 提供服务；
+// 等两个 SPA 达到功能对等再把 /ui/、/admin/ 指过来（路径切换只改注册处）。
+//
+// 嵌入与覆盖的关系：嵌入产物是「开箱即用」的默认值；<RuntimeDir>/ui/{user,admin}
+// 存在同名文件时优先用磁盘上的版本 —— 机构可以只替换前端，不动二进制。
+
+const (
+	userSPAEmbed  = "spa/user"
+	adminSPAEmbed = "spa/admin"
+)
+
+// WithUIOverrideDir 设置运行时界面覆盖根目录（通常是 <RuntimeDir>/ui）。
+func (s *Server) WithUIOverrideDir(dir string) *Server {
+	s.uiOverrideDir = dir
+	return s
+}
+
+func (s *Server) handleUserSPA(w http.ResponseWriter, r *http.Request) {
+	s.serveSPA(w, r, "/spa/user/", userSPAEmbed)
+}
+
+func (s *Server) handleAdminSPA(w http.ResponseWriter, r *http.Request) {
+	s.serveSPA(w, r, "/spa/admin/", adminSPAEmbed)
+}
+
+// serveSPA 服务一个 SPA 的静态资源。
+//
+// 用 hash 路由，所以不存在「前端路径回退到 index.html」的问题：请求路径只有
+// 前缀本身与 assets/*，不会出现 /overview 这种需要 rewrite 的地址。
+func (s *Server) serveSPA(w http.ResponseWriter, r *http.Request, prefix, embeddedDir string) {
+	if r.URL.Path == strings.TrimSuffix(prefix, "/") {
+		http.Redirect(w, r, prefix, http.StatusMovedPermanently)
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error", "界面资源只支持 GET")
+		return
+	}
+
+	name := strings.Trim(strings.TrimPrefix(r.URL.Path, prefix), "/")
+	if name == "" {
+		name = "index.html"
+	}
+	// 只接受干净的相对路径：挡掉 ../、绝对路径与空段
+	if !fs.ValidPath(name) {
+		writeJSONError(w, http.StatusNotFound, "invalid_request_error", "界面资源路径不合法")
+		return
+	}
+
+	h := w.Header()
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Referrer-Policy", "no-referrer")
+	// style-src 需要 'unsafe-inline'：Element Plus 的弹层/定位靠内联 style 属性，
+	// 旧页面的 CSSOM 写法不受影响。script-src 仍严格只允许本站脚本。
+	h.Set("Content-Security-Policy",
+		"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "+
+			"img-src 'self' data:; connect-src 'self' http: https:; base-uri 'none'; "+
+			"form-action 'none'; frame-ancestors 'none'")
+	if name == "index.html" {
+		h.Set("Cache-Control", "no-store")
+	} else {
+		// 构建产物文件名带内容哈希，长缓存是安全的
+		h.Set("Cache-Control", "public, max-age=31536000, immutable")
+	}
+
+	sub, err := fs.Sub(ui.FS, embeddedDir)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "internal", "界面资源不可用: "+err.Error())
+		return
+	}
+
+	if s.uiOverrideDir != "" {
+		root := os.DirFS(filepath.Join(s.uiOverrideDir, path.Base(embeddedDir)))
+		if _, statErr := fs.Stat(root, name); statErr == nil {
+			http.ServeFileFS(w, r, root, name)
+			return
+		}
+	}
+	if _, statErr := fs.Stat(sub, name); statErr != nil {
+		if name == "index.html" {
+			writeSPAMissing(w, embeddedDir)
+			return
+		}
+		writeJSONError(w, http.StatusNotFound, "invalid_request_error", "界面资源不存在")
+		return
+	}
+	http.ServeFileFS(w, r, sub, name)
+}
+
+// writeSPAMissing 在「源码运行但没构建前端」时给一句可操作的说明，
+// 而不是一个没有线索的 404。
+func writeSPAMissing(w http.ResponseWriter, embeddedDir string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	app := path.Base(embeddedDir)
+	_, _ = io.WriteString(w, `<!doctype html><meta charset="utf-8"><title>llmproxy 界面未构建</title>
+<body style="font:14px/1.6 -apple-system,BlinkMacSystemFont,'PingFang SC',sans-serif;padding:40px;color:#0f172a">
+<h2>前端资源未构建</h2>
+<p>发行包自带构建产物。从源码运行时先执行：</p>
+<pre style="background:#f6f7fb;padding:12px;border-radius:8px">cd web &amp;&amp; npm ci &amp;&amp; npm run build</pre>
+<p>或把机构的静态包放到运行时目录的 <code>ui/`+app+`</code> 下。</p>`)
 }

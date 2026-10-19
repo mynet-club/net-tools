@@ -46,6 +46,10 @@ type Server struct {
 
 	uiHandler http.Handler
 
+	// uiOverrideDir 是运行时界面覆盖根目录（<RuntimeDir>/ui）：其中 user/、admin/
+	// 存在同名文件时优先于嵌入的 SPA 产物。为空表示只用嵌入版本。
+	uiOverrideDir string
+
 	// 消费模式的当月计数与限流（内存，见 limits.go）
 	meters *meterSet
 
@@ -217,6 +221,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/ui/", s.handleUserUI)
 	mux.HandleFunc("/admin", s.handleAdminUI)
 	mux.HandleFunc("/admin/", s.handleAdminUI)
+	// 迁移期：两个 SPA 先挂在这里，旧页面仍在 /ui/、/admin/（见 uiserver.go）
+	mux.HandleFunc("/spa/user", s.handleUserSPA)
+	mux.HandleFunc("/spa/user/", s.handleUserSPA)
+	mux.HandleFunc("/spa/admin", s.handleAdminSPA)
+	mux.HandleFunc("/spa/admin/", s.handleAdminSPA)
 	mux.HandleFunc("/v1/openapi.yaml", s.handleOpenAPI)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/_providers", s.handleProviders)
@@ -703,6 +712,12 @@ func (s *Server) handleV1(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error",
 			fmt.Sprintf("不支持 %s /v1。可用端点：POST /v1/chat/completions、GET /v1/models", r.Method))
+		return
+	}
+
+	// 登录方式清单：登录页在鉴权之前读它来决定渲染哪些 tab。公开、无秘密。
+	if path == authMethodsPath {
+		s.handleAuthMethods(w, r)
 		return
 	}
 

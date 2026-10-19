@@ -336,6 +336,8 @@ func cmdStart(paths config.Paths) error {
 	defer lg.Close()
 
 	srv := server.New(storeCfg, db, r, lg)
+	// 机构定制界面：<RuntimeDir>/ui/{user,admin} 里的文件优先于嵌入的 SPA 产物
+	srv.WithUIOverrideDir(filepath.Join(paths.RuntimeDir, "ui"))
 
 	// 多用户能力依赖主密钥（用户自带的上游密钥要加密落库）
 	if secErr != nil {

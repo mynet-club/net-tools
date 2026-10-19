@@ -48,6 +48,21 @@ echo
 
 # ── 构建前先确认这棵树是好的 ────────────────────────────────────────────────
 # 宁可在这里失败，也不要产出一个跑不起来的发行包。
+echo "→ 前端构建（web/ → ui/spa/）"
+if ! command -v npm >/dev/null 2>&1; then
+  echo "缺 npm：发行包必须带上两个 SPA 的构建产物（构建需要 Node.js）" >&2
+  exit 1
+fi
+if [ ! -d web/node_modules ]; then
+  ( cd web && npm ci )
+fi
+( cd web && npm run build )
+for app in user admin; do
+  [ -f "ui/spa/$app/index.html" ] || {
+    echo "前端构建没有产出 ui/spa/$app/index.html，拒绝继续打包" >&2
+    exit 1
+  }
+done
 echo "→ go vet"
 go vet ./...
 echo "→ go test"
