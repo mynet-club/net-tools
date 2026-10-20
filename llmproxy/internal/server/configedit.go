@@ -58,6 +58,16 @@ func (s *Server) handleAdminConfig(w http.ResponseWriter, r *http.Request, rest 
 			writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error",
 				"只支持 GET（读）与 PUT（整段写回）")
 		}
+	case "auth":
+		switch r.Method {
+		case http.MethodGet, http.MethodHead:
+			s.adminShowAuth(w)
+		case http.MethodPut, http.MethodPost:
+			s.adminSaveAuth(w, r)
+		default:
+			writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error",
+				"只支持 GET（读）与 PUT（整段写回）")
+		}
 	case "validate":
 		if r.Method != http.MethodPost {
 			writeJSONError(w, http.StatusMethodNotAllowed, "invalid_request_error", "只支持 POST")
@@ -433,4 +443,200 @@ func backupConfig(path string, src []byte) (string, error) {
 		_ = os.Remove(old)
 	}
 	return dst, nil
+}
+
+// ------------------------------------------------------------------ auth 段（登录方式）
+
+// adminShowAuth 返回登录方式与 OAuth 客户端配置。密钥永不下发。
+func (s *Server) adminShowAuth(w http.ResponseWriter) {
+	path := s.cfgStore.Path()
+	src, err := os.ReadFile(path)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "internal", "读取配置文件失败: "+err.Error())
+		return
+	}
+	raw, err := config.RawAuth(src)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	o := raw.OAuth
+	writeJSON(w, http.StatusOK, map[string]any{
+		"path":           path,
+		"session_ttl_ms": raw.SessionTTLMs,
+		"methods": map[string]bool{
+			"password": raw.Methods.PasswordEnabled(),
+			"token":    raw.Methods.TokenEnabled(),
+			"oauth":    raw.Methods.OAuthEnabled(),
+			"ldap":     raw.Methods.LDAPEnabled(),
+		},
+		"oauth": map[string]any{
+			"provider_name": o.ProviderName,
+			"client_id":     o.ClientID,
+			"client_secret": "", // 永不下发
+			"has_secret":    o.ClientSecret != "",
+			"auth_url":      o.AuthURL,
+			"token_url":     o.TokenURL,
+			"userinfo_url":  o.UserinfoURL,
+			"scopes":        o.Scopes,
+			"redirect_url":  o.RedirectURL,
+			"subject_claim": o.SubjectClaim,
+			"name_claim":    o.NameClaim,
+			"auth_style":    o.AuthStyle,
+			"timeout_ms":    o.TimeoutMs,
+			"spa_path":      o.SPAPath,
+		},
+		"note": "只替换 config.yaml 的 auth 段；client_secret 留空保存 = 沿用原值",
+	})
+}
+
+// adminSaveAuth 整段写回 auth 段：校验 → 备份 → 写回 → 等热加载。
+func (s *Server) adminSaveAuth(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionTTLMs int `json:"session_ttl_ms"`
+		Methods      struct {
+			Password *bool `json:"password"`
+			Token    *bool `json:"token"`
+			OAuth    *bool `json:"oauth"`
+			LDAP     *bool `json:"ldap"`
+		} `json:"methods"`
+		OAuth struct {
+			ProviderName string   `json:"provider_name"`
+			ClientID     string   `json:"client_id"`
+			ClientSecret string   `json:"client_secret"`
+			AuthURL      string   `json:"auth_url"`
+			TokenURL     string   `json:"token_url"`
+			UserinfoURL  string   `json:"userinfo_url"`
+			Scopes       []string `json:"scopes"`
+			RedirectURL  string   `json:"redirect_url"`
+			SubjectClaim string   `json:"subject_claim"`
+			NameClaim    string   `json:"name_claim"`
+			AuthStyle    string   `json:"auth_style"`
+			TimeoutMs    int      `json:"timeout_ms"`
+			SPAPath      string   `json:"spa_path"`
+		} `json:"oauth"`
+	}
+	if err := readJSONBody(w, r, &req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+
+	path := s.cfgStore.Path()
+	src, err := os.ReadFile(path)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "internal", "读取配置文件失败: "+err.Error())
+		return
+	}
+	raw, err := config.RawAuth(src)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+
+	secret := req.OAuth.ClientSecret
+	if secret == "" {
+		// 留空 = 沿用原值（界面拿到的是空串，不能把空串当新密钥写回）
+		secret = raw.OAuth.ClientSecret
+	}
+	a := config.AuthConfig{
+		SessionTTLMs: req.SessionTTLMs,
+		Methods: config.AuthMethodsConfig{
+			Password: req.Methods.Password,
+			Token:    req.Methods.Token,
+			OAuth:    req.Methods.OAuth,
+			LDAP:     req.Methods.LDAP,
+		},
+		OAuth: config.OAuthConfig{
+			ProviderName: req.OAuth.ProviderName,
+			ClientID:     req.OAuth.ClientID,
+			ClientSecret: secret,
+			AuthURL:      req.OAuth.AuthURL,
+			TokenURL:     req.OAuth.TokenURL,
+			UserinfoURL:  req.OAuth.UserinfoURL,
+			Scopes:       req.OAuth.Scopes,
+			RedirectURL:  req.OAuth.RedirectURL,
+			SubjectClaim: req.OAuth.SubjectClaim,
+			NameClaim:    req.OAuth.NameClaim,
+			AuthStyle:    req.OAuth.AuthStyle,
+			TimeoutMs:    req.OAuth.TimeoutMs,
+			SPAPath:      req.OAuth.SPAPath,
+		},
+	}
+	newSrc, err := config.EditAuth(src, a)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	s.applyConfigSection(w, src, newSrc, "只替换了 auth 段，文件其余部分与注释保持原样")
+}
+
+// applyConfigSection 是「校验 → 备份 → 写回 → 等热加载」的公共落盘路径。
+func (s *Server) applyConfigSection(w http.ResponseWriter, src, newSrc []byte, note string) {
+	path := s.cfgStore.Path()
+	tmp := path + ".new"
+	if err := os.WriteFile(tmp, newSrc, 0o600); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "internal", "写临时文件失败: "+err.Error())
+		return
+	}
+	parsed, err := config.LoadFileLenient(tmp)
+	if err != nil {
+		_ = os.Remove(tmp)
+		writeJSONError(w, http.StatusBadRequest, "invalid_request_error",
+			"写回后的配置校验不通过，原文件未改动："+err.Error())
+		return
+	}
+	strictErr := ""
+	if _, err := config.LoadFile(tmp); err != nil {
+		strictErr = err.Error()
+	}
+	backup, err := backupConfig(path, src)
+	if err != nil {
+		_ = os.Remove(tmp)
+		writeJSONError(w, http.StatusInternalServerError, "internal", "备份失败，已放弃写入: "+err.Error())
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		writeJSONError(w, http.StatusInternalServerError, "internal", "写入失败: "+err.Error())
+		return
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		s.log.Warnf("收紧配置文件权限失败: %v", err)
+	}
+	s.log.Warnf("管理员通过控制台改写了配置文件的 auth 段（备份 %s）", filepath.Base(backup))
+
+	before := s.cfgStore.Revision()
+	applied := false
+	deadline := time.Now().Add(s.configApplyWait)
+	for time.Now().Before(deadline) {
+		if s.cfgStore.Revision() != before {
+			applied = true
+			break
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+
+	resp := map[string]any{
+		"written": true,
+		"applied": applied,
+		"backup":  filepath.Base(backup),
+		"path":    path,
+		"note":    note,
+	}
+	if applied {
+		resp["revision"] = s.cfgStore.Revision()
+	} else {
+		resp["note"] = note + "；热加载尚未完成（最多 2 秒），稍后刷新看结果"
+	}
+	if strictErr != "" {
+		resp["strict_ok"] = false
+		resp["strict_error"] = strictErr
+		resp["warning"] = "文件已写入，但服务加载它会失败，改动不会生效：" + strictErr
+	} else {
+		resp["strict_ok"] = true
+	}
+	if len(parsed.Warnings) > 0 {
+		resp["warnings"] = parsed.Warnings
+	}
+	writeJSON(w, http.StatusOK, resp)
 }

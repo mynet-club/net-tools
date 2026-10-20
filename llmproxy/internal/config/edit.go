@@ -501,3 +501,90 @@ func WriteFileSafely(path string, newSrc []byte) error {
 	}
 	return nil
 }
+
+// RawAuth 从**文件原文**解析 auth 段。
+//
+// 用原文而不是加载后的 Config：后者里的 client_secret 已经做过 ${ENV} 展开，
+// 把它写回文件等于把密钥明文落盘。
+func RawAuth(src []byte) (AuthConfig, error) {
+	var wrap struct {
+		Auth AuthConfig `yaml:"auth"`
+	}
+	if err := yaml.Unmarshal(src, &wrap); err != nil {
+		return AuthConfig{}, fmt.Errorf("原配置里的 auth 段解析失败: %w", err)
+	}
+	return wrap.Auth, nil
+}
+
+// EditAuth 把 src 里的 auth 段替换成 a，其余字节不动。
+func EditAuth(src []byte, a AuthConfig) ([]byte, error) {
+	rendered, err := renderAuth(a)
+	if err != nil {
+		return nil, err
+	}
+	return spliceSection(src, "auth", rendered)
+}
+
+func renderAuth(a AuthConfig) ([]byte, error) {
+	var b bytes.Buffer
+	ttl := a.SessionTTLMs
+	if ttl == 0 {
+		ttl = int(defaultLoginSessionTTL / time.Millisecond)
+	}
+	fmt.Fprintf(&b, "  session_ttl_ms: %d\n", ttl)
+	b.WriteString("  methods:\n")
+	fmt.Fprintf(&b, "    password: %t\n", a.Methods.PasswordEnabled())
+	fmt.Fprintf(&b, "    token: %t\n", a.Methods.TokenEnabled())
+	fmt.Fprintf(&b, "    oauth: %t\n", a.Methods.OAuthEnabled())
+	fmt.Fprintf(&b, "    ldap: %t\n", a.Methods.LDAPEnabled())
+
+	o := a.OAuth
+	anySet := o.ProviderName != "" || o.ClientID != "" || o.ClientSecret != "" ||
+		o.AuthURL != "" || o.TokenURL != "" || o.UserinfoURL != "" || o.RedirectURL != ""
+	if !anySet {
+		return b.Bytes(), nil
+	}
+	b.WriteString("  oauth:\n")
+	for _, kv := range []struct{ key, val string }{
+		{"provider_name", o.ProviderName},
+		{"client_id", o.ClientID},
+		{"client_secret", o.ClientSecret},
+		{"auth_url", o.AuthURL},
+		{"token_url", o.TokenURL},
+		{"userinfo_url", o.UserinfoURL},
+		{"redirect_url", o.RedirectURL},
+		{"subject_claim", o.SubjectClaim},
+		{"name_claim", o.NameClaim},
+		{"auth_style", o.AuthStyle},
+		{"spa_path", o.SPAPath},
+	} {
+		if strings.TrimSpace(kv.val) == "" {
+			continue
+		}
+		v, err := yamlScalar(kv.val)
+		if err != nil {
+			return nil, fmt.Errorf("auth.oauth.%s %w", kv.key, err)
+		}
+		fmt.Fprintf(&b, "    %s: %s\n", kv.key, v)
+	}
+	if len(o.Scopes) > 0 {
+		fmt.Fprintf(&b, "    scopes: %s\n", renderStringList(o.Scopes))
+	}
+	if o.TimeoutMs > 0 {
+		fmt.Fprintf(&b, "    timeout_ms: %d\n", o.TimeoutMs)
+	}
+	return b.Bytes(), nil
+}
+
+// renderStringList 把字符串切片渲染成 YAML 流式列表（值走 yamlScalar 转义）。
+func renderStringList(items []string) string {
+	parts := make([]string, 0, len(items))
+	for _, it := range items {
+		v, err := yamlScalar(it)
+		if err != nil {
+			v = `""`
+		}
+		parts = append(parts, v)
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
+}
