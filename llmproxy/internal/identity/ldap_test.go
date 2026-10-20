@@ -92,12 +92,12 @@ func aliceEntry() LDAPEntry {
 	return LDAPEntry{
 		DN: "uid=alice,ou=people,dc=example,dc=edu",
 		Attrs: map[string][]string{
-			"uid":                         {"alice"},
-			"displayname":                 {"Alice Zhang"},
-			"mail":                        {"alice@example.edu"},
-			"memberof":                    {"cn=cs-faculty,ou=groups,dc=example,dc=edu"},
+			"uid":                        {"alice"},
+			"displayname":                {"Alice Zhang"},
+			"mail":                       {"alice@example.edu"},
+			"memberof":                   {"cn=cs-faculty,ou=groups,dc=example,dc=edu"},
 			"edupersonScopedAffiliation": {"faculty@example.edu"},
-			"department":                  {"computer-science"},
+			"department":                 {"computer-science"},
 		},
 	}
 }
