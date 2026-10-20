@@ -2,7 +2,8 @@ package server
 
 // P0 基建的接口级测试：
 //   - 登录方式清单是公开的、顺序稳定，LDAP 是否可用跟 identity 配置走；
-//   - 两个 SPA 的静态服务在 /spa/ 下可用，运行时覆盖目录优先于嵌入产物。
+//   - 两个 SPA 的静态服务在 /ui/、/admin/ 下可用，运行时覆盖目录优先于嵌入产物；
+//   - 旧版管理台保留在 /admin/legacy/，旧 /spa/ 挂载点 301 到正式路径。
 
 import (
 	"encoding/json"
@@ -100,7 +101,7 @@ func TestSPAOverrideServesFromDisk(t *testing.T) {
 	}
 	h.srv.WithUIOverrideDir(dir)
 
-	resp, raw := h.get(t, "/spa/user/", "")
+	resp, raw := h.get(t, "/ui/", "")
 	if resp.StatusCode != http.StatusOK || !strings.Contains(string(raw), "override-index") {
 		t.Fatalf("覆盖目录没生效：%d %s", resp.StatusCode, raw)
 	}
@@ -112,7 +113,7 @@ func TestSPAOverrideServesFromDisk(t *testing.T) {
 		t.Errorf("index.html 不能缓存: %q", cc)
 	}
 
-	resp, raw = h.get(t, "/spa/user/assets/x.js", "")
+	resp, raw = h.get(t, "/ui/assets/x.js", "")
 	if resp.StatusCode != http.StatusOK || !strings.Contains(string(raw), "override") {
 		t.Fatalf("覆盖目录的资源没生效：%d %s", resp.StatusCode, raw)
 	}
@@ -126,9 +127,9 @@ func TestSPAOverrideServesFromDisk(t *testing.T) {
 
 func TestSPARejectsNonGet(t *testing.T) {
 	h := newHarness(t, spaTestConfig())
-	resp, _ := h.post(t, "/spa/user/", "", nil)
+	resp, _ := h.post(t, "/ui/", "", nil)
 	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("POST /spa/user/ = %d，期望 405", resp.StatusCode)
+		t.Fatalf("POST /ui/ = %d，期望 405", resp.StatusCode)
 	}
 }
 
@@ -137,15 +138,61 @@ func TestSPARedirectsBarePrefix(t *testing.T) {
 	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	}}
-	resp, err := client.Get(h.gateway.URL + "/spa/admin")
+	resp, err := client.Get(h.gateway.URL + "/admin")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusMovedPermanently {
-		t.Fatalf("/spa/admin = %d，期望 301", resp.StatusCode)
+		t.Fatalf("/admin = %d，期望 301", resp.StatusCode)
 	}
-	if loc := resp.Header.Get("Location"); loc != "/spa/admin/" {
-		t.Fatalf("Location = %q，期望 /spa/admin/", loc)
+	if loc := resp.Header.Get("Location"); loc != "/admin/" {
+		t.Fatalf("Location = %q，期望 /admin/", loc)
+	}
+}
+
+func TestLegacyAdminAtSubpath(t *testing.T) {
+	h := newHarness(t, spaTestConfig())
+	resp, raw := h.get(t, "/admin/legacy/", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/admin/legacy/ = %d: %s", resp.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), `id="login-form"`) {
+		t.Fatalf("旧管理台登录页没有返回: %s", raw[:min(len(raw), 200)])
+	}
+	resp, raw = h.get(t, "/admin/legacy/admin.js", "")
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(raw), "use strict") {
+		t.Fatalf("/admin/legacy/admin.js = %d", resp.StatusCode)
+	}
+	// 白名单之外（已删除的用户端旧页）取不到
+	resp, _ = h.get(t, "/admin/legacy/user.js", "")
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("旧管理台不该放行 user.js，实际 %d", resp.StatusCode)
+	}
+}
+
+func TestLegacySpaAliasesRedirect(t *testing.T) {
+	h := newHarness(t, spaTestConfig())
+	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	cases := []struct{ from, to string }{
+		{"/spa/user/", "/ui/"},
+		{"/spa/user/assets/app.js", "/ui/assets/app.js"},
+		{"/spa/admin/", "/admin/"},
+	}
+	for _, c := range cases {
+		resp, err := noRedirect.Get(h.gateway.URL + c.from)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusMovedPermanently {
+			t.Errorf("%s = %d，期望 301", c.from, resp.StatusCode)
+			continue
+		}
+		if loc := resp.Header.Get("Location"); loc != c.to {
+			t.Errorf("%s Location = %q，期望 %q", c.from, loc, c.to)
+		}
 	}
 }

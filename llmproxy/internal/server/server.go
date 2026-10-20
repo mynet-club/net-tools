@@ -224,12 +224,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/ui", s.handleUserUI)
 	mux.HandleFunc("/ui/", s.handleUserUI)
 	mux.HandleFunc("/admin", s.handleAdminUI)
+	// 旧版管理台留在子路径：高级面板（策略/处理器/知识源/回放/价格）还没迁到 SPA
+	mux.HandleFunc("/admin/legacy", s.handleLegacyAdminUI)
+	mux.HandleFunc("/admin/legacy/", s.handleLegacyAdminUI)
 	mux.HandleFunc("/admin/", s.handleAdminUI)
-	// 迁移期：两个 SPA 先挂在这里，旧页面仍在 /ui/、/admin/（见 uiserver.go）
-	mux.HandleFunc("/spa/user", s.handleUserSPA)
-	mux.HandleFunc("/spa/user/", s.handleUserSPA)
-	mux.HandleFunc("/spa/admin", s.handleAdminSPA)
-	mux.HandleFunc("/spa/admin/", s.handleAdminSPA)
+	// 4.0 迁移期的旧挂载点：301 到正式路径（保留子路径）
+	mux.HandleFunc("/spa/user", redirectPrefix("/spa/user", "/ui/"))
+	mux.HandleFunc("/spa/user/", redirectPrefix("/spa/user", "/ui/"))
+	mux.HandleFunc("/spa/admin", redirectPrefix("/spa/admin", "/admin/"))
+	mux.HandleFunc("/spa/admin/", redirectPrefix("/spa/admin", "/admin/"))
 	mux.HandleFunc("/v1/openapi.yaml", s.handleOpenAPI)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/_providers", s.handleProviders)

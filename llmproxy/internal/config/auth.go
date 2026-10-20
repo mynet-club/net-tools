@@ -72,7 +72,7 @@ type OAuthConfig struct {
 	// AuthStyle 是客户端认证方式：basic（默认）或 post。
 	AuthStyle string `yaml:"auth_style"`
 	TimeoutMs int    `yaml:"timeout_ms"`
-	// SPAPath 是登录成功后跳回的 SPA 路径；默认 /spa/user/。
+	// SPAPath 是登录成功后跳回的 SPA 路径；默认 /ui/。
 	SPAPath string `yaml:"spa_path"`
 }
 
@@ -153,7 +153,7 @@ func (o *OAuthConfig) normalize() error {
 		return fmt.Errorf("auth.oauth.auth_style 只能是 basic 或 post，当前是 %q", o.AuthStyle)
 	}
 	if o.SPAPath == "" {
-		o.SPAPath = "/spa/user/"
+		o.SPAPath = "/ui/"
 	}
 	if !strings.HasPrefix(o.SPAPath, "/") {
 		return fmt.Errorf("auth.oauth.spa_path 必须以 / 开头，当前是 %q", o.SPAPath)

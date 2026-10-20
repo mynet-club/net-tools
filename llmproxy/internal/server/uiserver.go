@@ -12,27 +12,26 @@ import (
 	"github.com/mynet-club/net-tools/llmproxy/ui"
 )
 
-// 两个界面，两套独立页面：
+// 两个界面，两个独立 SPA：
 //
-//	GET /ui/     用户控制台 —— 用「用户 token」登录，管自己的上游与用量
-//	GET /admin/  管理控制台 —— 用 server.admin_token 登录，管系统上游与用户
+//	GET /ui/     用户控制台 —— 登录后管自己的上游、用量与 token
+//	GET /admin/  管理控制台 —— 用 server.admin_token 登录，管用户/上游/登录方式/审计
+//
+// 迁移期把旧版管理台留在 /admin/legacy/：策略、处理器、知识源、回放、价格这几个
+// 交互较重的面板还没迁到 SPA，删掉旧页会让这些能力直接从界面上消失。
 //
 // 刻意不做「同一个页面按 token 猜身份」：那会让人分不清该拿哪个凭证登录，
-// 也把两类权限混在一个入口里。这里各自只放行自己的文件 ——
-// 用户台里拿不到 admin.js，管理台里也拿不到 user.js。
+// 也把两类权限混在一个入口里。两个 SPA 各自只服务自己的静态目录。
 //
 // 同源托管是另一个刻意选择：页面要带着 token 调 API，同源就不需要 CORS、
 // 也不担心别的站点跨源读取用量。
-var (
-	userAppFiles = map[string]bool{
-		"user.html": true, "user.js": true, "common.js": true, "app.css": true,
-		"openapi.yaml": true,
-	}
-	adminAppFiles = map[string]bool{
-		"admin.html": true, "admin.js": true, "common.js": true, "app.css": true,
-		"openapi.yaml": true,
-	}
-)
+const legacyAdminPrefix = "/admin/legacy/"
+
+// 旧版管理台只放行它自己的文件（用户端旧页已删除）。
+var adminAppFiles = map[string]bool{
+	"admin.html": true, "admin.js": true, "common.js": true, "app.css": true,
+	"openapi.yaml": true,
+}
 
 // newUIHandler 返回嵌在二进制里的静态文件服务（不做前缀剥离，路径由调用方决定）。
 func (s *Server) newUIHandler() http.Handler {
@@ -46,12 +45,26 @@ func (s *Server) newUIHandler() http.Handler {
 	return http.FileServer(http.FS(sub))
 }
 
+// handleUserUI / handleAdminUI 是正式入口：两个 SPA。
 func (s *Server) handleUserUI(w http.ResponseWriter, r *http.Request) {
-	s.serveApp(w, r, "/ui/", "user.html", userAppFiles)
+	s.serveSPA(w, r, "/ui/", userSPAEmbed)
 }
 
 func (s *Server) handleAdminUI(w http.ResponseWriter, r *http.Request) {
-	s.serveApp(w, r, "/admin/", "admin.html", adminAppFiles)
+	s.serveSPA(w, r, "/admin/", adminSPAEmbed)
+}
+
+// handleLegacyAdminUI 服务旧版管理台（只保留高级面板所需的页面）。
+func (s *Server) handleLegacyAdminUI(w http.ResponseWriter, r *http.Request) {
+	s.serveApp(w, r, legacyAdminPrefix, "admin.html", adminAppFiles)
+}
+
+// redirectPrefix 把旧挂载点原样搬到新路径（保留子路径，静态资源也跟着走）。
+func redirectPrefix(oldPrefix, newPrefix string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		rest := strings.TrimPrefix(r.URL.Path, oldPrefix)
+		http.Redirect(w, r, newPrefix+rest, http.StatusMovedPermanently)
+	}
 }
 
 // serveApp 服务一个界面的静态资源：只有 allow 里列出的文件能被取到。
@@ -105,8 +118,7 @@ func (s *Server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
 
 // ------------------------------------------------------------------ 两个 SPA
 //
-// 迁移期先挂在 /spa/{user,admin}/ 下，旧页面继续在 /ui/、/admin/ 提供服务；
-// 等两个 SPA 达到功能对等再把 /ui/、/admin/ 指过来（路径切换只改注册处）。
+// /ui/、/admin/ 是正式入口；旧的 /spa/{user,admin}/ 只做 301 兼容跳转。
 //
 // 嵌入与覆盖的关系：嵌入产物是「开箱即用」的默认值；<RuntimeDir>/ui/{user,admin}
 // 存在同名文件时优先用磁盘上的版本 —— 机构可以只替换前端，不动二进制。
@@ -120,14 +132,6 @@ const (
 func (s *Server) WithUIOverrideDir(dir string) *Server {
 	s.uiOverrideDir = dir
 	return s
-}
-
-func (s *Server) handleUserSPA(w http.ResponseWriter, r *http.Request) {
-	s.serveSPA(w, r, "/spa/user/", userSPAEmbed)
-}
-
-func (s *Server) handleAdminSPA(w http.ResponseWriter, r *http.Request) {
-	s.serveSPA(w, r, "/spa/admin/", adminSPAEmbed)
 }
 
 // serveSPA 服务一个 SPA 的静态资源。

@@ -382,7 +382,7 @@ func writeOAuthPage(w http.ResponseWriter, status int, msg string) {
 <body style="font:14px/1.7 -apple-system,BlinkMacSystemFont,'PingFang SC',sans-serif;padding:48px;color:#0f172a">
 <h2 style="margin:0 0 8px">登录未完成</h2>
 <p style="color:#64748b">`+htmlEscape(msg)+`</p>
-<p><a href="/spa/user/#/login">返回登录页</a></p>`)
+<p><a href="/ui/#/login">返回登录页</a></p>`)
 }
 
 func htmlEscape(s string) string {

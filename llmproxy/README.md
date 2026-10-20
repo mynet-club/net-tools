@@ -441,7 +441,7 @@ log:
 ### 管理接口（用 `server.admin_token` 鉴权）
 
 凭证用 `llmproxy admin token` 取、`llmproxy admin rotate` 轮换（见下面 CLI 一节）。
-没配 `admin_token` 时整个 `/v1/_admin` 一律 403（`/spa/admin/` 页面能打开，但登录会失败）。
+没配 `admin_token` 时整个 `/v1/_admin` 一律 403（`/admin/` 页面能打开，但登录会失败）。
 
 | 方法 | 路径 | 用途 |
 |------|------|------|
@@ -585,7 +585,7 @@ shadow。热加载只看配置文件 mtime，因此「内存里还是上一次�
 必然是 `unknown`，因为没有 PolicyContext，服务端不许替配置猜一级），后者是配置里声明的那一行。
 两者不等只说明「这一级已经写好、当前模式不用它」，不表示没配。
 
-旧版管理台 `/admin/` 的「策略与路由」面板就是这一组接口的界面（4.0 新管理台暂未迁移这块）：核对表、模式/生效包/发布表单、
+旧版管理台 `/admin/legacy/` 的「策略与路由」面板就是这一组接口的界面（4.0 新管理台暂未迁移这块）：核对表、模式/生效包/发布表单、
 路由模拟、决策痕迹。界面**不复算权限**（只检查 JSON 语法与必填项），条件键、选择器形态、
 分级取值一律由服务端领域校验判 —— 前端算一套就会出现「界面说会过、线上拒了」的分叉。
 
@@ -623,7 +623,7 @@ X-Identity-Token: v1...
   得管理员显式改 consumption 并配模型白名单）；已停用账号一律拒绝；
 - subject 必须能当网关用户名（字母/数字/点/下划线/连字符）；不合法直接拒绝、
   不做改名兜底 —— 改出来的名字会与 token 的 subject 永久对不上，绑定永远失败；
-- 用户台 `/spa/user/` 的「校园网账号」tab 是同一端点的界面版；登录后的会话令牌直接
+- 用户台 `/ui/` 的「校园网账号」tab 是同一端点的界面版；登录后的会话令牌直接
   用于 `/v1/_me*`，下行 token 只在用户主动点「创建/轮换」时才动。
 
 安全口径：
@@ -687,7 +687,7 @@ auth:
     subject_claim: sub
     name_claim: name
     auth_style: basic             # basic | post
-    spa_path: /spa/user/
+    spa_path: /ui/
 ```
 
 管理台「配置 → 登录方式」就是这段的可视化编辑；对应接口 `GET/PUT /v1/_admin/config/auth`
@@ -702,7 +702,7 @@ auth:
 | GET | `/v1/_admin/replay/export[?scope=kind:id]` | 导出记录文件本身（写出版本 schema v2，可读 v1+v2），**不加包装字段**；范围种类不限（user / organization / project / system） |
 | POST | `/v1/_admin/replay/clear` | 清空记录与计数（开关与过滤条件保持） |
 
-旧版管理台 `/admin/` 的「回放证据链」面板是同一组端点的界面版（窗口计数、开关、导出、清空），
+旧版管理台 `/admin/legacy/` 的「回放证据链」面板是同一组端点的界面版（窗口计数、开关、导出、清空），
 导出走浏览器下载：拿到的就是 `replay.Encode` 那串原始字节，与 `replay collect` 的产物
 逐字节相同，因此界面上存下来的那份同样能直接喂给下面那条 `replay run`。
 
@@ -848,10 +848,10 @@ llmproxy replay run -records /tmp/rec.json -now 2026-10-03T12:00:00Z
 
 | 入口 | 给谁 | 用什么登录 | 能做什么 |
 |------|------|-----------|---------|
-| `/spa/user/` | 普通用户 | 账号密码 / 下游 token / OAuth / LDAP | 管自己的上游与模型、看用量、创建/轮换 token、试一条请求、知识检索 |
-| `/spa/admin/` | 网关主人 | `server.admin_token` | 概览统计、用户与配额、系统上游、登录方式、操作审计 |
+| `/ui/` | 普通用户 | 账号密码 / 下游 token / OAuth / LDAP | 管自己的上游与模型、看用量、创建/轮换 token、试一条请求、知识检索 |
+| `/admin/` | 网关主人 | `server.admin_token` | 概览统计、用户与配额、系统上游、登录方式、操作审计 |
 
-迁移期（4.0）旧页面仍保留在 `/ui/`、`/admin/`；P4 会把这两个路径切到 SPA 并删除旧页。
+旧版管理台只保留在 `/admin/legacy/`：策略观测/发布、处理器、知识源、回放证据链、价格这几块还没迁到 SPA，其余页面均已在新管理台。旧的 `/spa/{user,admin}/` 会 301 到正式路径。
 
 刻意**不做「同一个页面按 token 猜身份」**：用户台与管理台是两个应用、两套会话键，
 同一个标签页里互不覆盖。凭据只存 sessionStorage，关标签即失效，不进 URL / Cookie / localStorage。
@@ -868,7 +868,7 @@ user 端界面，不需要重新编译网关（`cd web && npm run build` 的产�
 
 **管理台**：概览（7/30/90 天统计、按模型/按范围明细）、用户（建号 / 轮换 token /
 设置本地密码 / 配额与限流 / 启停 / 删除）、配置（系统上游整段编辑、**登录方式**）、
-操作审计。策略观测/发布、处理器、知识源、回放证据链、价格这几块仍在旧版 `/admin/`
+操作审计。策略观测/发布、处理器、知识源、回放证据链、价格这几块仍在旧版 `/admin/legacy/`
 （新管理台「高级面板」里有入口）。
 
 > ⚠️ **价目行仍没有界面**，只能用 API：`PUT /v1/_admin/prices/provider` 与
@@ -1184,7 +1184,7 @@ llmproxy user providers|usage <名字>   该用户的上游 / 消耗
 llmproxy user mode|quota|limits <名字> 消费模式的模式 / 配额 / 限流
 llmproxy user models|add-model <名字>  消费模式的模型白名单（也是模型映射）
 llmproxy user add-provider <用户> <上游名>   代用户配上游
-llmproxy admin token         打印管理凭证（管理台 /spa/admin/ 用）
+llmproxy admin token         打印管理凭证（管理台 /admin/ 用）
 llmproxy admin rotate        轮换管理凭证并写回 config.yaml
 llmproxy replay status       回放记录采集窗口的配置与计数
 llmproxy replay on|off       开 / 关线上判定记录采集（缺省关）
@@ -1288,8 +1288,7 @@ llmproxy/
     config.example.yaml
   ui/
     spa/user、spa/admin  两个 SPA 的构建产物（不入库，npm run build 生成，go:embed 编入）
-    user.html / user.js / admin.html / admin.js   旧版原生页（迁移期保留）
-    common.js / app.css 旧版共用资源
+    admin.html / admin.js / common.js / app.css   旧版管理台（只保留高级面板，/admin/legacy/）
     embed.go            嵌入声明
   web/                  前端工程（Vue 3 + Vite + Element Plus）
     user/               用户台 SPA

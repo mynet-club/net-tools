@@ -15,7 +15,7 @@ import AdminShell from '../components/AdminShell.vue'
       <p class="f-muted">
         同一台网关、同一个 <code>server.admin_token</code>。打开后需要再粘贴一次 token（旧版存的是另一个会话键）。
       </p>
-      <a href="/admin/" target="_blank" rel="noopener">
+      <a href="/admin/legacy/" target="_blank" rel="noopener">
         <el-button type="primary">打开旧版管理台</el-button>
       </a>
       <p class="f-muted" style="font-size: 12px; margin-bottom: 0">

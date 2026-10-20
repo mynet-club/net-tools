@@ -52,7 +52,7 @@ const auth = reactive({
     name_claim: 'name',
     auth_style: 'basic',
     timeout_ms: 10000,
-    spa_path: '/spa/user/',
+    spa_path: '/ui/',
   },
 })
 const authBusy = ref(false)
@@ -260,7 +260,7 @@ async function loadAuth() {
     auth.oauth.name_claim = o.name_claim || 'name'
     auth.oauth.auth_style = o.auth_style || 'basic'
     auth.oauth.timeout_ms = o.timeout_ms || 10000
-    auth.oauth.spa_path = o.spa_path || '/spa/user/'
+    auth.oauth.spa_path = o.spa_path || '/ui/'
   } catch (e) {
     ElMessage.error(e.message)
   }
@@ -446,7 +446,7 @@ onMounted(async () => {
           <el-form-item label="超时"><el-input-number v-model="auth.oauth.timeout_ms" :min="500" :step="1000" /><span class="f-muted" style="margin-left: 8px">毫秒</span></el-form-item>
           <el-form-item label="登录后跳回">
             <el-input v-model="auth.oauth.spa_path" />
-            <div class="f-muted" style="font-size: 12px">默认 /spa/user/（换成正式路径后同步改这里）</div>
+            <div class="f-muted" style="font-size: 12px">默认 /ui/（登录成功后跳回的 SPA 路径）</div>
           </el-form-item>
           <el-form-item>
             <el-button type="primary" :loading="authBusy" @click="saveAuth">保存登录方式</el-button>

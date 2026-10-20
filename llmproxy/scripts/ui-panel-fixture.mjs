@@ -11,7 +11,7 @@
 // 界面的对错由界面自己到服务端跑一圈来判，夹具只负责点与读。
 //
 // 环境变量（由 scripts/ui-panel-fixture.sh 传）：
-//   GW_BASE         网关地址，如 http://127.0.0.1:19123（页面从它的 /admin/ 加载，同源）
+//   GW_BASE         网关地址，如 http://127.0.0.1:19123（页面从它的 /admin/legacy/ 加载，同源）
 //   ADMIN_TOKEN     server.admin_token
 //   EXPORT_DIR      浏览器下载目录（导出落这里，交给 shell 与 CLI 产物比 sha256）
 //   EXPECT_EXPORT_SHA  期望的导出文件 sha256（shell 用 `llmproxy replay collect -out` 先算出来）
@@ -160,7 +160,7 @@ async function main() {
     });
 
     // ── 登录：走真实登录表单，不预置 sessionStorage ──────────────────
-    await cdp.send('Page.navigate', { url: GW + '/admin/' });
+    await cdp.send('Page.navigate', { url: GW + '/admin/legacy/' });
     await waitFor(cdp, `${visible('login')}`, 8000, '登录页渲染出来');
     await cdp.eval(setVal('login-base', GW));
     await cdp.eval(setVal('login-token', ADMIN));

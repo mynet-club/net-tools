@@ -241,7 +241,7 @@ auth:
     token_url: ` + idp.srv.URL + `/token
     userinfo_url: ` + idp.srv.URL + `/userinfo
     redirect_url: http://127.0.0.1:1/v1/_auth/oauth/callback
-    spa_path: /spa/user/
+    spa_path: /ui/
 `
 	if err := os.WriteFile(h.configPath, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
@@ -301,7 +301,7 @@ func TestOAuthLoginFlow(t *testing.T) {
 		t.Fatalf("callback 应 302，实际 %d", resp.StatusCode)
 	}
 	back, _ := url.Parse(resp.Header.Get("Location"))
-	if !strings.HasPrefix(back.Path, "/spa/user/") {
+	if !strings.HasPrefix(back.Path, "/ui/") {
 		t.Fatalf("回调应跳回 SPA，实际 %s", back)
 	}
 	frag, _ := url.ParseQuery(strings.TrimPrefix(back.Fragment, "/oauth-callback?"))

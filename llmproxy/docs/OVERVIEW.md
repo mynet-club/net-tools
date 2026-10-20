@@ -188,7 +188,7 @@ graph TB
         U3["用户自带的上游"]
     end
 
-    UI["网页控制台<br/>/spa/user/ 用户台 · /spa/admin/ 管理台<br/>两个 Vue SPA，go:embed 进二进制"]
+    UI["网页控制台<br/>/ui/ 用户台 · /admin/ 管理台<br/>两个 Vue SPA，go:embed 进二进制"]
 
     C1 -->|"OpenAI 协议"| S
     S --> R
@@ -604,8 +604,8 @@ DeepSeek 的缓存命中价只有未命中价的 **1/50**。不区分的话，ag
 
 | 入口 | 给谁 | 用什么登录 | 能做什么 |
 |---|---|---|---|
-| `/spa/user/` | 普通用户 | 账号密码 / 下游 token / OAuth / LDAP | 管自己的上游与模型、看用量、创建/轮换 token、试一条请求、知识检索 |
-| `/spa/admin/` | 网关主人 | `server.admin_token` | 概览统计、用户与配额、系统上游、登录方式、操作审计 |
+| `/ui/` | 普通用户 | 账号密码 / 下游 token / OAuth / LDAP | 管自己的上游与模型、看用量、创建/轮换 token、试一条请求、知识检索 |
+| `/admin/` | 网关主人 | `server.admin_token` | 概览统计、用户与配额、系统上游、登录方式、操作审计 |
 
 刻意**不做「同一个页面按 token 猜身份」**：用户台与管理台是两个应用、两套会话键，
 同一标签页里互不覆盖。凭据只存 `sessionStorage`，关标签即失效，不进 URL、Cookie 或 localStorage。
@@ -614,6 +614,8 @@ DeepSeek 的缓存命中价只有未命中价的 **1/50**。不区分的话，ag
 账号密码（本地 bcrypt）、下游 token、OAuth（授权码 + PKCE）、LDAP/AD。登录统一换一枚
 **短时会话令牌**（`X-Identity-Token`），它只放行 `/v1/_me*` 这类自助接口；**模型调用仍只认
 下游 token**，两种凭据各管一件事。
+
+旧版管理台只留在 `/admin/legacy/`（策略/处理器/知识源/回放/价格），其余页面已是 SPA。
 
 **机构可以只换前端**：两个 SPA 的构建产物默认编进二进制，运行时优先读
 `<RuntimeDir>/ui/{user,admin}` 下的同名文件——替换静态包即可定制 user 端，不用重编译。
