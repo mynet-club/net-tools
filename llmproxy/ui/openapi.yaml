@@ -61,9 +61,23 @@ paths:
     get:
       tags: [me]
       summary: 身份、上游与累计用量
+      description: |
+        也接受登录换到的短时会话令牌（`X-Identity-Token`）：本地账密 / OAuth / LDAP 登录后
+        无需先有下游 token 就能读自己的资料与用量。模型调用仍只认下游 token。
       security: [{bearerAuth: []}]
       responses:
         '200': { description: OK }
+  /v1/_me/token:
+    post:
+      tags: [me]
+      summary: 创建/轮换我的下游 token（有则轮换，无则创建）
+      description: |
+        一人一枚：明文只在本次响应里出现，旧 token 立即失效。也接受会话令牌
+        （`X-Identity-Token`），所以登录后不必先有 token。
+      security: [{bearerAuth: []}]
+      responses:
+        '200': { description: 轮换成功 }
+        '201': { description: 首次创建（按 subject 开号，默认 byo） }
   /v1/_me/providers:
     get:
       tags: [me]
@@ -163,6 +177,98 @@ paths:
         '403': { description: 身份无法构成范围链（静态 key）或范围没有生效策略包 }
         '501': { description: 未启用多用户策略链路或未配置知识源 }
         '502': { description: 所有被准入的知识源都失败（没有任何可读结果，不是没有命中） }
+  /v1/_auth/methods:
+    get:
+      tags: [auth]
+      summary: 登录方式清单（公开）
+      description: 登录页据此渲染 tab；四个开关来自 `auth.methods`，依赖不齐时 enabled=false。
+      responses:
+        '200': { description: 'methods[]：id / label / enabled' }
+  /v1/_auth/password/login:
+    post:
+      tags: [auth]
+      summary: 本地账号密码登录
+      description: |
+        密码存 bcrypt（`users.password_hash`）。失败统一回「用户名或口令不正确」，
+        与 LDAP 登录共用单 IP 每分钟 10 次、全局并发 4 的限速。
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string }
+      responses:
+        '200': { description: 'token / expires_at / subject / header=X-Identity-Token' }
+        '401': { description: 用户名或口令不正确 }
+        '429': { description: 登录尝试过于频繁 }
+        '501': { description: 多用户模式未启用（缺主密钥） }
+  /v1/_identity/ldap/login:
+    post:
+      tags: [auth]
+      summary: LDAP/AD 登录换短时会话令牌
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string }
+      responses:
+        '200': { description: 'token / expires_at / subject / display_name' }
+        '401': { description: 用户名或口令不正确 }
+        '404': { description: 未启用 LDAP 身份 }
+        '429': { description: 登录尝试过于频繁 }
+        '503': { description: 目录服务暂时不可用 }
+  /v1/_identity/me/token:
+    post:
+      tags: [auth]
+      summary: 用会话令牌创建/轮换下游 token
+      parameters:
+        - { name: X-Identity-Token, in: header, required: true, schema: { type: string } }
+      responses:
+        '200': { description: 轮换成功 }
+        '201': { description: 首次创建（按 subject 开号，默认 byo） }
+        '400': { description: subject 不能作网关用户名 }
+        '403': { description: 账号已停用 }
+  /v1/_auth/oauth/start:
+    get:
+      tags: [auth]
+      summary: 发起 OAuth 授权码登录（302 到 IdP）
+      description: 生成 state 与 PKCE，state 同时写进 SameSite=Lax 的 HttpOnly cookie。
+      responses:
+        '302': { description: 跳转到 auth_url }
+        '404': { description: 未配置或未启用 OAuth }
+  /v1/_auth/oauth/callback:
+    get:
+      tags: [auth]
+      summary: OAuth 回调（校验 state、换 token、读 userinfo）
+      parameters:
+        - { name: code, in: query, required: true, schema: { type: string } }
+        - { name: state, in: query, required: true, schema: { type: string } }
+      responses:
+        '302': { description: 跳回 spa_path，带 60 秒一次性 code（令牌不进 URL） }
+        '400': { description: state 失效或回调参数缺失 }
+        '502': { description: 身份提供方不可用 }
+  /v1/_auth/oauth/exchange:
+    post:
+      tags: [auth]
+      summary: 一次性 code 换会话令牌
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string }
+      responses:
+        '200': { description: 'token / subject / header=X-Identity-Token' }
+        '400': { description: code 已失效或参数缺失 }
   /v1/_admin/users:
     get:
       tags: [admin]
@@ -209,6 +315,25 @@ paths:
         - { name: name, in: path, required: true, schema: { type: string } }
       responses:
         '200': { description: OK }
+  /v1/_admin/users/{name}/password:
+    put:
+      tags: [admin]
+      summary: 设置/重置用户的本地密码（8..72 字节，bcrypt 落库）
+      security: [{adminAuth: []}]
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: { type: string }
+      responses:
+        '200': { description: 已设置 }
+        '400': { description: 口令长度不合法 }
+        '404': { description: 用户不存在 }
   /v1/_admin/usage/export:
     get:
       tags: [admin]
@@ -271,6 +396,22 @@ paths:
         会在同一道校验里被拒 —— 所以「切影子模式」的前置条件就是在这里把分级逐家声明齐。
         API 上**不能**把已声明的分级改回未声明（留空=沿用，而非清空）：那是放松一条收紧
         声明，只能由直接编辑配置文件的人做。
+      security: [{adminAuth: []}]
+      responses:
+        '200': { description: 'written / applied / backup / strict_ok' }
+        '400': { description: 校验不通过，原文件未改动 }
+  /v1/_admin/config/auth:
+    get:
+      tags: [admin]
+      summary: 读登录方式与 OAuth 客户端（client_secret 不下发）
+      security: [{adminAuth: []}]
+      responses:
+        '200': { description: 'methods / session_ttl_ms / oauth（has_secret）' }
+    put:
+      tags: [admin]
+      summary: 保存登录方式（只替换 auth 段）
+      description: |
+        写前校验、自动备份；`client_secret` 留空表示沿用原值（界面拿到的是空串）。
       security: [{adminAuth: []}]
       responses:
         '200': { description: 'written / applied / backup / strict_ok' }

@@ -30,8 +30,9 @@
   网关只负责鉴权、转发、按用户记账；上游密钥 AES-256-GCM 加密落库，熔断按用户隔离
 - **两种用户模式**：`byo`（用户自带上游，网关不掏钱）与 `consumption`（用户消费系统上游，
   带模型白名单、月度配额与金额估算、RPM、token 速率与并发上限）
-- **网页控制台**：`GET /ui/` 自带一个单页界面，用户用自己的 token 登录即可管自己的上游、
-  看自己的用量、发一条请求验证链路；静态资源编在二进制里，不需要额外部署
+- **两个网页控制台（4.0）**：用户台与管理台各是一个 Vue SPA，构建产物默认编进二进制；
+  用户可用**本地账号密码 / 下游 token / OAuth / LDAP** 四类方式登录，登录后自助创建/轮换 token；
+  管理台管用户、系统上游、登录方式与审计。机构可以用运行时目录覆盖 user 端界面，不改二进制
 
 ## 安全约定
 
@@ -83,7 +84,9 @@ cd llmproxy
 go build -o llmproxy ./cmd/llmproxy      # 本机平台
 ```
 
-依赖：Go ≥ 1.22。模块依赖只有两个：`gopkg.in/yaml.v3` 与 `modernc.org/sqlite`（纯 Go，不需要 cgo）。
+依赖：Go ≥ 1.22；构建发行包还需要 Node.js ≥ 18（两个 SPA 用 Vite 构建）。
+Go 模块依赖很少：`gopkg.in/yaml.v3`、`modernc.org/sqlite`（纯 Go，不需要 cgo）、
+`go-ldap`、`x/crypto`（账密 bcrypt）等。
 
 国内拉模块建议：
 
@@ -111,6 +114,8 @@ SHA256SUMS
 
 五点值得说明：
 
+- **先构建前端再编译**：`scripts/build.sh` 会先执行 `cd web && npm run build`，把两个 SPA
+  的产物写进 `ui/spa/{user,admin}`，再 `go:embed` 进二进制；缺 npm 或产物为空直接拒绝打包。
 - **不需要交叉工具链**：`CGO_ENABLED=0`，因为 SQLite 用的是 `modernc.org/sqlite`（纯 Go 实现）。
   一条命令就能出四个平台，脚本还会把 `GOOS/GOARCH/CGO_ENABLED` 从二进制里读回来核对一遍。
 - **脚本先 `go vet` + `go test` 再编译**：宁可在这里失败，也不要产出一个跑不起来的发行包。
@@ -417,11 +422,13 @@ log:
 
 ### 自助接口（用户自己配自己的上游）
 
-用户拿自己的 token 调，只能看见和改动自己的东西：
+用户拿自己的 token 调，只能看见和改动自己的东西。登录换到的会话令牌也可以调这一组
+（`X-Identity-Token`），所以登录后不必先有下游 token：
 
 | 方法 | 路径 | 用途 |
 |------|------|------|
 | GET | `/v1/_me` | 身份、上游名列表、累计用量 |
+| POST | `/v1/_me/token` | 创建/轮换我的下游 token（一人一枚，有则轮换、无则创建；明文只回一次） |
 | GET | `/v1/_me/providers` | 自己的上游详情（密钥脱敏到尾 4 位，如 `****9999`） |
 | PUT | `/v1/_me/providers/{name}` | 新增或覆盖一个上游（只传要改的字段，密钥不必重传） |
 | DELETE | `/v1/_me/providers/{name}` | 删掉一个上游 |
@@ -434,7 +441,7 @@ log:
 ### 管理接口（用 `server.admin_token` 鉴权）
 
 凭证用 `llmproxy admin token` 取、`llmproxy admin rotate` 轮换（见下面 CLI 一节）。
-没配 `admin_token` 时整个 `/v1/_admin` 与 `/admin/` 一律 403。
+没配 `admin_token` 时整个 `/v1/_admin` 一律 403（`/spa/admin/` 页面能打开，但登录会失败）。
 
 | 方法 | 路径 | 用途 |
 |------|------|------|
@@ -442,12 +449,14 @@ log:
 | POST | `/v1/_admin/users` | 建用户，返回明文 token（只此一次） |
 | GET / PUT / DELETE | `/v1/_admin/users/{name}` | 用户详情 / **改设置** / 删用户 |
 | POST | `/v1/_admin/users/{name}/token` | 轮换 token |
+| PUT | `/v1/_admin/users/{name}/password` | 设置/重置用户的本地密码（8..72 字节，bcrypt 落库） |
 | POST | `/v1/_admin/users/{name}/enable\|disable` | 启用 / 停用 |
 | GET | `/v1/_admin/users/{name}/providers` | 该用户自己配的上游（脱敏） |
 | GET / PUT / DELETE | `/v1/_admin/users/{name}/models` | 该用户的模型映射（增删改查） |
 | GET | `/v1/_admin/users/{name}/usage?days=N` | 该用户的用量（含金额与缓存命中） |
 | POST | `/v1/_admin/users/{name}/test` | **快速测试**：按这个用户的路由发一条极小请求（body `{"model":"<下游名>"}`） |
 | GET / PUT | `/v1/_admin/config` · `/v1/_admin/config/providers` | 读配置（密钥不下发）/ 写回 providers 段 |
+| GET / PUT | `/v1/_admin/config/auth` | 读登录方式与 OAuth 客户端（密钥不下发）/ 写回 auth 段 |
 | POST | `/v1/_admin/config/validate` | 试算：校验但不落盘 |
 | GET | `/v1/_admin/providers` | 系统上游列表（含各自声明的模型） |
 | POST | `/v1/_admin/providers/{name}/discover` | 探测某个系统上游的模型列表（body 可内联 `base_url`/`api_key`/`proxy`） |
@@ -576,7 +585,7 @@ shadow。热加载只看配置文件 mtime，因此「内存里还是上一次�
 必然是 `unknown`，因为没有 PolicyContext，服务端不许替配置猜一级），后者是配置里声明的那一行。
 两者不等只说明「这一级已经写好、当前模式不用它」，不表示没配。
 
-管理台 `/admin/` 的「策略与路由」面板就是这一组接口的界面：核对表、模式/生效包/发布表单、
+旧版管理台 `/admin/` 的「策略与路由」面板就是这一组接口的界面（4.0 新管理台暂未迁移这块）：核对表、模式/生效包/发布表单、
 路由模拟、决策痕迹。界面**不复算权限**（只检查 JSON 语法与必填项），条件键、选择器形态、
 分级取值一律由服务端领域校验判 —— 前端算一套就会出现「界面说会过、线上拒了」的分叉。
 
@@ -614,8 +623,8 @@ X-Identity-Token: v1...
   得管理员显式改 consumption 并配模型白名单）；已停用账号一律拒绝；
 - subject 必须能当网关用户名（字母/数字/点/下划线/连字符）；不合法直接拒绝、
   不做改名兜底 —— 改出来的名字会与 token 的 subject 永久对不上，绑定永远失败；
-- 用户控制台 `/ui/` 的「校园网账号登录」是同一对端点的界面版：登录 → 创建/轮换
-  token（弹窗只显示一次）→ 进控制台。
+- 用户台 `/spa/user/` 的「校园网账号」tab 是同一端点的界面版；登录后的会话令牌直接
+  用于 `/v1/_me*`，下行 token 只在用户主动点「创建/轮换」时才动。
 
 安全口径：
 
@@ -629,6 +638,61 @@ X-Identity-Token: v1...
 - 会话 token 的 subject 仍必须等于网关认定用户名，静态 key 没有用户归属，永远绑不上；
 - SAML 仍是显式 stub（`ErrNotImplemented`），不会伪装成已接上。
 
+#### 登录方式（4.0）：四个 tab + 管理员可配
+
+登录页按 `GET /v1/_auth/methods` 渲染 tab（公开端点，不含任何秘密）：
+
+```json
+{"methods":[
+  {"id":"password","label":"账号密码","enabled":true},
+  {"id":"token","label":"Token 登录","enabled":true},
+  {"id":"oauth","label":"统一身份认证","enabled":false},
+  {"id":"ldap","label":"校园网账号","enabled":false}]}
+```
+
+| 方式 | 入口 | 凭据与说明 |
+|------|------|------------|
+| 账号密码 | `POST /v1/_auth/password/login` | 本地账号库，`users.password_hash` 存 bcrypt；管理员用 `PUT /v1/_admin/users/{name}/password` 设置（8..72 字节）；登录口与 LDAP 共用单 IP 每分钟 10 次限速 |
+| Token | — | 直接粘贴下游 token（`sk-…`），不经过登录端点 |
+| OAuth | `GET /v1/_auth/oauth/start` → 回调 `/v1/_auth/oauth/callback` → `POST /v1/_auth/oauth/exchange` | 授权码 + PKCE；state 同时绑一枚 SameSite=Lax 的 HttpOnly cookie；回调只带 60 秒一次性 code，会话令牌由 SPA 用 POST 取，不进 URL |
+| LDAP | `POST /v1/_identity/ldap/login` | 目录口令只出现一次，换短时会话令牌（见上一节） |
+
+登录成功后统一拿到**短时会话令牌**：
+
+- `/v1/_me*` 接受 `X-Identity-Token`（LDAP/OIDC 身份令牌或本地登录会话令牌）；
+- **模型调用仍只认下游 token**（`Authorization: Bearer sk-…`）—— 会话令牌不能调
+  `/v1/chat/completions`；
+- 会话寿命 `auth.session_ttl_ms`，默认 12 小时、上限 24 小时；
+- 本地账密 / OAuth 首登按 subject 自动开号（默认 byo）；LDAP 同理。
+
+配置与运维：
+
+```yaml
+auth:
+  session_ttl_ms: 43200000        # 12 小时
+  methods:                        # 缺省全开；依赖不齐时自动不可用
+    password: true
+    token: true
+    oauth: true
+    ldap: true
+  oauth:
+    provider_name: 统一身份认证
+    client_id: llmproxy
+    client_secret: ${OAUTH_CLIENT_SECRET}
+    auth_url: https://sso.example.edu/oauth2/authorize
+    token_url: https://sso.example.edu/oauth2/token
+    userinfo_url: https://sso.example.edu/oauth2/userinfo
+    scopes: [openid, profile]
+    redirect_url: https://llmproxy.example.edu/v1/_auth/oauth/callback  # 路径固定
+    subject_claim: sub
+    name_claim: name
+    auth_style: basic             # basic | post
+    spa_path: /spa/user/
+```
+
+管理台「配置 → 登录方式」就是这段的可视化编辑；对应接口 `GET/PUT /v1/_admin/config/auth`
+只替换 `auth:` 段，写前校验、自动备份，`client_secret` 不下发、留空保存表示沿用原值。
+
 #### 回放证据链（3.0）：把线上判定取出来，换个进程重跑一遍
 
 | 方法 | 路径 | 用途 |
@@ -638,7 +702,7 @@ X-Identity-Token: v1...
 | GET | `/v1/_admin/replay/export[?scope=kind:id]` | 导出记录文件本身（写出版本 schema v2，可读 v1+v2），**不加包装字段**；范围种类不限（user / organization / project / system） |
 | POST | `/v1/_admin/replay/clear` | 清空记录与计数（开关与过滤条件保持） |
 
-管理台 `/admin/` 的「回放证据链」面板是同一组端点的界面版（窗口计数、开关、导出、清空），
+旧版管理台 `/admin/` 的「回放证据链」面板是同一组端点的界面版（窗口计数、开关、导出、清空），
 导出走浏览器下载：拿到的就是 `replay.Encode` 那串原始字节，与 `replay collect` 的产物
 逐字节相同，因此界面上存下来的那份同样能直接喂给下面那条 `replay run`。
 
@@ -780,39 +844,37 @@ llmproxy replay run -records /tmp/rec.json -now 2026-10-03T12:00:00Z
 
 ## 网页控制台
 
-网关自带**两个独立界面**，各自登录、互不感知：
+网关自带**两个独立 SPA**，各自登录、互不感知：
 
 | 入口 | 给谁 | 用什么登录 | 能做什么 |
 |------|------|-----------|---------|
-| `/ui/` | 普通用户 | 用户 token（`llmproxy user add` 建的） | 管自己的上游、看可用模型与用量、发一条请求试链路 |
-| `/admin/` | 网关主人 | `server.admin_token` | 编辑系统上游（config.yaml）、管用户与配额、配模型范围 |
+| `/spa/user/` | 普通用户 | 账号密码 / 下游 token / OAuth / LDAP | 管自己的上游与模型、看用量、创建/轮换 token、试一条请求、知识检索 |
+| `/spa/admin/` | 网关主人 | `server.admin_token` | 概览统计、用户与配额、系统上游、登录方式、操作审计 |
 
-刻意**不做「同一个页面按 token 猜身份」**：那会让人分不清该拿哪个凭证，也把两类权限混在一个入口里。
-两个界面各自只放行自己的静态文件（`/ui/` 取不到 `admin.js`，反之亦然），共用 `common.js` 与 `app.css`。
+迁移期（4.0）旧页面仍保留在 `/ui/`、`/admin/`；P4 会把这两个路径切到 SPA 并删除旧页。
 
-token 只存这个标签页的会话里，关掉标签就失效，不进 URL、Cookie 或 localStorage；
-两个界面用**不同的会话键**，同一个标签页里互不覆盖。
+刻意**不做「同一个页面按 token 猜身份」**：用户台与管理台是两个应用、两套会话键，
+同一个标签页里互不覆盖。凭据只存 sessionStorage，关标签即失效，不进 URL / Cookie / localStorage。
 
-**用户台 `/ui/`** 上能做四件事：
+**静态资源与机构定制**：两个 SPA 的构建产物默认 `go:embed` 进二进制；运行时优先读取
+`<RuntimeDir>/ui/user/`、`<RuntimeDir>/ui/admin/` 下的同名文件。机构只替换静态包就能改
+user 端界面，不需要重新编译网关（`cd web && npm run build` 的产物本身就是一份可直接投放的静态包）。
 
-| 区块 | 作用 |
-|------|------|
-| 概览 | 身份、上游数量、累计请求与 token |
-| 我的上游 | 增删改自己的上游；密钥加密落库，页面只显示尾 4 位；编辑时密钥留空表示不修改 |
-| 我的模型 | 按客户端请求的 `model` 名字汇总，看它挂在哪些上游上；挂两家以上就是负载均衡 + 失败切换 |
-| 我的用量 | 按 7/30/90 天看逐日逐模型的消耗与平均耗时 |
-| 试一下 | 用你的 token 从网关发一条请求，直接看到是**哪个上游接走的**、耗时多少 |
+**用户台**：概览 / 我的 API Token / 我的上游 / 我的模型 / 我的用量 / 试一下 / 知识检索。
 
-**管理台 `/admin/`** 是这几块：系统上游（编辑 `providers` 段）、策略与路由（核对表 / 发布 /
-回滚 / 模拟 / 痕迹）、处理器与知识库（两段声明的整段读写）、**回放证据链**（窗口计数 +
-开关 + 导出 + 清空）、用户（建号 / 配额 / 模型范围）、操作审计（按范围查）。
+- 登录后直接进入控制台（会话令牌读 `/v1/_me*`）；「试一下」需要下游 token，
+  会话登录的用户粘贴一次即可（只存本标签页）；
+- token 页一人一枚：点一次创建，再点轮换，旧 token 立即失效，明文只显示一次。
 
-> ⚠️ **价目行没有界面**，只能用 API：`PUT /v1/_admin/prices/provider` 与
-> `PUT /v1/_admin/prices/user`（见下面「价目从哪来」一节的 curl 示例）。
-> 管理台只能**看**用量与金额，不能改单价。同样地，`server` / `routing` / `log` /
-> `database` 段在管理台里是只读展示（`GET /v1/_admin/config` 会回 host、port、
-> api_key 数量、admin_token 是否已设、routing 与 warnings），**写回的只有 `providers` 段**。
-> 改那些要编辑 config.yaml —— 但 2 秒内自动热加载，不用重启。
+**管理台**：概览（7/30/90 天统计、按模型/按范围明细）、用户（建号 / 轮换 token /
+设置本地密码 / 配额与限流 / 启停 / 删除）、配置（系统上游整段编辑、**登录方式**）、
+操作审计。策略观测/发布、处理器、知识源、回放证据链、价格这几块仍在旧版 `/admin/`
+（新管理台「高级面板」里有入口）。
+
+> ⚠️ **价目行仍没有界面**，只能用 API：`PUT /v1/_admin/prices/provider` 与
+> `PUT /v1/_admin/prices/user`（见「价目从哪来」一节的 curl 示例）。
+> `server` / `routing` / `log` / `database` 段在管理台里是只读展示；
+> 可写回的只有 `providers` 与 `auth` 两段，其余改 config.yaml，2 秒内自动热加载。
 
 ### 用户台：模型怎么配（同步 + 勾选，不写 JSON）
 
@@ -1122,7 +1184,7 @@ llmproxy user providers|usage <名字>   该用户的上游 / 消耗
 llmproxy user mode|quota|limits <名字> 消费模式的模式 / 配额 / 限流
 llmproxy user models|add-model <名字>  消费模式的模型白名单（也是模型映射）
 llmproxy user add-provider <用户> <上游名>   代用户配上游
-llmproxy admin token         打印管理凭证（管理台 /admin/ 用）
+llmproxy admin token         打印管理凭证（管理台 /spa/admin/ 用）
 llmproxy admin rotate        轮换管理凭证并写回 config.yaml
 llmproxy replay status       回放记录采集窗口的配置与计数
 llmproxy replay on|off       开 / 关线上判定记录采集（缺省关）
@@ -1224,10 +1286,16 @@ llmproxy/
     logx/              日志（stdout + 轮转文件）
   config/
     config.example.yaml
-  ui/                网页控制台的源文件，编译时 go:embed 进二进制
-                     admin.html / admin.js（管理台）、user.html / user.js（用户台）、
-                     common.js / app.css（两边共用）、embed.go（嵌入声明）
-  scripts/           交叉编译脚本（build.sh）与端到端验证脚本（e2e-multiuser.sh）
+  ui/
+    spa/user、spa/admin  两个 SPA 的构建产物（不入库，npm run build 生成，go:embed 编入）
+    user.html / user.js / admin.html / admin.js   旧版原生页（迁移期保留）
+    common.js / app.css 旧版共用资源
+    embed.go            嵌入声明
+  web/                  前端工程（Vue 3 + Vite + Element Plus）
+    user/               用户台 SPA
+    admin/              管理台 SPA
+    shared/             api 客户端 / 会话 / F 型布局 / 主题 / 格式化
+  scripts/           交叉编译脚本（build.sh，含前端构建）与端到端验证脚本（e2e-multiuser.sh）
   data/                运行时数据（.gitkeep）
   logs/                日志目录（.gitkeep）
   go.mod / go.sum
@@ -1248,7 +1316,14 @@ go vet ./...
 # 多用户全链路端到端验证（三个假上游，不花上游额度、不碰正在运行的实例）
 bash scripts/e2e-multiuser.sh
 
-# 改网页控制台：源文件在 ui/，改完重新编译即可（静态资源是 go:embed 进二进制的）
+# 改前端：源码在 web/，先构建再编译（产物写进 ui/spa/ 后 go:embed）
+cd web && npm ci && npm run build
+cd .. && go build -o llmproxy ./cmd/llmproxy
+
+# 前端热更新开发（Vite 代理到本机网关；另开一个窗口起网关）
+cd web && npm run dev:user     # http://127.0.0.1:5173
+cd web && npm run dev:admin    # http://127.0.0.1:5174
+
 # 想在浏览器里改完即见，用 go run 起一个临时实例：
 #   LLMPROXY_HOME=/tmp/llmproxy-dev go run ./cmd/llmproxy start
 

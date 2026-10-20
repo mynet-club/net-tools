@@ -4,6 +4,39 @@
 
 ---
 
+## v3.4.0 — 2026-10-20
+
+前端换成两个 Vue SPA，登录补齐四路。自用实例（192.168.0.4）已于同日升级到该版本。
+
+### 前端：两个 SPA
+
+- 用户台 `/spa/user/`、管理台 `/spa/admin/`：Vue 3 + Vite + Element Plus，
+  F 型结构（左栏 + 右侧 title/nav + 内容区）
+- 构建产物 `ui/spa/{user,admin}` 由 `go:embed` 编进二进制；运行时优先读
+  `<RuntimeDir>/ui/{user,admin}`，机构可只替换静态包定制 user 端
+- `scripts/build.sh` 先构建前端再打包（需要 Node.js ≥ 18）
+- 旧 `/ui/`、`/admin/` 迁移期保留；策略/处理器/知识源/回放/价格仍在旧管理台
+
+### 登录四路
+
+- **本地账号密码**：`users.password_hash`（bcrypt），`POST /v1/_auth/password/login`；
+  管理员用 `PUT /v1/_admin/users/{name}/password` 设置
+- **OAuth**：授权码 + PKCE，state 绑 HttpOnly cookie；回调换 60 秒一次性 code，
+  再由 SPA 用 `POST /v1/_auth/oauth/exchange` 换会话令牌（令牌不进 URL）
+- **LDAP/AD**：登录换短时会话令牌；首登按 subject 自动开号（默认 byo）
+- **Token**：保留下游 token 直接登录
+- 登录统一发放短时会话令牌，`/v1/_me*` 接受 `X-Identity-Token`；
+  **模型调用仍只认下游 token**（`Authorization: Bearer sk-…`）
+- 登录方式清单 `GET /v1/_auth/methods`；`auth` 配置段（开关 / 会话时长 / OAuth 客户端），
+  管理端 `GET/PUT /v1/_admin/config/auth` 只替换该段、写前校验、自动备份
+
+### 自助接口
+
+- `POST /v1/_identity/me/token`：登录后创建/轮换自己的下游 token（有则轮换、无则创建）
+- 用户台「我的 API Token」页是它的界面版；会话登录即可操作，不必先有 token
+
+---
+
 ## v2.5.0 — 2026-09-30
 
 v2.3 计费闭环 + v2.4 开发者体验 + v2.5 规模生态，一次收束。
