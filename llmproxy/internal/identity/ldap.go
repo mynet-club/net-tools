@@ -46,6 +46,10 @@ type LDAPTrust struct {
 	// UserAttr 是稳定用户标识属性名（OpenLDAP 常用 uid，AD 用 sAMAccountName；
 	// objectGUID 也可用，本实现会把它转成十六进制）。
 	UserAttr string
+	// AllowNumericSubject 放开「纯数字学号/工号」形态的 subject。
+	// 默认关闭：数字标识可能随人事系统重建而复用。目录确实以学号/工号作
+	// 长期稳定 ID 时（国内高校常见）显式打开，此时审计只记摘要。
+	AllowNumericSubject bool
 	// DisplayNameAttr 是显示名属性（缺省 displayName，回落 cn）。
 	DisplayNameAttr string
 	// GroupAttr 是组成员属性名（AD 通常直接用 memberOf）。
@@ -373,11 +377,12 @@ func (p *LDAPDirectoryProvider) recordFailure(subject string, reason ReasonCode,
 // 目录里实际的那几个，大小写统一成小写（LDAP 属性名本身不区分大小写）。
 func ldapMapperConfig(trust LDAPTrust) MapperConfig {
 	return MapperConfig{
-		SubjectClaims:     []string{strings.ToLower(strings.TrimSpace(trust.UserAttr))},
-		DisplayNameClaims: uniqueLower(trust.DisplayNameAttr, "displayname", "cn"),
-		RoleClaims:        uniqueLower(trust.RoleAttr, "edupersonScopedAffiliation"),
-		GroupClaims:       uniqueLower(trust.GroupAttr, "memberof"),
-		ProjectClaims:     []string{"projects", "project", "course", "lab"},
+		SubjectClaims:       []string{strings.ToLower(strings.TrimSpace(trust.UserAttr))},
+		AllowNumericSubject: trust.AllowNumericSubject,
+		DisplayNameClaims:   uniqueLower(trust.DisplayNameAttr, "displayname", "cn"),
+		RoleClaims:          uniqueLower(trust.RoleAttr, "edupersonScopedAffiliation"),
+		GroupClaims:         uniqueLower(trust.GroupAttr, "memberof"),
+		ProjectClaims:       []string{"projects", "project", "course", "lab"},
 		ScopeRules: []ScopeRule{
 			{Claim: "organization", Kind: policy.ScopeOrganization, Primary: true},
 			{Claim: "department", Kind: policy.ScopeOrganization},

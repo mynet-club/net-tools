@@ -147,6 +147,50 @@ func TestLDAPAuthenticateMapsDirectoryEntry(t *testing.T) {
 	}
 }
 
+func TestLDAPNumericSubjectRequiresExplicitOptIn(t *testing.T) {
+	entry := LDAPEntry{
+		DN: "uid=20133399,ou=people,dc=example,dc=edu",
+		Attrs: map[string][]string{
+			"uid": {"20133399"},
+			"cn":  {"Numeric User"},
+		},
+	}
+	dir := &fakeLDAPDirectory{
+		byName:    map[string]LDAPEntry{"20133399": entry},
+		byDN:      map[string]LDAPEntry{entry.DN: entry},
+		passwords: map[string]string{entry.DN: "correct-horse"},
+	}
+	build := func(allow bool) *LDAPDirectoryProvider {
+		t.Helper()
+		p, err := NewLDAPDirectoryProvider(LDAPTrust{
+			Source:              "campus-ldap",
+			URL:                 "ldaps://ldap.example.edu:636",
+			BindDN:              "cn=svc,ou=services,dc=example,dc=edu",
+			BindPassword:        "svc-secret",
+			BaseDN:              "ou=people,dc=example,dc=edu",
+			UserAttr:            "uid",
+			AllowNumericSubject: allow,
+			IdentityTTL:         15 * time.Minute,
+			AllowedBindTargets:  []string{"ldap.example.edu:636"},
+			Timeout:             2 * time.Second,
+		}, dir, WithClock(func() time.Time { return ldapTestNow }))
+		if err != nil {
+			t.Fatalf("构造 LDAP 来源失败: %v", err)
+		}
+		return p
+	}
+	if _, err := build(false).Authenticate(context.Background(), "20133399", "correct-horse", "req-num"); err == nil {
+		t.Fatal("默认必须拒绝纯数字学号形态的 subject")
+	}
+	prin, err := build(true).Authenticate(context.Background(), "20133399", "correct-horse", "req-num")
+	if err != nil {
+		t.Fatalf("显式放开后应认证成功: %v", err)
+	}
+	if prin.Identity.Subject != "20133399" {
+		t.Errorf("subject = %q", prin.Identity.Subject)
+	}
+}
+
 func TestLDAPAuthenticateRejectsWrongPassword(t *testing.T) {
 	p := newTestLDAPProvider(t, aliceDirectory())
 	_, err := p.Authenticate(context.Background(), "alice", "wrong", "req-2")

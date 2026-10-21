@@ -10,6 +10,11 @@ const routes = [
   { path: '/overview', name: 'overview', component: () => import('./views/Overview.vue'), meta: { title: '概览' } },
   { path: '/users', name: 'users', component: () => import('./views/Users.vue'), meta: { title: '用户' } },
   { path: '/config', name: 'config', component: () => import('./views/Config.vue'), meta: { title: '配置' } },
+  { path: '/policy-view', name: 'policy-view', component: () => import('./views/PolicyView.vue'), meta: { title: '策略观测' } },
+  { path: '/policy-write', name: 'policy-write', component: () => import('./views/PolicyWrite.vue'), meta: { title: '策略发布' } },
+  { path: '/processors', name: 'processors', component: () => import('./views/Processors.vue'), meta: { title: '处理器' } },
+  { path: '/knowledge', name: 'knowledge', component: () => import('./views/Knowledge.vue'), meta: { title: '知识源' } },
+  { path: '/replay', name: 'replay', component: () => import('./views/Replay.vue'), meta: { title: '回放证据链' } },
   { path: '/audit', name: 'audit', component: () => import('./views/Audit.vue'), meta: { title: '操作审计' } },
   { path: '/legacy', name: 'legacy', component: () => import('./views/Legacy.vue'), meta: { title: '高级面板' } },
   { path: '/:pathMatch(.*)*', redirect: '/overview' },
@@ -22,7 +27,8 @@ const router = createRouter({
 
 router.beforeEach((to) => {
   const s = session.load()
-  if (s.base) configure({ base: s.base })
+  // 整页刷新后也要把凭证一起恢复：只恢复 base 会让所有管理接口报「缺少管理凭证」。
+  if (s.base) configure({ base: s.base, bearer: s.bearer })
   const authed = Boolean(s.bearer)
   if (!to.meta.public && !authed) return { name: 'login' }
   if (to.name === 'login' && authed) return { name: 'overview' }

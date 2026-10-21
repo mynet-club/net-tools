@@ -7,11 +7,15 @@ defineProps({ title: { type: String, default: '' } })
 
 const router = useRouter()
 const navItems = [
-  { to: '/overview', label: '概览' },
-  { to: '/users', label: '用户' },
-  { to: '/config', label: '配置' },
-  { to: '/audit', label: '操作审计' },
-  { to: '/legacy', label: '高级面板' },
+  { to: '/overview', label: '概览', group: '看板' },
+  { to: '/config', label: '配置', group: '配置' },
+  { to: '/policy-view', label: '策略观测', group: '高级配置' },
+  { to: '/policy-write', label: '策略发布', group: '高级配置' },
+  { to: '/processors', label: '处理器', group: '高级配置' },
+  { to: '/knowledge', label: '知识源', group: '高级配置' },
+  { to: '/replay', label: '回放证据链', group: '高级配置' },
+  { to: '/users', label: '用户', group: '运营' },
+  { to: '/audit', label: '操作审计', group: '运营' },
 ]
 
 function logout() {

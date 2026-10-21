@@ -85,6 +85,15 @@ code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monosp
 .f-nav a:hover { background: rgba(255, 255, 255, 0.06); color: #fff; }
 .f-nav a.router-link-active { background: var(--lp-brand); color: #fff; }
 
+.f-nav-group {
+  margin: 12px 12px 3px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: #7c8aa5;
+}
+
+.f-nav-group:first-child { margin-top: 2px; }
+
 .f-side-foot {
   margin-top: auto;
   padding: 14px 20px;

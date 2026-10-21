@@ -9,6 +9,8 @@ macOS / Linux / FreeBSD / Alpine / OpenWrt 网络工具集合，每个子目录�
 | [mihomo](./mihomo/) | Mihomo (Clash Meta) 代理管理 CLI 工具 | Node.js |
 | [smartxray](./smartxray/) | Xray 服务端管理（SQLite 用户库 + 动态配置 + 防火墙 + Web UI） | Node.js |
 | [subserver](./subserver/) | 订阅分发服务（节点集中管理 + 按用户动态生成 mihomo 订阅 YAML） | Node.js |
+| [llmproxy](./llmproxy/) | 自用 LLM 转发网关（权重路由 + 可用性熔断 + YAML 热加载 + 按供应商代理 + SQLite 记账） | Go |
+| [litellm-proxy](./litellm-proxy/) | LiteLLM LLM API 转发网关（按模型名路由到多上游 + config.yaml 可视化管理） | Docker / Python |
 | [toolstpl](./toolstpl/) | 跨平台网络工具脚手架模板（平台适配器模式 + 安装框架） | Node.js |
 
 ## 根目录结构

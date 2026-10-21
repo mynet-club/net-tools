@@ -177,6 +177,7 @@ log:
 #     bind_password: ${LDAP_BIND_PASSWORD}
 #     base_dn: ou=people,dc=example,dc=edu
 #     user_attr: uid                   # AD 可用 sAMAccountName / objectGUID
+#     allow_numeric_subject: false     # uid 是纯数字学号/工号时置 true（默认拒绝）
 #     display_name_attr: displayName
 #     group_attr: memberOf
 #     group_base_dn: ""                # 非空时按 member=<用户 DN> 反查组

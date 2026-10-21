@@ -53,6 +53,9 @@ type LDAPIdentityConfig struct {
 	BaseDN string `yaml:"base_dn"`
 	// UserAttr 是稳定用户标识属性（uid / sAMAccountName / objectGUID）。
 	UserAttr string `yaml:"user_attr"`
+	// AllowNumericSubject 允许 user_attr 取纯数字学号/工号作 subject。
+	// 默认 false：数字标识有被复用的风险；确认目录把它当长期稳定 ID 时再打开。
+	AllowNumericSubject bool `yaml:"allow_numeric_subject"`
 	// DisplayNameAttr 是显示名属性（缺省 displayName，回落 cn）。
 	DisplayNameAttr string `yaml:"display_name_attr"`
 	// GroupAttr 是用户条目上的组属性（AD 常用 memberOf）。

@@ -17,9 +17,12 @@ defineProps({
         <small v-if="subtitle">{{ subtitle }}</small>
       </div>
       <nav class="f-nav">
-        <router-link v-for="item in navItems" :key="item.to" :to="item.to">
-          {{ item.label }}
-        </router-link>
+        <template v-for="(item, i) in navItems" :key="item.to">
+          <span v-if="item.group && (i === 0 || navItems[i - 1].group !== item.group)" class="f-nav-group">
+            {{ item.group }}
+          </span>
+          <router-link :to="item.to">{{ item.label }}</router-link>
+        </template>
       </nav>
       <div class="f-side-foot">
         <slot name="foot" />

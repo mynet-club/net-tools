@@ -6,8 +6,8 @@ import AdminShell from '../components/AdminShell.vue'
   <AdminShell title="高级面板">
     <h2 class="f-page-title">高级面板</h2>
     <p class="f-page-sub">
-      策略观测与发布、处理器声明、知识源、回放证据链、价格这几块交互较重，目前仍在旧版管理台里，
-      本轮迁移先把概览、用户、配置、审计搬到新界面。
+      策略观测、策略发布、处理器、知识源、回放证据链已迁移到左侧「高级配置」。
+      这里保留旧版入口作为过渡，方便对照旧交互。
     </p>
 
     <div class="f-card" style="max-width: 720px">
@@ -19,7 +19,7 @@ import AdminShell from '../components/AdminShell.vue'
         <el-button type="primary">打开旧版管理台</el-button>
       </a>
       <p class="f-muted" style="font-size: 12px; margin-bottom: 0">
-        包含：策略观测 / 策略发布 / 处理器 / 知识源 / 回放证据链 / 价格。
+        旧版仍包含策略观测 / 策略发布 / 处理器 / 知识源 / 回放证据链。
       </p>
     </div>
   </AdminShell>

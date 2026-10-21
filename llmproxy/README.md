@@ -635,6 +635,8 @@ X-Identity-Token: v1...
 - 目录属性映射：`user_attr` → subject（`objectGUID` 转十六进制），
   `display_name_attr` → 显示名，`group_attr` / `group_base_dn` → groups（组 DN 只保留 CN），
   `role_attr` → roles，`department` / `college` / `organization` → organization 范围；
+- subject 默认拒绝「纯数字学号/工号」形态（有复用风险）；目录确实以学号/工号作
+  长期稳定 ID 时置 `identity.ldap.allow_numeric_subject: true`（默认 false）；
 - 会话 token 的 subject 仍必须等于网关认定用户名，静态 key 没有用户归属，永远绑不上；
 - SAML 仍是显式 stub（`ErrNotImplemented`），不会伪装成已接上。
 
@@ -849,9 +851,10 @@ llmproxy replay run -records /tmp/rec.json -now 2026-10-03T12:00:00Z
 | 入口 | 给谁 | 用什么登录 | 能做什么 |
 |------|------|-----------|---------|
 | `/ui/` | 普通用户 | 账号密码 / 下游 token / OAuth / LDAP | 管自己的上游与模型、看用量、创建/轮换 token、试一条请求、知识检索 |
-| `/admin/` | 网关主人 | `server.admin_token` | 概览统计、用户与配额、系统上游、登录方式、操作审计 |
+| `/admin/` | 网关主人 | `server.admin_token` | 概览统计、用户与配额、系统上游、登录方式、策略观测/发布、处理器、知识源、回放证据链、操作审计 |
 
-旧版管理台只保留在 `/admin/legacy/`：策略观测/发布、处理器、知识源、回放证据链、价格这几块还没迁到 SPA，其余页面均已在新管理台。旧的 `/spa/{user,admin}/` 会 301 到正式路径。
+旧版管理台保留在 `/admin/legacy/` 作为过渡（同一套接口、旧交互）。旧的 `/spa/{user,admin}/`
+会 301 到正式路径。
 
 刻意**不做「同一个页面按 token 猜身份」**：用户台与管理台是两个应用、两套会话键，
 同一个标签页里互不覆盖。凭据只存 sessionStorage，关标签即失效，不进 URL / Cookie / localStorage。
@@ -868,8 +871,7 @@ user 端界面，不需要重新编译网关（`cd web && npm run build` 的产�
 
 **管理台**：概览（7/30/90 天统计、按模型/按范围明细）、用户（建号 / 轮换 token /
 设置本地密码 / 配额与限流 / 启停 / 删除）、配置（系统上游整段编辑、**登录方式**）、
-操作审计。策略观测/发布、处理器、知识源、回放证据链、价格这几块仍在旧版 `/admin/legacy/`
-（新管理台「高级面板」里有入口）。
+高级配置（策略观测与模拟、策略发布、处理器、知识源、回放证据链）、操作审计。
 
 > ⚠️ **价目行仍没有界面**，只能用 API：`PUT /v1/_admin/prices/provider` 与
 > `PUT /v1/_admin/prices/user`（见「价目从哪来」一节的 curl 示例）。
