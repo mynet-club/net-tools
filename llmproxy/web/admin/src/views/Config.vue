@@ -1,6 +1,6 @@
 <script setup>
 import { onMounted, reactive, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '@shared/api'
 import AdminShell from '../components/AdminShell.vue'
 
@@ -8,6 +8,7 @@ const tab = ref('providers')
 const configPath = ref('')
 const providers = ref([])
 const busy = ref(false)
+const saving = ref(false)
 
 const dialog = ref(false)
 const editing = ref(false)
@@ -171,11 +172,17 @@ function buildModels() {
   return { map, catch_all: !!form.catchAll }
 }
 
-function saveDialog() {
+async function saveDialog() {
+  if (saving.value || syncing.value) return
   err.value = ''
   const name = form.name.trim()
   if (!name || !form.base_url.trim()) {
     err.value = '名称与地址必填'
+    return
+  }
+  const idx = providers.value.findIndex((p) => p.name === name)
+  if (!editing.value && idx >= 0) {
+    err.value = '供应商名称已存在，请编辑已有供应商'
     return
   }
   const models = buildModels()
@@ -193,7 +200,7 @@ function saveDialog() {
     base_url: form.base_url.trim(),
     api_key: form.api_key,
     has_key: form.has_key || Boolean(form.api_key),
-    api_key_hint: form.api_key_hint,
+    api_key_hint: form.api_key ? '' : form.api_key_hint,
     weight: Number(form.weight) || 1,
     proxy: (form.proxy || 'direct').trim(),
     timeout_ms: Number(form.timeout_ms) || 120000,
@@ -202,25 +209,31 @@ function saveDialog() {
     max_concurrent: Number(form.max_concurrent) || 0,
     models,
   }
-  const idx = providers.value.findIndex((p) => p.name === name)
-  if (editing.value && idx >= 0) providers.value.splice(idx, 1, item)
-  else providers.value.push(item)
-  dialog.value = false
+  const next = [...providers.value]
+  if (editing.value) next.splice(idx, 1, item)
+  else next.push(item)
+  saving.value = true
+  try {
+    await saveProviders(next)
+    form.api_key = ''
+    dialog.value = false
+  } catch (e) {
+    err.value = e.message
+  } finally {
+    saving.value = false
+  }
 }
 
-async function saveAll() {
-  const body = { providers: providers.value.map(toBody) }
-  try {
-    const data = await api('/v1/_admin/config/providers', { method: 'PUT', body })
-    ElMessage.success(
-      (data.applied ? '已保存并生效' : '已写入（热加载稍后生效）') +
-        (data.backup ? ' · 备份 ' + data.backup : ''),
-    )
-    if (data.warning) ElMessage.warning(data.warning)
-    await loadConfig()
-  } catch (e) {
-    ElMessage.error(e.message)
-  }
+async function saveProviders(next) {
+  const body = { providers: next.map(toBody) }
+  const data = await api('/v1/_admin/config/providers', { method: 'PUT', body })
+  providers.value = next.map((p) => ({ ...p, api_key: '' }))
+  ElMessage.success(
+    (data.applied ? '已保存并生效' : '已写入（热加载稍后生效）') +
+      (data.backup ? ' · 备份 ' + data.backup : ''),
+  )
+  if (data.warning) ElMessage.warning(data.warning)
+  await loadConfig()
 }
 
 async function validateAll() {
@@ -237,8 +250,25 @@ async function validateAll() {
   }
 }
 
-function removeProvider(i) {
-  providers.value.splice(i, 1)
+async function removeProvider(i) {
+  if (saving.value) return
+  if (providers.value.length === 1) {
+    ElMessage.warning('至少保留一个供应商')
+    return
+  }
+  saving.value = true
+  try {
+    await ElMessageBox.confirm(`确定移除供应商「${providers.value[i].name}」？`, '移除供应商', {
+      type: 'warning',
+      confirmButtonText: '移除',
+      cancelButtonText: '取消',
+    })
+    await saveProviders(providers.value.filter((_, index) => index !== i))
+  } catch (e) {
+    if (e !== 'cancel' && e !== 'close') ElMessage.error(e.message)
+  } finally {
+    saving.value = false
+  }
 }
 
 async function loadAuth() {
@@ -303,11 +333,10 @@ onMounted(async () => {
     <el-tabs v-model="tab">
       <el-tab-pane label="系统上游" name="providers">
         <div style="display: flex; gap: 10px; margin-bottom: 12px">
-          <el-button type="primary" @click="openNew">添加供应商</el-button>
-          <el-button @click="validateAll">校验</el-button>
-          <el-button @click="saveAll">保存</el-button>
+          <el-button type="primary" :disabled="busy || saving" @click="openNew">添加供应商</el-button>
+          <el-button :disabled="busy || saving" @click="validateAll">校验</el-button>
           <span class="f-muted" style="align-self: center; font-size: 12px">
-            密钥留空 = 沿用原值；保存前自动备份
+            新增、编辑和移除后立即保存；密钥留空 = 沿用原值；保存前自动备份
           </span>
         </div>
 
@@ -331,14 +360,15 @@ onMounted(async () => {
           </el-table-column>
           <el-table-column label="操作" width="130" fixed="right">
             <template #default="{ row, $index }">
-              <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
-              <el-button link type="danger" @click="removeProvider($index)">移除</el-button>
+              <el-button link type="primary" :disabled="busy || saving" @click="openEdit(row)">编辑</el-button>
+              <el-button link type="danger" :disabled="busy || saving" @click="removeProvider($index)">移除</el-button>
             </template>
           </el-table-column>
         </el-table>
 
-        <el-dialog v-model="dialog" :title="editing ? '编辑供应商' : '新增供应商'" width="760px" destroy-on-close>
-          <el-form label-width="96px">
+        <el-dialog v-model="dialog" :title="editing ? '编辑供应商' : '新增供应商'" width="760px" destroy-on-close
+          :close-on-click-modal="false" :close-on-press-escape="!saving" :show-close="!saving">
+          <el-form label-width="96px" :disabled="saving" @submit.prevent="saveDialog">
             <el-form-item label="名称"><el-input v-model="form.name" :disabled="editing" /></el-form-item>
             <el-form-item label="地址"><el-input v-model="form.base_url" placeholder="https://api.example.com/v1" /></el-form-item>
             <el-form-item label="密钥">
@@ -399,8 +429,8 @@ onMounted(async () => {
             <p v-if="err" style="color: #dc2626; margin: 0">{{ err }}</p>
           </el-form>
           <template #footer>
-            <el-button @click="dialog = false">取消</el-button>
-            <el-button type="primary" @click="saveDialog">确定</el-button>
+            <el-button :disabled="saving" @click="dialog = false">取消</el-button>
+            <el-button type="primary" :loading="saving" :disabled="syncing" @click="saveDialog">保存</el-button>
           </template>
         </el-dialog>
       </el-tab-pane>
