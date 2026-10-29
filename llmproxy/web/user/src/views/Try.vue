@@ -8,7 +8,7 @@ import AppShell from '../components/AppShell.vue'
 
 const tokenInput = ref('')
 const hasBearer = ref(Boolean(session.load().bearer))
-const model = ref('deepseek-chat')
+const model = ref('deepseek-flash')
 const prompt = ref('用一句话介绍你自己。')
 const answer = ref('')
 const meta = ref('')
@@ -39,7 +39,7 @@ async function send() {
       method: 'POST',
       headers: { Accept: 'application/json' },
       body: {
-        model: model.value.trim() || 'deepseek-chat',
+        model: model.value.trim() || 'deepseek-flash',
         messages: [{ role: 'user', content: prompt.value }],
       },
     })
@@ -79,7 +79,7 @@ onMounted(() => {
     <div class="f-card" style="max-width: 820px">
       <el-form label-width="70px">
         <el-form-item label="模型">
-          <el-input v-model="model" placeholder="deepseek-chat" />
+          <el-input v-model="model" placeholder="deepseek-flash" />
         </el-form-item>
         <el-form-item label="输入">
           <el-input v-model="prompt" type="textarea" :rows="4" />

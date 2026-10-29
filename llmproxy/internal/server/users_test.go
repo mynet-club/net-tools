@@ -638,7 +638,7 @@ func TestSameDownstreamNameDifferentUpstreamNames(t *testing.T) {
 
 	token := h.addUser(t, "arthur")
 	h.addProvider(t, "arthur", "plan-a", upA.baseURL+"/v1", "sk-a",
-		`{"my-df": "deepseek-chat"}`)
+		`{"my-df": "deepseek-flash"}`)
 	h.addProvider(t, "arthur", "plan-b", upB.baseURL+"/v1", "sk-b",
 		`{"my-df": "ds-v3-flash"}`)
 

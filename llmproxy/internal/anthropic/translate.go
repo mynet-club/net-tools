@@ -15,7 +15,7 @@ import (
 //
 // thinking（extended thinking）翻成 reasoning_effort：预算按三档映射
 // （<8192 low、<24576 medium、其余 high；不带预算按 medium）。上游认不认这个
-// 字段随它 —— 不认的（如 deepseek-chat）忽略即可，deepseek-reasoner 这类
+// 字段随它 —— 不认的（如 deepseek-flash）忽略即可，deepseek-reasoner 这类
 // 「换了模型才思考」的上游由用户自己的模型映射决定。响应侧的推理正文由
 // FromChat / StreamTranslator 翻回 thinking 块。
 //

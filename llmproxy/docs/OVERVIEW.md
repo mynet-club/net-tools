@@ -139,7 +139,7 @@ providers:
 curl http://127.0.0.1:8787/v1/chat/completions \
   -H "Authorization: Bearer sk-local-change-me" \
   -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"你好"}]}'
+  -d '{"model":"deepseek-flash","messages":[{"role":"user","content":"你好"}]}'
 ```
 
 想确认它活着、以及现在能用哪些模型，直接打 base URL 就行（`GET /v1` 与 `/v1/models`
@@ -147,7 +147,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 ```bash
 curl http://127.0.0.1:8787/v1 -H "Authorization: Bearer sk-local-change-me"
-# {"object":"list","data":[{"id":"deepseek-chat","object":"model","owned_by":"llmproxy"}]}
+# {"object":"list","data":[{"id":"deepseek-flash","object":"model","owned_by":"llmproxy"}]}
 ```
 
 响应头里会告诉你**是哪家上游接走的**、以及粘性决策：
@@ -232,7 +232,7 @@ graph TB
 ```
 
 为什么要三层？因为**同一个模型在不同供应商那里叫不同名字**。你想让客户端统一发
-`deepseek`，但官方那边叫 `deepseek-chat`，某个聚合商那边叫 `gp-5.6-so`。
+`deepseek`，但官方那边叫 `deepseek-flash`，某个聚合商那边叫 `gp-5.6-so`。
 三层映射让这件事变成配置，而不是让客户端去记每家的名字。
 
 生产上的真实例子：客户端发 `gpt-5-sol` → 供应商侧仍是 `gpt-5-sol` → 聚合商那边

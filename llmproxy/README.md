@@ -1010,7 +1010,7 @@ user 端界面，不需要重新编译网关（`cd web && npm run build` 的产�
 ```yaml
 providers:
   - name: deepseek-official
-    models: { deepseek: deepseek-chat }     # 第 2→3 层：deepseek 在这家叫 deepseek-chat
+    models: { deepseek: deepseek-flash }    # 第 2→3 层：deepseek 在这家叫 deepseek-flash
   - name: neolink
     models: { deepseek: gp-5.6-so }         # 同一个第 2 层名字，在这家叫 gp-5.6-so
 ```
@@ -1259,7 +1259,7 @@ llmproxy price list -scope default -model deepseek-flash
 按供应商/模型消耗:
 PROVIDER             MODEL                      REQ       OK     FAIL        TOKENS      AVG_MS
 openai-main          gpt-4o-2024-11-20           80       78        2        288400       2100
-deepseek             deepseek-chat               41       38        3         99300       1500
+deepseek             deepseek-flash              41       38        3         99300       1500
 ```
 
 ## 作为系统服务

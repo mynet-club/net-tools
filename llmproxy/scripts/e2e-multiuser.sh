@@ -189,9 +189,9 @@ sleep 2.6   # 等运行中的服务同步用户表
 echo
 echo "=== 2. 每个用户的请求走自己的上游 ==="
 ra=$(curl -s -X POST "$GW/v1/chat/completions" -H "Authorization: Bearer $A_TOKEN" \
-     -H 'Content-Type: application/json' -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}')
+     -H 'Content-Type: application/json' -d '{"model":"deepseek-flash","messages":[{"role":"user","content":"hi"}]}')
 rb=$(curl -s -X POST "$GW/v1/chat/completions" -H "Authorization: Bearer $B_TOKEN" \
-     -H 'Content-Type: application/json' -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}')
+     -H 'Content-Type: application/json' -d '{"model":"deepseek-flash","messages":[{"role":"user","content":"hi"}]}')
 echo "$ra" | grep -q "served-by:alice-up" && pass "alice 的请求落到她自己的上游" || fail "alice 的请求没落到自己的上游：$ra"
 echo "$rb" | grep -q "served-by:bob-up"   && pass "bob 的请求落到他自己的上游"   || fail "bob 的请求没落到自己的上游：$rb"
 chk "全局上游没有被这两个用户碰到" "$(curl -s "http://127.0.0.1:$GPORT/hits")" "0"
@@ -225,7 +225,7 @@ echo
 echo "=== 4. 鉴权边界 ==="
 c=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/chat/completions" \
     -H "Authorization: Bearer sk-wrong-token" -H 'Content-Type: application/json' \
-    -d '{"model":"deepseek-chat","messages":[]}')
+    -d '{"model":"deepseek-flash","messages":[]}')
 chk "错误 token 被拒" "$c" "401"
 c=$(curl -s -o /dev/null -w '%{http_code}' "$GW/v1/_admin/users" -H "Authorization: Bearer sk-wrong")
 chk "管理接口用错凭证被拒（403 而非 401，实现的选择）" "$c" "403"
@@ -238,7 +238,7 @@ chk "静态 key 不能使用自助接口" "$c" "403"
 echo
 echo "=== 5. 向后兼容：单用户时代的静态 key 仍走全局上游 ==="
 r=$(curl -s -X POST "$GW/v1/chat/completions" -H "Authorization: Bearer sk-single-user" \
-     -H 'Content-Type: application/json' -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}')
+     -H 'Content-Type: application/json' -d '{"model":"deepseek-flash","messages":[{"role":"user","content":"hi"}]}')
 echo "$r" | grep -q "served-by:global-up" && pass "静态 key 走全局上游" || fail "静态 key 没走全局：$r"
 
 echo
@@ -247,7 +247,7 @@ pkill -f "$STUB -name alice-up"
 sleep 0.5
 c=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/chat/completions" \
     -H "Authorization: Bearer $A_TOKEN" -H 'Content-Type: application/json' \
-    -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}')
+    -d '{"model":"deepseek-flash","messages":[{"role":"user","content":"hi"}]}')
 if [ "$c" != "200" ]; then pass "alice 的上游挂了 → 请求失败（HTTP ${c}），没有静默成功"; else fail "alice 的上游挂了却仍然成功，可能回退了全局"; fi
 chk "全局上游命中数没增加（仍是第 5 步那 1 次）" "$(curl -s "http://127.0.0.1:$GPORT/hits")" "1"
 
@@ -257,7 +257,7 @@ echo "=== 7. 停用用户 ==="
 sleep 2.6
 c=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/chat/completions" \
     -H "Authorization: Bearer $B_TOKEN" -H 'Content-Type: application/json' \
-    -d '{"model":"deepseek-chat","messages":[]}')
+    -d '{"model":"deepseek-flash","messages":[]}')
 chk "停用后的 token 被拒" "$c" "403"
 
 echo
@@ -789,10 +789,10 @@ chk "管理口的模拟不进影子计数（§3.0 线 1：只读旁观者）" "$
 chk "切到 enforce" "$(POLICY_MODE '{"mode":"enforce","data_level":"public"}')" "200"
 sleep 2.5
 chk "enforce 下 deny 生效" "$(alice_chat "$SECRET_MODEL")" "403"
-chk "enforce 下范围内的模型照常可用" "$(alice_chat "deepseek-chat")" "200"
+chk "enforce 下范围内的模型照常可用" "$(alice_chat "deepseek-flash")" "200"
 EXEC=$(curl -s -D - -o /dev/null -X POST "$GW/v1/chat/completions" \
   -H "Authorization: Bearer $A_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}' \
+  -d '{"model":"deepseek-flash","messages":[{"role":"user","content":"hi"}]}' \
   | tr -d '\r' | sed -n 's/^[Xx]-[Ll]lmproxy-[Ee]xecutor: *//p')
 chk "非流式那一段真的换执行器承载" "$EXEC" "http-openai"
 # §3.I 指标埋点：委托这件事实得在**可抓取的面**上留数 —— 响应头只服务当前那一发，
@@ -810,7 +810,7 @@ fi
 REC_RID="e2e-exec-rec-$$"
 curl -s -o /dev/null -X POST "$GW/v1/chat/completions" -H "Authorization: Bearer $A_TOKEN" \
   -H "X-Request-Id: $REC_RID" -H 'Content-Type: application/json' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"deepseek-flash","messages":[{"role":"user","content":"hi"}]}'
 sleep 0.4
 RECLINE=$(grep "event=executor_exchange" "$GWLOG" | grep "$REC_RID" | tail -1)
 if [ -n "$RECLINE" ]; then pass "真实进程的日志里留下了这次委托的执行记录"
@@ -833,7 +833,7 @@ fi
 STR_RID="e2e-exec-stream-$$"
 STRBODY=$(curl -s -N -D "$H/stream.head" -X POST "$GW/v1/chat/completions" \
   -H "Authorization: Bearer $A_TOKEN" -H "X-Request-Id: $STR_RID" -H 'Content-Type: application/json' \
-  -d '{"model":"deepseek-chat","stream":true,"messages":[{"role":"user","content":"hi"}]}')
+  -d '{"model":"deepseek-flash","stream":true,"messages":[{"role":"user","content":"hi"}]}')
 STR_EXEC=$(tr -d '\r' < "$H/stream.head" | sed -n 's/^[Xx]-[Ll]lmproxy-[Ee]xecutor: *//p')
 chk "流式那一段也换执行器承载（裁决 2：B 方案）" "$STR_EXEC" "http-openai"
 echo "$STRBODY" | grep -q "served-by:" \
@@ -874,7 +874,7 @@ grep -q '解释性回放' "$H/trace.json" && pass "没 seed 时痕迹自带说�
 RID2="e2e-trace-ok-$$"
 curl -s -o /dev/null -X POST "$GW/v1/chat/completions" -H "Authorization: Bearer $A_TOKEN" \
   -H "X-Request-Id: $RID2" -H 'Content-Type: application/json' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"deepseek-flash","messages":[{"role":"user","content":"hi"}]}'
 curl -s -o "$H/trace2.json" "$GW/v1/_admin/policy/trace?request_id=$RID2" -H "Authorization: Bearer $ADMIN"
 chk "放行那条有 seed，因此可逐字段回放" "$(jget "$H/trace2.json" exactly_replayable)" "True"
 chk "放行的痕迹也带归属范围（user:alice）" \
@@ -882,7 +882,7 @@ chk "放行的痕迹也带归属范围（user:alice）" \
 
 # 23f 回放证据链：CLI 是**另一个进程**，它只认磁盘上的策略包和记录文件
 "$BIN" replay on >/dev/null 2>&1 && pass "replay on（走管理口）" || fail "replay on 失败"
-alice_chat "deepseek-chat" >/dev/null
+alice_chat "deepseek-flash" >/dev/null
 alice_chat "$SECRET_MODEL" >/dev/null
 "$BIN" replay collect -out "$H/records.json" >/dev/null 2>&1
 if [ -f "$H/records.json" ]; then
@@ -944,7 +944,7 @@ sleep 2.5
 # 拿切换前的快照去比等于要求计数器忘掉它们真正发生过的那几交换。
 EXCH0=$(curl -s "$GW/metrics" | sed -n 's/^llmproxy_executor_exchanges_total{executor="http-openai"} *//p')
 chk "回滚后 deny 不再参与路由（行为恢复）" "$(alice_chat "$SECRET_MODEL")" "200"
-chk "回滚后范围内的模型照常可用" "$(alice_chat "deepseek-chat")" "200"
+chk "回滚后范围内的模型照常可用" "$(alice_chat "deepseek-flash")" "200"
 EXCH1=$(curl -s "$GW/metrics" | sed -n 's/^llmproxy_executor_exchanges_total{executor="http-openai"} *//p')
 chk "切回 legacy 后新请求不再产生委托（legacy 没有计划，也就没有计划声明的执行器）" "$EXCH1" "$EXCH0"
 curl -s -o "$H/insp.json" "$GW/v1/_admin/policy" -H "Authorization: Bearer $ADMIN"
@@ -979,7 +979,7 @@ echo "    本节的策略/回放写侧审计：$(sqlite3 "$DB" "SELECT group_con
 LEG_RID="e2e-exec-summary-legacy-$$"
 curl -s -o /dev/null -X POST "$GW/v1/chat/completions" -H "Authorization: Bearer $A_TOKEN" \
   -H "X-Request-Id: $LEG_RID" -H 'Content-Type: application/json' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"deepseek-flash","messages":[{"role":"user","content":"hi"}]}'
 sleep 0.4
 chk "委托那发的摘要落进了请求明细" \
   "$(sqlite3 "$DB" "SELECT executor||'|'||exchange_reason FROM requests WHERE request_id='$REC_RID';")" \
@@ -1068,7 +1068,7 @@ sleep 2.5
 EG_RID="e2e-audit-egress-$$"
 EG_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/chat/completions" \
   -H "Authorization: Bearer sk-single-user" -H "X-Request-Id: $EG_RID" -H 'Content-Type: application/json' \
-  -d "{\"model\":\"deepseek-chat\",\"messages\":[{\"role\":\"user\",\"content\":\"$MARK internal\"}]}")
+  -d "{\"model\":\"deepseek-flash\",\"messages\":[{\"role\":\"user\",\"content\":\"$MARK internal\"}]}")
 chk "内部档请求正常转发" "$EG_CODE" "200"
 chk "高于 public 的内容出网恰好留 1 条授权" \
   "$(sqlite3 "$DB" "SELECT COUNT(*) FROM audit_log WHERE action='egress.allow' AND detail LIKE '%$EG_RID%';")" "1"
@@ -1090,7 +1090,7 @@ AUDIT_BEFORE=$(sqlite3 "$DB" "SELECT COUNT(*) FROM audit_log WHERE action IN ('p
 chk "切回 legacy" "$(POLICY_MODE '{"mode":"legacy"}')" "200"
 sleep 2.5
 alice_chat "$SECRET_MODEL" >/dev/null
-alice_chat "deepseek-chat" >/dev/null
+alice_chat "deepseek-flash" >/dev/null
 chk "legacy 下一类新留痕也不写（观察数据不冒充处置事实）" \
   "$(sqlite3 "$DB" "SELECT COUNT(*) FROM audit_log WHERE action IN ('policy.deny','egress.allow');")" "$AUDIT_BEFORE"
 echo "    取证留痕读数：$(sqlite3 "$DB" "SELECT group_concat(action||'@'||scope_kind||':'||scope_id, ' | ') FROM (SELECT action, scope_kind, scope_id FROM audit_log WHERE action IN ('policy.deny','egress.allow') ORDER BY id DESC LIMIT 6);")"
@@ -1118,10 +1118,10 @@ curl -s -o "$H/rpscope.json" -X POST "$GW/v1/_admin/replay/sampling" \
   -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
   -d '{"enabled":true,"sample_permille":1000,"scope":"user:alice"}'
 chk "过滤按 kind:id 全串回显（不是裸用户名）" "$(jget "$H/rpscope.json" scope_filter)" "user:alice"
-alice_chat "deepseek-chat" -H "X-Request-Id: $LID_A" >/dev/null
+alice_chat "deepseek-flash" -H "X-Request-Id: $LID_A" >/dev/null
 curl -s -o /dev/null -X POST "$GW/v1/chat/completions" -H "Authorization: Bearer sk-single-user" \
   -H "X-Request-Id: $LID_S" -H 'Content-Type: application/json' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"deepseek-flash","messages":[{"role":"user","content":"hi"}]}'
 curl -s -o "$H/rpstat.json" "$GW/v1/_admin/replay" -H "Authorization: Bearer $ADMIN"
 chk "采集侧过滤在真进程里生效：只有 alice 那条进窗口" "$(jget "$H/rpstat.json" entries)" "1"
 curl -s -o "$H/exp-alice.json" "$GW/v1/_admin/replay/export?scope=user:alice" -H "Authorization: Bearer $ADMIN"
@@ -1133,7 +1133,7 @@ curl -s -o "$H/rpclear.json" -X POST "$GW/v1/_admin/replay/sampling" \
 chk "显式传空 scope 是清过滤（不是保持原值）" "$(jget "$H/rpclear.json" scope_filter)" ""
 curl -s -o /dev/null -X POST "$GW/v1/chat/completions" -H "Authorization: Bearer sk-single-user" \
   -H "X-Request-Id: $LID_S2" -H 'Content-Type: application/json' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"deepseek-flash","messages":[{"role":"user","content":"hi"}]}'
 curl -s -o "$H/exp-sys.json" "$GW/v1/_admin/replay/export?scope=system:global" -H "Authorization: Bearer $ADMIN"
 chk "静态 key 那条按 system:global 导得出来（旧口径下它是不可寻址的空串）" \
   "$(rec_ids "$H/exp-sys.json")" "$LID_S2"

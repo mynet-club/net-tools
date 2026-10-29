@@ -171,7 +171,7 @@ grep -q '"note"' "$H/rpset.json" || grep -q 'sampl\|permille\|enabled' "$H/rpset
   && pass "开启采集窗口" || fail "开启采集的响应意外：$(cat "$H/rpset.json")"
 REQ_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GW/v1/chat/completions" \
   -H "Authorization: Bearer $A_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}')
+  -d '{"model":"deepseek-flash","messages":[{"role":"user","content":"hi"}]}')
 chk "alice 的请求在 enforce 下正常放行" "$REQ_CODE" "200"
 sleep 0.6
 CAP=$(curl -s "$GW/v1/_admin/replay" -H "Authorization: Bearer $ADMIN" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("captured",0))')
