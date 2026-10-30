@@ -2,7 +2,6 @@ package anthropic
 
 import (
 	"encoding/json"
-	"strconv"
 	"strings"
 	"testing"
 )
@@ -182,39 +181,51 @@ func TestFromChatTextAndTools(t *testing.T) {
 
 func TestToChatThinkingMapping(t *testing.T) {
 	cases := []struct {
-		budget int
+		name   string
+		fields string
 		want   string
 	}{
-		{0, "medium"},    // 不带预算按 medium
-		{1024, "low"},    // <8192
-		{8192, "medium"}, // <24576
-		{24576, "high"},  // 之上
+		{"missing", "", ""},
+		{"null", `,"thinking":null`, ""},
+		{"enabled_default", `,"thinking":{"type":"enabled"}`, "medium"},
+		{"low_budget", `,"thinking":{"type":"enabled","budget_tokens":1024}`, "low"},
+		{"medium_budget", `,"thinking":{"type":"enabled","budget_tokens":8192}`, "medium"},
+		{"high_budget", `,"thinking":{"type":"enabled","budget_tokens":24576}`, "high"},
+		{"disabled", `,"thinking":{"type":"disabled"}`, "none"},
+		{"disabled_with_effort", `,"thinking":{"type":"disabled"},"output_config":{"effort":"high"}`, "none"},
+		{"adaptive_default", `,"thinking":{"type":"adaptive"}`, ""},
+		{"adaptive_low", `,"thinking":{"type":"adaptive"},"output_config":{"effort":"low"}`, "low"},
+		{"adaptive_medium", `,"thinking":{"type":"adaptive"},"output_config":{"effort":"medium"}`, "medium"},
+		{"adaptive_high", `,"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}`, "high"},
+		{"adaptive_max", `,"thinking":{"type":"adaptive"},"output_config":{"effort":"max"}`, "xhigh"},
+		{"adaptive_xhigh", `,"thinking":{"type":"adaptive"},"output_config":{"effort":"xhigh"}`, "xhigh"},
+		{"explicit_effort", `,"thinking":{"type":"enabled","budget_tokens":1024},"output_config":{"effort":"high"}`, "high"},
+		{"effort_without_thinking", `,"output_config":{"effort":"low"}`, "low"},
 	}
 	for _, tc := range cases {
-		req := mustReq(t, `{"model":"m","max_tokens":1,
-			"messages":[{"role":"user","content":"x"}],
-			"thinking":{"type":"enabled","budget_tokens":`+itoa(tc.budget)+`}}`)
-		chat, _, err := ToChat(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if chat.ReasoningEffort != tc.want {
-			t.Fatalf("budget=%d → %q，想要 %q", tc.budget, chat.ReasoningEffort, tc.want)
-		}
-	}
-	// disabled 与缺省都不写这个字段
-	for _, src := range []string{
-		`{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"x"}],"thinking":{"type":"disabled"}}`,
-		`{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"x"}]}`,
-	} {
-		req := mustReq(t, src)
-		chat, _, err := ToChat(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if chat.ReasoningEffort != "" {
-			t.Fatalf("%s 时不该带 reasoning_effort，拿到 %q", src, chat.ReasoningEffort)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			req := mustReq(t, `{"model":"m","max_tokens":65536,"messages":[{"role":"user","content":"x"}]`+tc.fields+`}`)
+			chat, _, err := ToChat(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if chat.ReasoningEffort != tc.want {
+				t.Fatalf("reasoning_effort = %q，想要 %q", chat.ReasoningEffort, tc.want)
+			}
+			raw, err := json.Marshal(chat)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &fields); err != nil {
+				t.Fatal(err)
+			}
+			for _, field := range []string{"thinking", "output_config"} {
+				if _, ok := fields[field]; ok {
+					t.Fatalf("OpenAI 请求不应带 %s: %s", field, raw)
+				}
+			}
+		})
 	}
 }
 
@@ -273,8 +284,4 @@ func mustJSON(t *testing.T, v any) string {
 		t.Fatal(err)
 	}
 	return string(b)
-}
-
-func itoa(n int) string {
-	return strconv.Itoa(n)
 }

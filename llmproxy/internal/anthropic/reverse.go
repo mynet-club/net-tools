@@ -42,7 +42,9 @@ func ToMessages(chat *ChatRequest) (*Request, error) {
 		StopSequences: chat.Stop,
 		Stream:        chat.Stream,
 	}
-	if chat.ReasoningEffort != "" {
+	if chat.ReasoningEffort == "none" {
+		out.Thinking = &Thinking{Type: "disabled"}
+	} else if chat.ReasoningEffort != "" {
 		out.Thinking = &Thinking{Type: "enabled", BudgetTokens: budgetForEffort(chat.ReasoningEffort)}
 	}
 
@@ -225,7 +227,7 @@ func chatFinishReason(stop string, hasTools bool) string {
 	}
 }
 
-// budgetForEffort 是 reasoningEffort 的逆映射（取各档的代表预算）。
+// 只有跨协议且没有原始预算时才按档位选择代表预算。
 func budgetForEffort(eff string) int {
 	switch eff {
 	case "low":

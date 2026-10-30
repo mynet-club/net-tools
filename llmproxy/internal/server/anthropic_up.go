@@ -51,7 +51,27 @@ func (t *anthropicTransport) RoundTrip(req *http.Request) (*http.Response, error
 	if err != nil {
 		return nil, fmt.Errorf("请求翻不成 Messages 形状: %w", err)
 	}
-	body, err := json.Marshal(msgReq)
+	var payload any = msgReq
+	if original, ok := req.Context().Value(anthropicReasoningKey{}).(anthropicReasoning); ok {
+		// 处理器显式改写的通用强度优先，不能被原生预算或 effort 覆盖。
+		if chat.ReasoningEffort != original.effort {
+			original.Thinking = nil
+			if msgReq.Thinking != nil {
+				original.Thinking, _ = json.Marshal(msgReq.Thinking)
+			}
+			var output map[string]json.RawMessage
+			if err := json.Unmarshal(original.OutputConfig, &output); err == nil && output != nil {
+				delete(output, "effort")
+				original.OutputConfig, _ = json.Marshal(output)
+			}
+		}
+		payload = struct {
+			*anthropic.Request
+			Thinking     json.RawMessage `json:"thinking,omitempty"`
+			OutputConfig json.RawMessage `json:"output_config,omitempty"`
+		}{msgReq, original.Thinking, original.OutputConfig}
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("Messages 请求编码失败: %w", err)
 	}

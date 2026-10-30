@@ -2,7 +2,9 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -248,6 +250,126 @@ func TestAnthropicThinkingStream(t *testing.T) {
 	}
 	if eff, _ := up.Calls()[0].Body["reasoning_effort"].(string); eff != "medium" {
 		t.Fatalf("预算 20000 应映射 medium，上游收到 %q", eff)
+	}
+}
+
+func TestAnthropicMessagesOpenAIReasoningEffort(t *testing.T) {
+	up := startMockUpstream(t, &mockUpstream{name: "a", apiKey: "sk-a"})
+	h := newHarness(t, cfgYAML(map[string]string{"a": up.baseURL}, []string{"sk-local"}))
+	cases := []struct {
+		name   string
+		fields string
+		effort string
+	}{
+		{"enabled", `{"thinking":{"type":"enabled","budget_tokens":1024}}`, "low"},
+		{"disabled", `{"thinking":{"type":"disabled"}}`, "none"},
+		{"adaptive_low", `{"thinking":{"type":"adaptive"},"output_config":{"effort":"low"}}`, "low"},
+		{"adaptive_medium", `{"thinking":{"type":"adaptive"},"output_config":{"effort":"medium"}}`, "medium"},
+		{"adaptive_high", `{"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}}`, "high"},
+		{"adaptive_max", `{"thinking":{"type":"adaptive"},"output_config":{"effort":"max"}}`, "xhigh"},
+		{"adaptive_xhigh", `{"thinking":{"type":"adaptive"},"output_config":{"effort":"xhigh"}}`, "xhigh"},
+		{"adaptive_default", `{"thinking":{"type":"adaptive"}}`, ""},
+		{"output_effort_only", `{"output_config":{"effort":"low"}}`, "low"},
+		{"absent", `{}`, ""},
+	}
+	for _, stream := range []bool{false, true} {
+		for _, tc := range cases {
+			t.Run(fmt.Sprintf("stream=%t/%s", stream, tc.name), func(t *testing.T) {
+				body := anthropicBody(stream)
+				body["max_tokens"] = 65536
+				if err := json.Unmarshal([]byte(tc.fields), &body); err != nil {
+					t.Fatal(err)
+				}
+				wantCalls := len(up.Calls()) + 1
+				resp, raw := h.post(t, "/v1/messages", "sk-local", body)
+				if resp.StatusCode != 200 {
+					t.Fatalf("状态 %d：%s", resp.StatusCode, raw)
+				}
+				wantType := "application/json"
+				if stream {
+					wantType = "text/event-stream"
+				}
+				if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, wantType) {
+					t.Errorf("响应类型 %q，期望 %q", ct, wantType)
+				}
+				calls := up.Calls()
+				if len(calls) != wantCalls {
+					t.Fatalf("上游调用次数 %d，期望 %d", len(calls), wantCalls)
+				}
+				call := calls[len(calls)-1]
+				if call.Path != "/chat/completions" {
+					t.Errorf("上游路径不对: %s", call.Path)
+				}
+				for _, key := range []string{"thinking", "output_config"} {
+					if _, ok := call.Body[key]; ok {
+						t.Errorf("OpenAI 上游不应收到 %s: %v", key, call.Body)
+					}
+				}
+				effort, present := call.Body["reasoning_effort"]
+				if tc.effort == "" {
+					if present {
+						t.Errorf("缺省请求不应带 reasoning_effort: %v", effort)
+					}
+				} else if effort != tc.effort {
+					t.Errorf("reasoning_effort = %v，期望 %q", effort, tc.effort)
+				}
+				if gotStream, _ := call.Body["stream"].(bool); gotStream != stream {
+					t.Errorf("上游 stream = %t，期望 %t", gotStream, stream)
+				}
+			})
+		}
+	}
+}
+
+func TestDetachAnthropicReasoning(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		body     string
+		effort   string
+		baseline string
+	}{
+		{"unchanged", `{"thinking":{"type":"enabled","budget_tokens":12000},"reasoning_effort":"medium"}`, "medium", "medium"},
+		{"native_disabled", `{"thinking":{"type":"disabled"},"reasoning_effort":"medium"}`, "none", "none"},
+		{"native_effort", `{"thinking":{"type":"adaptive"},"output_config":{"effort":"low"},"reasoning_effort":"medium"}`, "low", "low"},
+		{"native_removed", `{"reasoning_effort":"medium"}`, "", ""},
+		{"common_overrides_native", `{"thinking":{"type":"enabled","budget_tokens":12000},"reasoning_effort":"none"}`, "none", "medium"},
+		{"common_removed", `{"thinking":{"type":"enabled","budget_tokens":12000}}`, "", "medium"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.WithValue(context.Background(), anthropicReasoningKey{}, anthropicReasoning{effort: "medium"})
+			ctx, raw, err := detachAnthropicReasoning(ctx, []byte(tc.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &fields); err != nil {
+				t.Fatal(err)
+			}
+			var effort string
+			if value, ok := fields["reasoning_effort"]; ok {
+				if err := json.Unmarshal(value, &effort); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if effort != tc.effort {
+				t.Fatalf("reasoning_effort=%q，期望 %q", effort, tc.effort)
+			}
+			for _, key := range []string{"thinking", "output_config"} {
+				if _, ok := fields[key]; ok {
+					t.Errorf("OpenAI 正文不应带 %s", key)
+				}
+			}
+			processed := ctx.Value(anthropicReasoningKey{}).(anthropicReasoning)
+			if processed.effort != tc.baseline {
+				t.Errorf("处理后的基线=%q，期望 %q", processed.effort, tc.baseline)
+			}
+		})
+	}
+	for _, raw := range []string{`null`, `[]`, `{`, `{"thinking":"invalid"}`, `{"reasoning_effort":1}`} {
+		ctx := context.WithValue(context.Background(), anthropicReasoningKey{}, anthropicReasoning{})
+		if _, _, err := detachAnthropicReasoning(ctx, []byte(raw)); err == nil {
+			t.Errorf("处理后非法正文应拒绝: %s", raw)
+		}
 	}
 }
 

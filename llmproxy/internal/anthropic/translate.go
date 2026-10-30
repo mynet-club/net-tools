@@ -13,11 +13,7 @@ import (
 // 一处刻意的丢弃：top_k —— OpenAI 形状没有这个字段也没有等价物，静默丢弃
 // （带上去反而会被一些上游判成非法字段）。
 //
-// thinking（extended thinking）翻成 reasoning_effort：预算按三档映射
-// （<8192 low、<24576 medium、其余 high；不带预算按 medium）。上游认不认这个
-// 字段随它 —— 不认的（如 deepseek-flash）忽略即可，deepseek-reasoner 这类
-// 「换了模型才思考」的上游由用户自己的模型映射决定。响应侧的推理正文由
-// FromChat / StreamTranslator 翻回 thinking 块。
+// OpenAI 没有精确预算字段；这里只生成跨协议强度，原生参数由 HTTP 边缘保留。
 //
 // 返回的 estimate 是给 message_start / count_tokens 用的输入 token 估算值。
 func ToChat(req *Request) (*ChatRequest, int, error) {
@@ -35,7 +31,7 @@ func ToChat(req *Request) (*ChatRequest, int, error) {
 		TopP:            req.TopP,
 		Stop:            req.StopSequences,
 		Stream:          req.Stream,
-		ReasoningEffort: reasoningEffort(req.Thinking),
+		ReasoningEffort: ReasoningEffort(req.Thinking, req.OutputConfig),
 	}
 
 	// system → 首条 system 消息
@@ -173,9 +169,16 @@ func chatMessages(m *Message) ([]ChatMessage, int, error) {
 	return out, est, nil
 }
 
-// reasoningEffort 把 thinking 预算翻成上游的 reasoning_effort 三档。
-// disabled / 不带 thinking 返回空串（不写这个字段）。
-func reasoningEffort(th *Thinking) string {
+func ReasoningEffort(th *Thinking, output *OutputConfig) string {
+	if th != nil && th.Type == "disabled" {
+		return "none"
+	}
+	if output != nil && output.Effort != "" {
+		if output.Effort == "max" {
+			return "xhigh"
+		}
+		return output.Effort
+	}
 	if th == nil || th.Type != "enabled" {
 		return ""
 	}

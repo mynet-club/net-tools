@@ -16,26 +16,29 @@ import "encoding/json"
 // content 的两种形态（字符串或块数组）都收：Claude Code 用块数组，
 // 一行 curl 常用字符串，二者语义相同。
 type Request struct {
-	Model         string      `json:"model"`
-	MaxTokens     int         `json:"max_tokens"`
-	Messages      []Message   `json:"messages"`
-	System        Content     `json:"system,omitempty"`
-	Tools         []Tool      `json:"tools,omitempty"`
-	ToolChoice    *ToolChoice `json:"tool_choice,omitempty"`
-	Temperature   *float64    `json:"temperature,omitempty"`
-	TopP          *float64    `json:"top_p,omitempty"`
-	TopK          *float64    `json:"top_k,omitempty"` // OpenAI 形状没有对应物，翻译时丢弃
-	StopSequences []string    `json:"stop_sequences,omitempty"`
-	Stream        bool        `json:"stream,omitempty"`
-	Metadata      *Metadata   `json:"metadata,omitempty"`
-	Thinking      *Thinking   `json:"thinking,omitempty"`
+	Model         string        `json:"model"`
+	MaxTokens     int           `json:"max_tokens"`
+	Messages      []Message     `json:"messages"`
+	System        Content       `json:"system,omitempty"`
+	Tools         []Tool        `json:"tools,omitempty"`
+	ToolChoice    *ToolChoice   `json:"tool_choice,omitempty"`
+	Temperature   *float64      `json:"temperature,omitempty"`
+	TopP          *float64      `json:"top_p,omitempty"`
+	TopK          *float64      `json:"top_k,omitempty"` // OpenAI 形状没有对应物，翻译时丢弃
+	StopSequences []string      `json:"stop_sequences,omitempty"`
+	Stream        bool          `json:"stream,omitempty"`
+	Metadata      *Metadata     `json:"metadata,omitempty"`
+	Thinking      *Thinking     `json:"thinking,omitempty"`
+	OutputConfig  *OutputConfig `json:"output_config,omitempty"`
 }
 
-// Thinking 是 extended thinking 开关：type=enabled 时带上预算。
-// 预算翻成上游的 reasoning_effort（见 ToChat 的分档）；type=disabled 不带。
 type Thinking struct {
 	Type         string `json:"type"`
 	BudgetTokens int    `json:"budget_tokens,omitempty"`
+}
+
+type OutputConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 // Metadata 只有 user_id 一个字段会被上游认得；这里收下是为了校验形态。

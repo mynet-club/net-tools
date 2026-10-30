@@ -78,6 +78,40 @@ func TestToMessagesShapes(t *testing.T) {
 	}
 }
 
+func TestToMessagesThinkingMapping(t *testing.T) {
+	for _, tc := range []struct {
+		effort string
+		kind   string
+		budget int
+	}{
+		{"", "", 0},
+		{"none", "disabled", 0},
+		{"low", "enabled", 4096},
+		{"medium", "enabled", 16384},
+		{"high", "enabled", 32768},
+	} {
+		t.Run(tc.effort, func(t *testing.T) {
+			req, err := ToMessages(&ChatRequest{
+				Model: "m", MaxTokens: 65536,
+				Messages:        []ChatMessage{{Role: "user", Content: "x"}},
+				ReasoningEffort: tc.effort,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.kind == "" {
+				if req.Thinking != nil {
+					t.Fatalf("缺省强度不应启用 thinking: %+v", req.Thinking)
+				}
+				return
+			}
+			if req.Thinking == nil || req.Thinking.Type != tc.kind || req.Thinking.BudgetTokens != tc.budget {
+				t.Fatalf("thinking = %+v，想要 type=%s budget=%d", req.Thinking, tc.kind, tc.budget)
+			}
+		})
+	}
+}
+
 func TestFromMessagesShape(t *testing.T) {
 	resp := &Response{
 		ID: "msg_1", Model: "up-m",

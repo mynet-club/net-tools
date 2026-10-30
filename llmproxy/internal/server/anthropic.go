@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,10 +18,13 @@ import (
 // 交给 handleUpstreamPost 走完全一样的鉴权、限流、策略、选路、处理器与记账；
 // 出口用 anthropicWriter 把响应（含 SSE 流）翻回 Anthropic 格式。管线一个字节
 // 不改，治理面一视同仁地罩住两种协议进来的流量。
-//
-// 已知取舍（phase 1）：top_k 丢弃；stop_sequences 命中哪条回填不了（OpenAI 侧不报）；
-// 上游必须是 OpenAI 兼容形状（Anthropic 原生上游的直通是另一包活）。thinking 已双向
-// 翻译：请求侧预算 → reasoning_effort，响应侧 reasoning_content → thinking 块。
+type anthropicReasoningKey struct{}
+
+type anthropicReasoning struct {
+	Thinking     json.RawMessage `json:"thinking,omitempty"`
+	OutputConfig json.RawMessage `json:"output_config,omitempty"`
+	effort       string
+}
 
 // writeAnthropicError 按 Anthropic 的错误形状回错：
 // {"type":"error","error":{"type":…,"message":…}}。
@@ -74,7 +78,12 @@ func (s *Server) handleAnthropic(w http.ResponseWriter, r *http.Request, auth au
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	body, err := json.Marshal(chat)
+	var original anthropicReasoning
+	_ = json.Unmarshal(raw, &original)
+	body, err := json.Marshal(struct {
+		*anthropic.ChatRequest
+		anthropicReasoning
+	}{chat, original})
 	if err != nil {
 		writeAnthropicError(w, http.StatusInternalServerError, "api_error",
 			fmt.Sprintf("内部请求编码失败: %v", err))
@@ -83,7 +92,8 @@ func (s *Server) handleAnthropic(w http.ResponseWriter, r *http.Request, auth au
 
 	// 合成内部请求：路径换成 /v1/chat/completions，其余头（鉴权、X-Identity-Token、
 	// X-Request-Id、会话粘性）原样带过去 —— 策略与记账看到的与 OpenAI 协议请求无异。
-	r2 := r.Clone(r.Context())
+	baseline := anthropicReasoning{effort: chat.ReasoningEffort}
+	r2 := r.Clone(context.WithValue(r.Context(), anthropicReasoningKey{}, baseline))
 	r2.URL.Path = "/v1/chat/completions"
 	r2.Method = http.MethodPost
 	r2.Body = io.NopCloser(bytes.NewReader(body))
@@ -93,6 +103,48 @@ func (s *Server) handleAnthropic(w http.ResponseWriter, r *http.Request, auth au
 	wrap := newAnthropicWriter(w, areq.Model, est)
 	s.handleUpstreamPost(wrap, r2, auth)
 	wrap.finish()
+}
+
+// 必须在处理器之后提取，原生配置里的文本同样需要脱敏，且不能恢复处理器已删除的字段。
+func detachAnthropicReasoning(ctx context.Context, raw []byte) (context.Context, []byte, error) {
+	baseline, ok := ctx.Value(anthropicReasoningKey{}).(anthropicReasoning)
+	if !ok {
+		return ctx, raw, nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return ctx, nil, err
+	}
+	if fields == nil {
+		return ctx, nil, fmt.Errorf("请求体不是 JSON 对象")
+	}
+	var current struct {
+		Thinking        *anthropic.Thinking     `json:"thinking"`
+		OutputConfig    *anthropic.OutputConfig `json:"output_config"`
+		ReasoningEffort string                  `json:"reasoning_effort"`
+	}
+	if err := json.Unmarshal(raw, &current); err != nil {
+		return ctx, nil, err
+	}
+	// 未显式改写通用强度时，以处理后的原生参数重算，避免两种表达发生分歧。
+	if current.ReasoningEffort == baseline.effort {
+		baseline.effort = anthropic.ReasoningEffort(current.Thinking, current.OutputConfig)
+		delete(fields, "reasoning_effort")
+		if baseline.effort != "" {
+			fields["reasoning_effort"], _ = json.Marshal(baseline.effort)
+		}
+	}
+	processed := anthropicReasoning{
+		Thinking: fields["thinking"], OutputConfig: fields["output_config"],
+		effort: baseline.effort,
+	}
+	delete(fields, "thinking")
+	delete(fields, "output_config")
+	body, err := json.Marshal(fields)
+	if err != nil {
+		return ctx, nil, err
+	}
+	return context.WithValue(ctx, anthropicReasoningKey{}, processed), body, nil
 }
 
 // anthropicWriter 拦住管线写下来的 OpenAI 形状响应，翻成 Anthropic 形状再落给

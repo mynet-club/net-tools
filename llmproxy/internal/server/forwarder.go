@@ -347,6 +347,13 @@ func (s *Server) handleUpstreamPost(w http.ResponseWriter, r *http.Request, auth
 		}
 	}
 
+	requestCtx, raw, err := detachAnthropicReasoning(r.Context(), raw)
+	if err != nil {
+		s.fail(w, rec, http.StatusBadGateway, "processor_failed", "处理后的请求体不是合法 JSON", 0, started)
+		return
+	}
+	r = r.WithContext(requestCtx)
+
 	for i := 0; i < maxAttempts; i++ {
 		cand, err := s.router.PickFromPreferring(bucket, providers, probe.Model, exclude, prefer)
 		if err != nil {
